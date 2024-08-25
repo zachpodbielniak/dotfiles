@@ -40,25 +40,27 @@ alias dr="distrobox rm"
 
 alias flatpak="flatpak --user"
 alias vim="nvim"
+alias gpia="curl https://icanhazip.com"
+alias k="kubectl"
 
 export PATH="/var/home/zach/bin/scripts:$PATH"
 [ "$ORIG_PATH" == "" ] && export ORIG_PATH="$PATH"
 
 # Export only to main system not distrobox containers
 # or any other container that gets ~ mapped
-if [ ! -f /run/.containerenv ]; then
-    export PATH="/var/home/zach/bin/export:$PATH"
+if [ ! -f /run/.containerenv ]
+then 
+	export PATH="$HOME/bin/export:$PATH"
 else
-    export PATH="$ORIG_PATH"
+	export PATH="$ORIG_PATH"
 fi
 
-# PS1 Config -- No longer needed due to usage of starship
-#if [ -f /run/.containerenv ]
-#then
-#	export PS1="[\u@\h \W]\`parse_git_branch\`\[\e[37m\]\`nonzero_return\`\[\e[m\]\\$ "
-#else
-#	export PS1="[\W]\`parse_git_branch\`\[\e[37m\]\`nonzero_return\`\[\e[m\]\\$ "
-#fi
+if [ -f /run/.containerenv ]
+then
+	export PS1="[\u@\h \W]\`parse_git_branch\`\[\e[37m\]\`nonzero_return\`\[\e[m\]\\$ "
+else
+	export PS1="[\W]\`parse_git_branch\`\[\e[37m\]\`nonzero_return\`\[\e[m\]\\$ "
+fi
 
 # Container specific setups
 [ "dev" == "$(get_current_container_name)" ] &&
@@ -69,4 +71,12 @@ fi
 
 eval "$($HOME/bin/starship/starship init bash)"
 # WORKSTATION_BASHRC
-source ~/.bashrc-workstation
+# [ -f ~/.bashrc-workstation ] && source ~/.bashrc-workstation
+
+
+
+
+
+
+
+
