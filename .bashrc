@@ -31,7 +31,7 @@ export EDITOR=nvim
 export REGISTRY_AUTH_FILE="/var/home/$(whoami)/.config/containers/auth.json"
 
 source ~/.bashrc-functions
-source ~/.bashrc-secrets
+if [ -f ~/.bashrc-secrets ]; then source ~/.bashrc-secrets; fi
 
 alias dc="distrobox create"
 alias de="distrobox enter"
@@ -50,7 +50,7 @@ export PATH="/var/home/zach/bin/scripts:$PATH"
 # or any other container that gets ~ mapped
 if [ ! -f /run/.containerenv ]
 then 
-	export PATH="$HOME/bin/export:$PATH"
+	export PATH="$HOME/../linuxbrew/.linuxbrew/bin:$HOME/bin/export:$PATH"
 else
 	export PATH="$ORIG_PATH"
 fi
