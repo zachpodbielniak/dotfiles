@@ -32,6 +32,7 @@ export REGISTRY_AUTH_FILE="/var/home/$(whoami)/.config/containers/auth.json"
 
 source ~/.bashrc-functions
 if [ -f ~/.bashrc-secrets ]; then source ~/.bashrc-secrets; fi
+if [ -f /usr/immutablue/scripts/common.sh ]; then source /usr/immutablue/scripts/common.sh; fi
 
 alias dc="distrobox create"
 alias de="distrobox enter"
