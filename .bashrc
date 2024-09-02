@@ -28,12 +28,14 @@ unset rc
 set -o vi
 
 export EDITOR=nvim
-export REGISTRY_AUTH_FILE="/var/home/$(whoami)/.config/containers/auth.json"
+export REGISTRY_AUTH_FILE="$HOME/.config/containers/auth.json"
 
 source ~/.bashrc-functions
 if [ -f ~/.bashrc-secrets ]; then source ~/.bashrc-secrets; fi
 if [ -f /usr/immutablue/scripts/common.sh ]; then source /usr/immutablue/scripts/common.sh; fi
 
+
+# Aliases
 alias dc="distrobox create"
 alias de="distrobox enter"
 alias dl="distrobox list"
@@ -45,17 +47,20 @@ alias gpia="curl https://icanhazip.com"
 alias k="kubectl"
 alias cat="bat --theme=TwoDark --paging=never"
 
-export PATH="/var/home/zach/bin/scripts:$PATH"
+
+# Exports
+export PATH="$HOME/bin/scripts:$PATH"
+export PATH="$HOME/../linuxbrew/.linuxbrew/bin:$PATH"
 [ "$ORIG_PATH" == "" ] && export ORIG_PATH="$PATH"
 
 # Export only to main system not distrobox containers
 # or any other container that gets ~ mapped
-if [ ! -f /run/.containerenv ]
-then 
-	export PATH="$HOME/../linuxbrew/.linuxbrew/bin:$HOME/bin/export:$PATH"
-else
-	export PATH="$ORIG_PATH"
-fi
+# if [ ! -f /run/.containerenv ]
+# then 
+# 	export PATH="$HOME/../linuxbrew/.linuxbrew/bin:$HOME/bin/export:$PATH"
+# else
+# 	export PATH="$ORIG_PATH"
+# fi
 
 if [ -f /run/.containerenv ]
 then
@@ -64,17 +69,26 @@ else
 	export PS1="[\W]\`parse_git_branch\`\[\e[37m\]\`nonzero_return\`\[\e[m\]\\$ "
 fi
 
-# Container specific setups
-[ "dev" == "$(get_current_container_name)" ] &&
-    source /usr/share/bash-completion/bash_completion &&
-    source <(kubectl completion bash) &&
-    source <(_HASS_CLI_COMPLETE=bash_source hass-cli) &&
-    source "$HOME/.cargo/env"
 
-eval "$($HOME/bin/starship/starship init bash)"
-# WORKSTATION_BASHRC
-# [ -f ~/.bashrc-workstation ] && source ~/.bashrc-workstation
 
+
+# Settings
+# export FZF_DEFAULT_COMMAND='find . -type f ! -path "*git*"'
+export FZF_DEFAULT_COMMAND='rg --files --hidden --glob "!.git"'
+export FZF_DEFAULT_OPTS='-i --height=50% --preview="bat {}" --tmux center'
+
+
+
+# Bash completion stuff
+if [ -f /usr/share/bash-completion/bash_completion ]; then source /usr/share/bash-completion/bash_completion; fi
+
+type kubectl 2>/dev/null >/dev/null 
+if [ $? -eq 0 ]; then source <(kubectl completion bash); fi
+
+type hass-cli 2>/dev/null >/dev/null
+if [ $? -eq 0 ] && [ ! -f /run/.containerenv ]; then source <(_HASS_CLI_COMPLETE=bash_source hass-cli); fi
+
+if [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
 
 type fzf 2>/dev/null >/dev/null
 if [ $? -eq 0 ]; then eval "$(fzf --bash)"; fi
@@ -83,5 +97,6 @@ type himalaya 2>/dev/null >/dev/null
 if [ $? -eq 0 ]; then eval "$(himalaya completion bash)"; fi
 
 
-
+# Starship
+eval "$($HOME/bin/starship/starship init bash)"
 
