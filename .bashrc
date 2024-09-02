@@ -47,12 +47,16 @@ alias gpia="curl https://icanhazip.com"
 alias k="kubectl"
 alias cat="bat --theme=TwoDark --paging=never"
 
+alias weather="wthrr toledo,oh"
+alias forecast="wthrr --forecast d,w toledo,oh"
+
 
 # Exports
 export PATH="$HOME/bin/scripts:$PATH"
+export PATH="$HOME/bin/export:$PATH"
 export PATH="$HOME/../linuxbrew/.linuxbrew/bin:$PATH"
-[ "$ORIG_PATH" == "" ] && export ORIG_PATH="$PATH"
 
+# [ "$ORIG_PATH" == "" ] && export ORIG_PATH="$PATH"
 # Export only to main system not distrobox containers
 # or any other container that gets ~ mapped
 # if [ ! -f /run/.containerenv ]
