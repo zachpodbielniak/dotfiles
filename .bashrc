@@ -43,6 +43,7 @@ alias flatpak="flatpak --user"
 alias vim="nvim"
 alias gpia="curl https://icanhazip.com"
 alias k="kubectl"
+alias cat="bat --theme=TwoDark --paging=never"
 
 export PATH="/var/home/zach/bin/scripts:$PATH"
 [ "$ORIG_PATH" == "" ] && export ORIG_PATH="$PATH"
@@ -75,8 +76,11 @@ eval "$($HOME/bin/starship/starship init bash)"
 # [ -f ~/.bashrc-workstation ] && source ~/.bashrc-workstation
 
 
-eval "$(fzf --bash)"
+type fzf 2>/dev/null >/dev/null
+if [ $? -eq 0 ]; then eval "$(fzf --bash)"; fi
 
+type himalaya 2>/dev/null >/dev/null 
+if [ $? -eq 0 ]; then eval "$(himalaya completion bash)"; fi
 
 
 
