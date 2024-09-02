@@ -75,7 +75,7 @@ eval "$($HOME/bin/starship/starship init bash)"
 # [ -f ~/.bashrc-workstation ] && source ~/.bashrc-workstation
 
 
-
+eval "$(fzf --bash)"
 
 
 
