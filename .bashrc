@@ -101,6 +101,10 @@ type himalaya 2>/dev/null >/dev/null
 if [ $? -eq 0 ]; then eval "$(himalaya completion bash)"; fi
 
 
+# Keybinds
+bind -x '"\C-o":vim $(fzf)'
+
+
 # Starship
 eval "$($HOME/bin/starship/starship init bash)"
 
