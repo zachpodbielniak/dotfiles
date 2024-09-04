@@ -36,7 +36,7 @@ if [ -f /usr/immutablue/scripts/common.sh ]; then source /usr/immutablue/scripts
 
 
 # Aliases
-alias dc="distrobox create"
+alias dc="distrobox create --additional-flags '-v /var/home/linuxbrew:/var/home/linuxbrew -v /home/linuxbrew:/home/linuxbrew'"
 alias de="distrobox enter"
 alias dl="distrobox list"
 alias dr="distrobox rm"
