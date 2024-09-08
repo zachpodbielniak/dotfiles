@@ -45,7 +45,12 @@ alias flatpak="flatpak --user"
 alias vim="nvim"
 alias gpia="curl https://icanhazip.com"
 alias k="kubectl"
-alias cat="bat --theme=TwoDark --paging=never"
+alias cat="bat --theme='Catppuccin Mocha' --paging=never"
+
+alias cdd="cd $HOME/.dotfiles"
+alias cdp="cd $HOME/Source/Projects"
+alias cdi="cd $HOME/Source/Projects/immutablue"
+alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
 
 alias weather="wthrr toledo,oh"
 alias forecast="wthrr --forecast d,w toledo,oh"
