@@ -56,6 +56,13 @@ alias weather="wthrr toledo,oh"
 alias forecast="wthrr --forecast d,w toledo,oh"
 
 
+# Only for arm64 machines
+if [ "$(uname -m)" == "aarch64" ]
+then
+    alias box64="BOX64_LD_LIBRARY_PATH=\"$HOME/bin/libs/x64\" box64.asahi"
+fi
+
+
 # Exports
 export PATH="$HOME/bin/scripts:$PATH"
 export PATH="$HOME/bin/export:$PATH"
