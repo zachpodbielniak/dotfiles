@@ -91,7 +91,15 @@ fi
 # Settings
 # export FZF_DEFAULT_COMMAND='find . -type f ! -path "*git*"'
 export FZF_DEFAULT_COMMAND='rg --files --hidden --glob "!.git"'
-export FZF_DEFAULT_OPTS='-i --height=50% --preview="bat {}" --tmux center'
+# export FZF_DEFAULT_OPTS='-i --height=50% --preview="bat {}" --tmux center'
+# https://github.com/catppuccin/fzf
+export FZF_DEFAULT_OPTS=" \
+--color=bg+:#313244,bg:#1e1e2e,spinner:#f5e0dc,hl:#f38ba8 \
+--color=fg:#cdd6f4,header:#f38ba8,info:#cba6f7,pointer:#f5e0dc \
+--color=marker:#b4befe,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8 \
+--color=selected-bg:#45475a \
+--multi \
+-i --height=50% --preview="bat {}" --tmux center"
 
 
 
