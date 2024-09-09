@@ -94,8 +94,8 @@ if [ -f /usr/share/bash-completion/bash_completion ]; then source /usr/share/bas
 type kubectl 2>/dev/null >/dev/null 
 if [ $? -eq 0 ]; then source <(kubectl completion bash); fi
 
-type hass-cli 2>/dev/null >/dev/null
-if [ $? -eq 0 ] && [ ! -f /run/.containerenv ]; then source <(_HASS_CLI_COMPLETE=bash_source hass-cli); fi
+# type hass-cli 2>/dev/null >/dev/null
+# if [ $? -eq 0 ] && [ ! -f /run/.containerenv ]; then source <(_HASS_CLI_COMPLETE=bash_source hass-cli); fi
 
 if [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
 
