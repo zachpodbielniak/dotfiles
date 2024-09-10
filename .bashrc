@@ -128,4 +128,4 @@ bind -x '"\C-o":vim $(fzf)'
 # Starship
 eval "$($HOME/bin/starship/starship init bash)"
 
-fastfetch
+#fastfetch
