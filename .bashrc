@@ -90,7 +90,7 @@ fi
 
 # Settings
 # export FZF_DEFAULT_COMMAND='find . -type f ! -path "*git*"'
-export FZF_DEFAULT_COMMAND='rg --files --hidden --glob "!.git"'
+export FZF_DEFAULT_COMMAND='rg --files --hidden --glob "!.git" --preview-window=wrap'
 # export FZF_DEFAULT_OPTS='-i --height=50% --preview="bat {}" --tmux center'
 # https://github.com/catppuccin/fzf
 export FZF_DEFAULT_OPTS=" \
