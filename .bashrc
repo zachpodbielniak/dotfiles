@@ -121,6 +121,9 @@ if [ $? -eq 0 ]; then eval "$(fzf --bash)"; fi
 type himalaya 2>/dev/null >/dev/null 
 if [ $? -eq 0 ]; then eval "$(himalaya completion bash)"; fi
 
+type glab 2>/dev/null >/dev/null 
+if [ $? -eq 0 ]; then eval "$(glab completion -s bash)"; fi
+
 
 # Keybinds
 bind -x '"\C-o":vim $(fzf)'
