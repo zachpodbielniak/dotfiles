@@ -45,6 +45,7 @@ alias flatpak="flatpak --user"
 alias vim="nvim"
 alias gpia="curl https://icanhazip.com"
 alias k="kubectl"
+alias hm="hyacinth-macaw"
 alias cat="bat --theme='Catppuccin Mocha' --paging=never"
 
 alias cdd="cd $HOME/.dotfiles"
