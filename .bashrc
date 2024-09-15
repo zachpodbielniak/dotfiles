@@ -53,6 +53,7 @@ alias cdp="cd $HOME/Source/Projects"
 alias cdi="cd $HOME/Source/Projects/immutablue"
 alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
 
+alias nn="new_note"
 alias notes="bash -c 'cd $HOME/Documents/notes/personal && nvim 00_index.norg'"
 alias ninbox="bash -c 'cd $HOME/Documents/notes/personal && nvim ./00_inbox/00_index.norg'"
 alias nprojects="bash -c 'cd $HOME/Documents/notes/personal && nvim ./01_projects/00_index.norg'"
