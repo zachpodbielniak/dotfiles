@@ -53,6 +53,11 @@ alias cdp="cd $HOME/Source/Projects"
 alias cdi="cd $HOME/Source/Projects/immutablue"
 alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
 
+alias notes="bash -c 'cd $HOME/Documents/notes/personal && nvim index.norg'"
+alias cdn="cd $HOME/Documents/notes/"
+alias cdnp="cd $HOME/Documents/notes/personal/"
+alias cdnw="cd $HOME/Documents/notes/work/"
+
 alias weather="wthrr toledo,oh"
 alias forecast="wthrr --forecast d,w toledo,oh"
 
