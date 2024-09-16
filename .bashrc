@@ -54,6 +54,7 @@ alias cdi="cd $HOME/Source/Projects/immutablue"
 alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
 
 alias nn="new_note"
+alias on="open_note"
 alias notes="bash -c 'cd $HOME/Documents/notes/personal && nvim 00_index.norg'"
 alias ninbox="bash -c 'cd $HOME/Documents/notes/personal && nvim ./00_inbox/00_index.norg'"
 alias nprojects="bash -c 'cd $HOME/Documents/notes/personal && nvim ./01_projects/00_index.norg'"
@@ -102,7 +103,8 @@ fi
 
 # Settings
 # export FZF_DEFAULT_COMMAND='find . -type f ! -path "*git*"'
-export FZF_DEFAULT_COMMAND='rg --files --hidden --glob "!.git" --preview-window=wrap'
+# export FZF_DEFAULT_COMMAND='rg --files --hidden --glob "!.git" --preview-window=wrap'
+export FZF_DEFAULT_COMMAND='rg --files --hidden --glob "!.git"'
 # export FZF_DEFAULT_OPTS='-i --height=50% --preview="bat {}" --tmux center'
 # https://github.com/catppuccin/fzf
 export FZF_DEFAULT_OPTS=" \
@@ -111,7 +113,7 @@ export FZF_DEFAULT_OPTS=" \
 --color=marker:#b4befe,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8 \
 --color=selected-bg:#45475a \
 --multi \
--i --height=50% --preview=\"bat {}\" --tmux center"
+-i --height=50% --preview=\"bat {}\" --tmux center --preview-window=wrap"
 
 
 
