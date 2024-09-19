@@ -113,6 +113,8 @@ export FZF_DEFAULT_OPTS=" \
 --multi \
 -i --height=50% --preview=\"bat {}\" --tmux center --preview-window=wrap"
 
+# Prefer verbose mode for Just
+export JUST_VERBOSE=1
 
 
 # Bash completion stuff
