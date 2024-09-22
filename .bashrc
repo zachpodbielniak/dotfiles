@@ -55,6 +55,7 @@ alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
 
 alias nn="new_note"
 alias on="open_note"
+alias goals="bash -c 'cd $HOME/Documents/notes && nvim 02_areas/goals.norg'"
 alias notes="bash -c 'cd $HOME/Documents/notes && nvim 00_index.norg'"
 alias ninbox="bash -c 'cd $HOME/Documents/notes && nvim ./00_inbox/00_index.norg'"
 alias nprojects="bash -c 'cd $HOME/Documents/notes && nvim ./01_projects/00_index.norg'"
