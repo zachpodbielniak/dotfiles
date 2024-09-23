@@ -54,6 +54,7 @@ alias cdi="cd $HOME/Source/Projects/immutablue"
 alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
 
 alias nn="new_note"
+alias na="note_append"
 alias on="open_note"
 alias goals="bash -c 'cd $HOME/Documents/notes && nvim 02_areas/goals.norg'"
 alias notes="bash -c 'cd $HOME/Documents/notes && nvim 00_index.norg'"
