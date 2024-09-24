@@ -29,6 +29,8 @@ set -o vi
 
 export EDITOR=nvim
 export REGISTRY_AUTH_FILE="$HOME/.config/containers/auth.json"
+export MANPAGER="nvim +Man!"
+alias less="nvim +Man!"
 
 source ~/.bashrc-functions
 if [ -f ~/.bashrc-secrets ]; then source ~/.bashrc-secrets; fi
