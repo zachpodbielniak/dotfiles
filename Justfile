@@ -5,6 +5,13 @@ stow: dep_dirs
     stow --ignore=Justfile .
 
 
+stow_alt: dep_dirs
+    #!/bin/bash 
+    set -euxo pipefail
+
+    stow --ignore=Justfile --ignore=.gitconfig .
+
+
 unstow:
     #!/bin/bash 
     set -euxo pipefail
