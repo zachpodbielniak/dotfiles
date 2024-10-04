@@ -45,10 +45,12 @@ alias dr="distrobox rm"
 
 alias flatpak="flatpak --user"
 alias vim="nvim"
+alias v="vim"
 alias gpia="curl https://icanhazip.com"
 alias k="kubectl"
 alias hm="hyacinth-macaw"
 alias cat="bat --theme='Catppuccin Mocha' --paging=never"
+alias fcd='cd $(find * -type d | fzf)'
 
 alias cdd="cd $HOME/.dotfiles"
 alias cdp="cd $HOME/Source/Projects"
