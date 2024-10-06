@@ -51,11 +51,13 @@ alias k="kubectl"
 alias hm="hyacinth-macaw"
 alias cat="bat --theme='Catppuccin Mocha' --paging=never"
 alias fcd='cd $(find * -type d | fzf)'
+alias y="yazi"
 
 alias cdd="cd $HOME/.dotfiles"
 alias cdp="cd $HOME/Source/Projects"
 alias cdi="cd $HOME/Source/Projects/immutablue"
 alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
+alias cdk="cd $HOME/Source/Projects/kuberblue"
 
 alias nn="new_note"
 alias na="note_append"
