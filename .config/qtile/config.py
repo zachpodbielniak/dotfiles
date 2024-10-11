@@ -3,6 +3,7 @@
 from libqtile import bar, layout, qtile, widget, hook
 from libqtile.config import Click, Drag, Group, Key, Match, Screen
 from libqtile.lazy import lazy
+from libqtile.widget import backlight
 from os.path import expanduser
 from subprocess import Popen
 
@@ -17,6 +18,8 @@ MOD: str = "mod4"
 SHIFT: str = "shift"
 CTRL: str = "control"
 TAB: str = "Tab"
+
+FONT: str = "Hack Nerd Font Mono"
 
 terminal: str = "kitty"
 browser: str = flatpak_run("io.gitlab.librewolf-community", True)
@@ -79,6 +82,8 @@ keys = [
     Key([MOD, CTRL], "r", lazy.reload_config(), desc="Reload the config"),
     Key([MOD, CTRL], "q", lazy.shutdown(), desc="Shutdown Qtile"),
     Key([MOD], "r", lazy.spawncmd(), desc="Spawn a command using a prompt widget"),
+    Key([], "XF86MonBrightnessUp",lazy.widget['backlight'].change_backlight(backlight.ChangeDirection.UP)),
+    Key([], "XF86MonBrightnessDown", lazy.widget['backlight'].change_backlight(backlight.ChangeDirection.DOWN)),
 
     Key([MOD, SHIFT], "r", lazy.spawn("killall -s SIGUSR1 qtile"), desc="Reload qtile"),
     Key([MOD], "b", lazy.spawn(browser), desc="Launch Browser"),
@@ -125,9 +130,21 @@ for i in groups:
         ]
     )
 
+def init_layout_theme() -> dict:
+    return {
+        "margin":12,
+        "border_width":2,
+        "border_focus": "#81a1c1",
+        "border_normal": "#2e3440"
+    }
+
+layout_theme: dict = init_layout_theme()
+
 layouts = [
-    layout.Columns(border_focus_stack=["#d75f5f", "#8f3d3d"], border_width=4),
+    # layout.Columns(border_focus_stack=["#d75f5f", "#8f3d3d"], border_width=32),
+    layout.Columns(**layout_theme),
     layout.Max(),
+    layout.Floating(),
     # Try more layouts by unleashing below layouts.
     # layout.Stack(num_stacks=2),
     # layout.Bsp(),
@@ -142,15 +159,15 @@ layouts = [
 ]
 
 widget_defaults = dict(
-    font="sans",
-    fontsize=12,
-    padding=3,
+    font=FONT,
+    fontsize=16,
+    padding=4,
 )
 extension_defaults = widget_defaults.copy()
 
 screens = [
     Screen(
-        bottom=bar.Bar(
+        top=bar.Bar(
             [
                 widget.CurrentLayout(),
                 widget.GroupBox(),
@@ -162,18 +179,21 @@ screens = [
                     },
                     name_transform=lambda name: name.upper(),
                 ),
-                widget.TextBox("default config", name="default"),
-                widget.TextBox("Press &lt;M-r&gt; to spawn", foreground="#d75f5f"),
+                widget.Mpd2(),
+                widget.CPU(),
+                widget.Memory(measure_mem="G"),
+                widget.Net(),
                 # NB Systray is incompatible with Wayland, consider using StatusNotifier instead
-                # widget.StatusNotifier(),
-                widget.Systray(),
+                widget.StatusNotifier(),
+                # widget.Systray(),
                 widget.Clock(format="%Y-%m-%d %a %I:%M %p"),
-                widget.QuickExit(),
             ],
-            24,
+            56,
             # border_width=[2, 0, 2, 0],  # Draw top and bottom borders
             # border_color=["ff00ff", "000000", "ff00ff", "000000"]  # Borders are magenta
         ),
+        wallpaper=f"{HOME}/.local/share/backgrounds/background.jpg",
+        wallpaper_mode="fill"
         # You can uncomment this variable if you see that on X11 floating resize/moving is laggy
         # By default we handle these events delayed to already improve performance, however your system might still be struggling
         # This variable is set to None (no cap) by default, but you can set it to 60 to indicate that you limit it to 60 events per second
