@@ -1,8 +1,10 @@
 #!/usr/bin/python3
 
-from libqtile import bar, layout, qtile, widget
+from libqtile import bar, layout, qtile, widget, hook
 from libqtile.config import Click, Drag, Group, Key, Match, Screen
 from libqtile.lazy import lazy
+from os.path import expanduser
+from subprocess import Popen
 
 
 def flatpak_run(pkg: str, user: bool = True) -> str:
@@ -18,6 +20,17 @@ TAB: str = "Tab"
 
 terminal: str = "kitty"
 browser: str = flatpak_run("io.gitlab.librewolf-community", True)
+
+
+HOME: str = expanduser("~")
+QTILE_SCRIPTS: str = f"{HOME}/.config/qtile/scripts"
+
+
+@hook.subscribe.startup_once
+def autostart() -> None:
+    script: str = f"{QTILE_SCRIPTS}/autostart"
+    Popen([script])
+    lazy.spawn(flatpak_run("--branch=stable --command=syncthing-gtk me.kozec.syncthingtk"))
 
 
 keys = [
