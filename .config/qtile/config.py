@@ -85,9 +85,11 @@ keys = [
     Key([], "XF86MonBrightnessUp",lazy.widget['backlight'].change_backlight(backlight.ChangeDirection.UP)),
     Key([], "XF86MonBrightnessDown", lazy.widget['backlight'].change_backlight(backlight.ChangeDirection.DOWN)),
 
+    Key([MOD, SHIFT], "e", lazy.spawn("killall -9 qtile"), desc="Logout"),
     Key([MOD, SHIFT], "r", lazy.spawn("killall -s SIGUSR1 qtile"), desc="Reload qtile"),
     Key([MOD], "b", lazy.spawn(browser), desc="Launch Browser"),
-    Key([MOD], "y", lazy.spawn(f"{terminal} yazi"), desc="Yazi")
+    Key([MOD], "y", lazy.spawn(f"{terminal} yazi"), desc="Yazi"),
+    Key([MOD], "d", lazy.spawn("rofi -show drun"), desc="App Launcher")
 ]
 
 # Add key bindings to switch VTs in Wayland.
