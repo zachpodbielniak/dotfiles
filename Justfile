@@ -36,6 +36,7 @@ dep_dirs:
 
     mkdir -p $HOME/.config
     mkdir -p $HOME/.config/mpd
+    mkdir -p $HOME/.config/qtile
     mkdir -p $HOME/.config/systemd/user
     mkdir -p $HOME/.config/containers/systemd
 
