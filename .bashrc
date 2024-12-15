@@ -73,6 +73,7 @@ alias cdn="cd $HOME/Documents/notes/"
 
 alias weather="wthrr toledo,oh"
 alias forecast="wthrr --forecast d,w toledo,oh"
+alias calibre="flatpak run com.calibre_ebook.calibre"
 
 
 # Only for arm64 machines
