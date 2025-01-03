@@ -120,7 +120,9 @@ export FZF_DEFAULT_OPTS=" \
 --color=marker:#b4befe,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8 \
 --color=selected-bg:#45475a \
 --multi \
--i --height=50% --preview=\"bat {}\" --tmux center --preview-window=wrap"
+-i --height=50% \
+--preview=\"if [ -f "{}" ]; then bat {}; else echo "{}"; fi\" \
+--tmux center --preview-window=wrap"
 
 # Prefer verbose mode for Just
 export JUST_VERBOSE=1
