@@ -35,6 +35,7 @@ alias less="nvim +Man!"
 source ~/.bashrc-functions
 if [ -f ~/.bashrc-secrets ]; then source ~/.bashrc-secrets; fi
 if [ -f /usr/immutablue/scripts/common.sh ]; then source /usr/immutablue/scripts/common.sh; fi
+if [ -f /usr/libexec/immutablue/immutablue-header.sh ]; then source /usr/libexec/immutablue/immutablue-header.sh; fi
 
 
 # Aliases
