@@ -60,6 +60,12 @@ alias cdi="cd $HOME/Source/Projects/immutablue"
 alias cdh="cd $HOME/Source/Projects/hyacinth-macaw"
 alias cdk="cd $HOME/Source/Projects/kuberblue"
 
+alias cdnas="cd /var/mnt/NAS"
+alias cdnasme="cd /var/mnt/NAS/Media"
+alias cdnasmu="cd /var/mnt/NAS/Media/Music"
+alias cdnasmv="cd /var/mnt/NAS/Media/Movies"
+alias cdnastv="cd /var/mnt/NAS/Media/TV\ Series/"
+
 alias nn="new_note"
 alias na="note_append"
 alias on="open_note"
@@ -155,6 +161,11 @@ bind -x '"\C-o":vim $(fzf)'
 
 
 # Starship
-eval "$($HOME/bin/starship/starship init bash)"
+type starship 2>/dev/null >/dev/null
+if [[ $? -eq 0 ]]
+then 
+    eval "$(starship init bash)"
+else
+    eval "$($HOME/bin/starship/starship init bash)"
+fi
 
-#fastfetch
