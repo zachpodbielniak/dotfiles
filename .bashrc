@@ -132,7 +132,7 @@ export FZF_DEFAULT_OPTS=" \
 --tmux center --preview-window=wrap"
 
 # Prefer verbose mode for Just
-export JUST_VERBOSE=1
+# export JUST_VERBOSE=1
 
 
 # Bash completion stuff
