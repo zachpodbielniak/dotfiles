@@ -78,6 +78,7 @@ alias nresources="bash -c 'cd $HOME/Documents/notes && nvim ./03_resources/00_in
 alias narchives="bash -c 'cd $HOME/Documents/notes && nvim ./04_archives/00_index.norg'"
 alias cdn="cd $HOME/Documents/notes/"
 
+alias qw="qwik"
 alias weather="wthrr toledo,oh"
 alias forecast="wthrr --forecast d,w toledo,oh"
 alias calibre="flatpak run com.calibre_ebook.calibre"
