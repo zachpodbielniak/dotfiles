@@ -53,3 +53,20 @@ dep_dirs:
     mkdir -p $HOME/.config/mpd
     mkdir -p $HOME/.config/tmux/plugins
 
+
+# install deps
+bootstrap:
+    #!/bin/bash
+    set -euxo pipefail 
+    
+    if [[ -f "${HOME}/.config/.dotfiles_init" ]]
+    then 
+        echo "dotfiles_init file already exists...exiting"
+        exit 0
+    fi
+
+    # needed for $(pomo)
+    cpan install YAML::XS < <(yes)
+    # init pomo so it has a state file
+    bash -c "source ${HOME}/.bashrc && pomo -s && pomo -S"
+
