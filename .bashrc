@@ -60,7 +60,7 @@ _path_prepend \
     "${HOME}/perl5/bin" \
     "${HOME}/bin" \
     "${HOME}/bin/scripts" \
-    "${HOME}/bin/exports"
+    "${HOME}/bin/export"
 
 
 _path_append \
