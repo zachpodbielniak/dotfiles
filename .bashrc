@@ -161,8 +161,8 @@ alias cdn="cd ${HOME}/Documents/notes/"
 alias journal="bash -c 'cd ${HOME}/Documents/nodes && nvim ./02_areas/personal/journal/00_index.norg"
 
 alias qw="qwik"
-alias weather="wthrr toledo,oh"
-alias forecast="wthrr --forecast d,w toledo,oh"
+alias weather="wthrr -u f,in,mph toledo,oh 2>/dev/null | grep -vP \"(Hey friend|Weather data)\""
+alias forecast="wthrr -u f,in,mph --forecast d,w toledo,oh 2>/dev/null | grep -vP \"(Hey friend|Weather data)\""
 ! _have calibre && alias calibre="flatpak run com.calibre_ebook.calibre"
 
 
