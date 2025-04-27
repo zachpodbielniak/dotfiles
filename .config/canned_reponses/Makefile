@@ -1,4 +1,4 @@
-objects := 10-work.yaml 20-slack.yaml 50-code-bash.yaml 99-general.yaml
+objects := 10-work.yaml 20-slack.yaml 50-code-bash.yaml 60-prompts.yaml 99-general.yaml
 output := cr.yaml
 
 all: $(output)
