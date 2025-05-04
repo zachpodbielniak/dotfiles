@@ -22,6 +22,7 @@ Options:
   -L, --list-files        List the second brain directory structure including files
   -f, --full-path         Show full paths in directory listings
   --format FORMAT         Specify format for stdin content (e.g., "txt", "md", "json")
+  -e, --edit              Edit content using vipe before writing to file
 
 Examples:
   sbi document.md                          # Ingest to inbox
@@ -31,6 +32,7 @@ Examples:
   sbi --list                               # List directory structure
   echo "* My neorg content" | sbi          # Pipe neorg content directly
   cat data.json | sbi --format json        # Pipe content with specified format
+  echo "Draft note" | sbi --edit           # Open editor to modify before saving
 EOF
     exit 0
 }
@@ -325,14 +327,43 @@ detect_para_category() {
     esac
 }
 
+# Function to edit content using vipe if edit flag is set
+edit_with_vipe() {
+    local input_file="$1"
+    local output_file="$2"
+    
+    if [[ "$EDIT_FLAG" == true ]]; then
+        # Check if vipe is installed
+        if ! command -v vipe &> /dev/null; then
+            echo "Warning: 'vipe' utility not found. Skipping edit phase."
+            cp "$input_file" "$output_file"
+            return
+        fi
+        
+        # Use vipe to edit the content with proper redirection
+        # Try using EDITOR directly if vipe fails
+        if ! cat "$input_file" | vipe > "$output_file" 2>/dev/null; then
+            # Fall back to using the default editor directly
+            EDIT_TMP="$input_file"
+            ${EDITOR:-vi} "$EDIT_TMP"
+            cp "$EDIT_TMP" "$output_file"
+        fi
+    else
+        # No edit requested, just copy
+        cp "$input_file" "$output_file"
+    fi
+}
+
 convert_to_neorg() {
     local input_file="$1"
     local output_file="$2"
     local file_ext="${input_file##*.}"
+    local temp_output
     
-    # Special case for stdin with format already specified
-    if [[ "$STDIN_MODE" == true && "$input_file" == "$TEMP_FILE" && -n "$STDIN_FORMAT" ]]; then
-        # Just copy the content as-is, since we've already wrapped it in a code block
+    # Special case for stdin with format already specified or any stdin in edit mode
+    if [[ "$STDIN_MODE" == true && "$input_file" == "$TEMP_FILE" ]]; then
+        # Just copy the content as-is - we've already handled editing in the stdin processing 
+        # and/or formatted it as a code block
         cp "$input_file" "$output_file"
         return 0
     fi
@@ -340,10 +371,23 @@ convert_to_neorg() {
     if [[ "$file_ext" == "md" || "$file_ext" == "markdown" || "$file_ext" == "MD" ]]; then
         # Check if mton exists
         if command -v mton &> /dev/null; then
-            # Read the content and pass it to mton using a here-string
+            # Create temp file for intermediate result
+            temp_output=$(mktemp /tmp/sbi-convert-XXXXXX)
+            
+            # Read the content and pass it to mton
             local content
             content=$(cat "$input_file")
-            mton <<< "${content}" > "$output_file"
+            mton <<< "${content}" > "$temp_output"
+            
+            # Edit if requested
+            if [[ "$EDIT_FLAG" == true ]]; then
+                edit_with_vipe "$temp_output" "$output_file"
+            else
+                cp "$temp_output" "$output_file"
+            fi
+            
+            # Clean up
+            rm -f "$temp_output"
             return 0
         else
             echo "Warning: 'mton' script not found for Markdown conversion. Falling back to code block."
@@ -351,11 +395,23 @@ convert_to_neorg() {
     fi
     
     # For all other formats, put content in a code block
+    temp_output=$(mktemp /tmp/sbi-convert-XXXXXX)
+    
     {
         echo "@code $file_ext"
         cat "$input_file"
         echo "@end"
-    } > "$output_file"
+    } > "$temp_output"
+    
+    # Edit if requested
+    if [[ "$EDIT_FLAG" == true ]]; then
+        edit_with_vipe "$temp_output" "$output_file"
+    else
+        cp "$temp_output" "$output_file"
+    fi
+    
+    # Clean up
+    rm -f "$temp_output"
 }
 
 is_neorg_file() {
@@ -390,6 +446,7 @@ FULL_PATH_FLAG=false
 STDIN_MODE=false
 TEMP_FILE=""
 STDIN_FORMAT=""  # Format for stdin content
+EDIT_FLAG=false  # Flag to enable editing with vipe
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -418,6 +475,10 @@ while [[ $# -gt 0 ]]; do
             fi
             STDIN_FORMAT="$2"
             shift 2
+            ;;
+        -e|--edit)
+            EDIT_FLAG=true
+            shift
             ;;
         -p|--para)
             if [[ -z "$2" || "$2" == -* ]]; then
@@ -485,7 +546,7 @@ if [[ ${#FILES[@]} -eq 0 && "$LIST_FLAG" == false && "$LIST_FILES_FLAG" == false
         # We have stdin input; create a temporary file
         TEMP_FILE=$(mktemp /tmp/sbi-stdin-XXXXXX)
         
-        # Handle different formats
+        # Handle different formats first
         if [[ -n "$STDIN_FORMAT" ]]; then
             # If format is specified, create a code block with that format
             {
@@ -496,6 +557,12 @@ if [[ ${#FILES[@]} -eq 0 && "$LIST_FLAG" == false && "$LIST_FILES_FLAG" == false
         else
             # Default: assume content is already in neorg format
             cat > "$TEMP_FILE"
+        fi
+        
+        # If edit is requested, let the user edit directly with their editor
+        if [[ "$EDIT_FLAG" == true ]]; then
+            # Rather than using vipe, use the editor directly on the temp file
+            ${EDITOR:-vi} "$TEMP_FILE"
         fi
         
         FILES=("$TEMP_FILE")
@@ -587,32 +654,92 @@ for file in "${FILES[@]}"; do
     if [[ -f "$TARGET_FILE" ]]; then
         # File exists - append to it
         if is_neorg_file "$file"; then
-            # If source is already a neorg file, append its content with a separator
-            echo -e "\n* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" >> "$TARGET_FILE"
-            cat "$file" >> "$TARGET_FILE"
-            echo "Appended Neorg file to: $TARGET_FILE"
+            if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                # Only for non-stdin files
+                # Create temp file with content to append
+                EDIT_TEMP=$(mktemp /tmp/sbi-edit-XXXXXX)
+                echo -e "* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" > "$EDIT_TEMP"
+                cat "$file" >> "$EDIT_TEMP"
+                
+                # Edit the content directly with the editor
+                ${EDITOR:-vi} "$EDIT_TEMP"
+                
+                # Append the edited content
+                echo -e "\n" >> "$TARGET_FILE"
+                cat "$EDIT_TEMP" >> "$TARGET_FILE"
+                
+                # Clean up
+                rm -f "$EDIT_TEMP"
+                echo "Edited and appended to: $TARGET_FILE"
+            else
+                # If source is already a neorg file, append its content with a separator
+                echo -e "\n* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" >> "$TARGET_FILE"
+                cat "$file" >> "$TARGET_FILE"
+                echo "Appended Neorg file to: $TARGET_FILE"
+            fi
         else
-            # Convert to neorg and append with a separator
-            echo -e "\n* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" >> "$TARGET_FILE"
-            
-            # For non-neorg files, create a temporary file for conversion
-            APPEND_TEMP=$(mktemp /tmp/sbi-append-XXXXXX)
-            convert_to_neorg "$file" "$APPEND_TEMP"
-            cat "$APPEND_TEMP" >> "$TARGET_FILE"
-            rm -f "$APPEND_TEMP"
-            
-            echo "Converted and appended to: $TARGET_FILE"
+            if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                # Only for non-stdin files
+                # Convert to neorg first
+                CONVERT_TEMP=$(mktemp /tmp/sbi-convert-XXXXXX)
+                convert_to_neorg "$file" "$CONVERT_TEMP"
+                
+                # Add header to content
+                EDIT_TEMP=$(mktemp /tmp/sbi-edit-XXXXXX)
+                echo -e "* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" > "$EDIT_TEMP"
+                cat "$CONVERT_TEMP" >> "$EDIT_TEMP"
+                
+                # Edit directly with editor
+                ${EDITOR:-vi} "$EDIT_TEMP"
+                
+                # Append the edited content
+                echo -e "\n" >> "$TARGET_FILE"
+                cat "$EDIT_TEMP" >> "$TARGET_FILE"
+                
+                # Clean up
+                rm -f "$CONVERT_TEMP" "$EDIT_TEMP"
+                echo "Edited, converted and appended to: $TARGET_FILE"
+            else
+                # Convert to neorg and append with a separator
+                echo -e "\n* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" >> "$TARGET_FILE"
+                
+                # For non-neorg files, create a temporary file for conversion
+                APPEND_TEMP=$(mktemp /tmp/sbi-append-XXXXXX)
+                convert_to_neorg "$file" "$APPEND_TEMP"
+                cat "$APPEND_TEMP" >> "$TARGET_FILE"
+                rm -f "$APPEND_TEMP"
+                
+                echo "Converted and appended to: $TARGET_FILE"
+            fi
         fi
     else
         # New file
         if is_neorg_file "$file"; then
-            # If already a neorg file, just copy it
-            cp "$file" "$TARGET_FILE"
-            echo "Copied Neorg file to: $TARGET_FILE"
+            if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                # Only edit non-stdin files here (stdin is already edited if needed)
+                # Use the editor directly on a temp copy
+                EDIT_TEMP=$(mktemp /tmp/sbi-edit-XXXXXX)
+                cp "$file" "$EDIT_TEMP"
+                ${EDITOR:-vi} "$EDIT_TEMP"
+                cp "$EDIT_TEMP" "$TARGET_FILE"
+                rm -f "$EDIT_TEMP"
+                echo "Edited and copied Neorg file to: $TARGET_FILE"
+            else
+                # Just copy
+                cp "$file" "$TARGET_FILE"
+                echo "Copied Neorg file to: $TARGET_FILE"
+            fi
         else
             # Convert to neorg
             convert_to_neorg "$file" "$TARGET_FILE"
-            echo "Converted and ingested to: $TARGET_FILE"
+            
+            # Edit non-stdin files after conversion if requested
+            if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                ${EDITOR:-vi} "$TARGET_FILE"
+                echo "Converted, edited and ingested to: $TARGET_FILE"
+            else
+                echo "Converted and ingested to: $TARGET_FILE"
+            fi
         fi
     fi
 done
