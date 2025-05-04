@@ -38,6 +38,7 @@ Examples:
   sbi recording.mp3                        # Transcribe audio and create summary
   sbi meeting.mp4                          # Extract audio, transcribe, and summarize
   sbi https://youtu.be/dQw4w9WgXcQ        # Download YouTube audio, transcribe, and summarize
+  sbi https://example.com/article          # Download web page, summarize, and convert to neorg
 EOF
     exit 0
 }
@@ -499,6 +500,93 @@ is_youtube_url() {
     fi
 }
 
+# Function to download a generic URL and convert to markdown
+download_url_as_markdown() {
+    local url="$1"
+    local output_file="$2"
+    
+    echo "Downloading web page from URL: $url"
+    
+    # Create temp directory for processing
+    local temp_dir=$(mktemp -d /tmp/sbi-url-XXXXXX)
+    local html_file="${temp_dir}/page.html"
+    local md_file="${temp_dir}/page.md"
+    
+    # Check if curl is installed
+    if ! command -v curl &> /dev/null; then
+        echo "Error: curl not found. Please install it to download web pages."
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Download the webpage with curl
+    echo "Fetching web page content..."
+    if ! curl -s -L --max-redirs 5 --connect-timeout 10 --max-time 30 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" "$url" > "$html_file"; then
+        echo "Error: Failed to download web page."
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Check if pandoc is installed for HTML to Markdown conversion
+    if command -v pandoc &> /dev/null; then
+        echo "Converting HTML to Markdown using pandoc..."
+        if ! pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
+            echo "Error: Failed to convert HTML to Markdown with pandoc."
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    # Fallback to using distrobox with pandoc if system pandoc isn't available
+    elif command -v distrobox &> /dev/null; then
+        echo "Attempting to use pandoc via distrobox..."
+        if ! distrobox enter dev -- pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
+            echo "Error: Failed to convert HTML to Markdown with pandoc via distrobox."
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    # Last resort: Use a very simple HTML to text conversion with lynx or w3m
+    elif command -v lynx &> /dev/null; then
+        echo "Using lynx for basic HTML to text conversion..."
+        if ! lynx -dump -nolist "$html_file" > "$md_file"; then
+            echo "Error: Failed to convert HTML to text with lynx."
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    elif command -v w3m &> /dev/null; then
+        echo "Using w3m for basic HTML to text conversion..."
+        if ! w3m -dump "$html_file" > "$md_file"; then
+            echo "Error: Failed to convert HTML to text with w3m."
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    else
+        echo "Error: No HTML to Markdown conversion tools found (pandoc, lynx, or w3m)."
+        # Store the URL in the metadata
+        echo "$url" > "${output_file}.url"
+        # Copy the raw HTML as a fallback
+        cp "$html_file" "$output_file"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Extract title from HTML for potential use as filename
+    local title=$(grep -oP '(?<=<title>).*?(?=</title>)' "$html_file" | head -1 | sed 's/[^a-zA-Z0-9 ]/-/g' | tr -s ' ' '_')
+    
+    # Store URL and title in metadata files
+    echo "$url" > "${output_file}.url"
+    if [[ -n "$title" ]]; then
+        echo "$title" > "${output_file}.title"
+    fi
+    
+    # Copy the markdown to the output file
+    cp "$md_file" "$output_file"
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    echo "Successfully downloaded and converted URL to Markdown: $output_file"
+    return 0
+}
+
 # Function to download audio from YouTube URL
 download_youtube_audio() {
     local url="$1"
@@ -634,6 +722,116 @@ process_audio_file() {
     return 0
 }
 
+# Function to process web content from URL
+process_web_content() {
+    local input_file="$1"
+    local output_file="$2"
+    local filename_base="$3"
+    
+    echo "Processing web content: $input_file"
+    
+    # Create temp directory for processing
+    local temp_dir=$(mktemp -d /tmp/sbi-web-XXXXXX)
+    local url=""
+    local page_title=""
+    
+    # Check if URL metadata exists
+    if [[ -f "${input_file}.url" ]]; then
+        url=$(cat "${input_file}.url")
+    fi
+    
+    # Check if title metadata exists
+    if [[ -f "${input_file}.title" ]]; then
+        page_title=$(cat "${input_file}.title")
+    fi
+    
+    # Generate AI summary of the web content
+    echo "Generating AI summary of web content..."
+    local ai_summary=$(mktemp "${temp_dir}/ai_summary.XXXXXX")
+    
+    if command -v ai_summary_as_neorg &> /dev/null; then
+        # Create AI summary in neorg format
+        if ! cat "$input_file" | ai_summary_as_neorg > "$ai_summary"; then
+            echo "Warning: AI summary generation failed. Will create a basic summary."
+            # Create a minimal summary as fallback
+            {
+                echo "AI summary generation failed for this web content."
+                echo "Please see the full content below."
+            } > "$ai_summary"
+        fi
+    else
+        echo "Warning: 'ai_summary_as_neorg' not found. Creating basic structure instead."
+        # Create a minimal note as fallback
+        {
+            echo "AI summary tool not available."
+            echo "Please see the full content below."
+        } > "$ai_summary"
+    fi
+    
+    # Create the final neorg file with proper structure
+    local full_content=$(mktemp "${temp_dir}/full_content.XXXXXX")
+    
+    # Get just a snippet of the content for a preview
+    head -n 20 "$input_file" > "${temp_dir}/preview.md"
+    
+    # Convert the preview to neorg if mton is available
+    if command -v mton &> /dev/null; then
+        cat "${temp_dir}/preview.md" | mton > "${temp_dir}/preview.norg" 2>/dev/null || true
+    else
+        # Fallback to code block
+        {
+            echo "@code markdown"
+            cat "${temp_dir}/preview.md"
+            echo "@end"
+        } > "${temp_dir}/preview.norg"
+    fi
+    
+    # Create the final document with the structure we want
+    {
+        # Document title and metadata
+        echo "* Web Content: ${filename_base}"
+        echo
+        echo "Source: Web page"
+        if [[ -n "$page_title" ]]; then
+            echo "Title: ${page_title}"
+        fi
+        if [[ -n "$url" ]]; then
+            echo "URL: ${url}"
+        fi
+        echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+        echo
+        
+        # AI Summary section
+        echo "* AI Summary"
+        echo 
+        cat "$ai_summary"
+        echo
+        
+        # Content Preview
+        echo "* Content Preview"
+        echo
+        echo "This is just a preview. See the full content section for complete text."
+        echo
+        cat "${temp_dir}/preview.norg"
+        echo
+        
+        # Reference to original markdown
+        echo "* Full Content"
+        echo
+        echo "The complete content is stored as markdown and can be viewed at:"
+        echo "@code bash"
+        echo "cat \"$input_file\""
+        echo "@end"
+        
+    } > "$output_file"
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    echo "Web content processing complete."
+    return 0
+}
+
 # Function to process video files (strip audio, transcribe, and summarize)
 process_video_file() {
     local input_file="$1"
@@ -720,7 +918,8 @@ process_video_file() {
 PARA_TYPE="inbox"
 CATEGORY=""
 FILES=()
-URLS=()          # Array for URLs to process
+URLS=()          # Array for YouTube URLs to process
+WEB_URLS=()      # Array for generic web URLs to process
 LIST_FLAG=false
 LIST_FILES_FLAG=false
 FULL_PATH_FLAG=false
@@ -799,14 +998,14 @@ while [[ $# -gt 0 ]]; do
             if is_url "$1"; then
                 # Process URL
                 if is_youtube_url "$1"; then
-                    # This is a YouTube URL - add to a special URL array
+                    # This is a YouTube URL - add to a special URL array for audio processing
                     echo "Detected YouTube URL: $1"
                     URLS+=("$1")
                 else
-                    # For other URLs, we might handle differently in the future
-                    echo "Notice: Non-YouTube URLs are not fully supported yet: $1"
-                    # For now, add it to the URL array anyway, will attempt to process
-                    URLS+=("$1")
+                    # For other URLs, process as web content
+                    echo "Detected generic URL: $1"
+                    # Store in a different array for web content processing
+                    WEB_URLS+=("$1")
                     # Don't fall through to the file check, we know it's a URL
                 fi
             elif [[ -f "$1" ]]; then
@@ -842,7 +1041,7 @@ fi
 
 # Process YouTube URLs if any
 if [[ ${#URLS[@]} -gt 0 ]]; then
-    echo "Processing ${#URLS[@]} URL(s)..."
+    echo "Processing ${#URLS[@]} YouTube URL(s)..."
     
     # Create temp directory for downloads
     YT_TEMP_DIR=$(mktemp -d /tmp/sbi-youtube-XXXXXX)
@@ -881,6 +1080,43 @@ if [[ ${#URLS[@]} -gt 0 ]]; then
             fi
         else
             echo "Warning: Failed to process YouTube URL: $url"
+        fi
+    done
+fi
+
+# Process generic web URLs if any
+if [[ ${#WEB_URLS[@]} -gt 0 ]]; then
+    echo "Processing ${#WEB_URLS[@]} web URL(s)..."
+    
+    # Create temp directory for downloads
+    WEB_TEMP_DIR=$(mktemp -d /tmp/sbi-web-XXXXXX)
+    
+    # Process each URL
+    for url in "${WEB_URLS[@]}"; do
+        # Generate a unique filename for this URL
+        url_hash=$(echo "$url" | md5sum | cut -d' ' -f1)
+        md_file="${WEB_TEMP_DIR}/${url_hash}.md"
+        
+        # Download and convert web page to markdown
+        if download_url_as_markdown "$url" "$md_file"; then
+            # Add markdown file to the FILES array for processing
+            FILES+=("$md_file")
+            
+            # Mark this as a web content file for special processing
+            touch "${md_file}.web_content"
+            
+            # Get filename from title if available and name seed wasn't provided
+            if [[ -z "$NAME_SEED" && -f "${md_file}.title" ]]; then
+                # Use page title as filename base
+                web_title=$(cat "${md_file}.title")
+                if [[ -n "$web_title" ]]; then
+                    echo "Using web page title as filename: $web_title"
+                fi
+            elif [[ -n "$NAME_SEED" ]]; then
+                echo "Using custom name-seed for web content: $NAME_SEED"
+            fi
+        else
+            echo "Warning: Failed to process web URL: $url"
         fi
     done
 fi
@@ -1091,6 +1327,31 @@ for file in "${FILES[@]}"; do
                 cp "$file" "$TARGET_FILE"
                 echo "Copied Neorg file to: $TARGET_FILE"
             fi
+        elif [[ -f "${file}.web_content" ]]; then
+            # Process web content
+            echo "Detected web content. Processing..."
+            TEMP_NEORG=$(mktemp /tmp/sbi-web-neorg-XXXXXX)
+            
+            if process_web_content "$file" "$TEMP_NEORG" "$filename_no_ext"; then
+                # If processing succeeded, copy to target
+                cp "$TEMP_NEORG" "$TARGET_FILE"
+                echo "Web content processed and ingested to: $TARGET_FILE"
+                
+                # Edit if requested
+                if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                    ${EDITOR:-vi} "$TARGET_FILE"
+                    echo "Edited web content in: $TARGET_FILE"
+                fi
+            else
+                # If processing failed, fall back to normal conversion
+                echo "Web content processing failed, falling back to standard conversion."
+                convert_to_neorg "$file" "$TARGET_FILE"
+                echo "Converted and ingested to: $TARGET_FILE"
+            fi
+            
+            # Clean up
+            rm -f "$TEMP_NEORG"
+            
         elif is_audio_file "$file"; then
             # Process audio file - transcribe and summarize
             echo "Detected audio file. Processing..."
@@ -1337,4 +1598,10 @@ fi
 if [[ -n "${YT_TEMP_DIR:-}" && -d "${YT_TEMP_DIR}" ]]; then
     # Remove all files, including any metadata files (*.yturl)
     rm -rf "${YT_TEMP_DIR}"
+fi
+
+# Clean up web content temporary directory if it exists
+if [[ -n "${WEB_TEMP_DIR:-}" && -d "${WEB_TEMP_DIR}" ]]; then
+    # Remove all files, including any metadata files (*.url, *.title)
+    rm -rf "${WEB_TEMP_DIR}"
 fi
