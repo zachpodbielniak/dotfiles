@@ -37,6 +37,7 @@ Examples:
   echo "Meeting notes" | sbi --name-seed "team meeting" # Use custom filename
   sbi recording.mp3                        # Transcribe audio and create summary
   sbi meeting.mp4                          # Extract audio, transcribe, and summarize
+  sbi https://youtu.be/dQw4w9WgXcQ        # Download YouTube audio, transcribe, and summarize
 EOF
     exit 0
 }
@@ -474,6 +475,96 @@ is_video_file() {
     esac
 }
 
+# Function to detect if a string is a URL
+is_url() {
+    local input="$1"
+    
+    # Basic URL pattern matching
+    if [[ "$input" =~ ^https?:// ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to detect YouTube URLs specifically
+is_youtube_url() {
+    local url="$1"
+    
+    # Match common YouTube URL patterns - using grep for more reliable pattern matching
+    if echo "$url" | grep -q -E 'youtube\.com/watch|youtu\.be/'; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to download audio from YouTube URL
+download_youtube_audio() {
+    local url="$1"
+    local output_file="$2"
+    
+    echo "Downloading audio from YouTube URL: $url"
+    
+    # Check if yt-dlp is installed
+    if ! command -v yt-dlp &> /dev/null; then
+        echo "Error: yt-dlp not found. Please install it to download YouTube videos."
+        return 1
+    fi
+    
+    # Create temporary directory for yt-dlp 
+    local dl_dir=$(dirname "$output_file")
+    
+    # Download best audio quality and convert to ogg
+    # Use more reliable options: specify extension explicitly and use output template
+    local base_name=$(basename "$output_file")
+    
+    # For better reliability:
+    # 1. Using wav format which is more widely supported by transcribe_audio
+    # 2. Use explicit output template with the wav extension
+    # 3. Add --no-playlist to avoid playlist processing
+    # 4. Add --no-check-certificate for some problematic URLs
+    # 5. Add verbose output for debugging
+    echo "Running yt-dlp to download audio in WAV format..."
+    if ! yt-dlp -f "bestaudio" -x --audio-format wav --audio-quality 0 \
+              --no-playlist --no-check-certificate --verbose \
+              -o "${dl_dir}/${base_name}.wav" "$url"; then
+        echo "Error: Failed to download audio from YouTube URL."
+        return 1
+    fi
+    
+    echo "yt-dlp completed. Checking for downloaded file..."
+    # First check for the expected WAV file
+    if [[ -f "${dl_dir}/${base_name}.wav" ]]; then
+        echo "Found WAV file: ${dl_dir}/${base_name}.wav"
+        cp "${dl_dir}/${base_name}.wav" "${output_file}"
+        echo "Copied WAV file to: ${output_file}"
+    else
+        # Fallback: find any file that might have been created
+        echo "WAV file not found at expected location. Searching for alternatives..."
+        local found_file=$(find "$dl_dir" -name "${base_name}.*" -type f | head -1)
+        
+        # If we found something, use it
+        if [[ -n "$found_file" && -f "$found_file" ]]; then
+            echo "Found alternative file: ${found_file}"
+            cp "$found_file" "${output_file}"
+            echo "Copied alternative file to: ${output_file}"
+        else
+            echo "Error: Downloaded file not found."
+            return 1
+        fi
+    fi
+    
+    # Final verification
+    if [[ ! -f "$output_file" ]]; then
+        echo "Error: Failed to process downloaded file."
+        return 1
+    fi
+    
+    echo "Successfully downloaded audio to: $output_file"
+    return 0
+}
+
 # Function to process audio files (transcribe and summarize)
 process_audio_file() {
     local input_file="$1"
@@ -510,10 +601,22 @@ process_audio_file() {
     
     # Add source information to the beginning of the file
     local temp_output="${temp_dir}/output.norg"
+    
+    # Check if this is from a YouTube URL
+    local youtube_url=""
+    if [[ -f "${input_file}.yturl" ]]; then
+        youtube_url=$(cat "${input_file}.yturl")
+    fi
+    
     {
         echo "* Audio Summary: ${filename_base}"
         echo
-        echo "Source audio: ${input_file}"
+        if [[ -n "$youtube_url" ]]; then
+            echo "Source: YouTube video"
+            echo "URL: ${youtube_url}"
+        else
+            echo "Source audio: ${input_file}"
+        fi
         echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
         echo
         echo "* Summary"
@@ -576,10 +679,26 @@ process_video_file() {
     
     # Add source information to the beginning of the file
     local temp_output="${temp_dir}/output.norg"
+    
+    # Check if the original audio came from a YouTube URL
+    # (This would happen if a YouTube URL was processed and the audio file 
+    # was passed to process_video_file by mistake instead of process_audio_file)
+    local youtube_url=""
+    if [[ -f "${audio_file}.yturl" ]]; then
+        youtube_url=$(cat "${audio_file}.yturl")
+    elif [[ -f "${input_file}.yturl" ]]; then
+        youtube_url=$(cat "${input_file}.yturl")
+    fi
+    
     {
         echo "* Video Summary: ${filename_base}"
         echo
-        echo "Source video: ${input_file}"
+        if [[ -n "$youtube_url" ]]; then
+            echo "Source: YouTube video"
+            echo "URL: ${youtube_url}"
+        else
+            echo "Source video: ${input_file}"
+        fi
         echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
         echo
         echo "* Summary"
@@ -601,6 +720,7 @@ process_video_file() {
 PARA_TYPE="inbox"
 CATEGORY=""
 FILES=()
+URLS=()          # Array for URLs to process
 LIST_FLAG=false
 LIST_FILES_FLAG=false
 FULL_PATH_FLAG=false
@@ -675,10 +795,25 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            if [[ -f "$1" ]]; then
+            # Check if it's a URL
+            if is_url "$1"; then
+                # Process URL
+                if is_youtube_url "$1"; then
+                    # This is a YouTube URL - add to a special URL array
+                    echo "Detected YouTube URL: $1"
+                    URLS+=("$1")
+                else
+                    # For other URLs, we might handle differently in the future
+                    echo "Notice: Non-YouTube URLs are not fully supported yet: $1"
+                    # For now, add it to the URL array anyway, will attempt to process
+                    URLS+=("$1")
+                    # Don't fall through to the file check, we know it's a URL
+                fi
+            elif [[ -f "$1" ]]; then
+                # It's a valid file
                 FILES+=("$1")
             else
-                echo "Error: '$1' is not a valid file!"
+                echo "Error: '$1' is not a valid file or URL!"
                 exit 1
             fi
             shift
@@ -703,6 +838,49 @@ if [[ "$LIST_FLAG" == true || "$LIST_FILES_FLAG" == true ]]; then
         # show all PARA folders (full listing)
         list_structure "" "" "$include_files" "$FULL_PATH_FLAG"
     fi
+fi
+
+# Process YouTube URLs if any
+if [[ ${#URLS[@]} -gt 0 ]]; then
+    echo "Processing ${#URLS[@]} URL(s)..."
+    
+    # Create temp directory for downloads
+    YT_TEMP_DIR=$(mktemp -d /tmp/sbi-youtube-XXXXXX)
+    
+    # Process each URL
+    for url in "${URLS[@]}"; do
+        # Generate a unique filename for this URL
+        url_hash=$(echo "$url" | md5sum | cut -d' ' -f1)
+        audio_file="${YT_TEMP_DIR}/${url_hash}"  # Extension will be added by yt-dlp
+        
+        # Download audio from YouTube
+        if download_youtube_audio "$url" "$audio_file"; then
+            # Store YouTube URL in a metadata file that will be used during processing
+            echo "$url" > "${audio_file}.yturl"
+            
+            # Mark this as a direct audio file (not needing audio extraction)
+            # This will be used later to skip the audio extraction step
+            touch "${audio_file}.direct_audio"
+            
+            # Add audio file to the FILES array for processing
+            FILES+=("$audio_file")
+            
+            # Set name seed from YouTube title if not already specified
+            if [[ -z "$NAME_SEED" ]]; then
+                # Try to get video title using yt-dlp
+                title=$(yt-dlp --get-title "$url" 2>/dev/null)
+                if [[ -n "$title" ]]; then
+                    # Store the title in a more accessible way for later use
+                    NAME_SEED="$title"
+                    # Also store it in a metadata file for the specific URL
+                    echo "$title" > "${audio_file}.title"
+                    echo "Using YouTube video title as filename: $title"
+                fi
+            fi
+        else
+            echo "Warning: Failed to process YouTube URL: $url"
+        fi
+    done
 fi
 
 # Check if at least one file is provided or if we have stdin input, only if we're not listing
@@ -762,6 +940,12 @@ for file in "${FILES[@]}"; do
             filename="${current_date}"
             filename_no_ext="$filename"
         fi
+    # Check if this is a YouTube file (has a title metadata file)
+    elif [[ -f "${file}.title" ]]; then
+        # Use the YouTube video title as filename
+        filename=$(cat "${file}.title")
+        filename_no_ext="$filename"
+        echo "Using saved YouTube title for filename: $filename"
     else
         filename=$(basename "$file")
         filename_no_ext="${filename%.*}"
@@ -930,30 +1114,202 @@ for file in "${FILES[@]}"; do
             # Clean up
             rm -f "$TEMP_NEORG"
             
-        elif is_video_file "$file"; then
-            # Process video file - strip audio, transcribe, and summarize
-            echo "Detected video file. Processing..."
-            TEMP_NEORG=$(mktemp /tmp/sbi-video-neorg-XXXXXX)
-            
-            if process_video_file "$file" "$TEMP_NEORG" "$filename_no_ext"; then
-                # If processing succeeded, copy to target
-                cp "$TEMP_NEORG" "$TARGET_FILE"
-                echo "Video processed and ingested to: $TARGET_FILE"
+        elif is_video_file "$file" || [[ -f "${file}.direct_audio" ]]; then
+            # Process video file or direct audio from YouTube
+            if [[ -f "${file}.direct_audio" ]]; then
+                echo "Detected direct audio from YouTube. Processing..."
+                # For direct audio from YouTube, we skip the audio extraction step
+                TEMP_NEORG=$(mktemp /tmp/sbi-audio-neorg-XXXXXX)
+                
+                echo "Processing YouTube audio: $file"
+                
+                # Create temp files for processing
+                TRANSCRIPT_FILE=$(mktemp /tmp/sbi-transcript-XXXXXX)
+                SUMMARY_FILE=$(mktemp /tmp/sbi-summary-XXXXXX)
+                
+                # Check if the audio file exists and has non-zero size
+                if [[ ! -f "$file" || ! -s "$file" ]]; then
+                    echo "Error: Audio file is missing or empty: $file"
+                    echo "Creating a placeholder note instead."
+                    {
+                        echo "* YouTube Download Failure: ${filename_no_ext}"
+                        echo
+                        echo "Source: YouTube video"
+                        if [[ -f "${file}.yturl" ]]; then
+                            echo "URL: $(cat "${file}.yturl")"
+                        fi
+                        echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+                        echo
+                        echo "* Note"
+                        echo
+                        echo "There was an error downloading or processing this YouTube video."
+                        echo "Please try again or manually download the content."
+                    } > "$TEMP_NEORG"
+                    cp "$TEMP_NEORG" "$TARGET_FILE"
+                    echo "Created placeholder note at: $TARGET_FILE"
+                    continue
+                fi
+                
+                echo "Audio file exists and has content. File size: $(du -h "$file" | cut -f1)"
+                echo "File type: $(file -b "$file")"
+                
+                # Try to transcribe the audio directly
+                echo "Running transcribe_audio on: $file"
+                transcribe_audio "$file" || true  # Continue even if transcription fails
+                
+                echo "Checking for transcript file: ${file}.txt"
+                if [[ -f "${file}.txt" ]]; then
+                    echo "Transcript file found, moving to: $TRANSCRIPT_FILE"
+                    # Transcription succeeded, move transcript to our temp file
+                    cp "${file}.txt" "$TRANSCRIPT_FILE"
+                    
+                    # Check if transcript has content
+                    if [[ -s "$TRANSCRIPT_FILE" ]]; then
+                        echo "Transcript has content. Generating summary..."
+                        # Generate the summary
+                        ai_summary_as_neorg < "$TRANSCRIPT_FILE" > "$SUMMARY_FILE"
+                        
+                        # Check if summary was generated successfully
+                        if [[ -s "$SUMMARY_FILE" ]]; then
+                            echo "Summary generated successfully."
+                            
+                            # Create the final file with proper headers
+                            {
+                                echo "* YouTube Summary: ${filename_no_ext}"
+                                echo
+                                echo "Source: YouTube video"
+                                # Add YouTube URL if available
+                                if [[ -f "${file}.yturl" ]]; then
+                                    echo "URL: $(cat "${file}.yturl")"
+                                fi
+                                echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+                                echo
+                                echo "* Summary"
+                                echo
+                                cat "$SUMMARY_FILE"
+                            } > "$TEMP_NEORG"
+                            
+                            # Handle existing target file (append or create new)
+                            if [[ -f "$TARGET_FILE" ]]; then
+                                # If target exists, append with a separator
+                                echo -e "\n* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" >> "$TARGET_FILE"
+                                cat "$TEMP_NEORG" >> "$TARGET_FILE"
+                                echo "YouTube summary appended to existing file: $TARGET_FILE"
+                            else
+                                # New file
+                                cp "$TEMP_NEORG" "$TARGET_FILE"
+                                echo "YouTube audio processed and saved to: $TARGET_FILE"
+                            fi
+                        else
+                            echo "Summary generation failed. Creating placeholder with transcript."
+                            # Create a simple note with the transcript
+                            {
+                                echo "* YouTube Transcript: ${filename_no_ext}"
+                                echo
+                                echo "Source: YouTube video"
+                                # Add YouTube URL if available
+                                if [[ -f "${file}.yturl" ]]; then
+                                    echo "URL: $(cat "${file}.yturl")"
+                                fi
+                                echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+                                echo
+                                echo "* Transcript"
+                                echo
+                                cat "$TRANSCRIPT_FILE"
+                            } > "$TEMP_NEORG"
+                            
+                            # Save it
+                            cp "$TEMP_NEORG" "$TARGET_FILE"
+                            echo "Transcript saved to: $TARGET_FILE"
+                        fi
+                    else
+                        echo "Transcript file is empty. Creating placeholder note."
+                        # Create a simple note indicating failure
+                        {
+                            echo "* YouTube Processing Issue: ${filename_no_ext}"
+                            echo
+                            echo "Source: YouTube video"
+                            # Add YouTube URL if available
+                            if [[ -f "${file}.yturl" ]]; then
+                                echo "URL: $(cat "${file}.yturl")"
+                            fi
+                            echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+                            echo
+                            echo "* Note"
+                            echo
+                            echo "The audio was downloaded, but transcription failed to produce content."
+                            echo "The downloaded audio file is located at: $file"
+                        } > "$TEMP_NEORG"
+                        
+                        # Save it
+                        cp "$TEMP_NEORG" "$TARGET_FILE"
+                        echo "Created placeholder note at: $TARGET_FILE"
+                    fi
+                    
+                    # Clean up
+                    rm -f "$TRANSCRIPT_FILE" "$SUMMARY_FILE"
+                else
+                    # No transcript file found
+                    echo "No transcript file found. Creating placeholder note."
+                    {
+                        echo "* YouTube Processing Issue: ${filename_no_ext}"
+                        echo
+                        echo "Source: YouTube video"
+                        # Add YouTube URL if available
+                        if [[ -f "${file}.yturl" ]]; then
+                            echo "URL: $(cat "${file}.yturl")"
+                        fi
+                        echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+                        echo
+                        echo "* Note"
+                        echo
+                        echo "The audio was downloaded successfully, but the transcription process failed."
+                        echo "The downloaded audio file is located at: $file"
+                        echo 
+                        echo "You can try to manually transcribe this file by running:"
+                        echo "@code bash"
+                        echo "transcribe_audio \"$file\""
+                        echo "@end"
+                    } > "$TEMP_NEORG"
+                    
+                    # Save it
+                    cp "$TEMP_NEORG" "$TARGET_FILE"
+                    echo "Created placeholder note at: $TARGET_FILE"
+                fi
                 
                 # Edit if requested
                 if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
                     ${EDITOR:-vi} "$TARGET_FILE"
-                    echo "Edited video summary in: $TARGET_FILE"
+                    echo "Edited YouTube audio summary in: $TARGET_FILE"
                 fi
+                
+                # Clean up
+                rm -f "$TEMP_NEORG"
             else
-                # If processing failed, fall back to normal conversion
-                echo "Video processing failed, falling back to standard conversion."
-                convert_to_neorg "$file" "$TARGET_FILE"
-                echo "Converted and ingested to: $TARGET_FILE"
+                # Regular video file - strip audio, transcribe, and summarize
+                echo "Detected video file. Processing..."
+                TEMP_NEORG=$(mktemp /tmp/sbi-video-neorg-XXXXXX)
+                
+                if process_video_file "$file" "$TEMP_NEORG" "$filename_no_ext"; then
+                    # If processing succeeded, copy to target
+                    cp "$TEMP_NEORG" "$TARGET_FILE"
+                    echo "Video processed and ingested to: $TARGET_FILE"
+                    
+                    # Edit if requested
+                    if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                        ${EDITOR:-vi} "$TARGET_FILE"
+                        echo "Edited video summary in: $TARGET_FILE"
+                    fi
+                else
+                    # If processing failed, fall back to normal conversion
+                    echo "Video processing failed, falling back to standard conversion."
+                    convert_to_neorg "$file" "$TARGET_FILE"
+                    echo "Converted and ingested to: $TARGET_FILE"
+                fi
+                
+                # Clean up
+                rm -f "$TEMP_NEORG"
             fi
-            
-            # Clean up
-            rm -f "$TEMP_NEORG"
             
         else
             # Standard conversion for other file types
@@ -973,4 +1329,10 @@ done
 # Clean up temporary file if we used stdin mode
 if [[ "$STDIN_MODE" == true && -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
     rm -f "$TEMP_FILE"
+fi
+
+# Clean up YouTube temporary directory if it exists
+if [[ -n "${YT_TEMP_DIR:-}" && -d "${YT_TEMP_DIR}" ]]; then
+    # Remove all files, including any metadata files (*.yturl)
+    rm -rf "${YT_TEMP_DIR}"
 fi
