@@ -1,0 +1,267 @@
+#!/bin/bash
+set -euo pipefail
+
+# sbi - Second Brain Ingest
+# Script to ingest files into a second brain organized with PARA structure
+
+NOTES_DIR="$HOME/Documents/notes"
+DEFAULT_PARA="00_inbox"
+PARA_MAP=("00_inbox" "01_projects" "02_areas" "03_resources" "04_archives")
+
+show_help() {
+    cat << EOF
+Usage: sbi [OPTIONS] FILE1 [FILE2 ...]
+
+Ingest files into second brain with PARA organization.
+
+Options:
+  -h, --help              Show this help message
+  -p, --para CATEGORY     Specify PARA category (inbox, project, area, resource, archive, detect)
+  -c, --category PATH     Specify subcategory path (e.g., "personal" or "technical/linux")
+  -l, --list              List the second brain directory structure
+
+Examples:
+  sbi document.md                          # Ingest to inbox
+  sbi --para project document.md           # Ingest to projects
+  sbi --para resource --category technical/linux document.md  # Ingest to specific path
+  sbi --para detect document.md            # Auto-detect PARA category
+  sbi --list                               # List directory structure
+EOF
+    exit 0
+}
+
+list_structure() {
+    if ! command -v find &> /dev/null || ! command -v sort &> /dev/null; then
+        echo "Error: Required tools 'find' and 'sort' not found."
+        exit 1
+    fi
+    
+    echo "Second Brain Structure:"
+    find "$NOTES_DIR" -type d | sort | while read -r dir; do
+        # Get relative path to NOTES_DIR
+        rel_path="${dir#$NOTES_DIR/}"
+        if [[ "$rel_path" == "$NOTES_DIR" ]]; then
+            continue
+        fi
+        
+        # Calculate directory depth for indentation
+        depth=$(echo "$rel_path" | grep -o "/" | wc -l)
+        indent=$(printf "%$((depth*2))s" "")
+        
+        # Print the directory name
+        dir_name=$(basename "$dir")
+        echo "${indent}${dir_name}"
+    done
+    exit 0
+}
+
+detect_para_category() {
+    local file="$1"
+    local content
+    
+    # Check if perpy exists
+    if ! command -v perpy &> /dev/null; then
+        echo "Error: 'perpy' script not found. Defaulting to inbox."
+        echo "inbox"
+        return
+    fi
+    
+    content=$(cat "$file")
+    
+    # Ask perpy to determine the PARA category
+    local category
+    local query="Please analyze this content and determine which PARA category it belongs to. Respond with EXACTLY ONE WORD from these options: project, area, resource, archive. DO NOT include any explanation.\n\n${content}"
+
+    # Handle response from perpy more carefully
+    category=$(perpy <<< "${query}" | tr -d '\n' | tr '[:upper:]' '[:lower:]' | xargs)
+    
+    # Validate and clean response
+    case "$category" in
+        *project*)
+            echo "project"
+            ;;
+        *area*)
+            echo "area"
+            ;;
+        *resource*)
+            echo "resource"
+            ;;
+        *archive*)
+            echo "archive"
+            ;;
+        *)
+            echo "inbox"
+            ;;
+    esac
+}
+
+convert_to_neorg() {
+    local input_file="$1"
+    local output_file="$2"
+    local file_ext="${input_file##*.}"
+    
+    if [[ "$file_ext" == "md" || "$file_ext" == "markdown" || "$file_ext" == "MD" ]]; then
+        # Check if mton exists
+        if command -v mton &> /dev/null; then
+            # Read the content and pass it to mton using a here-string
+            local content
+            content=$(cat "$input_file")
+            mton <<< "${content}" > "$output_file"
+            return 0
+        else
+            echo "Warning: 'mton' script not found for Markdown conversion. Falling back to code block."
+        fi
+    fi
+    
+    # For all other formats, put content in a code block
+    {
+        echo "@code $file_ext"
+        cat "$input_file"
+        echo "@end"
+    } > "$output_file"
+}
+
+is_neorg_file() {
+    local file="$1"
+    local file_ext="${file##*.}"
+    
+    if [[ "$file_ext" == "norg" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Parse arguments
+PARA_TYPE="inbox"
+CATEGORY=""
+FILES=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            ;;
+        -l|--list)
+            list_structure
+            ;;
+        -p|--para)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: --para requires an argument"
+                exit 1
+            fi
+            case "$2" in
+                inbox|project|area|resource|archive|detect)
+                    PARA_TYPE="$2"
+                    ;;
+                *)
+                    echo "Error: Invalid PARA type. Must be one of: inbox, project, area, resource, archive, detect"
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        -c|--category)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: --category requires an argument"
+                exit 1
+            fi
+            CATEGORY="$2"
+            shift 2
+            ;;
+        *)
+            if [[ -f "$1" ]]; then
+                FILES+=("$1")
+            else
+                echo "Error: '$1' is not a valid file!"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Check if at least one file is provided, unless --list was specified
+if [[ ${#FILES[@]} -eq 0 ]]; then
+    echo "Error: No input files specified"
+    show_help
+fi
+
+# Process each file
+for file in "${FILES[@]}"; do
+    if [[ ! -f "$file" ]]; then
+        echo "Warning: File does not exist or is not a regular file: $file"
+        continue
+    fi
+    
+    filename=$(basename "$file")
+    filename_no_ext="${filename%.*}"
+    # Convert filename to under_score_case
+    filename_underscored=$(echo "$filename_no_ext" | tr ' -' '_' | tr '[:upper:]' '[:lower:]')
+    
+    # Determine PARA category folder
+    TARGET_PARA="00_inbox"  # Default value
+    if [[ "$PARA_TYPE" == "detect" ]]; then
+        detected=$(detect_para_category "$file")
+        echo "Detected category: ${detected}"
+        case "$detected" in
+            *project*)
+                TARGET_PARA="01_projects"
+                ;;
+            *area*)
+                TARGET_PARA="02_areas"
+                ;;
+            *resource*)
+                TARGET_PARA="03_resources"
+                ;;
+            *archive*)
+                TARGET_PARA="04_archives"
+                ;;
+            *)
+                TARGET_PARA="00_inbox"
+                ;;
+        esac
+        echo "Using folder: ${TARGET_PARA}"
+    else
+        case "$PARA_TYPE" in
+            inbox)
+                TARGET_PARA="00_inbox"
+                ;;
+            project)
+                TARGET_PARA="01_projects"
+                ;;
+            area)
+                TARGET_PARA="02_areas"
+                ;;
+            resource)
+                TARGET_PARA="03_resources"
+                ;;
+            archive)
+                TARGET_PARA="04_archives"
+                ;;
+        esac
+    fi
+    
+    # Build target directory path
+    if [[ -n "$CATEGORY" ]]; then
+        TARGET_DIR="${NOTES_DIR}/${TARGET_PARA}/${CATEGORY}"
+    else
+        TARGET_DIR="${NOTES_DIR}/${TARGET_PARA}"
+    fi
+    
+    # Create target directory if it doesn't exist
+    mkdir -p "$TARGET_DIR"
+    
+    # Process file based on type
+    TARGET_FILE="${TARGET_DIR}/${filename_underscored}.norg"
+    
+    if is_neorg_file "$file"; then
+        # If already a neorg file, just copy it
+        cp "$file" "$TARGET_FILE"
+        echo "Copied Neorg file to: $TARGET_FILE"
+    else
+        # Convert to neorg
+        convert_to_neorg "$file" "$TARGET_FILE"
+        echo "Converted and ingested to: $TARGET_FILE"
+    fi
+done
