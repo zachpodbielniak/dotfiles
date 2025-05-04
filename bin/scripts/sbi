@@ -35,6 +35,8 @@ Examples:
   cat data.json | sbi --format json        # Pipe content with specified format
   echo "Draft note" | sbi --edit           # Open editor to modify before saving
   echo "Meeting notes" | sbi --name-seed "team meeting" # Use custom filename
+  sbi recording.mp3                        # Transcribe audio and create summary
+  sbi meeting.mp4                          # Extract audio, transcribe, and summarize
 EOF
     exit 0
 }
@@ -438,6 +440,163 @@ is_neorg_file() {
     return 1
 }
 
+# Function to detect audio files by extension
+is_audio_file() {
+    local file="$1"
+    local file_ext="${file##*.}"
+    local file_ext_lower=$(echo "$file_ext" | tr '[:upper:]' '[:lower:]')
+    
+    # Common audio file extensions
+    case "$file_ext_lower" in
+        mp3|wav|ogg|flac|m4a|aac|wma|opus)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Function to detect video files by extension
+is_video_file() {
+    local file="$1"
+    local file_ext="${file##*.}"
+    local file_ext_lower=$(echo "$file_ext" | tr '[:upper:]' '[:lower:]')
+    
+    # Common video file extensions
+    case "$file_ext_lower" in
+        mp4|mkv|avi|mov|wmv|flv|webm|m4v|mpg|mpeg)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Function to process audio files (transcribe and summarize)
+process_audio_file() {
+    local input_file="$1"
+    local output_file="$2"
+    local filename_base="$3"
+    
+    echo "Processing audio file: $input_file"
+    
+    # Create temp directory for processing
+    local temp_dir=$(mktemp -d /tmp/sbi-audio-XXXXXX)
+    
+    # Generate transcript with transcribe_audio
+    echo "Transcribing audio..."
+    local transcript_file="${temp_dir}/transcript.txt"
+    if ! transcribe_audio "$input_file"; then
+        echo "Error: Transcription failed."
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Check if transcript was generated
+    if [[ ! -f "${input_file}.txt" ]]; then
+        echo "Error: Expected transcript file not found at ${input_file}.txt"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Move the transcript to our temp directory
+    mv "${input_file}.txt" "$transcript_file"
+    
+    # Generate summary in neorg format
+    echo "Generating summary..."
+    ai_summary_as_neorg < "${transcript_file}" > "$output_file"
+    
+    # Add source information to the beginning of the file
+    local temp_output="${temp_dir}/output.norg"
+    {
+        echo "* Audio Summary: ${filename_base}"
+        echo
+        echo "Source audio: ${input_file}"
+        echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+        echo
+        echo "* Summary"
+        echo
+        cat "$output_file"
+    } > "$temp_output"
+    
+    # Replace output file with our enhanced version
+    mv "$temp_output" "$output_file"
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    echo "Audio processing complete."
+    return 0
+}
+
+# Function to process video files (strip audio, transcribe, and summarize)
+process_video_file() {
+    local input_file="$1"
+    local output_file="$2"
+    local filename_base="$3"
+    
+    echo "Processing video file: $input_file"
+    
+    # Create temp directory for processing
+    local temp_dir=$(mktemp -d /tmp/sbi-video-XXXXXX)
+    
+    # Strip audio from video
+    echo "Extracting audio from video..."
+    local audio_file="${temp_dir}/audio.ogg"
+    if ! strip_audio "$input_file" "$audio_file"; then
+        echo "Error: Audio extraction failed."
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Transcribe audio
+    echo "Transcribing audio..."
+    local transcript_file="${temp_dir}/transcript.txt"
+    if ! transcribe_audio "$audio_file" > /dev/null; then
+        echo "Error: Transcription failed."
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Check if transcript was generated
+    if [[ ! -f "${audio_file}.txt" ]]; then
+        echo "Error: Expected transcript file not found at ${audio_file}.txt"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Move the transcript to our intended location
+    mv "${audio_file}.txt" "$transcript_file"
+    
+    # Generate summary in neorg format
+    echo "Generating summary..."
+    ai_summary_as_neorg < "$transcript_file" > "$output_file"
+    
+    # Add source information to the beginning of the file
+    local temp_output="${temp_dir}/output.norg"
+    {
+        echo "* Video Summary: ${filename_base}"
+        echo
+        echo "Source video: ${input_file}"
+        echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+        echo
+        echo "* Summary"
+        echo
+        cat "$output_file"
+    } > "$temp_output"
+    
+    # Replace output file with our enhanced version
+    mv "$temp_output" "$output_file"
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    echo "Video processing complete."
+    return 0
+}
+
 # Parse arguments
 PARA_TYPE="inbox"
 CATEGORY=""
@@ -746,8 +905,58 @@ for file in "${FILES[@]}"; do
                 cp "$file" "$TARGET_FILE"
                 echo "Copied Neorg file to: $TARGET_FILE"
             fi
+        elif is_audio_file "$file"; then
+            # Process audio file - transcribe and summarize
+            echo "Detected audio file. Processing..."
+            TEMP_NEORG=$(mktemp /tmp/sbi-audio-neorg-XXXXXX)
+            
+            if process_audio_file "$file" "$TEMP_NEORG" "$filename_no_ext"; then
+                # If processing succeeded, copy to target
+                cp "$TEMP_NEORG" "$TARGET_FILE"
+                echo "Audio processed and ingested to: $TARGET_FILE"
+                
+                # Edit if requested
+                if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                    ${EDITOR:-vi} "$TARGET_FILE"
+                    echo "Edited audio summary in: $TARGET_FILE"
+                fi
+            else
+                # If processing failed, fall back to normal conversion
+                echo "Audio processing failed, falling back to standard conversion."
+                convert_to_neorg "$file" "$TARGET_FILE"
+                echo "Converted and ingested to: $TARGET_FILE"
+            fi
+            
+            # Clean up
+            rm -f "$TEMP_NEORG"
+            
+        elif is_video_file "$file"; then
+            # Process video file - strip audio, transcribe, and summarize
+            echo "Detected video file. Processing..."
+            TEMP_NEORG=$(mktemp /tmp/sbi-video-neorg-XXXXXX)
+            
+            if process_video_file "$file" "$TEMP_NEORG" "$filename_no_ext"; then
+                # If processing succeeded, copy to target
+                cp "$TEMP_NEORG" "$TARGET_FILE"
+                echo "Video processed and ingested to: $TARGET_FILE"
+                
+                # Edit if requested
+                if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                    ${EDITOR:-vi} "$TARGET_FILE"
+                    echo "Edited video summary in: $TARGET_FILE"
+                fi
+            else
+                # If processing failed, fall back to normal conversion
+                echo "Video processing failed, falling back to standard conversion."
+                convert_to_neorg "$file" "$TARGET_FILE"
+                echo "Converted and ingested to: $TARGET_FILE"
+            fi
+            
+            # Clean up
+            rm -f "$TEMP_NEORG"
+            
         else
-            # Convert to neorg
+            # Standard conversion for other file types
             convert_to_neorg "$file" "$TARGET_FILE"
             
             # Edit non-stdin files after conversion if requested
