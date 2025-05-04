@@ -21,6 +21,7 @@ Options:
   -l, --list              List the second brain directory structure
   -L, --list-files        List the second brain directory structure including files
   -f, --full-path         Show full paths in directory listings
+  --format FORMAT         Specify format for stdin content (e.g., "txt", "md", "json")
 
 Examples:
   sbi document.md                          # Ingest to inbox
@@ -28,6 +29,8 @@ Examples:
   sbi --para resource --category technical/linux document.md  # Ingest to specific path
   sbi --para detect document.md            # Auto-detect PARA category
   sbi --list                               # List directory structure
+  echo "* My neorg content" | sbi          # Pipe neorg content directly
+  cat data.json | sbi --format json        # Pipe content with specified format
 EOF
     exit 0
 }
@@ -327,6 +330,13 @@ convert_to_neorg() {
     local output_file="$2"
     local file_ext="${input_file##*.}"
     
+    # Special case for stdin with format already specified
+    if [[ "$STDIN_MODE" == true && "$input_file" == "$TEMP_FILE" && -n "$STDIN_FORMAT" ]]; then
+        # Just copy the content as-is, since we've already wrapped it in a code block
+        cp "$input_file" "$output_file"
+        return 0
+    fi
+    
     if [[ "$file_ext" == "md" || "$file_ext" == "markdown" || "$file_ext" == "MD" ]]; then
         # Check if mton exists
         if command -v mton &> /dev/null; then
@@ -352,11 +362,22 @@ is_neorg_file() {
     local file="$1"
     local file_ext="${file##*.}"
     
+    # Check if it's a .norg file by extension
     if [[ "$file_ext" == "norg" ]]; then
         return 0
-    else
-        return 1
     fi
+    
+    # If it's our temp file from stdin AND no format was specified,
+    # we assume it's already in neorg format
+    if [[ "$STDIN_MODE" == true && "$file" == "$TEMP_FILE" && -z "$STDIN_FORMAT" ]]; then
+        return 0
+    fi
+    
+    # Even if format is specified for stdin, the convert_to_neorg function
+    # will handle it properly, so no need for special case here
+    
+    # Otherwise, not a neorg file
+    return 1
 }
 
 # Parse arguments
@@ -366,6 +387,9 @@ FILES=()
 LIST_FLAG=false
 LIST_FILES_FLAG=false
 FULL_PATH_FLAG=false
+STDIN_MODE=false
+TEMP_FILE=""
+STDIN_FORMAT=""  # Format for stdin content
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -386,6 +410,14 @@ while [[ $# -gt 0 ]]; do
             # Capture the full-path flag
             FULL_PATH_FLAG=true
             shift
+            ;;
+        --format)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: --format requires an argument"
+                exit 1
+            fi
+            STDIN_FORMAT="$2"
+            shift 2
             ;;
         -p|--para)
             if [[ -z "$2" || "$2" == -* ]]; then
@@ -442,10 +474,36 @@ if [[ "$LIST_FLAG" == true || "$LIST_FILES_FLAG" == true ]]; then
     fi
 fi
 
-# Check if at least one file is provided, only if we're not listing
+# Check if at least one file is provided or if we have stdin input, only if we're not listing
 if [[ ${#FILES[@]} -eq 0 && "$LIST_FLAG" == false && "$LIST_FILES_FLAG" == false ]]; then
-    echo "Error: No input files specified"
-    show_help
+    # Check if there's data on stdin (not a terminal)
+    if [ -t 0 ]; then
+        # No stdin input
+        echo "Error: No input files specified and no content provided via stdin"
+        show_help
+    else
+        # We have stdin input; create a temporary file
+        TEMP_FILE=$(mktemp /tmp/sbi-stdin-XXXXXX)
+        
+        # Handle different formats
+        if [[ -n "$STDIN_FORMAT" ]]; then
+            # If format is specified, create a code block with that format
+            {
+                echo "@code $STDIN_FORMAT"
+                cat
+                echo "@end"
+            } > "$TEMP_FILE"
+        else
+            # Default: assume content is already in neorg format
+            cat > "$TEMP_FILE"
+        fi
+        
+        FILES=("$TEMP_FILE")
+        # Flag to indicate this file should be removed after processing
+        STDIN_MODE=true
+    fi
+else
+    STDIN_MODE=false
 fi
 
 # Process each file
@@ -455,8 +513,17 @@ for file in "${FILES[@]}"; do
         continue
     fi
     
-    filename=$(basename "$file")
-    filename_no_ext="${filename%.*}"
+    # Generate filename - for stdin use date-based name
+    if [[ "$STDIN_MODE" == true && "$file" == "$TEMP_FILE" ]]; then
+        # For stdin content, use just the date as filename
+        current_date=$(date +"%Y-%m-%d")
+        filename="${current_date}"
+        filename_no_ext="$filename"
+    else
+        filename=$(basename "$file")
+        filename_no_ext="${filename%.*}"
+    fi
+    
     # Convert filename to under_score_case
     filename_underscored=$(echo "$filename_no_ext" | tr ' -' '_' | tr '[:upper:]' '[:lower:]')
     
@@ -516,13 +583,41 @@ for file in "${FILES[@]}"; do
     # Process file based on type
     TARGET_FILE="${TARGET_DIR}/${filename_underscored}.norg"
     
-    if is_neorg_file "$file"; then
-        # If already a neorg file, just copy it
-        cp "$file" "$TARGET_FILE"
-        echo "Copied Neorg file to: $TARGET_FILE"
+    # Check if the target file already exists
+    if [[ -f "$TARGET_FILE" ]]; then
+        # File exists - append to it
+        if is_neorg_file "$file"; then
+            # If source is already a neorg file, append its content with a separator
+            echo -e "\n* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" >> "$TARGET_FILE"
+            cat "$file" >> "$TARGET_FILE"
+            echo "Appended Neorg file to: $TARGET_FILE"
+        else
+            # Convert to neorg and append with a separator
+            echo -e "\n* Appended on $(date +"%Y-%m-%d %H:%M:%S")\n" >> "$TARGET_FILE"
+            
+            # For non-neorg files, create a temporary file for conversion
+            APPEND_TEMP=$(mktemp /tmp/sbi-append-XXXXXX)
+            convert_to_neorg "$file" "$APPEND_TEMP"
+            cat "$APPEND_TEMP" >> "$TARGET_FILE"
+            rm -f "$APPEND_TEMP"
+            
+            echo "Converted and appended to: $TARGET_FILE"
+        fi
     else
-        # Convert to neorg
-        convert_to_neorg "$file" "$TARGET_FILE"
-        echo "Converted and ingested to: $TARGET_FILE"
+        # New file
+        if is_neorg_file "$file"; then
+            # If already a neorg file, just copy it
+            cp "$file" "$TARGET_FILE"
+            echo "Copied Neorg file to: $TARGET_FILE"
+        else
+            # Convert to neorg
+            convert_to_neorg "$file" "$TARGET_FILE"
+            echo "Converted and ingested to: $TARGET_FILE"
+        fi
     fi
 done
+
+# Clean up temporary file if we used stdin mode
+if [[ "$STDIN_MODE" == true && -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
+    rm -f "$TEMP_FILE"
+fi
