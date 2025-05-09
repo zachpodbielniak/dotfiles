@@ -55,6 +55,7 @@ CRAWL_MODE=false                   # Web crawling mode flag, toggled with --craw
 EXPORT_MODE=false                  # Site export processing mode flag, toggled with --export
 CRAWL_ARCHIVE=false                # Whether to save the complete website archive
 SILENT_MODE=false                  # Silent mode flag, toggled with --silent
+NO_SUMMARY_MODE=false               # Skip AI summary generation, toggled with --no-summary
 CRAWL_DEPTH=1                      # Default crawl depth (1 = just the specified page)
 CRAWL_DOMAIN_RESTRICT=true         # Restrict crawl to the same domain by default
 CRAWL_WAIT=1                       # Wait between retrievals (seconds) for politeness
@@ -2260,6 +2261,7 @@ Options:
   -l, --list              List the second brain directory structure
   -L, --list-files        List the second brain directory structure including files
   -f, --full-path         Show full paths in directory listings
+  -n, --no-summary        Skip AI summary generation, directly convert content to Neorg format
   --format FORMAT         Specify format for stdin content (e.g., "txt", "md", "json")
   -e, --edit              Edit content before writing to file
   --name-seed NAME        Use NAME as seed for filename (for stdin content)
@@ -2295,6 +2297,7 @@ Examples:
   sbi book.epub                            # Convert ebook, generate summary, and save as neorg
   sbi document.docx                        # Convert Office document, generate summary, and save as neorg
   sbi presentation.pptx                    # Convert presentation, generate summary, and save as neorg
+  sbi --no-summary document.md             # Convert markdown to neorg without generating AI summary
   sbi --debug document.md                  # Ingest with debug logging enabled
   sbi --interactive                        # Launch interactive TUI mode for browsing and managing content
   
@@ -2932,7 +2935,7 @@ download_url_as_markdown() {
     fi
     
     # Download the webpage with curl
-    echo "Fetching web page content..."
+    show_progress "Fetching web page content..."
     if ! curl -s -L --max-redirs 5 --connect-timeout 10 --max-time 30 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" "$url" > "$html_file"; then
         handle_error "$ERROR_TYPE_NETWORK" "Failed to download web page from URL: $url" "" "ERROR"
         rm -rf "$temp_dir"
@@ -2949,7 +2952,7 @@ download_url_as_markdown() {
         fi
     # Fallback to using distrobox with pandoc if system pandoc isn't available
     elif command -v distrobox &> /dev/null; then
-        echo "Attempting to use pandoc via distrobox..."
+        show_progress "Attempting to use pandoc via distrobox..."
         if ! distrobox enter dev -- pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
             handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to Markdown with pandoc via distrobox" "" "ERROR"
             rm -rf "$temp_dir"
@@ -2957,14 +2960,14 @@ download_url_as_markdown() {
         fi
     # Last resort: Use a very simple HTML to text conversion with lynx or w3m
     elif command -v lynx &> /dev/null; then
-        echo "Using lynx for basic HTML to text conversion..."
+        show_progress "Using lynx for basic HTML to text conversion..."
         if ! lynx -dump -nolist "$html_file" > "$md_file"; then
             handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to text with lynx" "" "ERROR"
             rm -rf "$temp_dir"
             return 1
         fi
     elif command -v w3m &> /dev/null; then
-        echo "Using w3m for basic HTML to text conversion..."
+        show_progress "Using w3m for basic HTML to text conversion..."
         if ! w3m -dump "$html_file" > "$md_file"; then
             handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to text with w3m" "" "ERROR"
             rm -rf "$temp_dir"
@@ -2995,7 +2998,7 @@ download_url_as_markdown() {
     # Clean up
     rm -rf "$temp_dir"
     
-    echo "Successfully downloaded and converted URL to Markdown: $output_file"
+    show_progress "Successfully downloaded and converted URL to Markdown: $output_file"
     return 0
 }
 
@@ -3137,7 +3140,28 @@ process_audio_file() {
     # Move the transcript to our temp directory
     mv "${input_file}.txt" "$transcript_file"
     
-    # Generate summary in neorg format
+    # Check if we should bypass AI summary generation
+    if [[ "$NO_SUMMARY_MODE" == true ]]; then
+        show_progress "No-summary mode enabled, skipping AI summary generation for audio"
+        
+        # Create a simple Neorg document with just the transcript
+        {
+            echo "* Audio Transcript: ${filename_base}"
+            echo
+            echo "Source audio: ${input_file}"
+            echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+            echo
+            echo "* Transcript"
+            echo
+            cat "$transcript_file"
+        } > "$output_file"
+        
+        # Clean up and return
+        rm -rf "$temp_dir"
+        return 0
+    fi
+    
+    # Generate summary in neorg format (only if NO_SUMMARY_MODE is false)
     show_progress "Generating summary..."
     ai_summary_as_neorg < "${transcript_file}" > "$output_file"
     
@@ -3495,12 +3519,16 @@ process_document_content() {
     local md_file="${temp_dir}/content.md"
     local doc_type="${input_file##*.}"
     
-    # Convert document to markdown
-    if ! convert_document_to_markdown "$input_file" "$md_file"; then
+    # For markdown files, just copy the content instead of converting
+    if [[ "${doc_type,,}" == "md" || "${doc_type,,}" == "markdown" ]]; then
+        show_progress "File is already in markdown format, skipping conversion"
+        cp "$input_file" "$md_file"
+    # For other documents, convert to markdown
+    elif ! convert_document_to_markdown "$input_file" "$md_file"; then
         handle_error "$ERROR_TYPE_CONVERSION" "Document conversion failed: $input_file" "" "WARNING"
         
         # Create recovery content
-        echo "Creating basic document info as fallback..."
+        show_progress "Creating basic document info as fallback..."
         {
             echo "* Document Information: ${filename_base}"
             echo 
@@ -3526,28 +3554,50 @@ process_document_content() {
         return 0  # Return success to allow saving the recovery info
     fi
     
-    # Generate AI summary
+    # Get document title from markdown metadata or filename
+    local doc_title=$(grep -m 1 "^title: " "$md_file" | sed 's/^title: //' || echo "$filename_base")
+    
+    # Check if we should bypass AI summary generation
+    if [[ "$NO_SUMMARY_MODE" == true ]]; then
+        show_progress "No-summary mode enabled, skipping AI summary generation"
+        
+        # If mton is available, directly convert markdown to neorg and save to output file
+        if command -v mton &> /dev/null; then
+            show_progress "Converting markdown directly to Neorg format using mton"
+            if cat "$md_file" | mton > "$output_file"; then
+                show_progress "Successfully converted markdown to Neorg format"
+                # Clean up and return
+                rm -rf "$temp_dir"
+                return 0
+            else
+                handle_error "$ERROR_TYPE_CONVERSION" "mton conversion failed for: $input_file" "" "WARNING"
+                # Continue with normal workflow as fallback
+            fi
+        else
+            handle_error "$ERROR_TYPE_DEPENDENCY" "'mton' tool not found for direct Markdown to Neorg conversion" "" "WARNING"
+            # Continue with normal workflow as fallback
+        fi
+    fi
+    
+    # Generate AI summary (only reached if NO_SUMMARY_MODE is false or direct conversion failed)
     show_progress "Generating AI summary of document content..."
     local ai_summary="${temp_dir}/summary.norg"
     
     if command -v ai_summary_as_neorg &> /dev/null; then
         if ! cat "$md_file" | ai_summary_as_neorg > "$ai_summary"; then
-            echo "Warning: AI summary generation failed. Creating basic summary."
+            handle_error "$ERROR_TYPE_PROCESSING" "AI summary generation failed. Creating basic summary." "" "WARNING"
             {
                 echo "AI summary generation failed for this document."
                 echo "Please refer to the original file for content."
             } > "$ai_summary"
         fi
     else
-        echo "Warning: 'ai_summary_as_neorg' not found. Creating basic structure."
+        handle_error "$ERROR_TYPE_DEPENDENCY" "'ai_summary_as_neorg' not found. Creating basic structure." "" "WARNING"
         {
             echo "AI summary tool not available."
             echo "Please refer to the original file for content."
         } > "$ai_summary"
     fi
-    
-    # Get document title from markdown metadata or filename
-    local doc_title=$(grep -m 1 "^title: " "$md_file" | sed 's/^title: //' || echo "$filename_base")
     
     # Create content preview (first section or few pages)
     head -n 50 "$md_file" > "${temp_dir}/preview.md"
@@ -4059,7 +4109,7 @@ process_web_content() {
     local output_file="$2"
     local filename_base="$3"
     
-    echo "Processing web content: $input_file"
+    show_progress "Processing web content: $input_file"
     
     # Create temp directory for processing
     local temp_dir=$(mktemp -d $HOME/.tmp/sbi-web-XXXXXX)
@@ -4076,14 +4126,36 @@ process_web_content() {
         page_title=$(cat "${input_file}.title")
     fi
     
-    # Generate AI summary of the web content
-    echo "Generating AI summary of web content..."
+    # Check if we should bypass AI summary generation
+    if [[ "$NO_SUMMARY_MODE" == true ]]; then
+        show_progress "No-summary mode enabled, skipping AI summary generation"
+        
+        # If mton is available, directly convert markdown to neorg and save to output file
+        if command -v mton &> /dev/null; then
+            show_progress "Converting web content directly to Neorg format using mton"
+            if cat "$input_file" | mton > "$output_file"; then
+                show_progress "Successfully converted web content to Neorg format"
+                # Clean up and return
+                rm -rf "$temp_dir"
+                return 0
+            else
+                handle_error "$ERROR_TYPE_CONVERSION" "mton conversion failed for web content" "" "WARNING"
+                # Continue with normal workflow as fallback
+            fi
+        else
+            handle_error "$ERROR_TYPE_DEPENDENCY" "'mton' tool not found for direct Markdown to Neorg conversion" "" "WARNING"
+            # Continue with normal workflow as fallback
+        fi
+    fi
+    
+    # Generate AI summary of the web content (only reached if NO_SUMMARY_MODE is false or direct conversion failed)
+    show_progress "Generating AI summary of web content..."
     local ai_summary=$(mktemp "${temp_dir}/ai_summary.XXXXXX")
     
     if command -v ai_summary_as_neorg &> /dev/null; then
         # Create AI summary in neorg format
         if ! cat "$input_file" | ai_summary_as_neorg > "$ai_summary"; then
-            echo "Warning: AI summary generation failed. Will create a basic summary."
+            handle_error "$ERROR_TYPE_PROCESSING" "AI summary generation failed. Will create a basic summary." "" "WARNING"
             # Create a minimal summary as fallback
             {
                 echo "AI summary generation failed for this web content."
@@ -4091,7 +4163,7 @@ process_web_content() {
             } > "$ai_summary"
         fi
     else
-        echo "Warning: 'ai_summary_as_neorg' not found. Creating basic structure instead."
+        handle_error "$ERROR_TYPE_DEPENDENCY" "'ai_summary_as_neorg' not found. Creating basic structure instead." "" "WARNING"
         # Create a minimal note as fallback
         {
             echo "AI summary tool not available."
@@ -4169,7 +4241,7 @@ process_video_file() {
     local output_file="$2"
     local filename_base="$3"
     
-    echo "Processing video file: $input_file"
+    show_progress "Processing video file: $input_file"
     
     # Create temp directory for processing
     local temp_dir=$(mktemp -d $HOME/.tmp/sbi-video-XXXXXX)
@@ -4178,7 +4250,7 @@ process_video_file() {
     show_progress "Extracting audio from video..."
     local audio_file="${temp_dir}/audio.ogg"
     if ! strip_audio "$input_file" "$audio_file"; then
-        echo "Error: Audio extraction failed."
+        handle_error "$ERROR_TYPE_PROCESSING" "Audio extraction failed" "" "ERROR"
         rm -rf "$temp_dir"
         return 1
     fi
@@ -4187,14 +4259,14 @@ process_video_file() {
     show_progress "Transcribing audio..."
     local transcript_file="${temp_dir}/transcript.txt"
     if ! transcribe_audio "$audio_file" > /dev/null; then
-        echo "Error: Transcription failed."
+        handle_error "$ERROR_TYPE_PROCESSING" "Transcription failed" "" "ERROR"
         rm -rf "$temp_dir"
         return 1
     fi
     
     # Check if transcript was generated
     if [[ ! -f "${audio_file}.txt" ]]; then
-        echo "Error: Expected transcript file not found at ${audio_file}.txt"
+        handle_error "$ERROR_TYPE_FILE" "Expected transcript file not found at ${audio_file}.txt" "" "ERROR"
         rm -rf "$temp_dir"
         return 1
     fi
@@ -4202,7 +4274,29 @@ process_video_file() {
     # Move the transcript to our intended location
     mv "${audio_file}.txt" "$transcript_file"
     
-    # Generate summary in neorg format
+    # Check if we should bypass AI summary generation
+    if [[ "$NO_SUMMARY_MODE" == true ]]; then
+        show_progress "No-summary mode enabled, skipping AI summary generation for video"
+        
+        # Create a simple Neorg document with just the transcript
+        {
+            echo "* Video Transcript: ${filename_base}"
+            echo
+            echo "Source video: ${input_file}"
+            echo "Processed on: $(date +"%Y-%m-%d %H:%M:%S")"
+            echo
+            echo "* Transcript"
+            echo
+            cat "$transcript_file"
+        } > "$output_file"
+        
+        # Clean up and return
+        rm -rf "$temp_dir"
+        show_progress "Video processing complete."
+        return 0
+    fi
+    
+    # Generate summary in neorg format (only if NO_SUMMARY_MODE is false)
     show_progress "Generating summary..."
     ai_summary_as_neorg < "$transcript_file" > "$output_file"
     
@@ -4241,7 +4335,7 @@ process_video_file() {
     # Clean up
     rm -rf "$temp_dir"
     
-    echo "Video processing complete."
+    show_progress "Video processing complete."
     return 0
 }
 
@@ -4282,6 +4376,11 @@ while [[ $# -gt 0 ]]; do
         --silent)
             SILENT_MODE=true
             debug_log "INFO" "Silent mode enabled"
+            shift
+            ;;
+        -n|--no-summary)
+            NO_SUMMARY_MODE=true
+            debug_log "INFO" "No summary mode enabled - will bypass AI summary generation"
             shift
             ;;
         -i|--interactive)
@@ -5295,26 +5394,26 @@ for file in "${FILES[@]}"; do
             # Clean up
             rm -f "$TEMP_NEORG"
             
-        elif is_ebook_file "$file" || is_pdf_file "$file" || is_office_file "$file"; then
-            # Process ebook or PDF document
-            echo "Detected document file ($(basename "$file")). Processing..."
+        elif is_ebook_file "$file" || is_pdf_file "$file" || is_office_file "$file" || [[ "${file##*.}" == "md" || "${file##*.}" == "markdown" || "${file##*.}" == "MD" ]]; then
+            # Process ebook, PDF, office document, or markdown file
+            show_progress "Detected document file ($(basename "$file")). Processing..."
             TEMP_NEORG=$(mktemp $HOME/.tmp/sbi-document-neorg-XXXXXX)
             
             if process_document_content "$file" "$TEMP_NEORG" "$filename_no_ext"; then
                 # If processing succeeded, copy to target
                 cp "$TEMP_NEORG" "$TARGET_FILE"
-                echo "Document processed and ingested to: $TARGET_FILE"
+                show_progress "Document processed and ingested to: $TARGET_FILE"
                 
                 # Edit if requested
                 if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
                     ${EDITOR:-vi} "$TARGET_FILE"
-                    echo "Edited document summary in: $TARGET_FILE"
+                    show_progress "Edited document summary in: $TARGET_FILE"
                 fi
             else
                 # If processing failed, fall back to normal conversion
-                echo "Document processing failed, falling back to standard conversion."
+                handle_error "$ERROR_TYPE_PROCESSING" "Document processing failed, falling back to standard conversion." "" "WARNING"
                 convert_to_neorg "$file" "$TARGET_FILE"
-                echo "Converted and ingested to: $TARGET_FILE"
+                show_progress "Converted and ingested to: $TARGET_FILE"
             fi
             
             # Clean up
