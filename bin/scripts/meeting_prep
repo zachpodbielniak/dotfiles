@@ -1,0 +1,519 @@
+#!/usr/bin/python3
+
+import sys
+import os
+import yaml
+import argparse
+import datetime
+from icalendar import Calendar
+import pytz
+import glob
+import re
+import requests
+import tempfile
+import urllib.parse
+
+def load_config(config_path=None):
+    """Load the YAML config file that specifies ICS file locations."""
+    if config_path is None:
+        config_path = os.path.expanduser("~/.config/meeting_prep.yaml")
+    
+    if not os.path.exists(config_path):
+        print(f"Config file not found at {config_path}", file=sys.stderr)
+        print("Creating default config file...", file=sys.stderr)
+        create_default_config(config_path)
+    
+    try:
+        with open(config_path, 'r') as config_file:
+            config = yaml.safe_load(config_file)
+        return config
+    except Exception as e:
+        print(f"Error loading config file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def create_default_config(config_path):
+    """Create a default config file if none exists."""
+    default_config = {
+        'ics_files': [
+            '~/Calendar/work.ics',
+            '~/Calendar/personal.ics',
+            'https://example.com/calendar/mycal.ics'
+        ],
+        'time_ranges': {
+            'prep_time': 15,              # minutes before meeting to notify
+            'lookback_hours': 24,         # hours to look back for relevant context
+            'default_lookahead_days': 1,  # days to look ahead by default
+            'tomorrow_buffer_hours': 2,   # hours to include before/after tomorrow
+            'week_end_padding_days': 0    # days to include after the end of the week
+        },
+        'display': {
+            'max_meetings': 0,            # 0 means unlimited
+            'show_canceled': False,       # whether to show canceled meetings
+            'max_description_length': 300,
+            'max_attendees': 10
+        }
+    }
+    
+    try:
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as config_file:
+            yaml.dump(default_config, config_file, default_flow_style=False)
+        print(f"Default config created at {config_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error creating default config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def parse_ics_files(config):
+    """Parse all ICS files specified in the config and return events."""
+    events = []
+    
+    for ics_path in config.get('ics_files', []):
+        # Check if it's a URL or a local file
+        if ics_path.startswith(('http://', 'https://')):
+            try:
+                # It's a URL, download and parse it
+                response = requests.get(ics_path, timeout=30)
+                response.raise_for_status()  # Raise an exception for 4XX/5XX responses
+                
+                # Parse the calendar data
+                cal = Calendar.from_ical(response.content)
+                for component in cal.walk():
+                    if component.name == "VEVENT":
+                        events.append(component)
+                        
+                print(f"Successfully loaded calendar from URL: {ics_path}", file=sys.stderr)
+            except Exception as e:
+                print(f"Error fetching or parsing URL {ics_path}: {e}", file=sys.stderr)
+        else:
+            # It's a local file path
+            expanded_path = os.path.expanduser(ics_path)
+            # Handle glob patterns in case of wildcards
+            matching_paths = glob.glob(expanded_path)
+            if not matching_paths:
+                print(f"Warning: No files found matching pattern {expanded_path}", file=sys.stderr)
+                
+            for file_path in matching_paths:
+                try:
+                    with open(file_path, 'rb') as f:
+                        cal = Calendar.from_ical(f.read())
+                        for component in cal.walk():
+                            if component.name == "VEVENT":
+                                events.append(component)
+                except Exception as e:
+                    print(f"Error parsing {file_path}: {e}", file=sys.stderr)
+    
+    return events
+
+def get_time_range(args, config, events=None):
+    """
+    Determine the appropriate time range based on args and config.
+    Returns (start_time, end_time, reference_time) as aware datetime objects.
+    """
+    now = datetime.datetime.now(pytz.UTC)
+    reference_time = now  # Time used for filtering meetings
+    
+    # Extract configuration values with defaults
+    time_ranges = config.get('time_ranges', {})
+    lookback_hours = time_ranges.get('lookback_hours', 24)
+    default_lookahead_days = time_ranges.get('default_lookahead_days', 1)
+    tomorrow_buffer_hours = time_ranges.get('tomorrow_buffer_hours', 2)
+    week_end_padding_days = time_ranges.get('week_end_padding_days', 0)
+    
+    # Adjust for older config format
+    if 'lookback_hours' in config:
+        lookback_hours = config.get('lookback_hours', 24)
+    if 'lookahead_hours' in config:
+        # Convert to days for default if present in old format
+        default_lookahead_days = config.get('lookahead_hours', 24) / 24
+    
+    # Start with default values
+    start_time = now - datetime.timedelta(hours=lookback_hours)
+    
+    # Process different time range options
+    if args.days is not None:
+        # Custom days specified
+        end_time = now + datetime.timedelta(days=args.days)
+    elif args.tomorrow:
+        # Tomorrow with buffer
+        tomorrow = now + datetime.timedelta(days=1)
+        tomorrow_start = datetime.datetime(
+            tomorrow.year, tomorrow.month, tomorrow.day, 
+            0, 0, 0, tzinfo=tomorrow.tzinfo
+        )
+        tomorrow_end = datetime.datetime(
+            tomorrow.year, tomorrow.month, tomorrow.day,
+            23, 59, 59, tzinfo=tomorrow.tzinfo
+        )
+        
+        # Add buffer hours
+        start_time = tomorrow_start - datetime.timedelta(hours=tomorrow_buffer_hours)
+        end_time = tomorrow_end + datetime.timedelta(hours=tomorrow_buffer_hours)
+    elif args.week:
+        # Rest of the week
+        today = now.date()
+        days_to_end_of_week = 6 - today.weekday()  # Assuming Sunday = 6
+        week_end = today + datetime.timedelta(days=days_to_end_of_week)
+        week_end = datetime.datetime.combine(week_end, datetime.time(23, 59, 59))
+        week_end = pytz.UTC.localize(week_end)
+        
+        # Add padding days if configured
+        end_time = week_end + datetime.timedelta(days=week_end_padding_days)
+    else:
+        # Default to configured lookahead days
+        end_time = now + datetime.timedelta(days=default_lookahead_days)
+    
+    # Handle calendar date vs system date discrepancy
+    if events:
+        # Get the oldest and newest dates from events to determine a reasonable date range
+        event_dates = []
+        for event in events:
+            try:
+                dt = get_event_datetime(event.get('dtstart').dt)
+                event_dates.append(dt)
+            except Exception:
+                pass
+                
+        if event_dates:
+            # Sort by date to find oldest and newest
+            event_dates.sort()
+            oldest_event = event_dates[0]
+            newest_event = event_dates[-1]
+            
+            # If a specific year was requested, show a message
+            if args.specify_year:
+                print(f"Note: Using specified year ({args.specify_year}) instead of current year ({now.year}).", file=sys.stderr)
+            # Otherwise if calendar dates differ from system date, inform the user
+            elif abs((now - newest_event).total_seconds()) > 30 * 24 * 3600:
+                print(f"Note: Calendar dates ({newest_event.date()}) differ from system date ({now.date()}).", file=sys.stderr)
+                print(f"Using current year ({now.year}) for calculations. Use --specify-year to use a different year.", file=sys.stderr)
+    
+    # Ensure all times are timezone-aware
+    if start_time.tzinfo is None:
+        start_time = pytz.UTC.localize(start_time)
+    if end_time.tzinfo is None:
+        end_time = pytz.UTC.localize(end_time)
+    
+    return start_time, end_time, reference_time
+
+def filter_upcoming_meetings(events, start_time, end_time, reference_time, show_all=False, show_canceled=False, target_year=None):
+    """
+    Filter events based on time range and options.
+    
+    Args:
+        events: List of calendar events
+        start_time: Start of time range (aware datetime)
+        end_time: End of time range (aware datetime)
+        reference_time: Reference time for filtering (usually now, or latest event time)
+        show_all: If True, include past meetings
+        show_canceled: If True, include canceled meetings
+        target_year: The year to use for date comparisons (defaults to current year)
+    
+    Returns:
+        (upcoming_meetings, all_meetings) - Two filtered lists of meetings
+    """
+    upcoming_meetings = []
+    all_meetings = []
+    
+    # If no target year provided, use the current year
+    if target_year is None:
+        target_year = datetime.datetime.now().year
+    
+    for event in events:
+        try:
+            # Check if the meeting is canceled
+            status = event.get('status', '')
+            if status and status.lower() == 'cancelled' and not show_canceled:
+                continue
+                
+            # Some icalendar implementations use summary with "Canceled:" prefix
+            summary = event.get('summary', '')
+            if summary and summary.lower().startswith('canceled:') and not show_canceled:
+                continue
+                
+            dtstart = event.get('dtstart').dt
+            
+            # Convert to datetime with timezone if it's a date
+            if isinstance(dtstart, datetime.date) and not isinstance(dtstart, datetime.datetime):
+                dtstart = datetime.datetime.combine(dtstart, datetime.time.min)
+                dtstart = pytz.UTC.localize(dtstart)
+            # If it's a datetime but has no timezone (naive), localize it
+            elif isinstance(dtstart, datetime.datetime) and dtstart.tzinfo is None:
+                dtstart = pytz.UTC.localize(dtstart)
+                
+            # Always adjust the year to target_year unless specifically told not to
+            if dtstart.year != target_year:
+                # Try to create a date with the same month/day but target year
+                try:
+                    # Create a new datetime with the target year but same month/day/time
+                    new_dtstart = dtstart.replace(year=target_year)
+                    dtstart = new_dtstart
+                except ValueError:
+                    # Handle Feb 29 in leap years becoming Feb 28 in non-leap years
+                    if dtstart.month == 2 and dtstart.day == 29:
+                        new_dtstart = dtstart.replace(year=target_year, day=28)
+                        dtstart = new_dtstart
+            
+            # Add to all_meetings regardless of date
+            all_meetings.append(event)
+            
+            # Filter by date range for upcoming meetings
+            # When using --days option with calendar time reference, we compare days
+            # rather than exact times to make sure we get all meetings for those days
+            if (start_time.year, start_time.month, start_time.day) <= (dtstart.year, dtstart.month, dtstart.day) <= (end_time.year, end_time.month, end_time.day):
+                upcoming_meetings.append(event)
+        except Exception as e:
+            print(f"Error processing event: {e}", file=sys.stderr)
+    
+    # Sort by start time
+    upcoming_meetings.sort(key=lambda x: get_event_datetime(x.get('dtstart').dt, target_year))
+    all_meetings.sort(key=lambda x: get_event_datetime(x.get('dtstart').dt, target_year))
+    
+    # When not showing all meetings, we only want meetings on or after the reference date
+    # but we compare day values rather than exact timestamps to get all meetings for the day
+    if not show_all:
+        reference_date = (reference_time.year, reference_time.month, reference_time.day)
+        upcoming_meetings = [m for m in upcoming_meetings
+                            if (get_event_datetime(m.get('dtstart').dt, target_year).year,
+                                get_event_datetime(m.get('dtstart').dt, target_year).month,
+                                get_event_datetime(m.get('dtstart').dt, target_year).day) >= reference_date]
+    
+    return upcoming_meetings, all_meetings
+
+def get_event_datetime(dt, target_year=None):
+    """
+    Convert any date or datetime to a timezone-aware datetime for sorting.
+    
+    Args:
+        dt: The date or datetime to convert
+        target_year: Optional year to force on the date
+    """
+    if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
+        dt = datetime.datetime.combine(dt, datetime.time.min)
+        dt = pytz.UTC.localize(dt)
+    elif isinstance(dt, datetime.datetime) and dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt)
+    
+    # If target_year is specified, adjust the year
+    if target_year and dt.year != target_year:
+        try:
+            dt = dt.replace(year=target_year)
+        except ValueError:
+            # Handle Feb 29 in leap years
+            if dt.month == 2 and dt.day == 29:
+                dt = dt.replace(year=target_year, day=28)
+    
+    return dt
+
+def format_meeting_info(meeting, config=None, target_year=None):
+    """Format meeting information for display."""
+    # Get display options
+    max_desc_length = 300
+    max_attendees = 10
+    
+    if config and 'display' in config:
+        display_config = config.get('display', {})
+        max_desc_length = display_config.get('max_description_length', 300)
+        max_attendees = display_config.get('max_attendees', 10)
+    
+    summary = meeting.get('summary', 'Untitled Meeting')
+    
+    dtstart = meeting.get('dtstart').dt
+    dtstart = get_event_datetime(dtstart, target_year)
+    
+    # Format the date/time
+    local_dt = dtstart.astimezone(datetime.datetime.now().astimezone().tzinfo)
+    start_time = local_dt.strftime("%Y-%m-%d %H:%M")
+    
+    # Get duration
+    dtend = meeting.get('dtend')
+    duration = ""
+    if dtend:
+        dtend = dtend.dt
+        dtend = get_event_datetime(dtend, target_year)
+        duration_min = (dtend - dtstart).total_seconds() / 60
+        duration = f"{int(duration_min)} minutes"
+    
+    # Get location/virtual meeting link
+    location = meeting.get('location', 'No location specified')
+    
+    # Get description and extract potential meeting links
+    description = meeting.get('description', '')
+    meeting_links = extract_meeting_links(description)
+    
+    # Get attendees
+    attendees = []
+    for attendee in meeting.get('attendee', []):
+        if hasattr(attendee, 'params') and 'cn' in attendee.params:
+            attendees.append(attendee.params['cn'])
+        elif hasattr(attendee, 'value'):
+            email = attendee.value
+            if email.startswith('mailto:'):
+                email = email[7:]
+            attendees.append(email)
+    
+    result = f"Meeting: {summary}\n"
+    result += f"Time: {start_time}"
+    if duration:
+        result += f" ({duration})\n"
+    else:
+        result += "\n"
+    
+    result += f"Location: {location}\n"
+    
+    if meeting_links:
+        result += "Meeting Links:\n"
+        for link in meeting_links:
+            result += f"  - {link}\n"
+    
+    if attendees:
+        result += "Attendees:\n"
+        for attendee in attendees[:max_attendees]:  # Limit based on config
+            result += f"  - {attendee}\n"
+        if len(attendees) > max_attendees:
+            result += f"  - Plus {len(attendees) - max_attendees} more attendees\n"
+    
+    # Add description (limited length)
+    if description:
+        short_desc = description[:max_desc_length]
+        if len(description) > max_desc_length:
+            short_desc += "..."
+        result += "\nDescription:\n"
+        # Format description to fit within terminal width
+        for line in short_desc.split('\n'):
+            if line.strip():
+                result += f"  {line}\n"
+    
+    return result
+
+def extract_meeting_links(text):
+    """Extract video meeting links from text."""
+    if not text:
+        return []
+    
+    # Common meeting link patterns
+    patterns = [
+        r'https?://meet\.google\.com/[a-z-]+',
+        r'https?://[a-z-\.]+\.zoom\.us/j/\d+',
+        r'https?://teams\.microsoft\.com/l/meetup-join/[^\s<>"]+'
+    ]
+    
+    links = []
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        links.extend(matches)
+    
+    return links
+
+def main():
+    parser = argparse.ArgumentParser(description='Prepare for upcoming meetings by gathering context from calendar files.')
+    parser.add_argument('-c', '--config', help='Path to config file (default: ~/.config/meeting_prep.yaml)')
+    
+    # Meeting display options
+    parser.add_argument('-l', '--list', action='store_true', help='List upcoming meetings')
+    parser.add_argument('-n', '--next', action='store_true', help='Show only the next meeting')
+    parser.add_argument('-d', '--details', action='store_true', help='Show detailed meeting information')
+    parser.add_argument('-a', '--all', action='store_true', help='Show all meetings (including past meetings)')
+    
+    # Time range options
+    time_group = parser.add_argument_group('Time Range Options')
+    time_group.add_argument('--days', type=int, help='Show meetings for the next N days')
+    time_group.add_argument('--tomorrow', action='store_true', help="Show tomorrow's meetings")
+    time_group.add_argument('--week', action='store_true', help='Show meetings for the rest of the week')
+    time_group.add_argument('--specify-year', type=int, metavar='YEAR',
+                         help='Use a specific year instead of current year')
+    
+    # Debug options (hidden from help)
+    parser.add_argument('--debug', action='store_true', help=argparse.SUPPRESS)
+    
+    args = parser.parse_args()
+    
+    # Ensure time range arguments are mutually exclusive
+    if sum([bool(args.days is not None), args.tomorrow, args.week]) > 1:
+        print("Error: --days, --tomorrow, and --week are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Load configuration
+    config = load_config(args.config)
+    
+    # For backward compatibility with old config format
+    display_config = config.get('display', {})
+    if 'meeting_prep_time' in config:
+        # Old config format, migrate value
+        if 'time_ranges' not in config:
+            config['time_ranges'] = {}
+        config['time_ranges']['prep_time'] = config.get('meeting_prep_time', 15)
+    
+    # Parse calendar files
+    events = parse_ics_files(config)
+    
+    if not events:
+        print("No events found in the specified ICS files.")
+        sys.exit(0)
+    
+    # Determine time range based on arguments and configuration
+    start_time, end_time, reference_time = get_time_range(args, config, events)
+    
+    # Get display options
+    show_canceled = display_config.get('show_canceled', False)
+    max_meetings = display_config.get('max_meetings', 0)
+    
+    # Get the target year to use
+    target_year = args.specify_year if args.specify_year else datetime.datetime.now().year
+    
+    # Filter meetings based on time range
+    upcoming_meetings, all_meetings = filter_upcoming_meetings(
+        events, start_time, end_time, reference_time,
+        show_all=args.all,
+        show_canceled=show_canceled,
+        target_year=target_year
+    )
+    
+    # For debugging purposes
+    if not upcoming_meetings and args.debug:
+        print(f"DEBUG: No upcoming meetings found in range:", file=sys.stderr)
+        print(f"DEBUG: Start time: {start_time}", file=sys.stderr)
+        print(f"DEBUG: End time: {end_time}", file=sys.stderr)
+        print(f"DEBUG: Reference time: {reference_time}", file=sys.stderr)
+        print(f"DEBUG: Total events: {len(events)}", file=sys.stderr)
+        print(f"DEBUG: All meetings after filtering: {len(all_meetings)}", file=sys.stderr)
+        
+        # Check first few event dates
+        for i, event in enumerate(events[:5]):
+            try:
+                dt = get_event_datetime(event.get('dtstart').dt, target_year)
+                print(f"DEBUG: Event {i} date: {dt} - {event.get('summary', 'Unknown')}", file=sys.stderr)
+            except Exception as e:
+                print(f"DEBUG: Error getting event date: {e}", file=sys.stderr)
+    
+    # Handle case with no meetings
+    if not upcoming_meetings and not args.all:
+        print("No upcoming meetings found within the specified time frame.")
+        if all_meetings:
+            print("Try using the -a/--all flag to see all meetings.")
+        sys.exit(0)
+    
+    # Determine which meetings to display
+    meetings_to_display = all_meetings if args.all else upcoming_meetings
+    
+    if not meetings_to_display:
+        print("No meetings found.")
+        sys.exit(0)
+    
+    # Apply meeting count limit if configured
+    if max_meetings > 0 and len(meetings_to_display) > max_meetings:
+        print(f"Limiting display to {max_meetings} meetings (out of {len(meetings_to_display)}).")
+        meetings_to_display = meetings_to_display[:max_meetings]
+    
+    # Display meetings
+    if args.next and upcoming_meetings:
+        # Show only the next meeting
+        print(format_meeting_info(upcoming_meetings[0], config, target_year))
+    else:
+        # Show list of meetings
+        for i, meeting in enumerate(meetings_to_display):
+            if i > 0:
+                print("-" * 50)
+            print(format_meeting_info(meeting, config, target_year))
+
+if __name__ == "__main__":
+    main()
