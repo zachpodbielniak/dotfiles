@@ -1,0 +1,521 @@
+#!/bin/bash
+#
+# sbf - Second Brain Find
+# 
+# A script to search through your Second Brain knowledge base using ripgrep (rg).
+# Supports searching across all PARA categories or filtering by specific categories.
+# 
+# Features:
+# - Fast file content searching with ripgrep
+# - Filename and path pattern matching
+# - PARA category filtering
+# - Full file content display for matches
+# - Configurable search options
+#
+# Usage: See the show_help() function or run with --help flag
+# ==============================================================================
+
+set -euo pipefail
+
+# Configuration
+NOTES_DIR="$HOME/Documents/notes"  # Base directory for second brain
+DEFAULT_PARA="00_inbox"            # Default PARA category if none specified
+PARA_MAP=("00_inbox" "01_projects" "02_areas" "03_resources" "04_archives")  # Valid PARA categories
+DEBUG_MODE=false                   # Debug mode flag, toggled with --debug
+DEBUG_LOG_FILE=""                  # Optional log file path for persistent logging
+
+# Error types and exit codes
+readonly EXIT_SUCCESS=0            # Successful execution
+readonly EXIT_GENERAL_ERROR=1      # General/unspecified error
+readonly EXIT_USAGE_ERROR=2        # Command line usage error
+readonly EXIT_FILE_NOT_FOUND=3     # File or directory not found
+readonly EXIT_PERMISSION_DENIED=4  # Permission denied
+readonly EXIT_DEPENDENCY_ERROR=5   # Missing required dependency
+
+# ANSI color codes
+readonly COLOR_RED='\033[0;31m'
+readonly COLOR_GREEN='\033[0;32m'
+readonly COLOR_YELLOW='\033[0;33m'
+readonly COLOR_BLUE='\033[0;34m'
+readonly COLOR_MAGENTA='\033[0;35m'
+readonly COLOR_CYAN='\033[0;36m'
+readonly COLOR_RESET='\033[0m'
+readonly COLOR_BOLD='\033[1m'
+
+# ============================
+# Utility Functions
+# ============================
+
+# Function: debug_log
+# Purpose: Log debug information if debug mode is enabled
+# Args: $1 - Log level (INFO, DEBUG, WARNING, ERROR)
+#       $2 - Message to log
+debug_log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        # Log to stderr with timestamp
+        echo -e "${timestamp} [${level}] ${message}" >&2
+        
+        # If a log file is specified, also log to file
+        if [[ -n "$DEBUG_LOG_FILE" ]]; then
+            echo "${timestamp} [${level}] ${message}" >> "$DEBUG_LOG_FILE"
+        fi
+    fi
+}
+
+# Function: error_exit
+# Purpose: Display error message and exit with specified code
+# Args: $1 - Error message
+#       $2 - Exit code (optional, defaults to EXIT_GENERAL_ERROR)
+error_exit() {
+    local message="$1"
+    local exit_code="${2:-$EXIT_GENERAL_ERROR}"
+    
+    echo -e "${COLOR_RED}Error: ${message}${COLOR_RESET}" >&2
+    debug_log "ERROR" "$message (exit code: $exit_code)"
+    exit "$exit_code"
+}
+
+# Function: check_dependencies
+# Purpose: Check if required dependencies are installed
+check_dependencies() {
+    debug_log "INFO" "Checking dependencies"
+    
+    # Check for ripgrep (rg)
+    if ! command -v rg &> /dev/null; then
+        error_exit "ripgrep (rg) is required but not installed. Please install it and try again." "$EXIT_DEPENDENCY_ERROR"
+    fi
+    
+    # Check if NOTES_DIR exists
+    if [[ ! -d "$NOTES_DIR" ]]; then
+        error_exit "Notes directory not found at $NOTES_DIR. Please check your configuration." "$EXIT_FILE_NOT_FOUND"
+    fi
+    
+    debug_log "INFO" "All dependencies found"
+}
+
+# Function: is_valid_para
+# Purpose: Check if provided PARA category is valid
+# Args: $1 - PARA category to check
+# Returns: 0 if valid, 1 if invalid
+is_valid_para() {
+    local para="$1"
+    
+    for valid_para in "${PARA_MAP[@]}"; do
+        if [[ "$para" == "$valid_para" ]]; then
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# Function: get_para_from_category
+# Purpose: Convert a category name to a PARA directory
+# Args: $1 - Category name (inbox, projects, areas, resources, archives)
+# Returns: Corresponding PARA directory (00_inbox, etc.)
+get_para_from_category() {
+    local category="$1"
+    local para=""
+    
+    case "$category" in
+        inbox)     para="00_inbox" ;;
+        projects)  para="01_projects" ;;
+        areas)     para="02_areas" ;;
+        resources) para="03_resources" ;;
+        archives)  para="04_archives" ;;
+        *)         para="" ;;
+    esac
+    
+    echo "$para"
+}
+
+# ============================
+# Search Functions
+# ============================
+
+# Function: search_files
+# Purpose: Search files within the second brain for matching content
+# Args: $1 - Search query
+#       $2 - Search directory (optional, default is entire second brain)
+search_files() {
+    local query="$1"
+    local search_dir="${2:-$NOTES_DIR}"
+    local rg_opts=()
+    
+    debug_log "INFO" "Searching for: $query"
+    debug_log "DEBUG" "Search directory: $search_dir"
+    
+    # Set up ripgrep options
+    rg_opts+=(--smart-case)     # Case-insensitive if pattern is all lowercase
+    rg_opts+=(--color=never)    # No color in output - we'll handle formatting
+    rg_opts+=(--line-number)    # Show line numbers
+    rg_opts+=(--type-add="norg:*.norg") # Add .norg files explicitly
+    rg_opts+=(--follow)         # Follow symlinks
+    rg_opts+=(-u)               # Unrestricted search (include hidden/ignored files)
+    
+    # Check if search directory exists
+    if [[ ! -d "$search_dir" ]]; then
+        error_exit "Search directory not found: $search_dir" "$EXIT_FILE_NOT_FOUND"
+    fi
+    
+    # Get all matching files first to process each one
+    debug_log "DEBUG" "Search directory: $search_dir"
+    debug_log "DEBUG" "RG command: rg ${rg_opts[*]} --files-with-matches \"$query\" \"$search_dir\""
+    
+    local matching_files
+    matching_files=$(rg "${rg_opts[@]}" --files-with-matches "$query" "$search_dir" 2>/dev/null || true)
+    
+    debug_log "DEBUG" "RG command output (files): $matching_files"
+    
+    # Fallback to grep if ripgrep doesn't find anything
+    if [[ -z "$matching_files" ]]; then
+        echo -e "${COLOR_YELLOW}No matching files found with ripgrep for query: ${COLOR_BOLD}$query${COLOR_RESET}"
+        echo -e "${COLOR_BLUE}Trying with grep as fallback...${COLOR_RESET}"
+        
+        # Try with grep as fallback
+        matching_files=$(grep -r -l --include="*.norg" "$query" "$search_dir" 2>/dev/null || true)
+        
+        if [[ -z "$matching_files" ]]; then
+            echo -e "${COLOR_YELLOW}No matching files found with grep either. No results available.${COLOR_RESET}"
+            return
+        else
+            echo -e "${COLOR_GREEN}Found matches with grep fallback.${COLOR_RESET}"
+        fi
+    fi
+    
+    # Filter out files that we don't have read permission for
+    local readable_files=""
+    while IFS= read -r file; do
+        if [[ -r "$file" ]]; then
+            readable_files+="$file"$'\n'
+        else
+            echo -e "${COLOR_YELLOW}Warning: No read permission for: ${COLOR_BOLD}${file#$NOTES_DIR/}${COLOR_RESET}"
+        fi
+    done <<< "$matching_files"
+    
+    # Remove trailing newline
+    readable_files=${readable_files%$'\n'}
+    
+    # Check if we have any readable files
+    if [[ -z "$readable_files" ]]; then
+        echo -e "${COLOR_YELLOW}No readable files found.${COLOR_RESET}"
+        return
+    fi
+    
+    # Update the matching files list
+    matching_files="$readable_files"
+    
+    # Process each matching file
+    local count=0
+    while IFS= read -r file; do
+        (( count++ ))
+        
+        # Get relative path from NOTES_DIR
+        local rel_path="${file#$NOTES_DIR/}"
+        
+        # Print file header
+        echo -e "\n${COLOR_CYAN}=======================================${COLOR_RESET}"
+        echo -e "${COLOR_GREEN}Match $count: ${COLOR_BOLD}$rel_path${COLOR_RESET}"
+        echo -e "${COLOR_CYAN}=======================================${COLOR_RESET}\n"
+        
+        # Print file content
+        cat "$file"
+        
+    done <<< "$matching_files"
+    
+    # Print summary
+    echo -e "\n${COLOR_BLUE}Found $count matching file(s)${COLOR_RESET}"
+}
+
+# Function: search_files_cat_only
+# Purpose: Search files and output matching content with no formatting (just cat each file)
+# Args: $1 - Search query
+#       $2 - Search directory (optional, default is entire second brain)
+search_files_cat_only() {
+    local query="$1"
+    local search_dir="${2:-$NOTES_DIR}"
+    local rg_opts=()
+
+    debug_log "INFO" "Searching for: $query"
+    debug_log "DEBUG" "Search directory: $search_dir"
+    debug_log "INFO" "Cat-only mode: Simply cat each matching file"
+
+    # Set up ripgrep options
+    rg_opts+=(--smart-case)     # Case-insensitive if pattern is all lowercase
+    rg_opts+=(--color=never)    # No color in output - we'll handle formatting
+    rg_opts+=(--type-add="norg:*.norg") # Add .norg files explicitly
+    rg_opts+=(--follow)         # Follow symlinks
+    rg_opts+=(-u)               # Unrestricted search (include hidden/ignored files)
+
+    # Check if search directory exists
+    if [[ ! -d "$search_dir" ]]; then
+        error_exit "Search directory not found: $search_dir" "$EXIT_FILE_NOT_FOUND"
+    fi
+
+    # Get all matching files
+    local matching_files
+    matching_files=$(rg "${rg_opts[@]}" --files-with-matches "$query" "$search_dir" 2>/dev/null || true)
+
+    debug_log "DEBUG" "RG command output (files): $matching_files"
+
+    # Fallback to grep if ripgrep doesn't find anything
+    if [[ -z "$matching_files" ]]; then
+        debug_log "INFO" "No matches with ripgrep, trying grep"
+        matching_files=$(grep -r -l --include="*.norg" "$query" "$search_dir" 2>/dev/null || true)
+    fi
+
+    # Check if we found any matches
+    if [[ -z "$matching_files" ]]; then
+        debug_log "INFO" "No matching files found"
+        return
+    fi
+
+    # Simply cat each matching file (exactly as requested)
+    while IFS= read -r file; do
+        # Skip files we can't read
+        if [[ -r "$file" ]]; then
+            cat "$file" 2>/dev/null
+        fi
+    done <<< "$matching_files"
+}
+
+# Function: search_paths
+# Purpose: Search file and directory names within the second brain
+# Args: $1 - Search pattern
+#       $2 - Search directory (optional, default is entire second brain)
+search_paths() {
+    local pattern="$1"
+    local search_dir="${2:-$NOTES_DIR}"
+    
+    debug_log "INFO" "Searching paths for: $pattern"
+    debug_log "DEBUG" "Search directory: $search_dir"
+    
+    # Check if search directory exists
+    if [[ ! -d "$search_dir" ]]; then
+        error_exit "Search directory not found: $search_dir" "$EXIT_FILE_NOT_FOUND"
+    fi
+    
+    # Find matching paths (case-insensitive)
+    local matching_paths
+    matching_paths=$(find "$search_dir" -type f -o -type d | grep -i "$pattern" 2>/dev/null || true)
+    
+    if [[ -z "$matching_paths" ]]; then
+        echo -e "${COLOR_YELLOW}No matching paths found for pattern: ${COLOR_BOLD}$pattern${COLOR_RESET}"
+        return
+    fi
+    
+    # Process each matching path
+    local count=0
+    while IFS= read -r path; do
+        (( count++ ))
+        
+        # Get relative path from NOTES_DIR
+        local rel_path="${path#$NOTES_DIR/}"
+        
+        # Determine if it's a file or directory
+        if [[ -f "$path" ]]; then
+            # Print file header
+            echo -e "\n${COLOR_CYAN}=======================================${COLOR_RESET}"
+            echo -e "${COLOR_GREEN}Match $count (file): ${COLOR_BOLD}$rel_path${COLOR_RESET}"
+            echo -e "${COLOR_CYAN}=======================================${COLOR_RESET}\n"
+            
+            # Print file content
+            cat "$path"
+        else
+            # Just print directory path
+            echo -e "${COLOR_MAGENTA}Match $count (directory): ${COLOR_BOLD}$rel_path${COLOR_RESET}"
+        fi
+        
+    done <<< "$matching_paths"
+    
+    # Print summary
+    echo -e "\n${COLOR_BLUE}Found $count matching path(s)${COLOR_RESET}"
+}
+
+# ============================
+# UI Functions
+# ============================
+
+# Function: show_help
+# Purpose: Display help information
+show_help() {
+    cat << EOF
+${COLOR_BOLD}sbf - Second Brain Find${COLOR_RESET}
+
+A tool for searching through your Second Brain knowledge base.
+
+${COLOR_BOLD}USAGE:${COLOR_RESET}
+    sbf [OPTIONS] <SEARCH_QUERY>
+
+${COLOR_BOLD}OPTIONS:${COLOR_RESET}
+    -h, --help                  Show this help message and exit
+    -p, --para PARA             Filter search to specific PARA category
+                                Valid options: inbox, projects, areas, resources, archives
+    -c, --category CATEGORY     Specify a subcategory within the PARA category
+                                Example: --para areas --category work
+    -d, --debug                 Enable debug output
+    --log FILE                  Write debug output to specified log file
+    --path-only                 Search only file and directory names, not content
+    --cat                       Simply cat the content of matching files with no formatting
+
+${COLOR_BOLD}EXAMPLES:${COLOR_RESET}
+    sbf "python generators"     Search for "python generators" across all categories
+    sbf -p projects "docker"    Search for "docker" only in projects
+    sbf -p areas -c work "meeting"  Search for "meeting" in work area
+    sbf --path-only "notes"     Find files and directories with "notes" in their path
+    sbf --cat "linux" | grep kernel  Output file content directly with no formatting
+
+${COLOR_BOLD}PARA CATEGORIES:${COLOR_RESET}
+    inbox      (00_inbox)      - Temporary storage for unsorted notes
+    projects   (01_projects)   - Active projects with defined outcomes
+    areas      (02_areas)      - Ongoing responsibilities with standards
+    resources  (03_resources)  - Topics and themes of interest
+    archives   (04_archives)   - Inactive items from other categories
+EOF
+}
+
+# ============================
+# Main Program
+# ============================
+
+# Function: main
+# Purpose: Main program logic
+main() {
+    # Parse arguments
+    local target_para=""
+    local subcategory=""
+    local path_only=false
+    local cat_only=false
+    local query=""
+    
+    # Check if no arguments were provided
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit "$EXIT_USAGE_ERROR"
+    fi
+    
+    # Parse command-line options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit "$EXIT_SUCCESS"
+                ;;
+            -d|--debug)
+                DEBUG_MODE=true
+                debug_log "INFO" "Debug mode enabled"
+                shift
+                ;;
+            --log)
+                if [[ -n "$2" ]]; then
+                    DEBUG_LOG_FILE="$2"
+                    DEBUG_MODE=true
+                    debug_log "INFO" "Debug logging to file: $DEBUG_LOG_FILE"
+                    shift 2
+                else
+                    error_exit "No log file specified after --log" "$EXIT_USAGE_ERROR"
+                fi
+                ;;
+            -p|--para)
+                if [[ -n "$2" ]]; then
+                    local para
+                    para=$(get_para_from_category "$2")
+                    
+                    if [[ -n "$para" ]]; then
+                        target_para="$para"
+                        debug_log "INFO" "PARA category set to: $para"
+                    else
+                        error_exit "Invalid PARA category: $2. Use inbox, projects, areas, resources, or archives" "$EXIT_USAGE_ERROR"
+                    fi
+                    shift 2
+                else
+                    error_exit "No PARA category specified after --para" "$EXIT_USAGE_ERROR"
+                fi
+                ;;
+            -c|--category)
+                if [[ -n "$2" ]]; then
+                    # Store the subcategory directly, no validation needed
+                    subcategory="$2"
+                    debug_log "INFO" "Subcategory set to: $subcategory"
+                    shift 2
+                else
+                    error_exit "No category specified after --category" "$EXIT_USAGE_ERROR"
+                fi
+                ;;
+            --path-only)
+                path_only=true
+                debug_log "INFO" "Path-only search mode enabled"
+                shift
+                ;;
+            --cat)
+                cat_only=true
+                debug_log "INFO" "Cat-only output mode enabled"
+                shift
+                ;;
+            -*)
+                error_exit "Unknown option: $1" "$EXIT_USAGE_ERROR"
+                ;;
+            *)
+                # Assume anything else is the search query
+                query="$1"
+                shift
+                break
+                ;;
+        esac
+    done
+    
+    # Collect remaining args if any into the query
+    while [[ $# -gt 0 ]]; do
+        query+=" $1"
+        shift
+    done
+    
+    # Check if search query was provided
+    if [[ -z "$query" ]]; then
+        error_exit "No search query provided" "$EXIT_USAGE_ERROR"
+    fi
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Build the search path
+    local search_path="$NOTES_DIR"
+    
+    # If we have both a PARA category and subcategory
+    if [[ -n "$target_para" && -n "$subcategory" ]]; then
+        search_path="$NOTES_DIR/$target_para/$subcategory"
+        debug_log "INFO" "Searching in: $search_path"
+    # If we just have a PARA category
+    elif [[ -n "$target_para" ]]; then
+        search_path="$NOTES_DIR/$target_para"
+        debug_log "INFO" "Searching in: $search_path"
+    fi
+    
+    # Verify the search path exists
+    if [[ ! -d "$search_path" ]]; then
+        if [[ -n "$subcategory" ]]; then
+            error_exit "Subcategory path not found: $search_path" "$EXIT_FILE_NOT_FOUND"
+        else
+            error_exit "PARA category path not found: $search_path" "$EXIT_FILE_NOT_FOUND"
+        fi
+    fi
+    
+    # Perform the search
+    if [[ "$path_only" == "true" ]]; then
+        search_paths "$query" "$search_path"
+    elif [[ "$cat_only" == "true" ]]; then
+        search_files_cat_only "$query" "$search_path"
+    else
+        search_files "$query" "$search_path"
+    fi
+    
+    exit "$EXIT_SUCCESS"
+}
+
+# Run the main function
+main "$@"
