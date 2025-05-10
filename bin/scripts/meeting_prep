@@ -63,10 +63,10 @@ def create_default_config(config_path):
         print(f"Error creating default config: {e}", file=sys.stderr)
         sys.exit(1)
 
-def parse_ics_files(config):
+def parse_ics_files(config, debug=False):
     """Parse all ICS files specified in the config and return events."""
     events = []
-    
+
     for ics_path in config.get('ics_files', []):
         # Check if it's a URL or a local file
         if ics_path.startswith(('http://', 'https://')):
@@ -80,8 +80,10 @@ def parse_ics_files(config):
                 for component in cal.walk():
                     if component.name == "VEVENT":
                         events.append(component)
-                        
-                print(f"Successfully loaded calendar from URL: {ics_path}", file=sys.stderr)
+
+                # Only print status in debug mode
+                if debug:
+                    print(f"Successfully loaded calendar from URL: {ics_path}", file=sys.stderr)
             except Exception as e:
                 print(f"Error fetching or parsing URL {ics_path}: {e}", file=sys.stderr)
         else:
@@ -179,11 +181,11 @@ def get_time_range(args, config, events=None):
             oldest_event = event_dates[0]
             newest_event = event_dates[-1]
             
-            # If a specific year was requested, show a message
-            if args.specify_year:
+            # If a specific year was requested, show a message (only in debug mode or text output)
+            if args.specify_year and (args.debug or not args.yaml):
                 print(f"Note: Using specified year ({args.specify_year}) instead of current year ({now.year}).", file=sys.stderr)
-            # Otherwise if calendar dates differ from system date, inform the user
-            elif abs((now - newest_event).total_seconds()) > 30 * 24 * 3600:
+            # Otherwise if calendar dates differ from system date, inform the user (only in debug mode or text output)
+            elif abs((now - newest_event).total_seconds()) > 30 * 24 * 3600 and (args.debug or not args.yaml):
                 print(f"Note: Calendar dates ({newest_event.date()}) differ from system date ({now.date()}).", file=sys.stderr)
                 print(f"Using current year ({now.year}) for calculations. Use --specify-year to use a different year.", file=sys.stderr)
     
@@ -227,7 +229,7 @@ def filter_upcoming_meetings(events, start_time, end_time, reference_time, show_
                 
             # Some icalendar implementations use summary with "Canceled:" prefix
             summary = event.get('summary', '')
-            if summary and summary.lower().startswith('canceled:') and not show_canceled:
+            if summary and str(summary).lower().startswith('canceled:') and not show_canceled:
                 continue
                 
             dtstart = event.get('dtstart').dt
@@ -254,30 +256,29 @@ def filter_upcoming_meetings(events, start_time, end_time, reference_time, show_
                         dtstart = new_dtstart
             
             # Add to all_meetings regardless of date
-            all_meetings.append(event)
+            all_meetings.append((event, dtstart))
             
             # Filter by date range for upcoming meetings
             # When using --days option with calendar time reference, we compare days
             # rather than exact times to make sure we get all meetings for those days
             if (start_time.year, start_time.month, start_time.day) <= (dtstart.year, dtstart.month, dtstart.day) <= (end_time.year, end_time.month, end_time.day):
-                upcoming_meetings.append(event)
+                upcoming_meetings.append((event, dtstart))
         except Exception as e:
             print(f"Error processing event: {e}", file=sys.stderr)
     
     # Sort by start time
-    upcoming_meetings.sort(key=lambda x: get_event_datetime(x.get('dtstart').dt, target_year))
-    all_meetings.sort(key=lambda x: get_event_datetime(x.get('dtstart').dt, target_year))
+    upcoming_meetings.sort(key=lambda x: x[1])
+    all_meetings.sort(key=lambda x: x[1])
     
     # When not showing all meetings, we only want meetings on or after the reference date
     # but we compare day values rather than exact timestamps to get all meetings for the day
     if not show_all:
         reference_date = (reference_time.year, reference_time.month, reference_time.day)
-        upcoming_meetings = [m for m in upcoming_meetings
-                            if (get_event_datetime(m.get('dtstart').dt, target_year).year,
-                                get_event_datetime(m.get('dtstart').dt, target_year).month,
-                                get_event_datetime(m.get('dtstart').dt, target_year).day) >= reference_date]
+        upcoming_meetings = [(m, dt) for m, dt in upcoming_meetings
+                            if (dt.year, dt.month, dt.day) >= reference_date]
     
-    return upcoming_meetings, all_meetings
+    # Return only the event objects, not the augmented datetime
+    return [m for m, _ in upcoming_meetings], [m for m, _ in all_meetings]
 
 def get_event_datetime(dt, target_year=None):
     """
@@ -304,8 +305,8 @@ def get_event_datetime(dt, target_year=None):
     
     return dt
 
-def format_meeting_info(meeting, config=None, target_year=None):
-    """Format meeting information for display."""
+def get_meeting_data(meeting, config=None, target_year=None):
+    """Extract structured data from a meeting."""
     # Get display options
     max_desc_length = 300
     max_attendees = 10
@@ -315,7 +316,9 @@ def format_meeting_info(meeting, config=None, target_year=None):
         max_desc_length = display_config.get('max_description_length', 300)
         max_attendees = display_config.get('max_attendees', 10)
     
-    summary = meeting.get('summary', 'Untitled Meeting')
+    # Extract summary, ensuring it's a string
+    summary_val = meeting.get('summary', 'Untitled Meeting')
+    summary = str(summary_val)
     
     dtstart = meeting.get('dtstart').dt
     dtstart = get_event_datetime(dtstart, target_year)
@@ -323,63 +326,113 @@ def format_meeting_info(meeting, config=None, target_year=None):
     # Format the date/time
     local_dt = dtstart.astimezone(datetime.datetime.now().astimezone().tzinfo)
     start_time = local_dt.strftime("%Y-%m-%d %H:%M")
+    start_timestamp = int(dtstart.timestamp())
     
     # Get duration
     dtend = meeting.get('dtend')
-    duration = ""
+    duration = None
+    duration_min = None
+    end_timestamp = None
+    end_time = None
     if dtend:
         dtend = dtend.dt
         dtend = get_event_datetime(dtend, target_year)
-        duration_min = (dtend - dtstart).total_seconds() / 60
-        duration = f"{int(duration_min)} minutes"
+        duration_min = int((dtend - dtstart).total_seconds() / 60)
+        duration = f"{duration_min} minutes"
+        end_timestamp = int(dtend.timestamp())
+        end_time = dtend.astimezone(datetime.datetime.now().astimezone().tzinfo).strftime("%Y-%m-%d %H:%M")
     
-    # Get location/virtual meeting link
-    location = meeting.get('location', 'No location specified')
+    # Get location
+    location_val = meeting.get('location', 'No location specified')
+    location = str(location_val)
     
-    # Get description and extract potential meeting links
-    description = meeting.get('description', '')
+    # Get description
+    description_val = meeting.get('description', '')
+    description = str(description_val)
+    
+    # Extract meeting links
     meeting_links = extract_meeting_links(description)
     
     # Get attendees
     attendees = []
     for attendee in meeting.get('attendee', []):
         if hasattr(attendee, 'params') and 'cn' in attendee.params:
-            attendees.append(attendee.params['cn'])
+            attendees.append(str(attendee.params['cn']))
         elif hasattr(attendee, 'value'):
             email = attendee.value
-            if email.startswith('mailto:'):
+            if hasattr(email, 'startswith') and email.startswith('mailto:'):
                 email = email[7:]
-            attendees.append(email)
+            attendees.append(str(email))
     
-    result = f"Meeting: {summary}\n"
-    result += f"Time: {start_time}"
-    if duration:
-        result += f" ({duration})\n"
+    # Limit description length
+    if max_desc_length > 0 and description and len(description) > max_desc_length:
+        description = description[:max_desc_length] + "..."
+    
+    # Create a structured data dictionary with clean strings
+    meeting_data = {
+        'summary': summary,
+        'start_time': start_time,
+    }
+    
+    # Include optional fields only if they have values
+    if end_time:
+        meeting_data['end_time'] = end_time
+        
+    if duration_min:
+        meeting_data['duration_minutes'] = duration_min
+        
+    if location and location != "No location specified":
+        meeting_data['location'] = location
+        
+    # Only include meeting links if present
+    if meeting_links:
+        meeting_data['meeting_links'] = meeting_links
+    
+    if attendees:
+        # Limit attendees based on config
+        displayed_attendees = attendees[:max_attendees]
+        meeting_data['attendees'] = displayed_attendees
+        if len(attendees) > max_attendees:
+            meeting_data['total_attendees'] = len(attendees)
+    
+    if description and description.strip():
+        meeting_data['description'] = description
+    
+    return meeting_data
+
+def format_meeting_info(meeting, config=None, target_year=None):
+    """Format meeting information for display as text."""
+    # Get the structured data
+    data = get_meeting_data(meeting, config, target_year)
+    
+    # Format as text
+    result = f"Meeting: {data['summary']}\n"
+    result += f"Time: {data['start_time']}"
+    if 'duration_minutes' in data:
+        result += f" ({data['duration_minutes']} minutes)\n"
     else:
         result += "\n"
     
-    result += f"Location: {location}\n"
+    if 'location' in data:
+        result += f"Location: {data['location']}\n"
     
-    if meeting_links:
+    if data.get('meeting_links'):
         result += "Meeting Links:\n"
-        for link in meeting_links:
+        for link in data['meeting_links']:
             result += f"  - {link}\n"
     
-    if attendees:
+    if data.get('attendees'):
         result += "Attendees:\n"
-        for attendee in attendees[:max_attendees]:  # Limit based on config
+        for attendee in data['attendees']:
             result += f"  - {attendee}\n"
-        if len(attendees) > max_attendees:
-            result += f"  - Plus {len(attendees) - max_attendees} more attendees\n"
+        if 'total_attendees' in data and data['total_attendees'] > len(data['attendees']):
+            result += f"  - Plus {data['total_attendees'] - len(data['attendees'])} more attendees\n"
     
-    # Add description (limited length)
-    if description:
-        short_desc = description[:max_desc_length]
-        if len(description) > max_desc_length:
-            short_desc += "..."
+    # Add description
+    if 'description' in data:
         result += "\nDescription:\n"
         # Format description to fit within terminal width
-        for line in short_desc.split('\n'):
+        for line in data['description'].split('\n'):
             if line.strip():
                 result += f"  {line}\n"
     
@@ -413,6 +466,7 @@ def main():
     parser.add_argument('-n', '--next', action='store_true', help='Show only the next meeting')
     parser.add_argument('-d', '--details', action='store_true', help='Show detailed meeting information')
     parser.add_argument('-a', '--all', action='store_true', help='Show all meetings (including past meetings)')
+    parser.add_argument('-y', '--yaml', action='store_true', help='Output in YAML format instead of text')
     
     # Time range options
     time_group = parser.add_argument_group('Time Range Options')
@@ -444,7 +498,7 @@ def main():
         config['time_ranges']['prep_time'] = config.get('meeting_prep_time', 15)
     
     # Parse calendar files
-    events = parse_ics_files(config)
+    events = parse_ics_files(config, args.debug)
     
     if not events:
         print("No events found in the specified ICS files.")
@@ -505,15 +559,45 @@ def main():
         meetings_to_display = meetings_to_display[:max_meetings]
     
     # Display meetings
-    if args.next and upcoming_meetings:
-        # Show only the next meeting
-        print(format_meeting_info(upcoming_meetings[0], config, target_year))
+    if args.yaml:
+        # Output in YAML format
+        import yaml
+        
+        # Prepare data for YAML output
+        output_data = []
+        meetings_to_process = meetings_to_display
+        if args.next and upcoming_meetings:
+            meetings_to_process = [upcoming_meetings[0]]
+            
+        for meeting in meetings_to_process:
+            output_data.append(get_meeting_data(meeting, config, target_year))
+            
+        # Create a custom YAML representer for clean output
+        def str_presenter(dumper, data):
+            if len(data.splitlines()) > 1:  # check for multiline string
+                return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+            
+        # Use custom string representer
+        yaml.add_representer(str, str_presenter)
+            
+        # Output as YAML
+        print(yaml.dump(output_data, 
+                       default_flow_style=False, 
+                       sort_keys=False,
+                       allow_unicode=True,
+                       width=80))
     else:
-        # Show list of meetings
-        for i, meeting in enumerate(meetings_to_display):
-            if i > 0:
-                print("-" * 50)
-            print(format_meeting_info(meeting, config, target_year))
+        # Regular text output
+        if args.next and upcoming_meetings:
+            # Show only the next meeting
+            print(format_meeting_info(upcoming_meetings[0], config, target_year))
+        else:
+            # Show list of meetings
+            for i, meeting in enumerate(meetings_to_display):
+                if i > 0:
+                    print("-" * 50)
+                print(format_meeting_info(meeting, config, target_year))
 
 if __name__ == "__main__":
     main()
