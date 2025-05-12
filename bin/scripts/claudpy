@@ -1,0 +1,116 @@
+#!/usr/bin/python3
+
+from os import environ
+from subprocess import run
+from sys import argv, exit, stdin, stderr
+import argparse
+import json
+import requests
+import sys
+
+
+ctr_id: str|None = ""
+api_key: str|None = ""
+
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+
+    run(cmd)
+    exit(0)
+
+if ("CLAUDE_API_KEY" in environ):
+    api_key = environ.get("CLAUDE_API_KEY")
+else:
+    print("CLAUDE_API_KEY is not set")
+    exit(1)
+
+# Parse arguments
+parser = argparse.ArgumentParser(description="Query Claude API")
+parser.add_argument("--prompt", help="Prompt to prepend to the input")
+parser.add_argument("--model", default="claude-3-7-sonnet-latest",
+                    help="Model to use (default: claude-3-7-sonnet-latest). Available models: claude-3-7-sonnet-latest, claude-3-5-sonnet-latest, claude-3-5-haiku-latest, claude-3-opus-latest, claude-3-sonnet-20240229, claude-3-haiku-20240307")
+parser.add_argument("--debug", action="store_true", help="Enable debug mode (shows request details)")
+args = parser.parse_args()
+
+# Since outside of the distrobox we may not have these modules
+# quietly ignore the fact that they may not exist
+try:
+    # Read from standard input
+    query = stdin.read()
+
+    # Prepend prompt if provided
+    if args.prompt:
+        if query:
+            query = f"{args.prompt}\n\n{query}"
+        else:
+            query = args.prompt
+
+    # Set up API call
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    url = "https://api.anthropic.com/v1/messages"
+
+    data = {
+        "model": args.model,
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": query
+            }
+        ],
+        "stream": True
+    }
+
+    # Print debug info if requested
+    if args.debug:
+        print(f"Debug: API URL: {url}", file=sys.stderr)
+        print(f"Debug: Headers (API key partially hidden): {{'x-api-key': '{api_key[:5]}...{api_key[-4:]}', 'anthropic-version': '2023-06-01', 'content-type': 'application/json'}}", file=sys.stderr)
+        print(f"Debug: Data: {json.dumps(data)}", file=sys.stderr)
+
+    # Send request to Claude API with streaming
+    response = requests.post(url, headers=headers, json=data, stream=True)
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code}")
+        print(response.text)
+        exit(1)
+    
+    # Process the streaming response
+    for line in response.iter_lines():
+        if line:
+            # Skip the initial "data: " prefix
+            line_text = line.decode('utf-8')
+            if line_text.startswith("data: "):
+                line_json = line_text[6:]
+                
+                # The last message is usually "data: [DONE]"
+                if line_json == "[DONE]":
+                    break
+                    
+                try:
+                    event = json.loads(line_json)
+                    # Extract content delta if it exists
+                    if "delta" in event and "text" in event["delta"]:
+                        print(event["delta"]["text"], end="", flush=True)
+                except json.JSONDecodeError:
+                    continue
+
+except (ImportError, Exception) as e:
+    print(f"Error: {e}")
+    exit(1)
