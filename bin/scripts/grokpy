@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+
+from os import environ
+from subprocess import run
+from sys import argv, exit, stdin, stderr
+import argparse
+import json
+import requests
+import sys
+
+
+ctr_id: str|None = ""
+api_key: str|None = ""
+
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+
+    run(cmd)
+    exit(0)
+
+if ("GROK_API_KEY" in environ):
+    api_key = environ.get("GROK_API_KEY")
+    if ("" == api_key):
+        print("GROK_API_KEY is empty")
+        exit(1)
+else:
+    print("GROK_API_KEY is not set")
+    exit(1)
+
+# Parse arguments
+parser = argparse.ArgumentParser(description="Query Grok API")
+parser.add_argument("--prompt", help="Prompt to prepend to the input")
+parser.add_argument("--model", default="grok-3-beta",
+                    help="Model to use (default: grok-3-beta). Available models: grok-3-mini-fast-beta, grok-3-fast-beta, grok-3-mini-beta, grok-3-beta, grok-2-1212, grok-2-vision-1212")
+parser.add_argument("--debug", action="store_true", help="Enable debug mode (shows request details)")
+args = parser.parse_args()
+
+# Since outside of the distrobox we may not have these modules
+# quietly ignore the fact that they may not exist
+try:
+    # Read from standard input
+    query = stdin.read()
+
+    # Prepend prompt if provided
+    if args.prompt:
+        if query:
+            query = f"{args.prompt}\n\n{query}"
+        else:
+            query = args.prompt
+
+    # Set up API call
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    # Use the correct xAI/Grok API endpoint
+    url = "https://api.x.ai/v1/chat/completions"
+
+    data = {
+        "model": args.model,
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": query
+            }
+        ],
+        "stream": True
+    }
+
+    # Print debug info if requested
+    if args.debug:
+        print(f"Debug: API URL: {url}", file=sys.stderr)
+        print(f"Debug: Headers (API key partially hidden): {{'Authorization': 'Bearer {api_key[:5]}...{api_key[-4:]}', 'Content-Type': 'application/json'}}", file=sys.stderr)
+        print(f"Debug: Data: {json.dumps(data)}", file=sys.stderr)
+
+    # Send request to Grok API with streaming
+    response = requests.post(url, headers=headers, json=data, stream=True)
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code}")
+        print(response.text)
+        exit(1)
+    
+    # Process the streaming response
+    for line in response.iter_lines():
+        if line:
+            # Skip the initial "data: " prefix
+            line_text = line.decode('utf-8')
+            if line_text.startswith("data: "):
+                line_json = line_text[6:]
+                
+                # The last message is usually "data: [DONE]"
+                if line_json == "[DONE]":
+                    break
+                    
+                try:
+                    event = json.loads(line_json)
+                    # Extract content delta if it exists
+                    if "choices" in event and len(event["choices"]) > 0:
+                        choice = event["choices"][0]
+                        if "delta" in choice and "content" in choice["delta"]:
+                            print(choice["delta"]["content"], end="", flush=True)
+                except json.JSONDecodeError:
+                    continue
+
+except (ImportError, Exception) as e:
+    print(f"Error: {e}")
+    exit(1)
