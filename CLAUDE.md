@@ -81,3 +81,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - 03_resources: Topics and themes of interest
   - 04_archives: Inactive items from other categories
 - Default location: ~/Documents/notes
+
+## Script Documentation
+
+- For any scripts in ./bin/scripts, to understand details:
+  - Check the corresponding Neorg file at 02_areas/repos/dotfiles/<script_name>.norg
+  - If the Neorg file does not exist, create one with:
+    - Script details and purpose
+    - Logic flow
+    - Requirements
+    - Potential pitfalls and bugs
+    - Maintenance guidelines
+    - Ideas for future expansion
+  - Update this Neorg file whenever the script is modified
