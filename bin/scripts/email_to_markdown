@@ -1,0 +1,523 @@
+#!/usr/bin/python3
+#
+# Email to Markdown
+# =================
+# This script converts .eml and .msg email files to markdown format.
+# It supports reading from stdin or a specified input file and writing to stdout
+# or a specified output file.
+#
+# Required pip packages:
+#   - html2text: for converting HTML email parts to markdown
+#   - extract-msg: for parsing .msg files (Outlook format)
+#
+# Installation:
+#   pip install html2text extract-msg
+#
+# Usage:
+#   cat email.eml | email_to_markdown > email.md
+#   email_to_markdown -i email.eml -o email.md
+#   cat email.eml | email_to_markdown | mton > email.norg
+#   cat email.msg | email_to_markdown -m msg > email.md
+#
+# Options:
+#   -i, --input FILE     Input file (.eml or .msg). If not specified, reads from stdin
+#   -o, --output FILE    Output file. If not specified, writes to stdout
+#   -m, --mail-type TYPE Specify email format (eml or msg) when reading from stdin (default: eml)
+#   --debug              Toggle debug logging
+#
+
+import sys
+import os
+import io
+import argparse
+from subprocess import run 
+from os import environ
+from sys import argv, exit, stdin, stderr
+
+try:
+    import email
+    import tempfile
+    from email import policy, message_from_bytes, message_from_string
+    from email.parser import BytesParser, Parser
+    from pathlib import Path
+    import re
+except ImportError:
+    pass
+
+# Check if we're in the dev distrobox
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# If we're not in the 'dev' distrobox, re-exec the script inside it
+if ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+
+    run(cmd)
+    exit(0)
+
+# Now we're in the distrobox, import the required libraries
+import html2text
+
+# Import extract-msg if available, for .msg file support
+try:
+    import extract_msg
+    # Also check for the command-line tool
+    extract_msg_cmd = run(
+        ["which", "extract_msg"], 
+        capture_output=True, 
+        text=True
+    )
+    has_extract_msg = extract_msg_cmd.returncode == 0
+except ImportError:
+    has_extract_msg = False
+
+
+def debug_print(message, is_debug=False):
+    """Print debug message to stderr if debug mode is enabled"""
+    if is_debug:
+        print(f"[DEBUG] {message}", file=sys.stderr, flush=True)
+
+
+def create_html2text_converter():
+    """Create and configure an HTML to markdown converter"""
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.body_width = 0  # No wrapping
+    h.ignore_images = False
+    h.mark_code = True
+    h.unicode_snob = True
+    h.open_quote = '"'
+    h.close_quote = '"'
+    return h
+
+
+def parse_eml(content_bytes, debug=False):
+    """Parse .eml content and convert to markdown"""
+    # Parse the email
+    debug_print("Parsing .eml content", debug)
+    
+    # Handle the content_bytes parameter correctly based on its type
+    try:
+        if hasattr(content_bytes, 'read'):
+            # If it's a binary file-like object, use the BytesParser
+            debug_print("Content is a file-like object", debug)
+            msg = BytesParser(policy=policy.default).parse(content_bytes)
+        elif isinstance(content_bytes, bytes):
+            # If it's a bytes object, use BytesParser with BytesIO
+            debug_print("Content is a bytes object", debug)
+            msg = BytesParser(policy=policy.default).parse(io.BytesIO(content_bytes))
+        else:
+            # If it's something else, convert to string then to bytes
+            debug_print("Content is something else, converting", debug)
+            if isinstance(content_bytes, str):
+                content_bytes = content_bytes.encode('utf-8')
+            else:
+                content_bytes = str(content_bytes).encode('utf-8')
+            msg = BytesParser(policy=policy.default).parse(io.BytesIO(content_bytes))
+    except Exception as e:
+        debug_print(f"Error during parsing: {str(e)}", debug)
+        # Try an alternative approach with the Parser class
+        debug_print("Trying alternative parsing approach", debug)
+        
+        # If we have a file-like object, try to read it all at once
+        if hasattr(content_bytes, 'read'):
+            content = content_bytes.read()
+            # Reset file pointer
+            if hasattr(content_bytes, 'seek'):
+                content_bytes.seek(0)
+            
+            # Use a different approach based on the content type
+            if isinstance(content, bytes):
+                # For binary content, use email.message_from_bytes
+                debug_print("Using message_from_bytes for binary content", debug)
+                from email import message_from_bytes
+                msg = message_from_bytes(content, policy=policy.default)
+            else:
+                # For string content, use Parser.parsestr
+                debug_print("Using Parser.parsestr for string content", debug)
+                content = str(content)
+                parser = Parser(policy=policy.default)
+                msg = parser.parsestr(content)
+        else:
+            # For bytes or other objects
+            if isinstance(content_bytes, bytes):
+                # For binary content, use email.message_from_bytes
+                debug_print("Using message_from_bytes for loose binary content", debug)
+                from email import message_from_bytes
+                msg = message_from_bytes(content_bytes, policy=policy.default)
+            else:
+                # Convert to string if it's not already a string
+                content = str(content_bytes)
+                debug_print("Using message_from_string for loose string content", debug)
+                from email import message_from_string
+                msg = message_from_string(content, policy=policy.default)
+    
+    # Extract email metadata
+    from_addr = msg.get('From', 'Unknown')
+    to_addr = msg.get('To', 'Unknown')
+    cc_addr = msg.get('Cc', 'Unknown') if msg.get('Cc') else None
+    subject = msg.get('Subject', 'No Subject')
+    date = msg.get('Date', 'Unknown Date')
+    
+    debug_print(f"From: {from_addr}", debug)
+    debug_print(f"Subject: {subject}", debug)
+    
+    # Extract body content
+    body_parts = []
+    attachments = []
+    
+    # Create HTML to markdown converter
+    h = create_html2text_converter()
+    
+    # Function to process a message part
+    def process_part(part):
+        content_type = part.get_content_type()
+        disposition = part.get_content_disposition()
+        
+        debug_print(f"Processing part: {content_type}, disposition: {disposition}", debug)
+        
+        # Handle attachments
+        if disposition == 'attachment' or disposition == 'inline':
+            filename = part.get_filename()
+            if filename:
+                size = len(part.get_payload(decode=True)) if part.get_payload() else 0
+                size_kb = size / 1024
+                attachments.append(f"- {filename} ({size_kb:.2f} KB)")
+            return
+        
+        # Handle plain text
+        if content_type == 'text/plain':
+            try:
+                text = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='replace')
+                body_parts.append(text)
+            except Exception as e:
+                debug_print(f"Error processing text/plain part: {str(e)}", debug)
+                body_parts.append("*[Error processing plain text part]*")
+        
+        # Handle HTML
+        elif content_type == 'text/html':
+            try:
+                html_content = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='replace')
+                body_parts.append(h.handle(html_content))
+            except Exception as e:
+                debug_print(f"Error processing text/html part: {str(e)}", debug)
+                body_parts.append("*[Error processing HTML part]*")
+    
+    # Process the email body
+    if msg.is_multipart():
+        for part in msg.walk():
+            process_part(part)
+    else:
+        process_part(msg)
+    
+    # If we have no body parts but there is a payload, try to decode it
+    if not body_parts and msg.get_payload():
+        try:
+            if isinstance(msg.get_payload(), str):
+                body_parts.append(msg.get_payload())
+            else:
+                body_content = msg.get_payload(decode=True)
+                if body_content:
+                    body_parts.append(body_content.decode('utf-8', errors='replace'))
+        except Exception as e:
+            debug_print(f"Error processing payload: {str(e)}", debug)
+            body_parts.append("*[Error processing email payload]*")
+    
+    # Combine all parts
+    body = "\n\n".join(body_parts).strip()
+    
+    # Construct the markdown output
+    markdown = f"# {subject}\n\n"
+    markdown += f"**From**: {from_addr}  \n"
+    markdown += f"**To**: {to_addr}  \n"
+    if cc_addr:
+        markdown += f"**Cc**: {cc_addr}  \n"
+    markdown += f"**Date**: {date}  \n"
+    markdown += "\n---\n\n"
+    markdown += body
+    
+    # Add attachments if present
+    if attachments:
+        markdown += "\n\n## Attachments\n\n"
+        markdown += "\n".join(attachments)
+    
+    return markdown
+
+
+def parse_msg(file_path, debug=False):
+    """Parse .msg file and convert to markdown using subprocess call to extract_msg CLI"""
+    if not has_extract_msg:
+        raise ImportError("extract_msg module is required for .msg file support. Install with: pip install extract-msg")
+    
+    # Convert Path object to string if needed
+    if isinstance(file_path, Path):
+        file_path = str(file_path)
+    
+    debug_print(f"Opening .msg file: {file_path}", debug)
+    
+    # Instead of using the Python API directly, use the command-line tool
+    # This avoids potential encoding issues with file paths
+    temp_dir = tempfile.mkdtemp()
+    debug_print(f"Created temporary directory: {temp_dir}", debug)
+    
+    try:
+        # Escape spaces and special characters in file path for command line
+        escaped_path = file_path.replace(" ", r"\ ").replace("(", r"\(").replace(")", r"\)")
+        
+        # Run extract_msg CLI to extract the MSG file
+        # Try without --json first as it might not be supported in all versions
+        extract_cmd = f"extract_msg '{file_path}' --out '{temp_dir}' --skip-embedded"
+        debug_print(f"Running command: {extract_cmd}", debug)
+        
+        result = run(
+            extract_cmd,
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            debug_print(f"Command failed with return code {result.returncode}", debug)
+            debug_print(f"Error output: {result.stderr}", debug)
+            raise RuntimeError(f"Failed to extract MSG file: {result.stderr}")
+        
+        debug_print(f"Command output: {result.stdout}", debug)
+        
+        # Extract metadata from the output files
+        msg_info_path = Path(temp_dir) / "message.txt"
+        
+        # Get basic metadata
+        from_addr = "Unknown"
+        to_addr = "Unknown"
+        cc_addr = None
+        subject = "No Subject"
+        date = "Unknown Date"
+        
+        if msg_info_path.exists():
+            debug_print(f"Found message info file: {msg_info_path}", debug)
+            # Parse the message.txt file for metadata
+            with open(msg_info_path, 'r', encoding='utf-8', errors='replace') as f:
+                info_content = f.read()
+                
+                # Extract key info using regex
+                import re
+                from_match = re.search(r"From: (.*?)(?:\n|$)", info_content)
+                to_match = re.search(r"To: (.*?)(?:\n|$)", info_content)
+                cc_match = re.search(r"CC: (.*?)(?:\n|$)", info_content)
+                subject_match = re.search(r"Subject: (.*?)(?:\n|$)", info_content)
+                date_match = re.search(r"Date: (.*?)(?:\n|$)", info_content)
+                
+                if from_match:
+                    from_addr = from_match.group(1).strip()
+                if to_match:
+                    to_addr = to_match.group(1).strip()
+                if cc_match:
+                    cc_addr = cc_match.group(1).strip()
+                if subject_match:
+                    subject = subject_match.group(1).strip()
+                if date_match:
+                    date = date_match.group(1).strip()
+                
+                debug_print(f"Extracted metadata - From: {from_addr}, Subject: {subject}", debug)
+        else:
+            debug_print("No message.txt file found, trying alternative approaches", debug)
+            # Try to look for json files as an alternate approach
+            json_files = list(Path(temp_dir).glob("*.json"))
+            if json_files:
+                debug_print(f"Found JSON metadata: {json_files[0]}", debug)
+                try:
+                    import json
+                    with open(json_files[0], 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                    
+                    # Extract email metadata
+                    from_addr = metadata.get("sender", "Unknown")
+                    to_addr = metadata.get("to", "Unknown")
+                    cc_addr = metadata.get("cc")
+                    subject = metadata.get("subject", "No Subject")
+                    date = metadata.get("date", "Unknown Date")
+                except Exception as e:
+                    debug_print(f"Failed to parse JSON metadata: {str(e)}", debug)
+        
+        debug_print(f"From: {from_addr}", debug)
+        debug_print(f"Subject: {subject}", debug)
+        
+        # Get the body
+        # Look for html-body.txt or body.txt
+        html_body_path = Path(temp_dir) / "html-body.txt"
+        body_path = Path(temp_dir) / "body.txt"
+        
+        body = ""
+        h = create_html2text_converter()
+        
+        if html_body_path.exists():
+            debug_print(f"Found HTML body: {html_body_path}", debug)
+            with open(html_body_path, 'r', encoding='utf-8', errors='replace') as f:
+                html_content = f.read()
+                body = h.handle(html_content)
+        elif body_path.exists():
+            debug_print(f"Found plain text body: {body_path}", debug)
+            with open(body_path, 'r', encoding='utf-8', errors='replace') as f:
+                body = f.read()
+        else:
+            debug_print("No body found", debug)
+            body = "*No message body found*"
+        
+        # Construct the markdown output
+        markdown = f"# {subject}\n\n"
+        markdown += f"**From**: {from_addr}  \n"
+        markdown += f"**To**: {to_addr}  \n"
+        if cc_addr:
+            markdown += f"**Cc**: {cc_addr}  \n"
+        markdown += f"**Date**: {date}  \n"
+        markdown += "\n---\n\n"
+        markdown += body
+        
+        # Add attachments if present
+        attachments_dir = Path(temp_dir) / "attachments"
+        if attachments_dir.exists() and any(attachments_dir.iterdir()):
+            markdown += "\n\n## Attachments\n\n"
+            for attachment in attachments_dir.iterdir():
+                size_kb = attachment.stat().st_size / 1024
+                markdown += f"- {attachment.name} ({size_kb:.2f} KB)\n"
+        
+        return markdown
+    
+    finally:
+        # Clean up the temporary directory
+        import shutil
+        try:
+            shutil.rmtree(temp_dir)
+            debug_print(f"Cleaned up temporary directory: {temp_dir}", debug)
+        except Exception as e:
+            debug_print(f"Error cleaning up temporary directory: {str(e)}", debug)
+
+
+def main():
+    """Main function to process the email file"""
+    parser = argparse.ArgumentParser(description="Convert email files (.eml, .msg) to markdown")
+    parser.add_argument("-i", "--input", help="Input file path (.eml or .msg). If not specified, reads from stdin")
+    parser.add_argument("-o", "--output", help="Output file path. If not specified, writes to stdout")
+    parser.add_argument("-m", "--mail-type", choices=["eml", "msg"], default="eml", 
+                      help="Specify email format when reading from stdin (default: eml)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    args = parser.parse_args()
+    
+    debug_print("Starting email_to_markdown", args.debug)
+    
+    # Process input
+    if args.input:
+        # Input from file
+        file_path = Path(args.input)
+        
+        if not file_path.exists():
+            print(f"Error: Input file '{file_path}' does not exist.", file=sys.stderr)
+            sys.exit(1)
+        
+        file_extension = file_path.suffix.lower()
+        debug_print(f"Input file: {file_path}, extension: {file_extension}", args.debug)
+        
+        if file_extension == '.eml':
+            # Process .eml file
+            try:
+                # Read file content first, then parse
+                with open(file_path, 'rb') as f:
+                    eml_content = f.read()
+                markdown_content = parse_eml(eml_content, args.debug)
+            except Exception as e:
+                print(f"Error parsing .eml file: {str(e)}", file=sys.stderr)
+                if args.debug:
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                sys.exit(1)
+                
+        elif file_extension == '.msg':
+            # Process .msg file
+            if not has_extract_msg:
+                print("Error: extract_msg module not available. Install with: pip install extract-msg", file=sys.stderr)
+                sys.exit(1)
+            
+            try:
+                # Pass the file path directly without converting to string
+                # The parse_msg function will handle type conversions internally
+                markdown_content = parse_msg(file_path, args.debug)
+            except Exception as e:
+                print(f"Error parsing .msg file: {str(e)}", file=sys.stderr)
+                if args.debug:
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                sys.exit(1)
+        
+        else:
+            print(f"Error: Unsupported file extension '{file_extension}'. Supported: .eml, .msg", file=sys.stderr)
+            sys.exit(1)
+    
+    else:
+        # Input from stdin
+        debug_print(f"Reading from stdin with mail-type: {args.mail_type}", args.debug)
+        content_bytes = sys.stdin.buffer.read()
+        
+        if args.mail_type == "eml":
+            try:
+                # Process as .eml content (priority over .msg)
+                debug_print("Processing stdin as .eml content", args.debug)
+                # Wrap the bytes in a BytesIO object to make it file-like
+                markdown_content = parse_eml(io.BytesIO(content_bytes), args.debug)
+            except Exception as e:
+                print(f"Error parsing input from stdin as .eml: {str(e)}", file=sys.stderr)
+                if args.debug:
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                sys.exit(1)
+        elif args.mail_type == "msg":
+            if not has_extract_msg:
+                print("Error: extract_msg module not available. Install with: pip install extract-msg", file=sys.stderr)
+                sys.exit(1)
+                
+            # For .msg files from stdin, we need to pass the content directly
+            try:
+                # Create a temporary file to store stdin content
+                with tempfile.NamedTemporaryFile(suffix='.msg', delete=False) as temp_file:
+                    temp_file.write(content_bytes)
+                    temp_path = temp_file.name
+                
+                debug_print(f"Created temporary file for stdin .msg processing: {temp_path}", args.debug)
+                markdown_content = parse_msg(temp_path, args.debug)
+                # Note: parse_msg handles cleanup of its own temporary files
+                
+                # Extra safety check - make sure the temporary file is deleted
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                    debug_print(f"Additional cleanup of temporary file: {temp_path}", args.debug)
+                
+            except Exception as e:
+                print(f"Error parsing input from stdin as .msg: {str(e)}", file=sys.stderr)
+                if args.debug:
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                sys.exit(1)
+    
+    # Output the markdown
+    if args.output:
+        # Output to file
+        output_path = Path(args.output)
+        debug_print(f"Writing to file: {output_path}", args.debug)
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(markdown_content)
+    
+    else:
+        # Output to stdout
+        debug_print("Writing to stdout", args.debug)
+        print(markdown_content)
+
+
+if __name__ == "__main__":
+    main()
