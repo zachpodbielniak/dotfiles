@@ -1,0 +1,643 @@
+#!/usr/bin/env perl
+#==============================================================================
+# sanitize_data - A tool to identify and redact sensitive data from text
+#==============================================================================
+# 
+# PURPOSE:
+# This script is designed to scan text for potentially sensitive information 
+# (such as PII - Personally Identifiable Information, credentials, keys, etc.)
+# and redact it by replacing the sensitive content with a user-defined string.
+# 
+# The script offers fine-grained control through:
+# - Whitelist mode: Exempt specific data types from redaction
+# - Blacklist mode: Only redact specific data types
+# - Custom redaction text: Control how redacted content appears
+#
+# USAGE:
+#   sanitize_data [options] < input.txt > output.txt
+#   See --help for full details
+#
+#==============================================================================
+
+use strict;         # Enforce variable declarations and references
+use warnings;       # Enable compiler warnings
+use Getopt::Long;   # Handle command-line options
+use English qw(-no_match_vars);  # Use readable names for special variables
+
+#------------------------------------------------------------------------------
+# Configure I/O settings
+#------------------------------------------------------------------------------
+
+# Set UTF-8 output encoding to ensure proper handling of Unicode characters
+# This is important for correct processing of international text and special chars
+binmode(STDOUT, ":encoding(UTF-8)");
+
+#------------------------------------------------------------------------------
+# Default settings
+#------------------------------------------------------------------------------
+
+# Input source configuration (default is standard input)
+my $input_file  = '-';  # '-' is a convention for stdin/stdout
+
+# Output destination configuration (default is standard output)
+my $output_file = '-';
+
+# Text that replaces sensitive data (can be changed with --redaction)
+my $redaction_text = '<redacted>';
+
+# Control flags for script behavior
+my $show_help = 0;          # Show help text and exit when true
+my $debug_mode = 0;         # Enable detailed debug output when true
+my $whitelist_string = '';  # CSV list of pattern types to exempt from redaction
+my $blacklist_string = '';  # CSV list of pattern types to exclusively redact
+my $list_patterns = 0;      # Show available pattern modules and exit when true
+
+#------------------------------------------------------------------------------
+# Parse command line arguments
+#------------------------------------------------------------------------------
+# Parse arguments using GetOptions from Getopt::Long
+# Short and long form options are supported using | syntax
+# Options requiring values use the =s suffix (string)
+# Boolean options take no value
+
+GetOptions(
+    # File handling options
+    'input|i=s'     => \$input_file,     # Input file path (default: stdin)
+    'output|o=s'    => \$output_file,    # Output file path (default: stdout)
+    
+    # Redaction control options
+    'redaction|r=s' => \$redaction_text, # Custom redaction text
+    'whitelist|w=s' => \$whitelist_string, # CSV list of patterns to exclude from redaction
+    'blacklist|b=s' => \$blacklist_string, # CSV list of patterns to exclusively redact
+    
+    # Information and control options
+    'list|l'        => \$list_patterns,  # List available pattern modules
+    'help|h'        => \$show_help,      # Show help and exit
+    'debug|d'       => \$debug_mode,     # Enable debug output
+) or die "Error in command line arguments\n";  # Exit on invalid arguments
+
+#------------------------------------------------------------------------------
+# Pattern Module Definition
+#------------------------------------------------------------------------------
+# This hash table defines all the pattern modules used for data detection
+# Each module has:
+#   - A key (used in whitelist/blacklist commands)
+#   - A description (human-readable explanation)
+#   - A pattern (Perl regex to match sensitive data)
+#
+# ARCHITECTURE NOTE:
+# The modular design enables easy addition of new pattern types. When adding a
+# new pattern, follow these guidelines:
+#   1. Create a clear, descriptive key (no spaces, all lowercase)
+#   2. Add a concise description
+#   3. Test the regex pattern thoroughly to minimize false positives
+#   4. Document the pattern's limitations in comments
+#   5. Consider potential overlaps with existing patterns
+#
+# POTENTIAL PITFALLS:
+# - Some patterns may create false positives (e.g. passport numbers may match random alphanumeric strings)
+# - Some patterns may overlap (e.g. bank account numbers may match other numeric identifiers)
+# - Unicode characters might affect pattern matching
+# - Keep patterns efficient to avoid performance issues with large files
+#
+my %pattern_modules = (
+    #--------------------------------------------------------------------------
+    # Financial Information
+    #--------------------------------------------------------------------------
+    
+    'credit_card' => {
+        'description' => 'Credit Card Numbers',
+        # Matches common credit card formats including:
+        # - 13-16 digits with optional spaces/dashes
+        # - 4 groups of 4 digits (XXXX-XXXX-XXXX-XXXX)
+        # - Amex format (XXXX-XXXXXX-XXXXX)
+        # LIMITATION: May produce false positives on random digit sequences
+        # LIMITATION: Doesn't validate checksums (would require additional logic)
+        'pattern' => qr/\b(?:\d[ -]*?){13,16}\b|\b(?:\d{4}[ -]){3}\d{4}\b|\b\d{4}[ -]\d{6}[ -]\d{5}\b/,
+    },
+    
+    'bank_account' => {
+        'description' => 'Bank Account Numbers',
+        # Matches numeric sequences of 8-17 digits
+        # LIMITATION: High risk of false positives with other numeric sequences
+        # LIMITATION: Account number formats vary widely between countries
+        'pattern' => qr/\b\d{8,17}\b/,
+    },
+    
+    'bitcoin' => {
+        'description' => 'Bitcoin Addresses',
+        # Matches Bitcoin addresses (legacy and SegWit formats)
+        # - P2PKH: starts with 1, 26-34 alphanumeric chars
+        # - P2SH: starts with 3, 26-34 alphanumeric chars
+        # - Bech32: starts with bc1, 42+ chars
+        # LIMITATION: Doesn't validate checksum
+        'pattern' => qr/\b(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-Z0-9]{39,59})\b/,
+    },
+    
+    'ethereum' => {
+        'description' => 'Ethereum Addresses',
+        # Matches Ethereum wallet addresses (0x followed by 40 hex chars)
+        # LIMITATION: Doesn't validate checksum or ENS names
+        'pattern' => qr/\b0x[a-fA-F0-9]{40}\b/,
+    },
+    
+    'ripple' => {
+        'description' => 'Ripple (XRP) Addresses',
+        # Matches XRP wallet addresses (starts with r, 24-34 alphanumeric)
+        # LIMITATION: Doesn't validate checksum or X-format addresses
+        'pattern' => qr/\br[a-zA-Z0-9]{24,34}\b/,
+    },
+    
+    'litecoin' => {
+        'description' => 'Litecoin Addresses',
+        # Matches Litecoin addresses (starts with L, M, or 3)
+        # LIMITATION: Some overlap with Bitcoin P2SH addresses (3...)
+        'pattern' => qr/\b[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}\b/,
+    },
+    
+    'monero' => {
+        'description' => 'Monero Addresses',
+        # Matches Monero addresses (starts with 4 or 8, 95 chars)
+        # LIMITATION: Doesn't catch subaddresses or integrated addresses
+        'pattern' => qr/\b(?:4|8)[0-9AB][a-zA-Z0-9]{93}\b/,
+    },
+    
+    'dogecoin' => {
+        'description' => 'Dogecoin Addresses',
+        # Matches Dogecoin addresses (starts with D, 34 chars)
+        # LIMITATION: Could match other data starting with D
+        'pattern' => qr/\bD[a-km-zA-HJ-NP-Z1-9]{33}\b/,
+    },
+    
+    #--------------------------------------------------------------------------
+    # Personal Identifiers
+    #--------------------------------------------------------------------------
+    
+    'ssn' => {
+        'description' => 'Social Security Numbers (US)',
+        # Matches US SSN format: XXX-XX-XXXX or XXX XX XXXX
+        # LIMITATION: Doesn't validate against actual SSN rules (e.g., no 000 prefix)
+        'pattern' => qr/\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/,
+    },
+    
+    'passport' => {
+        'description' => 'Passport Numbers',
+        # Matches alphanumeric strings of 6-9 characters
+        # LIMITATION: High risk of false positives (very generic pattern)
+        # LIMITATION: Does not account for country-specific formats
+        'pattern' => qr/\b[A-Z0-9]{6,9}\b/,
+    },
+    
+    'drivers_license' => {
+        'description' => 'Driver\'s License Numbers',
+        # Matches alphanumeric strings of 6-12 characters
+        # LIMITATION: High risk of false positives (very generic pattern)
+        # LIMITATION: Does not account for state-specific formats
+        'pattern' => qr/\b[A-Z0-9]{6,12}\b/,
+    },
+    
+    'national_id' => {
+        'description' => 'National ID Numbers',
+        # Matches common national ID formats (6-10 digits followed by 4 more)
+        # LIMITATION: Doesn't account for country-specific formats
+        # LIMITATION: May produce false positives
+        'pattern' => qr/\b\d{6,10}[-\s]?\d{4}\b/,
+    },
+    
+    'medical_record' => {
+        'description' => 'Medical Record Numbers',
+        # Matches "MRN" or "MR#" followed by 5-10 digits
+        # LIMITATION: Hospital-specific formats may vary widely
+        'pattern' => qr/\bMR[N#][\s:]?\d{5,10}\b/i,
+    },
+    
+    #--------------------------------------------------------------------------
+    # Contact Information
+    #--------------------------------------------------------------------------
+    
+    'email' => {
+        'description' => 'Email Addresses',
+        # Matches standard email address format
+        # LIMITATION: May not catch all valid email formats (extremely complex)
+        # LIMITATION: Doesn't validate against actual email format rules
+        'pattern' => qr/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/,
+    },
+    
+    'phone' => {
+        'description' => 'Phone Numbers',
+        # Matches common US/international phone number formats
+        # LIMITATION: Doesn't account for all international formats
+        # LIMITATION: May miss some unusual formats or match random digit sequences
+        'pattern' => qr/\b(?:\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/,
+    },
+    
+    'address' => {
+        'description' => 'Street Addresses',
+        # Matches common US street address patterns
+        # LIMITATION: Won't catch all address formats, especially international
+        # LIMITATION: May miss unusual street types or abbreviations
+        'pattern' => qr/\b\d+\s+[A-Za-z0-9\s,]+(?:Avenue|Ave|Street|St|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Parkway|Pkwy|Plaza|Plz|Place|Pl)\b/i,
+    },
+    
+    #--------------------------------------------------------------------------
+    # Network and System Identifiers
+    #--------------------------------------------------------------------------
+    
+    'ipv4' => {
+        'description' => 'IP Addresses (IPv4)',
+        # Matches IPv4 addresses (e.g., 192.168.1.1)
+        # LIMITATION: Allows invalid values (e.g., 999.999.999.999)
+        # IMPROVEMENT: Could add validation for valid ranges (0-255)
+        'pattern' => qr/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/,
+    },
+    
+    'ipv6' => {
+        'description' => 'IP Addresses (IPv6)',
+        # Matches standard IPv6 addresses
+        # LIMITATION: Only matches full format, not compressed notation with ::
+        # LIMITATION: Very simplified pattern that could match invalid IPv6
+        'pattern' => qr/\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/,
+    },
+    
+    'mac_address' => {
+        'description' => 'MAC Addresses',
+        # Matches MAC addresses in common formats (XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX)
+        # LIMITATION: Doesn't catch unusual separators or formats
+        'pattern' => qr/\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b/,
+    },
+    
+    #--------------------------------------------------------------------------
+    # Location Data
+    #--------------------------------------------------------------------------
+    
+    'gps' => {
+        'description' => 'GPS Coordinates',
+        # Matches GPS coordinates in decimal format (lat,long)
+        # LIMITATION: Complex pattern with potential for false positives/negatives
+        # LIMITATION: Doesn't match all coordinate formats (DMS format not included)
+        'pattern' => qr/\b[-+]?([1-8]?\d(\.\d+)?|90(\.0+)?),\s*[-+]?(180(\.0+)?|((1[0-7]\d)|([1-9]?\d))(\.\d+)?)\b/,
+    },
+    
+    #--------------------------------------------------------------------------
+    # Date Information
+    #--------------------------------------------------------------------------
+    
+    'date' => {
+        'description' => 'Dates',
+        # Matches common date formats:
+        # - XX/XX/XXXX or XX-XX-XXXX
+        # - Month name followed by day and year (Jan 1, 2023)
+        # LIMITATION: May match invalid dates (e.g., 99/99/9999)
+        # LIMITATION: Doesn't match all international date formats
+        'pattern' => qr/\b\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b/,
+    },
+    
+    #--------------------------------------------------------------------------
+    # Authentication and Security
+    #--------------------------------------------------------------------------
+    
+    'url_auth' => {
+        'description' => 'URLs with Authentication',
+        # Matches URLs containing embedded credentials (username:password@domain)
+        # Very sensitive security info that should almost always be redacted
+        'pattern' => qr/https?:\/\/[^:]+:[^@]+@[^\/]+/,
+    },
+    
+    'api_key' => {
+        'description' => 'API Keys and Tokens',
+        # Matches common API key/token patterns
+        # LIMITATION: Highly variable formats across different services
+        # LIMITATION: May miss keys that don't follow naming conventions
+        'pattern' => qr/\b(?:api[_-]?key|access[_-]?token|secret[_-]?key)[^\w]+[a-zA-Z0-9]{16,}\b/i,
+    },
+    
+    'aws_key' => {
+        'description' => 'AWS Keys',
+        # Matches AWS access key format (AKIA or ASIA followed by 16 chars)
+        # Highly sensitive authentication information
+        'pattern' => qr/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+    },
+    
+    'private_key' => {
+        'description' => 'Private Keys',
+        # Matches the header line of private key files (PEM format)
+        # LIMITATION: Only catches the beginning of the key, not full content
+        # LIMITATION: Won't catch binary format private keys
+        'pattern' => qr/-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----/,
+    },
+    
+    'password' => {
+        'description' => 'Password Fields',
+        # Matches common password assignment patterns in text/config files
+        # LIMITATION: Highly variable formats, may miss many password declarations
+        # LIMITATION: May also match similar but non-password fields
+        'pattern' => qr/\b(?:password|passwd|pwd)\s*[=:]\s*\S+/i,
+    },
+    
+    'auth_token' => {
+        'description' => 'Authentication Tokens',
+        # Matches common auth token patterns (bearer/auth/token followed by string)
+        # LIMITATION: Many formats exist that won't be caught by this pattern
+        'pattern' => qr/\b(?:bearer|auth|token)\s+[a-zA-Z0-9_\-\.=]{8,}\b/i,
+    },
+);
+
+#------------------------------------------------------------------------------
+# Help and Module Listing Functions
+#------------------------------------------------------------------------------
+# Check if user requested help or pattern listing before doing any processing
+
+# Show list of available pattern modules if requested
+if ($list_patterns) {
+    list_pattern_modules();
+    exit 0;
+}
+
+# Show help if requested
+if ($show_help) {
+    show_help();
+    exit 0;
+}
+
+#------------------------------------------------------------------------------
+# Whitelist/Blacklist Processing
+#------------------------------------------------------------------------------
+# Process whitelist and blacklist options to determine which patterns to apply
+# Only one mode (whitelist or blacklist) can be active at a time
+
+my %whitelisted;   # Hash to store whitelisted patterns (exempted from redaction)
+my %blacklisted;   # Hash to store blacklisted patterns (exclusively redacted)
+my $blacklist_mode = 0;  # Flag for blacklist mode (0 = normal mode, 1 = blacklist mode)
+
+# Process whitelist (takes precedence if both are provided)
+if ($whitelist_string) {
+    # Handle conflict: both whitelist and blacklist provided
+    if ($blacklist_string) {
+        print STDERR "Warning: Both whitelist and blacklist provided. Using whitelist only.\n";
+        $blacklist_string = '';  # Clear blacklist if both are provided
+    }
+    
+    # Parse comma-separated list of pattern keys
+    my @whitelist = split(/,/, $whitelist_string);
+    foreach my $key (@whitelist) {
+        $key =~ s/^\s+|\s+$//g; # Trim whitespace from key
+        
+        # Validate pattern key exists
+        if (exists $pattern_modules{$key}) {
+            $whitelisted{$key} = 1;  # Mark pattern as whitelisted
+            
+            # Debug output for whitelisted patterns
+            if ($debug_mode) {
+                print STDERR "Whitelisted pattern: $key (", $pattern_modules{$key}{'description'}, ")\n";
+            }
+        } else {
+            # Warn about unknown pattern keys
+            print STDERR "Warning: Unknown pattern module '$key' in whitelist\n";
+            # POTENTIAL IMPROVEMENT: Could show nearest matches as suggestions
+        }
+    }
+}
+
+# Process blacklist (only used if whitelist is not provided)
+if ($blacklist_string) {
+    # Set blacklist mode flag to change redaction behavior
+    $blacklist_mode = 1;
+    
+    # Parse comma-separated list of pattern keys
+    my @blacklist = split(/,/, $blacklist_string);
+    foreach my $key (@blacklist) {
+        $key =~ s/^\s+|\s+$//g; # Trim whitespace from key
+        
+        # Validate pattern key exists
+        if (exists $pattern_modules{$key}) {
+            $blacklisted{$key} = 1;  # Mark pattern as blacklisted
+            
+            # Debug output for blacklisted patterns
+            if ($debug_mode) {
+                print STDERR "Blacklisted pattern: $key (", $pattern_modules{$key}{'description'}, ")\n";
+            }
+        } else {
+            # Warn about unknown pattern keys
+            print STDERR "Warning: Unknown pattern module '$key' in blacklist\n";
+        }
+    }
+}
+
+#------------------------------------------------------------------------------
+# File Handling
+#------------------------------------------------------------------------------
+# Open input and output files (or use stdin/stdout)
+# POTENTIAL PITFALL: Encoding issues could occur with non-UTF-8 files
+
+# Open input file or use STDIN
+my $input_handle;
+if ($input_file eq '-') {
+    # Use standard input when no file specified
+    $input_handle = \*STDIN;
+    
+    # POTENTIAL IMPROVEMENT: Could add encoding option for input
+    # binmode(STDIN, ":encoding(UTF-8)"); # If needed for non-UTF-8 input
+} else {
+    # Open specified input file
+    open($input_handle, '<', $input_file) or die "Cannot open input file '$input_file': $OS_ERROR\n";
+    
+    # POTENTIAL IMPROVEMENT: Could detect and handle file encoding automatically
+    # POTENTIAL PITFALL: Large files might cause memory issues - could add chunking
+}
+
+# Open output file or use STDOUT
+my $output_handle;
+if ($output_file eq '-') {
+    # Use standard output when no file specified 
+    $output_handle = \*STDOUT;
+} else {
+    # Open specified output file
+    open($output_handle, '>', $output_file) or die "Cannot open output file '$output_file': $OS_ERROR\n";
+    
+    # POTENTIAL IMPROVEMENT: Could add option to preserve original file permissions
+}
+
+#------------------------------------------------------------------------------
+# Main Processing Loop
+#------------------------------------------------------------------------------
+# Process input line by line, applying pattern matching and redaction
+
+my $redaction_count = 0;  # Counter for total redactions performed
+
+# Read input line by line to avoid loading entire file into memory
+# POTENTIAL PITFALL: Multi-line patterns won't be detected across line boundaries
+while (my $line = <$input_handle>) {
+    # For each pattern module, check and apply redaction if needed
+    foreach my $pattern_name (keys %pattern_modules) {
+        # Skip processing this pattern if:
+        # - In normal mode: pattern is whitelisted (exempt from redaction)
+        # - In blacklist mode: pattern is not blacklisted (only redact blacklisted)
+        if ((!$blacklist_mode && exists $whitelisted{$pattern_name}) ||
+            ($blacklist_mode && !exists $blacklisted{$pattern_name})) {
+            next;
+        }
+        
+        # Get the regex pattern for this module
+        my $pattern = $pattern_modules{$pattern_name}{'pattern'};
+        
+        # Apply the pattern and count replacements
+        my $count = 0;
+        
+        # POTENTIAL PITFALL: Particularly complex regex patterns might cause
+        # catastrophic backtracking on certain inputs. Consider setting a
+        # timeout for pattern matching or simplifying overly complex patterns.
+        
+        # Replace matching text with redaction string and count replacements
+        $count += () = $line =~ s/($pattern)/$redaction_text/g;
+        $redaction_count += $count;
+        
+        # Debug output for redacted content
+        if ($debug_mode && $count > 0) {
+            print STDERR "Redacted $count instance(s) of $pattern_name (", 
+                $pattern_modules{$pattern_name}{'description'}, ")\n";
+        }
+    }
+    
+    # Output the sanitized line
+    print $output_handle $line;
+    
+    # POTENTIAL IMPROVEMENT: Add option to show redacted positions/context
+    # POTENTIAL IMPROVEMENT: Add option to write summary report of redactions
+}
+
+#------------------------------------------------------------------------------
+# Cleanup and Summary
+#------------------------------------------------------------------------------
+
+# Close input file if not stdin
+if ($input_file ne '-') {
+    close($input_handle);
+}
+
+# Close output file if not stdout
+if ($output_file ne '-') {
+    close($output_handle);
+    
+    # Show confirmation message in debug mode
+    if ($debug_mode) {
+        print STDERR "Sanitized data written to '$output_file'\n";
+    }
+}
+
+# Show summary count in debug mode
+if ($debug_mode) {
+    print STDERR "Total redactions: $redaction_count\n";
+}
+
+# POTENTIAL IMPROVEMENT: Could add statistics on redactions by type
+# POTENTIAL IMPROVEMENT: Could return exit code based on whether any redactions occurred
+
+exit 0;
+
+#------------------------------------------------------------------------------
+# Helper Functions
+#------------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# list_pattern_modules()
+# 
+# Purpose: Displays a list of all available pattern modules with descriptions
+# 
+# Arguments: None
+# 
+# Returns: None (prints to stdout)
+#
+# USAGE INFO: Call this function when the user needs to see all available
+# pattern keys for use with --whitelist or --blacklist options.
+#------------------------------------------------------------------------------
+sub list_pattern_modules {
+    print "Available pattern modules:\n";
+    print "==========================\n";
+    
+    # Print each pattern module with consistent formatting
+    foreach my $key (sort keys %pattern_modules) {
+        printf "%-20s - %s\n", $key, $pattern_modules{$key}{'description'};
+    }
+    
+    # Provide usage examples for pattern keys
+    print "\nUsage examples:\n";
+    print "  --whitelist key1,key2,...  # Exempt these types from redaction\n";
+    print "  --blacklist key1,key2,...  # Only redact these types, keep all others\n";
+}
+
+#------------------------------------------------------------------------------
+# show_help()
+# 
+# Purpose: Displays comprehensive help information for the script
+# 
+# Arguments: None
+# 
+# Returns: None (prints to stdout)
+#
+# MAINTENANCE NOTE: When adding new options or patterns, be sure to update
+# this function to reflect those changes.
+#------------------------------------------------------------------------------
+sub show_help {
+    print <<EOF;
+sanitize_data - Filter data to redact sensitive information
+
+Usage:
+  sanitize_data [options]
+
+Options:
+  -i, --input FILE      Input file (default: STDIN)
+  -o, --output FILE     Output file (default: STDOUT)
+  -r, --redaction TEXT  Text to use for redacted content (default: <redacted>)
+  -w, --whitelist LIST  Comma-separated list of pattern types to exempt from redaction
+  -b, --blacklist LIST  Comma-separated list of pattern types to ONLY redact (excludes all others)
+  -l, --list            List all available pattern modules
+  -d, --debug           Show debugging information
+  -h, --help            Display this help message and exit
+
+Notes:
+  - Whitelist and blacklist are mutually exclusive; whitelist takes precedence if both are provided
+  - Whitelist mode: All patterns are redacted EXCEPT those in the whitelist
+  - Blacklist mode: ONLY patterns in the blacklist are redacted, all others are kept
+
+Examples:
+  cat data.txt | sanitize_data > sanitized.txt
+  sanitize_data -i data.txt -o sanitized.txt
+  sanitize_data -r '[HIDDEN]' < data.txt > sanitized.txt
+  sanitize_data --whitelist ssn,ipv4 < data.txt > partially_sanitized.txt
+  sanitize_data --blacklist ipv4,ipv6 < data.txt > ip_addresses_redacted.txt
+  sanitize_data --list
+
+Description:
+  This script scans text for potentially sensitive information such as:
+  - Credit card numbers
+  - Social security numbers
+  - Email addresses
+  - Phone numbers
+  - IP addresses
+  - Dates
+  - Street addresses
+  - Passport numbers
+  - Driver's license numbers
+  - Bank account numbers
+  - API keys and tokens
+  - AWS keys
+  - Private keys
+  - Bitcoin addresses
+  - MAC addresses
+  - GPS coordinates
+  - National ID numbers
+  - Passwords
+  - Authentication tokens
+  - Medical record numbers
+
+  Any matching data is replaced with the redaction text.
+  Use --list to see all pattern module keys for use with --whitelist or --blacklist.
+
+Maintenance Notes:
+  - Add new pattern modules by extending the %pattern_modules hash
+  - Keep patterns organized by category
+  - Document limitations of regex patterns in comments
+  - Test new patterns extensively to minimize false positives
+  - Consider performance impact with large files
+EOF
+}
