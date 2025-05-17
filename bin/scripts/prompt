@@ -1,0 +1,1432 @@
+#!/usr/bin/python3
+
+"""
+prompt - A TUI for interacting with multiple AI providers
+
+This script provides a text-based user interface for chatting with various AI models
+from different providers (Claude, Perplexity, Grok, Ollama). It supports:
+- Switching between providers/models mid-conversation
+- Maintaining conversation history across provider switches
+- Saving conversations to files
+- Sending messages to multiple models simultaneously
+- Piping conversation output to other commands
+"""
+
+import os
+import sys
+import argparse
+import logging
+import json
+import curses
+import textwrap
+import threading
+import queue
+import tempfile
+import subprocess
+import time
+import re
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Tuple, Any, Union, Set
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+# Set up logging if debug mode is enabled
+def setup_logging(debug: bool) -> None:
+    """Configure logging based on debug flag"""
+    if debug:
+        log_file = os.path.expanduser("~/prompt_debug.log")
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.DEBUG,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        logging.debug("Debug logging initialized")
+    else:
+        # Disable logging if not in debug mode
+        logging.getLogger().disabled = True
+
+
+# Check if we're in the dev distrobox container and re-exec if not
+def ensure_distrobox() -> None:
+    """Check if we're in the dev distrobox, if not re-exec the script inside it"""
+    ctr_id = os.environ.get("CONTAINER_ID", "")
+    
+    if ctr_id != "dev":
+        logging.debug("Not in dev container, re-execing inside distrobox")
+        cmd = [
+            "distrobox",
+            "enter",
+            "dev",
+            "--",
+            *sys.argv
+        ]
+        subprocess.run(cmd)
+        sys.exit(0)
+
+
+class MessageRole(Enum):
+    """Enum for message roles in a conversation"""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+@dataclass
+class Message:
+    """Represents a message in a conversation"""
+    role: MessageRole
+    content: str
+    timestamp: float = field(default_factory=time.time)
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+@dataclass
+class Conversation:
+    """Represents a full conversation history"""
+    messages: List[Message] = field(default_factory=list)
+    
+    def add_message(self, message: Message) -> None:
+        """Add a message to the conversation"""
+        self.messages.append(message)
+    
+    def get_messages_for_provider(self, provider: str, model: str) -> List[Dict[str, Any]]:
+        """
+        Get messages formatted for a specific provider's API
+        
+        Different providers may have different message formats/requirements
+        """
+        # This is a base implementation - provider-specific classes can override
+        formatted_messages = []
+        for msg in self.messages:
+            formatted_messages.append({
+                "role": msg.role.value,
+                "content": msg.content
+            })
+        return formatted_messages
+    
+    def to_markdown(self) -> str:
+        """Convert the conversation to markdown format"""
+        md = "# AI Conversation\n\n"
+        
+        for msg in self.messages:
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(msg.timestamp))
+            
+            if msg.provider and msg.model:
+                md += f"## {msg.role.value.title()} ({msg.provider}/{msg.model}) - {timestamp}\n\n"
+            else:
+                md += f"## {msg.role.value.title()} - {timestamp}\n\n"
+                
+            md += f"{msg.content}\n\n"
+            
+        return md
+    
+    def to_json(self) -> str:
+        """Convert the conversation to JSON format"""
+        conversation_dict = {
+            "messages": [
+                {
+                    "role": msg.role.value,
+                    "content": msg.content,
+                    "timestamp": msg.timestamp,
+                    "provider": msg.provider,
+                    "model": msg.model
+                }
+                for msg in self.messages
+            ]
+        }
+        return json.dumps(conversation_dict, indent=2)
+
+
+class AIProvider(ABC):
+    """Base class for AI provider implementations"""
+    
+    @abstractmethod
+    def get_name(self) -> str:
+        """Get the name of the provider"""
+        pass
+    
+    @abstractmethod
+    def get_available_models(self) -> List[str]:
+        """Get list of available models from this provider"""
+        pass
+    
+    @abstractmethod
+    def check_environment(self) -> bool:
+        """Check if the necessary environment variables are set"""
+        pass
+    
+    @abstractmethod
+    def send_message(self, conversation: Conversation, model: str, 
+                    response_queue: queue.Queue) -> None:
+        """
+        Send a message to the AI provider
+        
+        Args:
+            conversation: Complete conversation history
+            model: Model to use for this request
+            response_queue: Queue to send response chunks to for display
+        """
+        pass
+
+
+class ClaudeProvider(AIProvider):
+    """Provider implementation for Anthropic's Claude"""
+    
+    def get_name(self) -> str:
+        return "claude"
+    
+    def get_available_models(self) -> List[str]:
+        return [
+            "claude-3-7-sonnet-latest",
+            "claude-3-5-sonnet-latest", 
+            "claude-3-5-haiku-latest", 
+            "claude-3-opus-latest", 
+            "claude-3-sonnet-20240229", 
+            "claude-3-haiku-20240307"
+        ]
+    
+    def check_environment(self) -> bool:
+        return "CLAUDE_API_KEY" in os.environ and os.environ["CLAUDE_API_KEY"] != ""
+    
+    def send_message(self, conversation: Conversation, model: str, 
+                    response_queue: queue.Queue) -> None:
+        try:
+            import requests
+            
+            api_key = os.environ.get("CLAUDE_API_KEY", "")
+            url = "https://api.anthropic.com/v1/messages"
+            
+            # Get the last user message
+            user_messages = [msg for msg in conversation.messages if msg.role == MessageRole.USER]
+            if not user_messages:
+                response_queue.put(("ERROR", "No user message found in conversation"))
+                return
+            
+            # Format messages for Claude API
+            messages = []
+            for msg in conversation.messages:
+                messages.append({
+                    "role": msg.role.value,
+                    "content": msg.content
+                })
+            
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+            
+            data = {
+                "model": model,
+                "max_tokens": 4096,
+                "messages": messages,
+                "stream": True
+            }
+            
+            logging.debug(f"Claude API request: {url}")
+            logging.debug(f"Claude API headers: {headers['anthropic-version']}")
+            logging.debug(f"Claude API data: {json.dumps(data)}")
+            
+            # Send request to Claude API with streaming
+            response = requests.post(url, headers=headers, json=data, stream=True)
+            
+            if response.status_code != 200:
+                error_msg = f"Error: {response.status_code}\n{response.text}"
+                response_queue.put(("ERROR", error_msg))
+                return
+            
+            # Process the streaming response
+            full_response = ""
+            for line in response.iter_lines():
+                if line:
+                    # Skip the initial "data: " prefix
+                    line_text = line.decode('utf-8')
+                    if line_text.startswith("data: "):
+                        line_json = line_text[6:]
+                        
+                        # The last message is usually "data: [DONE]"
+                        if line_json == "[DONE]":
+                            break
+                            
+                        try:
+                            event = json.loads(line_json)
+                            # Extract content delta if it exists
+                            if "delta" in event and "text" in event["delta"]:
+                                chunk = event["delta"]["text"]
+                                full_response += chunk
+                                response_queue.put(("CHUNK", chunk))
+                        except json.JSONDecodeError:
+                            continue
+            
+            # Add the assistant's response to the conversation
+            response_queue.put(("COMPLETE", {
+                "role": MessageRole.ASSISTANT,
+                "content": full_response,
+                "provider": self.get_name(),
+                "model": model
+            }))
+            
+        except Exception as e:
+            logging.error(f"Error in Claude provider: {str(e)}")
+            response_queue.put(("ERROR", f"Error: {str(e)}"))
+
+
+class PerplexityProvider(AIProvider):
+    """Provider implementation for Perplexity AI"""
+    
+    def get_name(self) -> str:
+        return "perplexity"
+    
+    def get_available_models(self) -> List[str]:
+        return [
+            "sonar-pro",
+            "sonar", 
+            "llama-3.1-sonar-small-128k-online", 
+            "llama-3.1-sonar-large-128k-online", 
+            "llama-3.1-sonar-huge-128k-online", 
+            "llama-3.1-sonar-small-128k-chat", 
+            "llama-3.1-sonar-large-128k-chat", 
+            "llama-3.1-8b-instruct", 
+            "llama-3.1-70b-instruct", 
+            "reasoning-pro", 
+            "sonar-reasoning-pro", 
+            "r1-1776"
+        ]
+    
+    def check_environment(self) -> bool:
+        return "PERPLEXITY_TOKEN" in os.environ and os.environ["PERPLEXITY_TOKEN"] != ""
+    
+    def send_message(self, conversation: Conversation, model: str, 
+                    response_queue: queue.Queue) -> None:
+        try:
+            from perplexipy import PerplexityClient
+            
+            api_key = os.environ.get("PERPLEXITY_TOKEN", "")
+            
+            client = PerplexityClient(key=api_key)
+            client.model = model
+            
+            # Get the last user message
+            user_messages = [msg for msg in conversation.messages if msg.role == MessageRole.USER]
+            if not user_messages:
+                response_queue.put(("ERROR", "No user message found in conversation"))
+                return
+            
+            # For perplexity, we'll send the full conversation context
+            full_context = ""
+            for msg in conversation.messages:
+                prefix = "User: " if msg.role == MessageRole.USER else "Assistant: "
+                full_context += f"{prefix}{msg.content}\n\n"
+            
+            logging.debug(f"Perplexity request: model={model}")
+            logging.debug(f"Perplexity context (truncated): {full_context[:100]}...")
+            
+            # Execute the API call with streaming
+            full_response = ""
+            results = client.queryStreamable(full_context)
+            for result in results:
+                response_queue.put(("CHUNK", result))
+                full_response += result
+            
+            # Add the assistant's response to the conversation
+            response_queue.put(("COMPLETE", {
+                "role": MessageRole.ASSISTANT,
+                "content": full_response,
+                "provider": self.get_name(),
+                "model": model
+            }))
+            
+        except Exception as e:
+            logging.error(f"Error in Perplexity provider: {str(e)}")
+            response_queue.put(("ERROR", f"Error: {str(e)}"))
+
+
+class GrokProvider(AIProvider):
+    """Provider implementation for xAI Grok"""
+    
+    def get_name(self) -> str:
+        return "grok"
+    
+    def get_available_models(self) -> List[str]:
+        return [
+            "grok-3-beta",
+            "grok-3-mini-fast-beta", 
+            "grok-3-fast-beta", 
+            "grok-3-mini-beta", 
+            "grok-2-1212",
+            "grok-2-vision-1212"
+        ]
+    
+    def check_environment(self) -> bool:
+        return "GROK_API_KEY" in os.environ and os.environ["GROK_API_KEY"] != ""
+    
+    def send_message(self, conversation: Conversation, model: str, 
+                    response_queue: queue.Queue) -> None:
+        try:
+            import requests
+            
+            api_key = os.environ.get("GROK_API_KEY", "")
+            url = "https://api.x.ai/v1/chat/completions"
+            
+            # Format messages for Grok API
+            messages = []
+            for msg in conversation.messages:
+                messages.append({
+                    "role": msg.role.value,
+                    "content": msg.content
+                })
+            
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "model": model,
+                "max_tokens": 4096,
+                "messages": messages,
+                "stream": True
+            }
+            
+            logging.debug(f"Grok API request: {url}")
+            logging.debug(f"Grok API data: {json.dumps(data)}")
+            
+            # Send request to Grok API with streaming
+            response = requests.post(url, headers=headers, json=data, stream=True)
+            
+            if response.status_code != 200:
+                error_msg = f"Error: {response.status_code}\n{response.text}"
+                response_queue.put(("ERROR", error_msg))
+                return
+            
+            # Process the streaming response
+            full_response = ""
+            for line in response.iter_lines():
+                if line:
+                    # Skip the initial "data: " prefix
+                    line_text = line.decode('utf-8')
+                    if line_text.startswith("data: "):
+                        line_json = line_text[6:]
+                        
+                        # The last message is usually "data: [DONE]"
+                        if line_json == "[DONE]":
+                            break
+                            
+                        try:
+                            event = json.loads(line_json)
+                            # Extract content delta if it exists
+                            if "choices" in event and len(event["choices"]) > 0:
+                                choice = event["choices"][0]
+                                if "delta" in choice and "content" in choice["delta"]:
+                                    chunk = choice["delta"]["content"]
+                                    full_response += chunk
+                                    response_queue.put(("CHUNK", chunk))
+                        except json.JSONDecodeError:
+                            continue
+            
+            # Add the assistant's response to the conversation
+            response_queue.put(("COMPLETE", {
+                "role": MessageRole.ASSISTANT,
+                "content": full_response,
+                "provider": self.get_name(),
+                "model": model
+            }))
+            
+        except Exception as e:
+            logging.error(f"Error in Grok provider: {str(e)}")
+            response_queue.put(("ERROR", f"Error: {str(e)}"))
+
+
+class OllamaProvider(AIProvider):
+    """Provider implementation for Ollama (local models)"""
+    
+    def __init__(self):
+        self.endpoint = "http://localhost:11434"
+    
+    def get_name(self) -> str:
+        return "ollama"
+    
+    def get_available_models(self) -> List[str]:
+        """
+        Fetch available models from Ollama
+        
+        Note: This dynamically fetches from the Ollama instance
+        """
+        try:
+            import requests
+            
+            url = f"{self.endpoint}/api/tags"
+            response = requests.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return [model["name"] for model in data.get("models", [])]
+            else:
+                logging.error(f"Failed to fetch Ollama models: {response.status_code}")
+                return ["llama3.1:8b"]  # Default fallback
+                
+        except Exception as e:
+            logging.error(f"Error fetching Ollama models: {str(e)}")
+            return ["llama3.1:8b"]  # Default fallback
+    
+    def check_environment(self) -> bool:
+        """
+        For Ollama, we just check if the endpoint is reachable
+        No API key needed as it's typically run locally
+        """
+        try:
+            import requests
+            response = requests.get(f"{self.endpoint}/api/version")
+            return response.status_code == 200
+        except:
+            return False
+    
+    def send_message(self, conversation: Conversation, model: str, 
+                    response_queue: queue.Queue) -> None:
+        try:
+            import requests
+            
+            url = f"{self.endpoint}/api/chat"
+            
+            # Format messages for Ollama API
+            messages = []
+            for msg in conversation.messages:
+                messages.append({
+                    "role": msg.role.value,
+                    "content": msg.content
+                })
+            
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "model": model,
+                "messages": messages,
+                "stream": True
+            }
+            
+            logging.debug(f"Ollama API request: {url}")
+            logging.debug(f"Ollama API data: {json.dumps(data)}")
+            
+            # Send request to Ollama API with streaming
+            response = requests.post(url, headers=headers, json=data, stream=True)
+            
+            if response.status_code != 200:
+                error_msg = f"Error: {response.status_code}\n{response.text}"
+                response_queue.put(("ERROR", error_msg))
+                return
+            
+            # Process the streaming response
+            full_response = ""
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        event = json.loads(line.decode('utf-8'))
+                        # Extract content from the message
+                        if "message" in event and "content" in event["message"]:
+                            chunk = event["message"]["content"]
+                            full_response += chunk
+                            response_queue.put(("CHUNK", chunk))
+                        # Handle done message
+                        if event.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Add the assistant's response to the conversation
+            response_queue.put(("COMPLETE", {
+                "role": MessageRole.ASSISTANT,
+                "content": full_response,
+                "provider": self.get_name(),
+                "model": model
+            }))
+            
+        except Exception as e:
+            logging.error(f"Error in Ollama provider: {str(e)}")
+            response_queue.put(("ERROR", f"Error: {str(e)}"))
+
+
+class ProviderManager:
+    """Manages all available AI providers"""
+    
+    def __init__(self):
+        self.providers: Dict[str, AIProvider] = {}
+        
+        # Register all providers
+        self._register_provider(ClaudeProvider())
+        self._register_provider(PerplexityProvider())
+        self._register_provider(GrokProvider())
+        self._register_provider(OllamaProvider())
+    
+    def _register_provider(self, provider: AIProvider) -> None:
+        """Register a new provider"""
+        self.providers[provider.get_name()] = provider
+    
+    def get_provider(self, name: str) -> Optional[AIProvider]:
+        """Get a provider by name"""
+        return self.providers.get(name)
+    
+    def get_available_providers(self) -> List[Tuple[str, bool]]:
+        """
+        Get list of all registered providers with availability status
+        
+        Returns:
+            List of tuples (provider_name, is_available)
+        """
+        return [(name, provider.check_environment()) 
+                for name, provider in self.providers.items()]
+    
+    def send_message(self, provider_name: str, model: str, 
+                    conversation: Conversation, response_queue: queue.Queue) -> None:
+        """Send a message using the specified provider and model"""
+        provider = self.get_provider(provider_name)
+        if not provider:
+            response_queue.put(("ERROR", f"Provider '{provider_name}' not found"))
+            return
+        
+        if not provider.check_environment():
+            response_queue.put(("ERROR", f"Provider '{provider_name}' is not properly configured"))
+            return
+        
+        # Send the message in a separate thread to keep the UI responsive
+        thread = threading.Thread(
+            target=provider.send_message,
+            args=(conversation, model, response_queue)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return thread
+
+
+class UIManager:
+    """Manages the TUI interface using curses"""
+    
+    def __init__(self, stdscr, provider_manager: ProviderManager):
+        self.stdscr = stdscr
+        self.provider_manager = provider_manager
+        self.conversation = Conversation()
+        self.response_queue = queue.Queue()
+        
+        # UI state
+        self.current_provider = None
+        self.current_model = None
+        self.input_buffer = ""
+        self.cursor_pos = 0
+        self.scroll_pos = 0
+        self.max_scroll = 0
+        self.active_providers: Set[Tuple[str, str]] = set()  # Set of (provider, model) tuples
+        self.threads = []
+        self.mode = "chat"  # chat, provider_select, model_select, help
+        self.status_message = ""
+        self.status_time = 0
+        
+        # Set initial provider and model
+        self._auto_select_provider()
+        
+        # Set up colors if terminal supports them
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()  # Allow terminal default background (supports transparency)
+            curses.init_pair(1, curses.COLOR_GREEN, -1)  # User
+            curses.init_pair(2, curses.COLOR_BLUE, -1)   # Assistant
+            curses.init_pair(3, curses.COLOR_RED, -1)    # Error/Status
+            curses.init_pair(4, curses.COLOR_YELLOW, -1) # Highlight
+    
+    def _auto_select_provider(self) -> None:
+        """Automatically select the first available provider and model"""
+        available_providers = self.provider_manager.get_available_providers()
+        for provider_name, available in available_providers:
+            if available:
+                self.current_provider = provider_name
+                provider = self.provider_manager.get_provider(provider_name)
+                models = provider.get_available_models()
+                if models:
+                    self.current_model = models[0]
+                return
+    
+    def _add_message(self, message: Message) -> None:
+        """Add a message to the conversation"""
+        self.conversation.add_message(message)
+        self.scroll_pos = 0  # Reset scroll to show newest message
+    
+    def _get_color(self, color_pair: int) -> int:
+        """Get color attribute or default to normal if colors aren't supported"""
+        if curses.has_colors():
+            return curses.color_pair(color_pair)
+        return curses.A_NORMAL
+    
+    def set_status(self, message: str, error: bool = False) -> None:
+        """Set a temporary status message"""
+        self.status_message = message
+        self.status_time = time.time()
+        self.is_error = error
+    
+    def handle_input(self) -> bool:
+        """
+        Handle user input
+        
+        Returns:
+            bool: True if the app should continue, False if it should exit
+        """
+        key = self.stdscr.getch()
+        
+        # If timeout occurred (-1) just continue without handling input
+        if key == -1:
+            return True
+            
+        # Universal key commands
+        if key == curses.KEY_RESIZE:
+            # Terminal resized, refresh UI
+            return True
+        elif key == 27:  # ESC
+            if self.mode != "chat":
+                # Return to chat mode from any other mode
+                self.mode = "chat"
+                return True
+            # In chat mode, ask if user wants to quit
+            self.set_status("Press Ctrl+Q to quit", False)
+            return True
+        elif key == 17:  # Ctrl+Q
+            return False
+        elif key == 18:  # Ctrl+R
+            # Reset/clear conversation
+            self.conversation = Conversation()
+            self.set_status("Conversation cleared", False)
+            return True
+        elif key == 15:  # Ctrl+O
+            # Save conversation
+            self._save_conversation()
+            return True
+        elif key == 16:  # Ctrl+P
+            # Switch to provider selection mode
+            self.mode = "provider_select"
+            return True
+        elif key == 8:  # Ctrl+H
+            # Switch to help mode
+            self.mode = "help"
+            return True
+        
+        # Mode-specific key handling
+        if self.mode == "chat":
+            return self._handle_chat_input(key)
+        elif self.mode == "provider_select":
+            return self._handle_provider_select_input(key)
+        elif self.mode == "model_select":
+            return self._handle_model_select_input(key)
+        elif self.mode == "help":
+            # Any key in help mode returns to chat
+            self.mode = "chat"
+            return True
+        
+        return True
+    
+    def _handle_chat_input(self, key: int) -> bool:
+        """Handle input in chat mode"""
+        if key == curses.KEY_ENTER or key == 10 or key == 13:  # Enter
+            if not self.input_buffer.strip():
+                return True
+            
+            # Add user message to conversation
+            user_message = Message(
+                role=MessageRole.USER,
+                content=self.input_buffer.strip()
+            )
+            self._add_message(user_message)
+            
+            # Clear input buffer
+            self.input_buffer = ""
+            self.cursor_pos = 0
+            
+            # If no active providers, use the current provider/model
+            if not self.active_providers:
+                if not self.current_provider or not self.current_model:
+                    self.set_status("No provider/model selected", True)
+                    return True
+                
+                # Send message to current provider/model
+                thread = self.provider_manager.send_message(
+                    self.current_provider,
+                    self.current_model,
+                    self.conversation,
+                    self.response_queue
+                )
+                if thread:
+                    self.threads.append(thread)
+            else:
+                # Send message to all active providers/models
+                for provider_name, model in self.active_providers:
+                    thread = self.provider_manager.send_message(
+                        provider_name,
+                        model,
+                        self.conversation,
+                        self.response_queue
+                    )
+                    if thread:
+                        self.threads.append(thread)
+            
+            return True
+            
+        elif key == curses.KEY_BACKSPACE or key == 127 or key == 8:
+            # Backspace
+            if self.cursor_pos > 0:
+                self.input_buffer = (self.input_buffer[:self.cursor_pos-1] + 
+                                    self.input_buffer[self.cursor_pos:])
+                self.cursor_pos -= 1
+        elif key == curses.KEY_DC:
+            # Delete
+            if self.cursor_pos < len(self.input_buffer):
+                self.input_buffer = (self.input_buffer[:self.cursor_pos] + 
+                                    self.input_buffer[self.cursor_pos+1:])
+        elif key == curses.KEY_LEFT:
+            # Move cursor left
+            if self.cursor_pos > 0:
+                self.cursor_pos -= 1
+        elif key == curses.KEY_RIGHT:
+            # Move cursor right
+            if self.cursor_pos < len(self.input_buffer):
+                self.cursor_pos += 1
+        elif key == curses.KEY_HOME:
+            # Move cursor to start
+            self.cursor_pos = 0
+        elif key == curses.KEY_END:
+            # Move cursor to end
+            self.cursor_pos = len(self.input_buffer)
+        elif key == curses.KEY_UP:
+            # Scroll conversation up
+            if self.scroll_pos > 0:
+                self.scroll_pos -= 1
+        elif key == curses.KEY_DOWN:
+            # Scroll conversation down
+            if self.scroll_pos < self.max_scroll:
+                self.scroll_pos += 1
+        elif key == 5:  # Ctrl+E
+            # Edit current input in $EDITOR
+            self.input_buffer = self._edit_in_external_editor(self.input_buffer)
+            self.cursor_pos = len(self.input_buffer)
+        elif key == 1:  # Ctrl+A
+            # Add/remove current provider to active providers
+            if self.current_provider and self.current_model:
+                provider_model = (self.current_provider, self.current_model)
+                if provider_model in self.active_providers:
+                    self.active_providers.remove(provider_model)
+                    self.set_status(f"Removed {self.current_provider}/{self.current_model} from active providers")
+                else:
+                    self.active_providers.add(provider_model)
+                    self.set_status(f"Added {self.current_provider}/{self.current_model} to active providers")
+        elif key == 24:  # Ctrl+X
+            # Clear active providers
+            self.active_providers.clear()
+            self.set_status("Cleared active providers")
+        elif key == 2:  # Ctrl+B
+            # Toggle between available providers
+            self._cycle_provider()
+        elif key == 9:  # Tab
+            # Switch to model selection mode
+            self.mode = "model_select"
+        elif key == 23:  # Ctrl+W
+            # Delete word
+            if self.cursor_pos > 0:
+                # Find the start of the current word
+                pos = self.cursor_pos - 1
+                while pos > 0 and self.input_buffer[pos] == " ":
+                    pos -= 1
+                while pos > 0 and self.input_buffer[pos-1] != " ":
+                    pos -= 1
+                
+                self.input_buffer = (self.input_buffer[:pos] + 
+                                    self.input_buffer[self.cursor_pos:])
+                self.cursor_pos = pos
+        elif key == 21:  # Ctrl+U
+            # Clear line
+            self.input_buffer = ""
+            self.cursor_pos = 0
+        elif key == 11:  # Ctrl+K
+            # Clear from cursor to end
+            self.input_buffer = self.input_buffer[:self.cursor_pos]
+        elif key >= 32 and key <= 126:
+            # Printable character
+            self.input_buffer = (self.input_buffer[:self.cursor_pos] + 
+                                chr(key) + 
+                                self.input_buffer[self.cursor_pos:])
+            self.cursor_pos += 1
+        
+        return True
+    
+    def _handle_provider_select_input(self, key: int) -> bool:
+        """Handle input in provider selection mode"""
+        if key == curses.KEY_ENTER or key == 10 or key == 13:  # Enter
+            # Return to chat mode
+            self.mode = "chat"
+            return True
+        
+        available_providers = self.provider_manager.get_available_providers()
+        available_providers = [name for name, available in available_providers if available]
+        
+        if not available_providers:
+            self.set_status("No providers available", True)
+            self.mode = "chat"
+            return True
+        
+        if key == curses.KEY_UP:
+            # Select previous provider
+            current_index = available_providers.index(self.current_provider) if self.current_provider in available_providers else 0
+            new_index = (current_index - 1) % len(available_providers)
+            self.current_provider = available_providers[new_index]
+            
+            # Auto-select first model for new provider
+            provider = self.provider_manager.get_provider(self.current_provider)
+            models = provider.get_available_models()
+            if models:
+                self.current_model = models[0]
+                
+        elif key == curses.KEY_DOWN:
+            # Select next provider
+            current_index = available_providers.index(self.current_provider) if self.current_provider in available_providers else 0
+            new_index = (current_index + 1) % len(available_providers)
+            self.current_provider = available_providers[new_index]
+            
+            # Auto-select first model for new provider
+            provider = self.provider_manager.get_provider(self.current_provider)
+            models = provider.get_available_models()
+            if models:
+                self.current_model = models[0]
+                
+        elif key == 9:  # Tab
+            # Switch to model selection mode
+            self.mode = "model_select"
+        
+        return True
+    
+    def _handle_model_select_input(self, key: int) -> bool:
+        """Handle input in model selection mode"""
+        if key == curses.KEY_ENTER or key == 10 or key == 13:  # Enter
+            # Return to chat mode
+            self.mode = "chat"
+            return True
+        
+        if not self.current_provider:
+            self.set_status("No provider selected", True)
+            self.mode = "chat"
+            return True
+        
+        provider = self.provider_manager.get_provider(self.current_provider)
+        models = provider.get_available_models()
+        
+        if not models:
+            self.set_status(f"No models available for {self.current_provider}", True)
+            self.mode = "chat"
+            return True
+        
+        if key == curses.KEY_UP:
+            # Select previous model
+            current_index = models.index(self.current_model) if self.current_model in models else 0
+            new_index = (current_index - 1) % len(models)
+            self.current_model = models[new_index]
+        elif key == curses.KEY_DOWN:
+            # Select next model
+            current_index = models.index(self.current_model) if self.current_model in models else 0
+            new_index = (current_index + 1) % len(models)
+            self.current_model = models[new_index]
+        elif key == 9:  # Tab
+            # Switch back to provider selection mode
+            self.mode = "provider_select"
+        
+        return True
+    
+    def _edit_in_external_editor(self, text: str) -> str:
+        """Open an external editor to edit text"""
+        editor = os.environ.get("EDITOR", "nano")
+        
+        with tempfile.NamedTemporaryFile(suffix=".md", mode="w+", delete=False) as temp:
+            temp_filename = temp.name
+            temp.write(text)
+            temp.flush()
+        
+        try:
+            subprocess.run([editor, temp_filename], check=True)
+            with open(temp_filename, 'r') as temp:
+                return temp.read()
+        finally:
+            os.unlink(temp_filename)
+    
+    def _save_conversation(self) -> None:
+        """Save the conversation to a file or pipe it to a command"""
+        # Get filename with curses text input
+        curses.echo()
+        self.stdscr.addstr(0, 0, "Save to file (or |command): ")
+        self.stdscr.clrtoeol()
+        dest = self.stdscr.getstr(0, 28).decode('utf-8').strip()
+        curses.noecho()
+        
+        if not dest:
+            self.set_status("Save cancelled", False)
+            return
+        
+        try:
+            # Determine if we're piping to a command
+            if dest.startswith('|'):
+                command = dest[1:].strip()
+                pipe_process = subprocess.Popen(
+                    command, 
+                    shell=True, 
+                    stdin=subprocess.PIPE, 
+                    text=True
+                )
+                pipe_process.communicate(input=self.conversation.to_markdown())
+                if pipe_process.returncode == 0:
+                    self.set_status(f"Conversation piped to '{command}'")
+                else:
+                    self.set_status(f"Error piping to '{command}'", True)
+                    
+            else:
+                # Determine format based on extension
+                if dest.endswith('.json'):
+                    content = self.conversation.to_json()
+                else:
+                    # Default to markdown
+                    content = self.conversation.to_markdown()
+                    if not dest.endswith(('.md', '.markdown')):
+                        dest += '.md'
+                
+                # Expand ~ in path
+                dest = os.path.expanduser(dest)
+                
+                with open(dest, 'w') as f:
+                    f.write(content)
+                self.set_status(f"Conversation saved to {dest}")
+                    
+        except Exception as e:
+            self.set_status(f"Error saving: {str(e)}", True)
+            logging.error(f"Error saving conversation: {str(e)}")
+    
+    def _cycle_provider(self) -> None:
+        """Cycle through available providers"""
+        available_providers = self.provider_manager.get_available_providers()
+        available_providers = [name for name, available in available_providers if available]
+        
+        if not available_providers:
+            self.set_status("No providers available", True)
+            return
+        
+        if not self.current_provider or self.current_provider not in available_providers:
+            self.current_provider = available_providers[0]
+        else:
+            current_index = available_providers.index(self.current_provider)
+            next_index = (current_index + 1) % len(available_providers)
+            self.current_provider = available_providers[next_index]
+        
+        # Auto-select first model for new provider
+        provider = self.provider_manager.get_provider(self.current_provider)
+        models = provider.get_available_models()
+        if models:
+            self.current_model = models[0]
+            
+        self.set_status(f"Switched to {self.current_provider}/{self.current_model}")
+    
+    def draw(self) -> None:
+        """Draw the UI"""
+        self.stdscr.clear()
+        height, width = self.stdscr.getmaxyx()
+        
+        if self.mode == "chat":
+            self._draw_chat_mode(height, width)
+        elif self.mode == "provider_select":
+            self._draw_provider_select_mode(height, width)
+        elif self.mode == "model_select":
+            self._draw_model_select_mode(height, width)
+        elif self.mode == "help":
+            self._draw_help_mode(height, width)
+        
+        self.stdscr.refresh()
+    
+    def _draw_chat_mode(self, height: int, width: int) -> None:
+        """Draw chat mode UI"""
+        # Draw header
+        header = f" prompt - {self.current_provider}/{self.current_model}"
+        if self.active_providers:
+            header += f" (+{len(self.active_providers)} active)"
+        self.stdscr.addstr(0, 0, header[:width-1])
+        self.stdscr.addstr(0, len(header), " " * (width - len(header) - 1))
+        
+        # Draw status message if recent
+        if self.status_message and time.time() - self.status_time < 3:
+            status_attr = self._get_color(3) if self.is_error else curses.A_NORMAL
+            self.stdscr.addstr(0, 0, self.status_message[:width-1], status_attr)
+        
+        # Draw conversation area
+        conv_height = height - 3  # Reserve 3 lines for input
+        
+        y_pos = 1
+        messages_to_show = []
+        
+        # Determine which messages to show based on scroll position
+        visible_lines = 0
+        temp_messages = []
+        
+        # Count lines needed for each message
+        for msg in self.conversation.messages:
+            msg_lines = 0
+            
+            # Role header
+            role_text = f"[{msg.role.value.upper()}]"
+            if msg.provider and msg.model:
+                role_text += f" ({msg.provider}/{msg.model})"
+            msg_lines += 1
+            
+            # Content with word wrapping
+            wrapped_content = textwrap.wrap(msg.content, width - 2)
+            msg_lines += len(wrapped_content)
+            
+            # Add empty line after message
+            msg_lines += 1
+            
+            temp_messages.append((msg, msg_lines))
+            visible_lines += msg_lines
+        
+        # Calculate max scroll position
+        self.max_scroll = max(0, visible_lines - conv_height)
+        
+        # Apply scroll position
+        remaining_scroll = self.scroll_pos
+        for msg, msg_lines in reversed(temp_messages):
+            if remaining_scroll >= msg_lines:
+                remaining_scroll -= msg_lines
+                continue
+            
+            messages_to_show.insert(0, (msg, remaining_scroll))
+            remaining_scroll = 0
+        
+        # Draw visible messages
+        for msg, skip_lines in messages_to_show:
+            if y_pos >= conv_height:
+                break
+                
+            # Role header with color
+            role_text = f"[{msg.role.value.upper()}]"
+            if msg.provider and msg.model:
+                role_text += f" ({msg.provider}/{msg.model})"
+                
+            color = 1 if msg.role == MessageRole.USER else 2
+            if skip_lines <= 0:
+                self.stdscr.addstr(y_pos, 1, role_text, self._get_color(color))
+                y_pos += 1
+            else:
+                skip_lines -= 1
+            
+            # Content with word wrapping
+            wrapped_content = textwrap.wrap(msg.content, width - 2)
+            for i, line in enumerate(wrapped_content):
+                if skip_lines <= 0:
+                    if y_pos < conv_height:
+                        self.stdscr.addstr(y_pos, 1, line)
+                        y_pos += 1
+                else:
+                    skip_lines -= 1
+            
+            # Empty line after message
+            if y_pos < conv_height and skip_lines <= 0:
+                y_pos += 1
+        
+        # Fill remaining conversation area
+        while y_pos < conv_height:
+            self.stdscr.addstr(y_pos, 0, " " * (width - 1))
+            y_pos += 1
+        
+        # Draw horizontal separator
+        self.stdscr.addstr(conv_height, 0, "─" * (width - 1))
+        
+        # Draw input area
+        prompt = "> "
+        self.stdscr.addstr(conv_height + 1, 0, prompt)
+        
+        # Determine visible part of input based on cursor position
+        visible_start = max(0, self.cursor_pos - (width - len(prompt) - 5))
+        visible_input = self.input_buffer[visible_start:visible_start+width-len(prompt)-1]
+        
+        self.stdscr.addstr(conv_height + 1, len(prompt), visible_input)
+        self.stdscr.addstr(conv_height + 1, len(prompt) + len(visible_input), " " * (width - len(prompt) - len(visible_input) - 1))
+        
+        # Draw shortcuts help line
+        shortcuts = "Ctrl+P: Provider | Tab: Model | Ctrl+A: Add/Remove Active | Ctrl+X: Clear Active | Ctrl+O: Save | Ctrl+R: Reset | Ctrl+Q: Quit"
+        if len(shortcuts) > width - 1:
+            shortcuts = shortcuts[:width-4] + "..."
+        self.stdscr.addstr(height - 1, 0, shortcuts)
+        
+        # Position cursor in input field
+        cursor_x = len(prompt) + (self.cursor_pos - visible_start)
+        self.stdscr.move(conv_height + 1, cursor_x)
+    
+    def _draw_provider_select_mode(self, height: int, width: int) -> None:
+        """Draw provider selection mode UI"""
+        # Draw header
+        self.stdscr.addstr(0, 0, " Select AI Provider ")
+        self.stdscr.addstr(0, 18, "─" * (width - 19))
+        
+        # Get available providers
+        available_providers = self.provider_manager.get_available_providers()
+        
+        # Draw provider list
+        y_pos = 2
+        for i, (provider_name, available) in enumerate(available_providers):
+            prefix = "→ " if provider_name == self.current_provider else "  "
+            status = "[AVAILABLE]" if available else "[UNAVAILABLE]"
+            
+            # Color based on selection and availability
+            if provider_name == self.current_provider:
+                attr = self._get_color(4)  # Highlight color
+            elif not available:
+                attr = curses.A_DIM
+            else:
+                attr = curses.A_NORMAL
+                
+            # Provider name and status
+            self.stdscr.addstr(y_pos, 2, f"{prefix}{provider_name} {status}", attr)
+            y_pos += 1
+            
+            # Show information about provider
+            if available:
+                provider = self.provider_manager.get_provider(provider_name)
+                models_count = len(provider.get_available_models())
+                
+                self.stdscr.addstr(y_pos, 4, f"• {models_count} model(s) available")
+                y_pos += 1
+                
+                # If this is the current provider, list some models
+                if provider_name == self.current_provider:
+                    models = provider.get_available_models()[:3]  # Show only first 3
+                    for model in models:
+                        model_str = f"• {model}"
+                        if model == self.current_model:
+                            model_str += " [SELECTED]"
+                            self.stdscr.addstr(y_pos, 6, model_str, self._get_color(4))
+                        else:
+                            self.stdscr.addstr(y_pos, 6, model_str)
+                        y_pos += 1
+                    
+                    if len(provider.get_available_models()) > 3:
+                        self.stdscr.addstr(y_pos, 6, f"• ... and {len(provider.get_available_models()) - 3} more")
+                        y_pos += 1
+            else:
+                # Show reason why provider is unavailable
+                if provider_name == "claude":
+                    self.stdscr.addstr(y_pos, 4, "• Missing CLAUDE_API_KEY environment variable")
+                elif provider_name == "perplexity":
+                    self.stdscr.addstr(y_pos, 4, "• Missing PERPLEXITY_TOKEN environment variable")
+                elif provider_name == "grok":
+                    self.stdscr.addstr(y_pos, 4, "• Missing GROK_API_KEY environment variable")
+                elif provider_name == "ollama":
+                    self.stdscr.addstr(y_pos, 4, "• Ollama service not running or unreachable")
+                y_pos += 1
+            
+            # Add spacing between providers
+            y_pos += 1
+        
+        # Draw instructions
+        self.stdscr.addstr(height - 3, 0, "─" * (width - 1))
+        self.stdscr.addstr(height - 2, 2, "↑/↓: Navigate | Tab: Model Selection | Enter: Confirm | Esc: Cancel")
+    
+    def _draw_model_select_mode(self, height: int, width: int) -> None:
+        """Draw model selection mode UI"""
+        if not self.current_provider:
+            self.stdscr.addstr(0, 0, " No provider selected ")
+            self.stdscr.addstr(0, 21, "─" * (width - 22))
+            self.stdscr.addstr(2, 2, "Please select a provider first (Esc, then Ctrl+P)")
+            return
+        
+        # Draw header
+        self.stdscr.addstr(0, 0, f" Select {self.current_provider} Model ")
+        self.stdscr.addstr(0, len(f" Select {self.current_provider} Model "), "─" * (width - len(f" Select {self.current_provider} Model ") - 1))
+        
+        # Get models for current provider
+        provider = self.provider_manager.get_provider(self.current_provider)
+        models = provider.get_available_models()
+        
+        # Draw model list
+        y_pos = 2
+        for i, model_name in enumerate(models):
+            prefix = "→ " if model_name == self.current_model else "  "
+            
+            # Color based on selection
+            if model_name == self.current_model:
+                attr = self._get_color(4)  # Highlight color
+            else:
+                attr = curses.A_NORMAL
+                
+            # Model name
+            self.stdscr.addstr(y_pos, 2, f"{prefix}{model_name}", attr)
+            y_pos += 1
+        
+        # Draw instructions
+        self.stdscr.addstr(height - 3, 0, "─" * (width - 1))
+        self.stdscr.addstr(height - 2, 2, "↑/↓: Navigate | Tab: Provider Selection | Enter: Confirm | Esc: Cancel")
+    
+    def _draw_help_mode(self, height: int, width: int) -> None:
+        """Draw help mode UI"""
+        # Draw header
+        self.stdscr.addstr(0, 0, " prompt Help ")
+        self.stdscr.addstr(0, 13, "─" * (width - 14))
+        
+        # Draw help content
+        y_pos = 2
+        help_text = [
+            "Keyboard Shortcuts:",
+            "",
+            "Chat Mode:",
+            "  Enter          Send message",
+            "  Ctrl+E         Open message in external editor ($EDITOR)",
+            "  Ctrl+P         Switch to provider selection",
+            "  Tab            Switch to model selection",
+            "  Ctrl+A         Add/remove current provider/model to active set",
+            "  Ctrl+X         Clear active providers",
+            "  Ctrl+B         Cycle through available providers",
+            "  Ctrl+O         Save conversation (to file or pipe to command)",
+            "  Ctrl+R         Reset/clear conversation",
+            "  Ctrl+Q         Quit",
+            "  ↑/↓            Scroll conversation history",
+            "  Ctrl+U         Clear entire input",
+            "  Ctrl+K         Clear input from cursor to end",
+            "  Ctrl+W         Delete word",
+            "",
+            "Provider/Model Selection:",
+            "  ↑/↓            Navigate options",
+            "  Tab            Switch between provider/model selection",
+            "  Enter          Confirm selection",
+            "  Esc            Cancel and return to chat",
+            "",
+            "Active Providers:",
+            "  When multiple providers are active, messages will be sent to all of them.",
+            "  This allows you to compare responses from different models simultaneously.",
+            "",
+            "Saving Conversations:",
+            "  You can save to a file: ~/conversation.md",
+            "  Or pipe to a command: |vipe > ~/conversation.md",
+            "  Format is determined by extension (.md or .json)"
+        ]
+        
+        for i, line in enumerate(help_text):
+            if y_pos + i >= height - 1:
+                break
+            
+            if not line:
+                self.stdscr.addstr(y_pos + i, 2, "")
+            elif line.endswith(":"):
+                # Section headers
+                self.stdscr.addstr(y_pos + i, 2, line, curses.A_BOLD)
+            elif line.startswith("  "):
+                # Shortcut descriptions
+                parts = line.split("  ", 2)
+                if len(parts) >= 3:
+                    key, desc = parts[1], parts[2]
+                    self.stdscr.addstr(y_pos + i, 2, "  ")
+                    self.stdscr.addstr(y_pos + i, 4, key, self._get_color(4))
+                    self.stdscr.addstr(y_pos + i, 4 + len(key) + (10 - len(key)), desc)
+                else:
+                    self.stdscr.addstr(y_pos + i, 2, line)
+            else:
+                self.stdscr.addstr(y_pos + i, 2, line)
+        
+        # Draw footer
+        self.stdscr.addstr(height - 2, 2, "Press any key to return to chat")
+    
+    def process_responses(self) -> None:
+        """Process any responses in the queue"""
+        try:
+            while not self.response_queue.empty():
+                msg_type, data = self.response_queue.get_nowait()
+                
+                if msg_type == "CHUNK":
+                    # For streaming responses, we need to update the latest assistant message
+                    # or create a new one if this is the start of a response
+                    assistant_messages = [msg for msg in self.conversation.messages 
+                                         if msg.role == MessageRole.ASSISTANT]
+                    
+                    if assistant_messages and assistant_messages[-1].provider is None:
+                        # Update the last assistant message that's still being streamed
+                        assistant_messages[-1].content += data
+                    else:
+                        # Create a new assistant message
+                        self._add_message(Message(
+                            role=MessageRole.ASSISTANT,
+                            content=data
+                        ))
+                
+                elif msg_type == "COMPLETE":
+                    # Response is complete - update message with final data
+                    msg_data = data
+                    
+                    # Find the incomplete assistant message
+                    for i, msg in enumerate(self.conversation.messages):
+                        if msg.role == MessageRole.ASSISTANT and msg.provider is None:
+                            # Update with provider info
+                            self.conversation.messages[i].provider = msg_data["provider"]
+                            self.conversation.messages[i].model = msg_data["model"]
+                            break
+                
+                elif msg_type == "ERROR":
+                    # Add error as assistant message
+                    self._add_message(Message(
+                        role=MessageRole.ASSISTANT,
+                        content=f"ERROR: {data}",
+                        provider="system",
+                        model="error"
+                    ))
+                    
+                self.response_queue.task_done()
+        except Exception as e:
+            logging.error(f"Error processing responses: {str(e)}")
+
+
+def main(stdscr) -> None:
+    """Main function for the curses application"""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Interactive TUI for chatting with different AI providers")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(args.debug)
+    
+    # Ensure we're in the dev distrobox
+    ensure_distrobox()
+    
+    # Configure curses
+    curses.curs_set(1)  # Show cursor
+    curses.noecho()  # Don't echo input
+    curses.cbreak()  # React to keys without Enter
+    stdscr.keypad(True)  # Enable special keys
+    
+    # Initialize managers
+    provider_manager = ProviderManager()
+    ui_manager = UIManager(stdscr, provider_manager)
+    
+    # Main loop
+    while True:
+        # Process any responses from providers
+        ui_manager.process_responses()
+        
+        # Draw UI
+        ui_manager.draw()
+        
+        # Set timeout for getch (100ms) to allow for UI updates without keypresses
+        stdscr.timeout(100)
+        
+        # Handle input (returns False to exit)
+        if not ui_manager.handle_input():
+            break
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        # Handle Ctrl+C gracefully
+        pass
+    except Exception as e:
+        # Fall back to basic error reporting if curses fails
+        import traceback
+        print(f"Error: {str(e)}")
+        print(traceback.format_exc())
