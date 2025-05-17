@@ -51,6 +51,7 @@ my $debug_mode = 0;         # Enable detailed debug output when true
 my $whitelist_string = '';  # CSV list of pattern types to exempt from redaction
 my $blacklist_string = '';  # CSV list of pattern types to exclusively redact
 my $list_patterns = 0;      # Show available pattern modules and exit when true
+my $redact_with_rule = 0;   # Include pattern module name in redaction text
 
 #------------------------------------------------------------------------------
 # Parse command line arguments
@@ -69,6 +70,7 @@ GetOptions(
     'redaction|r=s' => \$redaction_text, # Custom redaction text
     'whitelist|w=s' => \$whitelist_string, # CSV list of patterns to exclude from redaction
     'blacklist|b=s' => \$blacklist_string, # CSV list of patterns to exclusively redact
+    'redact-with-rule' => \$redact_with_rule, # Include pattern module name in redaction
     
     # Information and control options
     'list|l'        => \$list_patterns,  # List available pattern modules
@@ -554,7 +556,8 @@ my %pattern_modules = (
         'description' => 'CAGE Codes',
         # Matches CAGE (Commercial and Government Entity) codes: 5 alphanumeric chars
         # LIMITATION: Could match other 5-character alphanumeric strings
-        'pattern' => qr/\bCAGE[:\s]?[A-Z0-9]{5}\b|\b[A-Z][A-Z0-9]{4}\b/i,
+        # Only match explicit CAGE codes or typical patterns used for them
+        'pattern' => qr/\bCAGE[:\s]?[A-Z0-9]{5}\b|\b(?:CAGE\s+)?[A-Z][0-9][A-Z0-9]{3}\b/i,
     },
     
     #--------------------------------------------------------------------------
@@ -738,7 +741,13 @@ my $redaction_count = 0;  # Counter for total redactions performed
 # Read input line by line to avoid loading entire file into memory
 # POTENTIAL PITFALL: Multi-line patterns won't be detected across line boundaries
 while (my $line = <$input_handle>) {
-    # For each pattern module, check and apply redaction if needed
+    # The original line for redaction
+    my $original_line = $line;
+    
+    # Find all matches for each pattern
+    my %matches;    # pattern_name => [ [start_pos, end_pos], ... ]
+    
+    # Track which patterns have matched which segments
     foreach my $pattern_name (keys %pattern_modules) {
         # Skip processing this pattern if:
         # - In normal mode: pattern is whitelisted (exempt from redaction)
@@ -751,26 +760,108 @@ while (my $line = <$input_handle>) {
         # Get the regex pattern for this module
         my $pattern = $pattern_modules{$pattern_name}{'pattern'};
         
-        # Apply the pattern and count replacements
-        my $count = 0;
+        # Collect all matches without modifying the original line
+        my @pattern_matches = ();
         
-        # POTENTIAL PITFALL: Particularly complex regex patterns might cause
-        # catastrophic backtracking on certain inputs. Consider setting a
-        # timeout for pattern matching or simplifying overly complex patterns.
+        # Find all matches and record their positions
+        while ($original_line =~ /($pattern)/g) {
+            my $match_text = $1;
+            # Calculate start and end positions
+            my $start_pos = $-[0];  # Start position of the match
+            my $end_pos = $+[0];    # End position of the match
+            
+            push @pattern_matches, [$start_pos, $end_pos, $match_text];
+        }
         
-        # Replace matching text with redaction string and count replacements
-        $count += () = $line =~ s/($pattern)/$redaction_text/g;
-        $redaction_count += $count;
+        # Store matches for this pattern
+        if (@pattern_matches) {
+            $matches{$pattern_name} = \@pattern_matches;
+        }
+    }
+    
+    # Now build a new sanitized line by replacing matches with redaction text
+    # First, create a sorted list of match positions
+    my @all_positions = ();
+    foreach my $pattern_name (keys %matches) {
+        foreach my $match (@{$matches{$pattern_name}}) {
+            push @all_positions, [$match->[0], $match->[1], $pattern_name, $match->[2]];
+        }
+    }
+    
+    # Sort by start position (and then by end position for nested matches)
+    @all_positions = sort { $a->[0] <=> $b->[0] || $b->[1] <=> $a->[1] } @all_positions;
+    
+    # Now build the sanitized line by marking non-overlapping segments for redaction
+    my @segments = ();  # [start, end, redacted]
+    
+    # First segment
+    if (@all_positions) {
+        # Add segment from start to first match
+        if ($all_positions[0]->[0] > 0) {
+            push @segments, [0, $all_positions[0]->[0], 0, ''];
+        }
         
-        # Debug output for redacted content
-        if ($debug_mode && $count > 0) {
-            print STDERR "Redacted $count instance(s) of $pattern_name (", 
-                $pattern_modules{$pattern_name}{'description'}, ")\n";
+        my $last_end = 0;
+        
+        # Process each match in order
+        foreach my $i (0 .. $#all_positions) {
+            my ($start, $end, $pattern_name, $match_text) = @{$all_positions[$i]};
+            
+            # Skip this match if it starts before the last match end
+            # (meaning it's completely nested within a previous match)
+            if ($start < $last_end) {
+                next;
+            }
+            
+            # Determine redaction text
+            my $redacted_text = $redact_with_rule ?
+                $redaction_text . '[' . $pattern_name . ']' :
+                $redaction_text;
+            
+            # Add the redaction segment
+            push @segments, [$start, $end, 1, $redacted_text];
+            $redaction_count++;
+            
+            # Debug output for redacted content
+            if ($debug_mode) {
+                print STDERR "Redacted 1 instance(s) of $pattern_name (", 
+                    $pattern_modules{$pattern_name}{'description'}, ")\n";
+            }
+            
+            # Add a segment for any text between this match and the next match
+            if ($i < $#all_positions && $end < $all_positions[$i+1]->[0]) {
+                push @segments, [$end, $all_positions[$i+1]->[0], 0, ''];
+            }
+            
+            # Update last_end
+            $last_end = $end;
+        }
+        
+        # Add segment from last match to end of line
+        if ($last_end < length($original_line)) {
+            push @segments, [$last_end, length($original_line), 0, ''];
+        }
+    } else {
+        # No matches, just add the whole line as a non-redacted segment
+        push @segments, [0, length($original_line), 0, ''];
+    }
+    
+    # Now build the sanitized line
+    my $sanitized_line = '';
+    foreach my $segment (@segments) {
+        my ($start, $end, $is_redacted, $redacted_text) = @$segment;
+        
+        if ($is_redacted) {
+            # For redacted segments, add the redaction text
+            $sanitized_line .= $redacted_text;
+        } else {
+            # For non-redacted segments, add the original text
+            $sanitized_line .= substr($original_line, $start, $end - $start);
         }
     }
     
     # Output the sanitized line
-    print $output_handle $line;
+    print $output_handle $sanitized_line;
     
     # POTENTIAL IMPROVEMENT: Add option to show redacted positions/context
     # POTENTIAL IMPROVEMENT: Add option to write summary report of redactions
@@ -861,6 +952,7 @@ Options:
   -r, --redaction TEXT  Text to use for redacted content (default: <redacted>)
   -w, --whitelist LIST  Comma-separated list of pattern types to exempt from redaction
   -b, --blacklist LIST  Comma-separated list of pattern types to ONLY redact (excludes all others)
+  --redact-with-rule    Include pattern module name in redaction text (e.g., <redacted>[ipv4])
   -l, --list            List all available pattern modules
   -d, --debug           Show debugging information
   -h, --help            Display this help message and exit
@@ -876,6 +968,7 @@ Examples:
   sanitize_data -r '[HIDDEN]' < data.txt > sanitized.txt
   sanitize_data --whitelist ssn,ipv4 < data.txt > partially_sanitized.txt
   sanitize_data --blacklist ipv4,ipv6 < data.txt > ip_addresses_redacted.txt
+  sanitize_data --redact-with-rule < data.txt > labeled_redactions.txt
   sanitize_data --list
 
 Description:
