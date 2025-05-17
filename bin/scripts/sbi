@@ -3006,6 +3006,28 @@ is_office_file() {
     esac
 }
 
+is_generic_text_format() {
+    # Function: is_generic_text_format
+    # Purpose: Detect if a file is a generic text format (CSV, JSON, XML)
+    # Arguments:
+    #   $1 - File path to check
+    # Returns: 0 if file is a recognized generic text format, 1 otherwise
+    
+    local file="$1"
+    local file_ext="${file##*.}"  # Extract extension
+    local file_ext_lower=$(echo "$file_ext" | tr '[:upper:]' '[:lower:]')  # Case-insensitive matching
+    
+    # Generic text format extensions
+    case "$file_ext_lower" in
+        csv|json|xml)
+            return 0  # File is a recognized generic text format
+            ;;
+        *)
+            return 1  # Not a recognized generic text format
+            ;;
+    esac
+}
+
 # Function to detect if a string is a URL
 is_url() {
     # Function: is_url
@@ -3356,10 +3378,15 @@ convert_document_to_markdown() {
             pandoc_input_format="epub"
             ;;
         pdf)
-            # Don't use pandoc for PDF files - will use pdftotext instead
+            # Don't use pandoc for PDF files - will use markitdown or pdftotext instead
             pandoc_input_format="pdf"
-            # Set a flag to indicate we should use pdftotext
-            use_pdftotext=true
+            # First check if markitdown is available
+            if command -v markitdown &> /dev/null; then
+                use_markitdown=true
+            else
+                # Otherwise use pdftotext
+                use_pdftotext=true
+            fi
             ;;
         mobi|azw|azw3)
             # Pandoc doesn't directly support these formats
@@ -3371,7 +3398,12 @@ convert_document_to_markdown() {
             pandoc_input_format="docx"
             ;;
         pptx)
-            pandoc_input_format="pptx"
+            # Check if markitdown is available for PowerPoint files
+            if command -v markitdown &> /dev/null; then
+                use_markitdown=true
+            else
+                pandoc_input_format="pptx"
+            fi
             ;;
         *)
             # For other formats, try to use the extension as the format
@@ -3380,7 +3412,30 @@ convert_document_to_markdown() {
             ;;
     esac
     
-    # First try pdftotext for PDF files
+    # First try markitdown for PDF or PowerPoint files
+    if [[ "$use_markitdown" == true ]]; then
+        local file_type="file"
+        if [[ "$file_ext_lower" == "pdf" ]]; then
+            file_type="PDF"
+        elif [[ "$file_ext_lower" == "pptx" ]]; then
+            file_type="PowerPoint"
+        fi
+        
+        echo "Using markitdown for $file_type conversion..."
+        if ! markitdown "$input_file" -o "$output_file"; then
+            handle_error "$ERROR_TYPE_CONVERSION" "markitdown conversion failed for file: $input_file" "" "WARNING"
+            # Continue to try other methods as a fallback
+            if [[ "$file_ext_lower" == "pdf" ]]; then
+                use_pdftotext=true
+            fi
+        else
+            # Skip other processing
+            echo "$file_type processing complete with markitdown."
+            return 0
+        fi
+    fi
+    
+    # If markitdown not available or failed, try pdftotext
     if [[ "$use_pdftotext" == true ]] && command -v pdftotext &> /dev/null; then
         echo "Using pdftotext for PDF conversion..."
         if ! pdftotext -layout "$input_file" "$temp_dir/temp.txt"; then
@@ -3399,7 +3454,8 @@ convert_document_to_markdown() {
                 cat "$temp_dir/temp.txt"
             } > "$output_file"
             # Skip pandoc processing
-            echo "PDF processing complete."
+            echo "PDF processing complete with pdftotext."
+            return 0
         fi
     # If pdftotext failed or for non-PDF files, check if pandoc is installed
     elif command -v pandoc &> /dev/null; then
@@ -3486,8 +3542,37 @@ convert_document_to_markdown() {
         if ! distrobox enter dev -- pandoc -f "$pandoc_input_format" -t markdown_strict --extract-media="${temp_dir}/media" "$input_file" -o "$output_file"; then
             echo "Error: Distrobox pandoc conversion failed."
             
-            # For PDFs, try pdftotext as a fallback if we haven't tried it already
-            if [[ "$file_ext_lower" == "pdf" ]] && command -v pdftotext &> /dev/null && [[ "$use_pdftotext" != true ]]; then
+            # For PDFs, try markitdown first if available
+            if [[ "$file_ext_lower" == "pdf" ]] && command -v markitdown &> /dev/null; then
+                echo "Falling back to markitdown for PDF conversion..."
+                if ! markitdown "$input_file" -o "$output_file"; then
+                    echo "Warning: markitdown conversion failed, trying pdftotext..."
+                    # If markitdown fails, try pdftotext
+                    if command -v pdftotext &> /dev/null && [[ "$use_pdftotext" != true ]]; then
+                        if ! pdftotext -layout "$input_file" "$temp_dir/temp.txt"; then
+                            echo "Error: pdftotext conversion failed."
+                            rm -rf "$temp_dir"
+                            return 1
+                        fi
+                        # Convert plain text to simple markdown
+                        {
+                            # Add title from filename
+                            echo "# $(basename "${input_file%.*}")"
+                            echo
+                            # Add file info
+                            echo "*Converted from PDF file: $(basename "$input_file")*"
+                            echo
+                            # Add content with paragraph breaks
+                            cat "$temp_dir/temp.txt"
+                        } > "$output_file"
+                    else
+                        echo "Error: PDF conversion failed."
+                        rm -rf "$temp_dir"
+                        return 1
+                    fi
+                fi
+            # If markitdown not available, try pdftotext
+            elif [[ "$file_ext_lower" == "pdf" ]] && command -v pdftotext &> /dev/null && [[ "$use_pdftotext" != true ]]; then
                 echo "Falling back to pdftotext for PDF conversion..."
                 if ! pdftotext -layout "$input_file" "$temp_dir/temp.txt"; then
                     echo "Error: pdftotext conversion failed."
@@ -3510,7 +3595,25 @@ convert_document_to_markdown() {
                 return 1
             fi
         fi
-    # For PDFs, try pdftotext as a fallback if not already tried
+    # For PDFs, try markitdown first if available
+    elif [[ "$file_ext_lower" == "pdf" ]] && command -v markitdown &> /dev/null && [[ "$use_markitdown" != true ]]; then
+        echo "Using markitdown for PDF conversion..."
+        if ! markitdown "$input_file" -o "$output_file"; then
+            echo "Warning: markitdown conversion failed, trying pdftotext..."
+            # Try pdftotext as fallback
+            if command -v pdftotext &> /dev/null; then
+                use_pdftotext=true
+                # Continue to the next section that will handle pdftotext
+            else
+                echo "Error: No PDF conversion tools available."
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        else
+            echo "PDF processing complete with markitdown."
+            return 0
+        fi
+    # For PDFs, try pdftotext if markitdown is not available or failed
     elif [[ "$file_ext_lower" == "pdf" ]] && command -v pdftotext &> /dev/null && [[ "$use_pdftotext" != true ]]; then
         echo "Using pdftotext for PDF conversion..."
         if ! pdftotext -layout "$input_file" "$temp_dir/temp.txt"; then
@@ -3688,6 +3791,171 @@ convert_document_to_markdown() {
 }
 
 # Function to process document content (ebook/PDF/office)
+# Process generic text format (CSV, JSON, XML)
+process_generic_text_format() {
+    local input_file="$1"
+    local output_file="$2"
+    local filename_base="$3"
+    
+    show_progress "Processing generic text format: $input_file"
+    
+    # Create a temporary directory
+    local temp_dir=$(mktemp -d ~/.tmp/generic-text-processing-XXXXX)
+    local temp_md="$temp_dir/temp.md"
+    
+    # Extract file extension for reference
+    local file_ext="${input_file##*.}"
+    local file_ext_lower=$(echo "$file_ext" | tr '[:upper:]' '[:lower:]')
+    
+    # Determine file type name for messages
+    local file_type="file"
+    case "$file_ext_lower" in
+        csv) file_type="CSV" ;;
+        json) file_type="JSON" ;;
+        xml) file_type="XML" ;;
+    esac
+    
+    # Set title from filename base or directly from input file
+    local title
+    if [[ -n "$filename_base" ]]; then
+        title="$filename_base"
+    else
+        title="$(basename "${input_file%.*}")"
+    fi
+    
+    # Check if markitdown is available
+    if command -v markitdown &> /dev/null; then
+        show_progress "Using markitdown for $file_type conversion..."
+        
+        # Convert to markdown using markitdown
+        if ! markitdown "$input_file" -o "$temp_md"; then
+            handle_error "$ERROR_TYPE_CONVERSION" "markitdown conversion failed for file: $input_file" "" "WARNING"
+            # Create basic markdown representation
+            {
+                echo "# $title"
+                echo
+                echo "*Converted from $file_type file: $(basename "$input_file")*"
+                echo
+                echo '```'${file_ext_lower}
+                cat "$input_file"
+                echo '```'
+            } > "$temp_md"
+        fi
+    else
+        # If markitdown not available, create basic markdown representation
+        show_progress "markitdown not available. Creating basic $file_type representation..."
+        {
+            echo "# $title"
+            echo
+            echo "*Converted from $file_type file: $(basename "$input_file")*"
+            echo
+            echo '```'${file_ext_lower}
+            cat "$input_file"
+            echo '```'
+        } > "$temp_md"
+    fi
+    
+    # Handle different output formats based on flags
+    if [[ "$NO_SUMMARY_MODE" == true ]]; then
+        if [[ "$MARKDOWN_MODE" == true ]]; then
+            # --no-summary --markdown: Just use the markdown as is
+            show_progress "Saving direct markdown conversion (no summary)..."
+            cp "$temp_md" "$output_file"
+        else
+            # --no-summary: Convert markdown to neorg
+            show_progress "Converting to Neorg format (no summary)..."
+            if command -v mton &> /dev/null; then
+                cat "$temp_md" | mton > "$output_file"
+            else
+                handle_error "$ERROR_TYPE_CONVERSION" "mton tool not available for markdown to neorg conversion" "" "WARNING"
+                # Basic fallback - create a code block
+                {
+                    echo "@document.meta"
+                    echo "title: $title"
+                    echo "description: Converted $file_type file"
+                    echo "created: $(date +"%Y-%m-%d")"
+                    echo "@end"
+                    echo ""
+                    echo "* $title"
+                    echo ""
+                    echo "Source: $file_type file"
+                    echo "Filename: $(basename "$input_file")"
+                    echo "Processed on: $(date +'%Y-%m-%d %H:%M:%S')"
+                    echo ""
+                    echo "@code $file_ext_lower"
+                    cat "$input_file"
+                    echo "@end"
+                } > "$output_file"
+            fi
+        fi
+    else
+        # Generate summary
+        if [[ "$MARKDOWN_MODE" == true ]]; then
+            # --markdown: Use ai_summary_as_markdown
+            show_progress "Generating markdown summary with AI..."
+            
+            # Pass all relevant options to summarization script
+            local summary_options=""
+            [[ -n "$SUMMARY_TYPE" ]] && summary_options+=" --type $SUMMARY_TYPE"
+            [[ -n "$CUSTOM_PROMPT" ]] && summary_options+=" --prompt \"$CUSTOM_PROMPT\""
+            [[ "$PRINCIPLE_MODE" == true ]] && summary_options+=" --principle"
+            [[ -n "$MODEL" ]] && summary_options+=" --model $MODEL"
+            [[ -n "$PROVIDER" ]] && summary_options+=" --provider $PROVIDER"
+            
+            # Run the summarization script
+            if ! ai_summary_as_markdown "$temp_md" $summary_options > "$output_file"; then
+                handle_error "$ERROR_TYPE_PROCESSING" "Failed to generate markdown summary" "" "WARNING"
+                # Fallback to just the converted markdown
+                cp "$temp_md" "$output_file"
+            fi
+        else
+            # Default: Use ai_summary_as_neorg
+            show_progress "Generating Neorg summary with AI..."
+            
+            # Pass all relevant options to summarization script
+            local summary_options=""
+            [[ -n "$SUMMARY_TYPE" ]] && summary_options+=" --type $SUMMARY_TYPE"
+            [[ -n "$CUSTOM_PROMPT" ]] && summary_options+=" --prompt \"$CUSTOM_PROMPT\""
+            [[ "$PRINCIPLE_MODE" == true ]] && summary_options+=" --principle"
+            [[ -n "$MODEL" ]] && summary_options+=" --model $MODEL" 
+            [[ -n "$PROVIDER" ]] && summary_options+=" --provider $PROVIDER"
+            
+            # Run the summarization script
+            if ! ai_summary_as_neorg "$temp_md" $summary_options > "$output_file"; then
+                handle_error "$ERROR_TYPE_PROCESSING" "Failed to generate neorg summary" "" "WARNING"
+                # Fallback - convert markdown to neorg
+                if command -v mton &> /dev/null; then
+                    cat "$temp_md" | mton > "$output_file"
+                else
+                    # Last resort fallback
+                    {
+                        echo "@document.meta"
+                        echo "title: $title"
+                        echo "description: Converted $file_type file"
+                        echo "created: $(date +"%Y-%m-%d")"
+                        echo "@end"
+                        echo ""
+                        echo "* $title"
+                        echo ""
+                        echo "Source: $file_type file"
+                        echo "Filename: $(basename "$input_file")"
+                        echo "Processed on: $(date +'%Y-%m-%d %H:%M:%S')"
+                        echo ""
+                        echo "@code $file_ext_lower"
+                        cat "$input_file"
+                        echo "@end"
+                    } > "$output_file"
+                fi
+            fi
+        fi
+    fi
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    return 0
+}
+
 process_document_content() {
     local input_file="$1"
     local output_file="$2"
@@ -5642,6 +5910,25 @@ for file in "${FILES[@]}"; do
             # Clean up
             rm -f "$TEMP_NEORG"
             
+        elif is_generic_text_format "$file"; then
+            # Process generic text format (CSV, JSON, XML)
+            show_progress "Detected generic text format ($(basename "$file")). Processing..."
+            TEMP_NEORG=$(mktemp $HOME/.tmp/sbi-text-format-XXXXXX)
+            
+            if process_generic_text_format "$file" "$TEMP_NEORG" "$filename_no_ext"; then
+                # If processing succeeded, copy to target
+                cp "$TEMP_NEORG" "$TARGET_FILE"
+                show_progress "Generic text format processed and ingested to: $TARGET_FILE"
+                
+                # Edit if requested
+                if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
+                    ${EDITOR:-vi} "$TARGET_FILE"
+                    show_progress "Edited document summary in: $TARGET_FILE"
+                fi
+            fi
+            
+            # Clean up
+            rm -f "$TEMP_NEORG"
         elif is_ebook_file "$file" || is_pdf_file "$file" || is_office_file "$file" || [[ "${file##*.}" == "md" || "${file##*.}" == "markdown" || "${file##*.}" == "MD" ]]; then
             # Process ebook, PDF, office document, or markdown file
             show_progress "Detected document file ($(basename "$file")). Processing..."
