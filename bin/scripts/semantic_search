@@ -13,8 +13,10 @@ import argparse
 import json
 import tempfile
 import time
+import multiprocessing
 from subprocess import run, PIPE
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ----- Distrobox Container Check -----
 # Check if we're running inside the dev container by examining the CONTAINER_ID env var
@@ -147,6 +149,11 @@ def parse_args():
         help="Include 00_index.norg files when indexing (skipped by default)"
     )
     parser.add_argument(
+        "--parallel",
+        type=int,
+        help="Number of parallel processes to use for indexing (default: single-process)"
+    )
+    parser.add_argument(
         "--threshold", 
         type=float, 
         default=0.75,
@@ -244,6 +251,86 @@ def ensure_extension_and_table(conn, table_name, provider):
         conn.commit()
 
 # ----- Embedding Functions -----
+def process_file(file_data):
+    """Process a single file to generate an embedding and prepare it for the database.
+    
+    This function is designed to be called either directly or by a parallel process pool.
+    
+    Args:
+        file_data (dict): A dictionary containing all necessary data to process a file:
+            - file_path: Path object of the file
+            - base_path: Base path of the second brain
+            - provider: AI provider to use
+            - model: Embedding model to use
+            - use_fallback_prompt: Whether to use prompt-based approach
+            - index: File index in the total list (for display)
+            - total_files: Total number of files (for display)
+            
+    Returns:
+        dict: Result data with embedding and metadata, or None if skipped or failed
+    """
+    file_path = file_data["file_path"]
+    base_path = file_data["base_path"]
+    provider = file_data["provider"]
+    model = file_data["model"]
+    use_fallback_prompt = file_data["use_fallback_prompt"]
+    i = file_data["index"]
+    total_files = file_data["total_files"]
+    
+    try:
+        rel_path = file_path.relative_to(base_path)
+        file_id = str(rel_path).replace("/", "_").replace(".", "_")
+        
+        # Check if this file should be skipped because it's an index file
+        if file_data.get("skip_index_files", True) and file_path.name == "00_index.norg":
+            print(f"[{i+1}/{total_files}] Skipping index file: {rel_path}")
+            return None
+            
+        # Read the file content
+        content = get_file_content(file_path)
+        if not content:
+            print(f"[{i+1}/{total_files}] Skipping (empty or unreadable): {rel_path}")
+            return None
+            
+        # Generate a snippet for preview
+        snippet = create_content_snippet(content)
+        
+        # Generate embedding
+        embedding = generate_embedding(content, provider, model, use_fallback_prompt)
+        if not embedding:
+            print(f"[{i+1}/{total_files}] Failed to generate embedding: {rel_path}")
+            return None
+        
+        # Create metadata
+        try:
+            last_modified = os.path.getmtime(file_path)
+        except (FileNotFoundError, OSError):
+            # Handle files with spaces or special characters in the path
+            print(f"Warning: Could not get modification time for {file_path}, using current time")
+            last_modified = time.time()
+            
+        metadata = {
+            "filename": file_path.name,
+            "file_type": file_path.suffix,
+            "size": len(content),
+            "last_modified": last_modified
+        }
+        
+        result = {
+            "file_id": file_id,
+            "rel_path": str(rel_path),
+            "embedding": embedding,
+            "snippet": snippet,
+            "metadata": metadata,
+            "index": i,
+            "total_files": total_files
+        }
+        
+        return result
+    except Exception as e:
+        print(f"Error processing file {file_path}: {e}")
+        return None
+
 def generate_embedding(text, provider=DEFAULT_PROVIDER, model=None, use_fallback_prompt=False):
     """Generate an embedding vector for the given text using the specified AI provider.
     
@@ -592,6 +679,68 @@ def create_content_snippet(content, max_length=300):
     
     return snippet
 
+def check_file_exists(conn, table_name, file_id, provider, model):
+    """Check if a file is already indexed in the database."""
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                f"SELECT id FROM {table_name} WHERE id = %s AND provider = %s AND model = %s",
+                (file_id, provider, model)
+            )
+            exists = cur.fetchone() is not None
+        except Exception:
+            # Table might not have provider/model columns yet
+            try:
+                cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
+                exists = cur.fetchone() is not None
+            except Exception:
+                exists = False
+    return exists
+
+def save_to_database(conn, table_name, result, provider, model):
+    """Save processed embedding result to the database."""
+    file_id = result["file_id"]
+    rel_path = result["rel_path"]
+    embedding = result["embedding"]
+    snippet = result["snippet"]
+    metadata = result["metadata"]
+    i = result["index"]
+    total_files = result["total_files"]
+    
+    try:
+        # Insert or update in database
+        with conn.cursor() as cur:
+            # Check if we have this file with a different provider/model
+            try:
+                cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
+                exists_with_diff_provider = cur.fetchone() is not None
+            except Exception:
+                exists_with_diff_provider = False
+                
+            if exists_with_diff_provider:
+                # Update existing record
+                cur.execute(
+                    f"UPDATE {table_name} SET embedding = %s, content_snippet = %s, "
+                    f"provider = %s, model = %s, metadata = %s WHERE id = %s",
+                    (embedding, snippet, provider, model, json.dumps(metadata), file_id)
+                )
+                print(f"[{i+1}/{total_files}] Updated: {rel_path}")
+            else:
+                # Insert new record
+                cur.execute(
+                    f"INSERT INTO {table_name} "
+                    f"(id, embedding, path, content_snippet, provider, model, metadata) "
+                    f"VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (file_id, embedding, rel_path, snippet, 
+                     provider, model, json.dumps(metadata))
+                )
+                print(f"[{i+1}/{total_files}] Indexed: {rel_path}")
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error saving to database: {e}")
+        return False
+
 def index_files(args, conn, table_name):
     """Index files from the second brain into the vector database."""
     base_path = Path(args.path)
@@ -644,7 +793,8 @@ def index_files(args, conn, table_name):
     total_files = len(files_to_index)
     print(f"Found {total_files} files to index")
     
-    # Process each file
+    # Filter out already indexed files before processing
+    files_to_process = []
     for i, file_path in enumerate(files_to_index):
         rel_path = file_path.relative_to(base_path)
         file_id = str(rel_path).replace("/", "_").replace(".", "_")
@@ -653,87 +803,80 @@ def index_files(args, conn, table_name):
         if not args.embed_index_files and file_path.name == "00_index.norg":
             print(f"[{i+1}/{total_files}] Skipping index file: {rel_path}")
             continue
-            
-        # Check if this file is already indexed with current provider/model
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    f"SELECT id FROM {table_name} WHERE id = %s AND provider = %s AND model = %s",
-                    (file_id, provider, model)
-                )
-                exists = cur.fetchone() is not None
-            except Exception:
-                # Table might not have provider/model columns yet
-                try:
-                    cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
-                    exists = cur.fetchone() is not None
-                except Exception:
-                    exists = False
-            
-            if exists:
-                print(f"[{i+1}/{total_files}] Already indexed: {rel_path}")
-                continue
         
-        # Read the file content
-        content = get_file_content(file_path)
-        if not content:
-            print(f"[{i+1}/{total_files}] Skipping (empty or unreadable): {rel_path}")
+        # Check if already indexed
+        if check_file_exists(conn, table_name, file_id, provider, model):
+            print(f"[{i+1}/{total_files}] Already indexed: {rel_path}")
             continue
             
-        # Generate a snippet for preview
-        snippet = create_content_snippet(content)
+        # Add to processing list
+        files_to_process.append((i, file_path))
+    
+    # Process files - either in parallel or serially
+    if args.parallel and args.parallel > 1:
+        # Use parallel processing
+        num_workers = min(args.parallel, len(files_to_process))
+        print(f"Processing {len(files_to_process)} files using {num_workers} parallel workers...")
         
-        # Generate embedding (using fallback prompt mode if requested)
-        embedding = generate_embedding(content, provider, model, args.fallback_prompt)
-        if not embedding:
-            print(f"[{i+1}/{total_files}] Failed to generate embedding: {rel_path}")
-            continue
+        # Prepare file data for processing
+        file_data_list = []
+        for i, file_path in files_to_process:
+            file_data = {
+                "file_path": file_path,
+                "base_path": base_path,
+                "provider": provider,
+                "model": model,
+                "use_fallback_prompt": args.fallback_prompt,
+                "index": i,
+                "total_files": total_files,
+                "skip_index_files": not args.embed_index_files
+            }
+            file_data_list.append(file_data)
         
-        # Create metadata
-        try:
-            last_modified = os.path.getmtime(file_path)
-        except (FileNotFoundError, OSError):
-            # Handle files with spaces or special characters in the path
-            print(f"Warning: Could not get modification time for {file_path}, using current time")
-            last_modified = time.time()
+        # Process files in parallel
+        processed_count = 0
+        completed_count = 0
+        total_count = len(file_data_list)
+        print(f"Starting parallel processing of {total_count} files...")
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Start the tasks
+            future_to_file = {executor.submit(process_file, file_data): file_data for file_data in file_data_list}
             
-        metadata = {
-            "filename": file_path.name,
-            "file_type": file_path.suffix,
-            "size": len(content),
-            "last_modified": last_modified
-        }
-        
-        # Insert or update in database
-        with conn.cursor() as cur:
-            # Check if we have this file with a different provider/model
-            try:
-                cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
-                exists_with_diff_provider = cur.fetchone() is not None
-            except Exception:
-                exists_with_diff_provider = False
+            # Simple progress tracking
+            for future in as_completed(future_to_file):
+                completed_count += 1
                 
-            if exists_with_diff_provider:
-                # Update existing record
-                # Use embedding directly without converting to numpy array
-                cur.execute(
-                    f"UPDATE {table_name} SET embedding = %s, content_snippet = %s, "
-                    f"provider = %s, model = %s, metadata = %s WHERE id = %s",
-                    (embedding, snippet, provider, model, json.dumps(metadata), file_id)
-                )
-                print(f"[{i+1}/{total_files}] Updated: {rel_path}")
-            else:
-                # Insert new record
-                # Convert embedding to a list to avoid numpy array serialization issues
-                cur.execute(
-                    f"INSERT INTO {table_name} "
-                    f"(id, embedding, path, content_snippet, provider, model, metadata) "
-                    f"VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (file_id, embedding, str(rel_path), snippet, 
-                     provider, model, json.dumps(metadata))
-                )
-                print(f"[{i+1}/{total_files}] Indexed: {rel_path}")
-            conn.commit()
+                # Print progress every 10% or for every file if less than 10 files
+                if total_count <= 10 or completed_count % max(1, total_count // 10) == 0:
+                    progress_percent = (completed_count / total_count) * 100
+                    print(f"Progress: {completed_count}/{total_count} files ({progress_percent:.1f}%)")
+                
+                # Process result
+                result = future.result()
+                if result:
+                    # Save to database
+                    save_to_database(conn, table_name, result, provider, model)
+                    processed_count += 1
+        
+        print(f"Parallel indexing complete. {processed_count} files successfully processed out of {len(files_to_process)} attempted.")
+    else:
+        # Process serially (original method)
+        for i, file_path in files_to_process:
+            file_data = {
+                "file_path": file_path,
+                "base_path": base_path,
+                "provider": provider,
+                "model": model,
+                "use_fallback_prompt": args.fallback_prompt,
+                "index": i,
+                "total_files": total_files,
+                "skip_index_files": not args.embed_index_files
+            }
+            
+            result = process_file(file_data)
+            if result:
+                save_to_database(conn, table_name, result, provider, model)
     
     print(f"Indexing complete. {total_files} files processed.")
 
