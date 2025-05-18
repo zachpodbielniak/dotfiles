@@ -558,6 +558,178 @@ class OllamaProvider(AIProvider):
             response_queue.put(("ERROR", f"Error: {str(e)}"))
 
 
+class GeminiProvider(AIProvider):
+    """Provider implementation for Google's Gemini"""
+    
+    def get_name(self) -> str:
+        return "gemini"
+    
+    def get_available_models(self) -> List[str]:
+        return [
+            "gemini-2.5-pro-preview-05-06", 
+            "gemini-2.5-flash-preview-04-17", 
+            "gemini-2.0-flash", 
+            "gemini-2.0-flash-preview-image-generation", 
+            "gemini-2.0-flash-lite", 
+            "gemini-1.5-flash", 
+            "gemini-1.5-flash-8b", 
+            "gemini-1.5-pro", 
+            "gemini-embedding-exp", 
+            "imagen-3.0-generate-002", 
+            "veo-2.0-generate-001", 
+            "gemini-2.0-flash-live-001", 
+            "text-embedding-004", 
+            "embedding-001", 
+            "models/aqa"
+        ]
+    
+    def check_environment(self) -> bool:
+        return "GEMINI_API_KEY" in os.environ and os.environ["GEMINI_API_KEY"] != ""
+    
+    def send_message(self, conversation: Conversation, model: str, 
+                    response_queue: queue.Queue) -> None:
+        try:
+            import requests
+            
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent"
+            
+            # Format messages for Gemini API
+            messages = []
+            for msg in conversation.messages:
+                role = "user" if msg.role == MessageRole.USER else "model"
+                messages.append({
+                    "role": role,
+                    "parts": [{"text": msg.content}]
+                })
+            
+            headers = {
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "contents": messages,
+                "generation_config": {
+                    "max_output_tokens": 4096
+                }
+            }
+            
+            logging.debug(f"Gemini API request: {url}")
+            logging.debug(f"Gemini API data: {json.dumps(data)}")
+            
+            # Send request to Gemini API with streaming
+            response = requests.post(url, headers=headers, json=data, stream=True)
+            
+            if response.status_code != 200:
+                error_msg = f"Error: {response.status_code}\n{response.text}"
+                response_queue.put(("ERROR", error_msg))
+                return
+            
+            # Process the streaming response
+            full_response = ""
+            
+            # Initialize a buffer to handle potential partial JSON in the stream
+            buffer = ""
+            
+            # Keep track of the last text we sent to avoid duplicates
+            last_sent_text = ""
+            processed_text_segments = set()
+            
+            # Compile regex pattern for extracting text fields
+            import re
+            text_pattern = re.compile(r'"text":\s*"((?:\\.|[^"\\])*)"')
+            
+            # Debug support
+            logging.debug(f"Starting to process Gemini streaming response")
+            
+            # Use iter_content for more reliable streaming behavior
+            for chunk in response.iter_content(chunk_size=1024):
+                if not chunk:
+                    continue
+                    
+                # Decode chunk and add to buffer    
+                chunk_text = chunk.decode('utf-8')
+                buffer += chunk_text
+                
+                logging.debug(f"Received chunk of size {len(chunk_text)}")
+                
+                # Try the regex approach first - extract any text fields
+                matches = text_pattern.findall(buffer)
+                if matches:
+                    for match in matches:
+                        # Unescape the JSON string and normalize spaces
+                        text = match.encode('utf-8').decode('unicode_escape').replace('\u00a0', ' ')
+                        
+                        # Only send text we haven't seen before
+                        if text != last_sent_text and text not in processed_text_segments:
+                            full_response += text
+                            response_queue.put(("CHUNK", text))
+                            processed_text_segments.add(text)
+                            last_sent_text = text
+                
+                # Also try to parse complete JSON objects
+                try:
+                    # Look for complete JSON objects (starts with { and ends with })
+                    while buffer:
+                        json_start = buffer.find('{')
+                        if json_start == -1:
+                            break
+                            
+                        # Find matching closing brace by tracking depth
+                        json_depth = 0
+                        json_end = -1
+                        
+                        for i, char in enumerate(buffer[json_start:]):
+                            if char == '{':
+                                json_depth += 1
+                            elif char == '}':
+                                json_depth -= 1
+                                if json_depth == 0:
+                                    json_end = json_start + i + 1
+                                    break
+                        
+                        if json_end != -1:
+                            # Extract complete JSON object
+                            json_obj = buffer[json_start:json_end]
+                            buffer = buffer[json_end:]
+                            
+                            # Try to parse and extract text
+                            try:
+                                data = json.loads(json_obj)
+                                if "candidates" in data and len(data["candidates"]) > 0:
+                                    for candidate in data["candidates"]:
+                                        if "content" in candidate and "parts" in candidate["content"]:
+                                            for part in candidate["content"]["parts"]:
+                                                if "text" in part:
+                                                    text = part["text"].replace('\u00a0', ' ')
+                                                    if text != last_sent_text and text not in processed_text_segments:
+                                                        full_response += text
+                                                        response_queue.put(("CHUNK", text))
+                                                        processed_text_segments.add(text)
+                                                        last_sent_text = text
+                            except json.JSONDecodeError:
+                                pass  # Incomplete JSON, continue
+                        else:
+                            # No complete JSON found, keep buffer for next chunk
+                            break
+                except Exception as e:
+                    logging.error(f"Error parsing JSON in Gemini stream: {str(e)}")
+                    # Continue processing despite errors
+            
+            # Add the assistant's response to the conversation
+            response_queue.put(("COMPLETE", {
+                "role": MessageRole.ASSISTANT,
+                "content": full_response,
+                "provider": self.get_name(),
+                "model": model
+            }))
+            
+        except Exception as e:
+            logging.error(f"Error in Gemini provider: {str(e)}")
+            response_queue.put(("ERROR", f"Error: {str(e)}"))
+
+
 class ProviderManager:
     """Manages all available AI providers"""
     
@@ -569,6 +741,7 @@ class ProviderManager:
         self._register_provider(PerplexityProvider())
         self._register_provider(GrokProvider())
         self._register_provider(OllamaProvider())
+        self._register_provider(GeminiProvider())
     
     def _register_provider(self, provider: AIProvider) -> None:
         """Register a new provider"""
