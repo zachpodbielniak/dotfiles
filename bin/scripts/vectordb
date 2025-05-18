@@ -1,0 +1,425 @@
+#!/usr/bin/python3
+
+# vectordb - A command-line tool for interacting with a PostgreSQL pgvector database
+# This script provides a convenient interface for vector database operations, including:
+# - Creating tables with vector columns
+# - Inserting vectors with associated metadata
+# - Querying vectors by similarity
+# - Managing vector database tables
+# The script automatically runs in the 'dev' distrobox container where all dependencies are installed.
+
+import os
+import sys
+import argparse
+from subprocess import run
+
+# ----- Distrobox Container Check -----
+# Check if we're running inside the dev container by examining the CONTAINER_ID env var
+# This is necessary because the required Python modules are only available inside the container
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# If we're not in the 'dev' distrobox, re-execute this exact script with all arguments
+# inside the dev container using distrobox enter
+if ctr_id != "dev":
+    # Build a command list that will re-execute this script inside the dev container
+    # We use sys.argv to preserve all original command-line arguments exactly as passed
+    cmd = [
+        "distrobox",  # The distrobox command
+        "enter",      # Enter an existing distrobox container
+        "dev",        # The name of our development container
+        "--",         # Separator indicating the command to run inside the container
+        *sys.argv     # All arguments from the original command (includes script name)
+    ]
+    # Execute the command as a subprocess and wait for it to complete
+    run(cmd)
+    # Exit this process since the containerized version will take over
+    sys.exit(0)
+
+# ----- Dependencies -----
+# Import specialized libraries available only in the container
+# These libraries are required for PostgreSQL operations and vector manipulation
+try:
+    # psycopg: PostgreSQL driver for Python
+    # psycopg_binary: Binary protocol support for psycopg
+    # numpy: Required for vector data type handling
+    import psycopg
+    import psycopg_binary
+    import numpy as np
+    from psycopg.rows import dict_row  # For returning results as dictionaries
+except ImportError as e:
+    # Provide a detailed error message explaining what's missing and how to fix it
+    print(f"Error: Required module not found: {e}")
+    print("Please ensure psycopg, psycopg_binary, and numpy are installed in the dev container")
+    sys.exit(1)
+
+# ----- Command-line Argument Parsing -----
+def parse_args():
+    """
+    Parse and validate command-line arguments.
+    
+    This function defines the complete CLI interface with several subcommands:
+    - create: Create new vector tables with configurable dimensions
+    - insert: Add vector data with associated metadata
+    - query: Search for similar vectors using cosine distance
+    - delete: Remove vectors by ID
+    - list: Show all vector tables in the database
+    - drop: Remove entire vector tables
+    
+    Each subcommand has its own set of arguments that control its behavior.
+    
+    Returns:
+        argparse.Namespace: The parsed command-line arguments.
+    """
+    parser = argparse.ArgumentParser(description="Vector database operations using pgvector")
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    
+    # Create table command
+    # This creates a new table with a vector column of specified dimension
+    create_parser = subparsers.add_parser("create", help="Create a new vector table")
+    create_parser.add_argument("table", help="Table name to create")
+    create_parser.add_argument("--dim", type=int, default=1536, 
+                             help="Vector dimension (default: 1536, matches OpenAI embeddings)")
+    
+    # Insert command
+    # This adds a new vector to an existing table with an ID and optional metadata
+    insert_parser = subparsers.add_parser("insert", help="Insert vectors into table")
+    insert_parser.add_argument("table", help="Table name to insert into")
+    insert_parser.add_argument("--id", required=True, help="ID for the vector entry")
+    insert_parser.add_argument("--vector", required=True, 
+                             help="Vector data (comma-separated float values)")
+    insert_parser.add_argument("--metadata", help="Optional JSON metadata")
+    
+    # Query command
+    # This searches for similar vectors using cosine distance
+    query_parser = subparsers.add_parser("query", help="Query vectors by similarity")
+    query_parser.add_argument("table", help="Table name to query")
+    query_parser.add_argument("--vector", required=True, 
+                            help="Query vector (comma-separated float values)")
+    query_parser.add_argument("--limit", type=int, default=5, 
+                            help="Maximum number of results (default: 5)")
+    query_parser.add_argument("--threshold", type=float, 
+                            help="Similarity threshold (0-1)")
+    
+    # Delete command
+    # This removes a vector with the specified ID
+    delete_parser = subparsers.add_parser("delete", help="Delete vectors from table")
+    delete_parser.add_argument("table", help="Table name to delete from")
+    delete_parser.add_argument("--id", required=True, help="ID of the vector to delete")
+    
+    # List tables command
+    # This shows all vector tables in the database
+    list_parser = subparsers.add_parser("list", help="List vector tables")
+    
+    # Drop table command
+    # This removes an entire vector table
+    drop_parser = subparsers.add_parser("drop", help="Drop a vector table")
+    drop_parser.add_argument("table", help="Table name to drop")
+    
+    return parser.parse_args()
+
+# ----- Database Connection -----
+def get_connection():
+    """
+    Connect to the PostgreSQL database with pgvector extension.
+    
+    Establishes a connection to the local PostgreSQL database running in a systemd container.
+    Connection parameters are hardcoded to match the container configuration from postgres.container:
+    - host: 127.0.0.1 (localhost)
+    - port: 5432 (standard PostgreSQL port)
+    - dbname: postgres (default database)
+    - user: postgres (default user)
+    - password: postgres (as specified in container config)
+    
+    Returns:
+        psycopg.Connection: An active database connection configured with dict_row
+                           to return results as dictionaries.
+    
+    Raises:
+        SystemExit: If the connection fails for any reason.
+    """
+    try:
+        # Connect to the PostgreSQL database
+        # The row_factory=dict_row option makes query results return as dictionaries
+        # instead of tuples, which is more convenient for accessing fields by name
+        conn = psycopg.connect(
+            host="127.0.0.1",  # Localhost address for the containerized PostgreSQL
+            port=5432,         # Standard PostgreSQL port
+            dbname="postgres", # Default database name
+            user="postgres",   # Username as defined in container config
+            password="postgres", # Password as defined in container config
+            row_factory=dict_row # Return rows as dictionaries
+        )
+        return conn
+    except Exception as e:
+        # Provide a helpful error message with details
+        print(f"Error connecting to database: {e}")
+        sys.exit(1)
+
+# ----- Extension Management -----
+def ensure_extension(conn):
+    """
+    Ensure the pgvector extension is installed in the database.
+    
+    This function checks if the pgvector extension is installed and activates it if needed.
+    The extension must be available in the PostgreSQL container for this to succeed.
+    This is a prerequisite for any vector operations and is called at the start of the script.
+    
+    Args:
+        conn (psycopg.Connection): An active database connection.
+    """
+    with conn.cursor() as cur:
+        # Create the vector extension if it doesn't exist
+        # This is required for the vector data type and operations
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        conn.commit()
+
+# ----- Table Management -----
+def create_table(conn, table_name, dimension):
+    """
+    Create a new vector table with the specified dimensions.
+    
+    This function creates a table with:
+    - id: Text primary key for identifying vectors
+    - embedding: Vector column with the specified dimension
+    - metadata: JSONB column for storing associated information
+    
+    The table structure is optimized for vector similarity searches.
+    
+    Args:
+        conn (psycopg.Connection): An active database connection.
+        table_name (str): Name of the table to create.
+        dimension (int): Dimension of the vector column (e.g., 1536 for OpenAI embeddings).
+    """
+    with conn.cursor() as cur:
+        # Create the table if it doesn't exist
+        # - id: A unique text identifier for each vector
+        # - embedding: The vector data with specified dimension
+        # - metadata: Optional JSON data associated with each vector
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id TEXT PRIMARY KEY,
+            embedding VECTOR({dimension}),
+            metadata JSONB
+        )
+        """)
+        conn.commit()
+    print(f"Table '{table_name}' created successfully with dimension {dimension}")
+
+# ----- Vector Operations -----
+def insert_vector(conn, table_name, id_value, vector_data, metadata=None):
+    """
+    Insert a vector into the table or update if ID already exists.
+    
+    This function:
+    1. Parses the comma-separated vector string into a numeric array
+    2. Inserts the vector with its ID and optional metadata
+    3. Uses ON CONFLICT to update existing vectors with the same ID
+    
+    Args:
+        conn (psycopg.Connection): An active database connection.
+        table_name (str): Name of the table to insert into.
+        id_value (str): Unique identifier for the vector.
+        vector_data (str): Comma-separated floating-point values.
+        metadata (str, optional): JSON-formatted metadata string.
+    """
+    try:
+        # Convert the comma-separated string to a list of floats
+        # This handles input like "0.1,0.2,0.3,..." and converts it to [0.1, 0.2, 0.3, ...]
+        vector_values = [float(x.strip()) for x in vector_data.split(',')]
+        # Convert the list to a numpy array for pgvector compatibility
+        vector_array = np.array(vector_values)
+
+        with conn.cursor() as cur:
+            if metadata:
+                # If metadata is provided, include it in the INSERT/UPDATE
+                cur.execute(
+                    # Insert with the vector and metadata, or update if the ID already exists
+                    f"INSERT INTO {table_name} (id, embedding, metadata) VALUES (%s, %s, %s) "
+                    f"ON CONFLICT (id) DO UPDATE SET embedding = %s, metadata = %s",
+                    (id_value, vector_array, metadata, vector_array, metadata)
+                )
+            else:
+                # If no metadata is provided, insert with NULL metadata
+                cur.execute(
+                    f"INSERT INTO {table_name} (id, embedding, metadata) VALUES (%s, %s, NULL) "
+                    f"ON CONFLICT (id) DO UPDATE SET embedding = %s, metadata = NULL",
+                    (id_value, vector_array, vector_array)
+                )
+            conn.commit()
+        print(f"Vector inserted successfully with ID: {id_value}")
+    except Exception as e:
+        # Handle errors and roll back the transaction
+        print(f"Error inserting vector: {e}")
+        conn.rollback()
+
+def query_vectors(conn, table_name, query_vector, limit, threshold=None):
+    """
+    Query vectors by similarity using cosine distance.
+    
+    This function:
+    1. Parses the query vector string into a numeric array
+    2. Executes a similarity search using the <=> operator (cosine distance)
+    3. Returns the most similar vectors, optionally filtered by a threshold
+    
+    The <=> operator is provided by pgvector and represents cosine distance
+    (lower values mean more similar vectors).
+    
+    Args:
+        conn (psycopg.Connection): An active database connection.
+        table_name (str): Name of the table to query.
+        query_vector (str): Comma-separated vector to compare against.
+        limit (int): Maximum number of results to return.
+        threshold (float, optional): Maximum distance threshold (0-1).
+    """
+    try:
+        # Parse the query vector string into a numpy array
+        vector_values = [float(x.strip()) for x in query_vector.split(',')]
+        vector_array = np.array(vector_values)
+        
+        with conn.cursor() as cur:
+            # Base query using the <=> operator (cosine distance)
+            # Lower values mean vectors are more similar
+            query = f"""
+            SELECT id, embedding <=> %s AS distance, metadata
+            FROM {table_name}
+            """
+            
+            # If a threshold is provided, add a WHERE clause to filter results
+            if threshold is not None:
+                query += f" WHERE embedding <=> %s <= {threshold}"
+                
+            # Always order by distance and limit the results
+            query += f" ORDER BY distance LIMIT {limit}"
+            
+            # Execute the query with the appropriate parameters
+            if threshold is not None:
+                # When using a threshold, we need to pass the vector array twice
+                # Once for the SELECT and once for the WHERE clause
+                cur.execute(query, (vector_array, vector_array))
+            else:
+                # Without a threshold, we only need the vector once
+                cur.execute(query, (vector_array,))
+                
+            # Fetch and display the results
+            results = cur.fetchall()
+            
+            if not results:
+                print("No similar vectors found.")
+            else:
+                print(f"Found {len(results)} similar vectors:")
+                for row in results:
+                    # Print each match with its distance score (lower is better)
+                    print(f"ID: {row['id']}, Distance: {row['distance']:.4f}, Metadata: {row['metadata']}")
+    except Exception as e:
+        print(f"Error querying vectors: {e}")
+
+def delete_vector(conn, table_name, id_value):
+    """
+    Delete a vector from the table by its ID.
+    
+    Args:
+        conn (psycopg.Connection): An active database connection.
+        table_name (str): Name of the table to delete from.
+        id_value (str): ID of the vector to delete.
+    """
+    with conn.cursor() as cur:
+        # Delete the vector with the specified ID
+        cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (id_value,))
+        # Check if any rows were affected by the DELETE
+        if cur.rowcount > 0:
+            print(f"Vector with ID {id_value} deleted successfully")
+        else:
+            print(f"No vector found with ID {id_value}")
+        conn.commit()
+
+def list_tables(conn):
+    """
+    List all vector tables in the database with vector counts.
+    
+    This function:
+    1. Queries the information_schema to find all tables
+    2. For each table, counts the number of vectors it contains
+    3. Displays the table names and counts
+    
+    Args:
+        conn (psycopg.Connection): An active database connection.
+    """
+    with conn.cursor() as cur:
+        # Get all tables in the public schema
+        cur.execute("""
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        ORDER BY table_name
+        """)
+        tables = cur.fetchall()
+        
+        if not tables:
+            print("No tables found.")
+        else:
+            print("Vector tables:")
+            for table in tables:
+                # Count the vectors in each table
+                cur.execute(f"SELECT COUNT(*) as count FROM {table['table_name']}")
+                count = cur.fetchone()['count']
+                print(f"  - {table['table_name']} ({count} vectors)")
+
+def drop_table(conn, table_name):
+    """
+    Drop a table from the database.
+    
+    This permanently removes the table and all its data.
+    
+    Args:
+        conn (psycopg.Connection): An active database connection.
+        table_name (str): Name of the table to drop.
+    """
+    with conn.cursor() as cur:
+        # Drop the table if it exists
+        cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+        conn.commit()
+    print(f"Table '{table_name}' dropped successfully")
+
+# ----- Main Function -----
+def main():
+    """
+    Main entry point for the script.
+    
+    This function:
+    1. Parses command-line arguments
+    2. Establishes a database connection
+    3. Ensures the pgvector extension is installed
+    4. Executes the requested command with provided arguments
+    5. Cleans up the database connection
+    """
+    # Parse the command-line arguments
+    args = parse_args()
+    
+    # Connect to the database
+    conn = get_connection()
+    
+    # Make sure the pgvector extension is available
+    ensure_extension(conn)
+    
+    # Execute the requested command
+    if args.command == "create":
+        create_table(conn, args.table, args.dim)
+    elif args.command == "insert":
+        insert_vector(conn, args.table, args.id, args.vector, args.metadata)
+    elif args.command == "query":
+        query_vectors(conn, args.table, args.vector, args.limit, args.threshold)
+    elif args.command == "delete":
+        delete_vector(conn, args.table, args.id)
+    elif args.command == "list":
+        list_tables(conn)
+    elif args.command == "drop":
+        drop_table(conn, args.table)
+    else:
+        print("No command specified. Use --help for usage information.")
+    
+    # Close the database connection
+    conn.close()
+
+# ----- Script Entry Point -----
+if __name__ == "__main__":
+    main()

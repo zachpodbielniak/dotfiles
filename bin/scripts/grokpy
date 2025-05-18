@@ -44,6 +44,8 @@ parser.add_argument("--prompt", help="Prompt to prepend to the input")
 parser.add_argument("--model", default="grok-3-beta",
                     help="Model to use (default: grok-3-beta). Available models: grok-3-mini-fast-beta, grok-3-fast-beta, grok-3-mini-beta, grok-3-beta, grok-2-1212, grok-2-vision-1212")
 parser.add_argument("--debug", action="store_true", help="Enable debug mode (shows request details)")
+parser.add_argument("--json", action="store_true", help="Return a clean JSON response without streaming")
+parser.add_argument("--embedding", action="store_true", help="Generate an embedding vector instead of a text response")
 args = parser.parse_args()
 
 # Since outside of the distrobox we may not have these modules
@@ -65,9 +67,20 @@ try:
         "Content-Type": "application/json"
     }
 
-    # Use the correct xAI/Grok API endpoint
-    url = "https://api.x.ai/v1/chat/completions"
+    # Set the API endpoint based on the request type
+    if args.embedding:
+        # When Grok supports a dedicated embeddings endpoint, use that instead
+        # For now, we'll use their chat endpoint with a special prompt
+        url = "https://api.x.ai/v1/chat/completions"
+        
+        # Add embedding instructions to the query
+        embedding_instruction = "Generate an embedding vector for the following text. Return ONLY a JSON object with a single key 'embedding' whose value is the embedding vector as an array of 1536 floats. No other text.\n\n"
+        query = embedding_instruction + query
+    else:
+        # Standard chat completion endpoint
+        url = "https://api.x.ai/v1/chat/completions"
 
+    # Configure request data
     data = {
         "model": args.model,
         "max_tokens": 4096,
@@ -77,7 +90,8 @@ try:
                 "content": query
             }
         ],
-        "stream": True
+        # Don't stream if JSON output is requested or for embeddings
+        "stream": not (args.json or args.embedding)
     }
 
     # Print debug info if requested
@@ -86,35 +100,76 @@ try:
         print(f"Debug: Headers (API key partially hidden): {{'Authorization': 'Bearer {api_key[:5]}...{api_key[-4:]}', 'Content-Type': 'application/json'}}", file=sys.stderr)
         print(f"Debug: Data: {json.dumps(data)}", file=sys.stderr)
 
-    # Send request to Grok API with streaming
-    response = requests.post(url, headers=headers, json=data, stream=True)
+    # Send request to Grok API
+    response = requests.post(url, headers=headers, json=data, stream=data["stream"])
 
     if response.status_code != 200:
         print(f"Error: {response.status_code}")
         print(response.text)
         exit(1)
     
-    # Process the streaming response
-    for line in response.iter_lines():
-        if line:
-            # Skip the initial "data: " prefix
-            line_text = line.decode('utf-8')
-            if line_text.startswith("data: "):
-                line_json = line_text[6:]
-                
-                # The last message is usually "data: [DONE]"
-                if line_json == "[DONE]":
-                    break
+    # Handle the response based on the request type
+    if data["stream"]:
+        # Process streaming response
+        for line in response.iter_lines():
+            if line:
+                # Skip the initial "data: " prefix
+                line_text = line.decode('utf-8')
+                if line_text.startswith("data: "):
+                    line_json = line_text[6:]
                     
-                try:
-                    event = json.loads(line_json)
-                    # Extract content delta if it exists
-                    if "choices" in event and len(event["choices"]) > 0:
-                        choice = event["choices"][0]
-                        if "delta" in choice and "content" in choice["delta"]:
-                            print(choice["delta"]["content"], end="", flush=True)
-                except json.JSONDecodeError:
-                    continue
+                    # The last message is usually "data: [DONE]"
+                    if line_json == "[DONE]":
+                        break
+                        
+                    try:
+                        event = json.loads(line_json)
+                        # Extract content delta if it exists
+                        if "choices" in event and len(event["choices"]) > 0:
+                            choice = event["choices"][0]
+                            if "delta" in choice and "content" in choice["delta"]:
+                                print(choice["delta"]["content"], end="", flush=True)
+                    except json.JSONDecodeError:
+                        continue
+    else:
+        # Process non-streaming response (JSON or embedding)
+        response_data = response.json()
+        
+        if args.embedding:
+            # For embeddings, extract the message and parse it to find the embedding
+            try:
+                # Get the full message content
+                message_content = response_data["choices"][0]["message"]["content"]
+                
+                # Try to extract a JSON object containing the embedding
+                import re
+                json_pattern = r'\{\s*"embedding"\s*:\s*\[.*?\]\s*\}'
+                match = re.search(json_pattern, message_content)
+                
+                if match:
+                    embedding_json = match.group(0)
+                    print(embedding_json)  # Print just the embedding JSON
+                else:
+                    # If no JSON pattern found, try parsing the whole content as JSON
+                    try:
+                        content_json = json.loads(message_content)
+                        if "embedding" in content_json:
+                            print(json.dumps({"embedding": content_json["embedding"]}))
+                        else:
+                            print(message_content)  # Fallback to printing the raw content
+                    except json.JSONDecodeError:
+                        print(message_content)  # Fallback to printing the raw content
+            except (KeyError, IndexError, json.JSONDecodeError):
+                # If we can't extract/parse properly, output the raw response
+                print(json.dumps(response_data))
+        elif args.json:
+            # For regular JSON output, return the full message content
+            try:
+                message_content = response_data["choices"][0]["message"]["content"]
+                print(message_content)
+            except (KeyError, IndexError):
+                # Fallback to printing the full response
+                print(json.dumps(response_data))
 
 except (ImportError, Exception) as e:
     print(f"Error: {e}")
