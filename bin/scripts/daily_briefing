@@ -1,0 +1,1708 @@
+#!/usr/bin/python3
+
+try:
+    import sys
+    import os
+    import yaml
+    import argparse
+    import datetime
+    import pytz
+    import requests
+    import json
+    import subprocess
+    import re
+    import contextlib
+    from io import StringIO
+    import html
+    import urllib.parse
+    try:
+        import feedparser
+        FEEDPARSER_AVAILABLE = True
+    except ImportError:
+        FEEDPARSER_AVAILABLE = False
+    from subprocess import run, PIPE
+except ImportError:
+    pass
+
+from os import environ
+from subprocess import run
+from sys import argv
+
+# container id
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    
+    run(cmd)
+    exit(0)
+
+def load_config(config_path=None):
+    """Load the YAML config file for the daily briefing settings."""
+    if config_path is None:
+        config_path = os.path.expanduser("~/.config/daily_briefing.yaml")
+    
+    if not os.path.exists(config_path):
+        print(f"Config file not found at {config_path}", file=sys.stderr)
+        print("Creating default config file...", file=sys.stderr)
+        create_default_config(config_path)
+    
+    try:
+        with open(config_path, 'r') as config_file:
+            config = yaml.safe_load(config_file)
+        return config
+    except Exception as e:
+        print(f"Error loading config file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def create_default_config(config_path):
+    """Create a default config file if none exists."""
+    default_config = {
+        'weather': {
+            'location': 'auto',  # 'auto' for IP-based, or a city name or coordinates
+            'units': 'metric',   # 'metric' for Celsius/km/h/mm or 'imperial' for Fahrenheit/mph/inches
+            'api_key': '',       # API key for weather service (if using OpenWeatherMap)
+            'service': 'wttr.in' # 'wttr.in' or 'openweathermap'
+        },
+        'calendar': {
+            'days_to_show': 1,   # How many days of calendar events to show
+            'config_path': None  # Path to meetings config or None for default
+        },
+        'todo': {
+            'show_todos': True,  # Whether to show todos
+            'filter_date': '',   # Empty string for all, or 'today', 'tomorrow', specific date
+            'max_items': 5       # Maximum number of todo items to show
+        },
+        'news': {
+            'enabled': True,     # Whether to show news
+            'max_items': 3,      # Maximum number of news items per source
+            'feeds': [
+                {
+                    'name': 'Newsmax Finance',
+                    'url': 'https://www.newsmax.com/rss/Finance/1/',
+                    'category': 'finance'
+                },
+                {
+                    'name': 'Newsmax Money',
+                    'url': 'https://www.newsmax.com/rss/Money/118/',
+                    'category': 'finance'
+                },
+                {
+                    'name': 'Daily Wire News',
+                    'url': 'https://www.dailywire.com/feeds/rss.xml',
+                    'category': 'news'
+                }
+            ],
+            'categories': ['finance', 'news'],  # Categories to include (empty for all)
+        },
+        'second_brain': {
+            'enabled': True,     # Whether to suggest notes from Second Brain
+            'notes_dir': '~/Documents/notes',  # Path to Second Brain directory
+            'max_suggestions': 3  # Maximum number of suggested notes
+        },
+        'quote': {
+            'enabled': True      # Whether to show a quote of the day
+        },
+        'output': {
+            'format': 'text',    # 'text', 'markdown', 'neorg', 'html', or 'yaml'
+            'wrap_sbi': False    # Whether to wrap the output with sbi for final note generation
+        }
+    }
+    
+    try:
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as config_file:
+            yaml.dump(default_config, config_file, default_flow_style=False)
+        print(f"Default config created at {config_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error creating default config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_calendar_events(config):
+    """Get calendar events using the meetings script."""
+    calendar_config = config.get('calendar', {})
+    days_to_show = calendar_config.get('days_to_show', 1)
+    config_path = calendar_config.get('config_path', None)
+    
+    # Build the command to run the meetings script
+    cmd = ['meetings', '--yaml']
+    
+    if days_to_show > 0:
+        cmd.extend(['--days', str(days_to_show)])
+    
+    if config_path:
+        cmd.extend(['--config', config_path])
+    
+    try:
+        # Run the meetings script and capture its output
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        # Parse the YAML output
+        events = yaml.safe_load(result.stdout) if result.stdout.strip() else []
+        return events
+    except subprocess.CalledProcessError as e:
+        print(f"Error getting calendar events: {e}", file=sys.stderr)
+        if e.stderr:
+            print(f"Error details: {e.stderr}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"Error processing calendar events: {e}", file=sys.stderr)
+        return []
+
+def get_weather_forecast(config):
+    """Get weather forecast based on configured service."""
+    weather_config = config.get('weather', {})
+    location = weather_config.get('location', 'auto')
+    units = weather_config.get('units', 'metric')  # 'metric' or 'imperial'
+    service = weather_config.get('service', 'wttr.in')
+    
+    if service == 'wttr.in':
+        return get_wttr_weather(location, units)
+    elif service == 'openweathermap':
+        api_key = weather_config.get('api_key', '')
+        if not api_key:
+            print("Error: OpenWeatherMap API key is required.", file=sys.stderr)
+            return None
+        return get_openweathermap_weather(location, units, api_key)
+    else:
+        print(f"Error: Unsupported weather service: {service}", file=sys.stderr)
+        return None
+
+def get_wttr_weather(location, units):
+    """Get weather from wttr.in."""
+    unit_param = 'm' if units == 'metric' else 'u'  # m for metric, u for US/imperial
+    
+    try:
+        # Format the URL for wttr.in
+        url = f"https://wttr.in/{location}?format=j1&{unit_param}"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        # Parse the JSON response
+        weather_data = response.json()
+        
+        # Extract current conditions and forecast
+        current = weather_data.get('current_condition', [{}])[0]
+        forecast = weather_data.get('weather', [])
+        
+        # Format the data in a simplified structure
+        weather = {
+            'current': {
+                'temperature': current.get('temp_C' if units == 'metric' else 'temp_F'),
+                'feels_like': current.get('FeelsLikeC' if units == 'metric' else 'FeelsLikeF'),
+                'condition': current.get('weatherDesc', [{}])[0].get('value', ''),
+                'humidity': current.get('humidity'),
+                'wind_speed': current.get('windspeedKmph' if units == 'metric' else 'windspeedMiles'),
+                'precipitation': current.get('precipMM'),
+                'units': {
+                    'temperature': '°C' if units == 'metric' else '°F',
+                    'wind': 'km/h' if units == 'metric' else 'mph',
+                    'precipitation': 'mm' if units == 'metric' else 'in'
+                }
+            },
+            'forecast': []
+        }
+        
+        # Add forecast data for upcoming days
+        for day in forecast[:3]:  # Limit to 3 days
+            date = day.get('date', '')
+            day_data = {
+                'date': date,
+                'max_temp': day.get('maxtempC' if units == 'metric' else 'maxtempF'),
+                'min_temp': day.get('mintempC' if units == 'metric' else 'mintempF'),
+                'condition': day.get('hourly', [{}])[4].get('weatherDesc', [{}])[0].get('value', ''),  # Mid-day forecast
+                'precipitation': day.get('hourly', [{}])[4].get('precipMM')
+            }
+            weather['forecast'].append(day_data)
+        
+        return weather
+    except Exception as e:
+        print(f"Error fetching weather from wttr.in: {e}", file=sys.stderr)
+        return None
+
+def get_openweathermap_weather(location, units, api_key):
+    """Get weather from OpenWeatherMap API."""
+    try:
+        # Determine location parameter
+        loc_param = ""
+        if location == 'auto':
+            # Get location from IP
+            ip_lookup = requests.get("https://ipinfo.io/json", timeout=5)
+            ip_data = ip_lookup.json()
+            loc_param = f"q={ip_data.get('city', 'London')}"
+        elif re.match(r'^-?\d+(\.\d+)?,-?\d+(\.\d+)?$', location):
+            # Coordinates
+            lat, lon = location.split(',')
+            loc_param = f"lat={lat}&lon={lon}"
+        else:
+            # City name
+            loc_param = f"q={location}"
+        
+        # Get current weather
+        url = f"https://api.openweathermap.org/data/2.5/weather?{loc_param}&units={units}&appid={api_key}"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        current_data = response.json()
+        
+        # Get forecast
+        forecast_url = f"https://api.openweathermap.org/data/2.5/forecast?{loc_param}&units={units}&appid={api_key}"
+        forecast_response = requests.get(forecast_url, timeout=10)
+        forecast_response.raise_for_status()
+        forecast_data = forecast_response.json()
+        
+        # Format current weather
+        weather = {
+            'current': {
+                'temperature': str(round(current_data.get('main', {}).get('temp', 0))),
+                'feels_like': str(round(current_data.get('main', {}).get('feels_like', 0))),
+                'condition': current_data.get('weather', [{}])[0].get('description', ''),
+                'humidity': str(current_data.get('main', {}).get('humidity', 0)),
+                'wind_speed': str(round(current_data.get('wind', {}).get('speed', 0))),
+                'precipitation': '0',  # OpenWeatherMap doesn't provide this directly
+                'units': {
+                    'temperature': '°C' if units == 'metric' else '°F',
+                    'wind': 'm/s' if units == 'metric' else 'mph',  # OpenWeatherMap uses m/s for metric
+                    'precipitation': 'mm' if units == 'metric' else 'in'
+                }
+            },
+            'forecast': []
+        }
+        
+        # Process forecast data
+        forecast_days = {}
+        for item in forecast_data.get('list', []):
+            date = item.get('dt_txt', '').split(' ')[0]
+            if date not in forecast_days:
+                forecast_days[date] = {
+                    'temps': [],
+                    'conditions': [],
+                    'precipitations': []
+                }
+            
+            temp = item.get('main', {}).get('temp', 0)
+            forecast_days[date]['temps'].append(temp)
+            
+            condition = item.get('weather', [{}])[0].get('description', '')
+            forecast_days[date]['conditions'].append(condition)
+            
+            precip = item.get('rain', {}).get('3h', 0)
+            forecast_days[date]['precipitations'].append(precip)
+        
+        # Create daily forecast summaries
+        for date, data in list(forecast_days.items())[:3]:  # Limit to 3 days
+            if data['temps']:
+                day_data = {
+                    'date': date,
+                    'max_temp': str(round(max(data['temps']))),
+                    'min_temp': str(round(min(data['temps']))),
+                    'condition': max(set(data['conditions']), key=data['conditions'].count),  # Most common condition
+                    'precipitation': str(round(sum(data['precipitations']), 1))
+                }
+                weather['forecast'].append(day_data)
+        
+        return weather
+    except Exception as e:
+        print(f"Error fetching weather from OpenWeatherMap: {e}", file=sys.stderr)
+        return None
+
+def get_todo_items(config):
+    """Get todo items using the todo script."""
+    todo_config = config.get('todo', {})
+    show_todos = todo_config.get('show_todos', True)
+    filter_date = todo_config.get('filter_date', '')
+    max_items = todo_config.get('max_items', 5)
+    
+    if not show_todos:
+        return []
+    
+    # Build the command to run the todo script
+    cmd = ['todo', '--yaml']
+    
+    if filter_date:
+        if filter_date == 'today':
+            # Convert to YYYY-MM-DD format
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+            cmd.extend(['--date', today])
+        elif filter_date == 'tomorrow':
+            # Get tomorrow's date in YYYY-MM-DD format
+            tomorrow = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+            cmd.extend(['--date', tomorrow])
+        else:
+            # Use the provided date
+            cmd.extend(['--date', filter_date])
+    
+    try:
+        # Run the todo script and capture its output
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        # Parse the YAML output
+        todo_data = yaml.safe_load(result.stdout) if result.stdout.strip() else {'todo': []}
+        
+        # Extract todo items and limit by max_items
+        todos = todo_data.get('todo', [])
+        
+        if max_items > 0 and len(todos) > max_items:
+            todos = todos[:max_items]
+            
+        return todos
+    except subprocess.CalledProcessError as e:
+        print(f"Error getting todo items: {e}", file=sys.stderr)
+        if e.stderr:
+            print(f"Error details: {e.stderr}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"Error processing todo items: {e}", file=sys.stderr)
+        return []
+
+def get_news_items(config):
+    """Get news items from RSS feeds specified in config."""
+    news_config = config.get('news', {})
+    enabled = news_config.get('enabled', True)
+    max_items = news_config.get('max_items', 3)
+    
+    if not enabled:
+        return []
+        
+    # Check if feedparser is available
+    if not 'FEEDPARSER_AVAILABLE' in globals() or not FEEDPARSER_AVAILABLE:
+        print("Warning: feedparser module not available. Using mock news data.", file=sys.stderr)
+        # Generate mock news data
+        news = []
+        mock_sources = ['Financial News', 'Market Updates', 'Daily Headlines']
+        for source in mock_sources:
+            source_news = {
+                'source': source,
+                'items': []
+            }
+            
+            for i in range(max_items):
+                item = {
+                    'title': f"Sample {source} article {i+1}",
+                    'summary': f"This is a sample summary for a {source} article.",
+                    'url': f"https://example.com/news/{source.lower().replace(' ', '_')}/{i+1}",
+                    'category': 'mock'
+                }
+                source_news['items'].append(item)
+            
+            news.append(source_news)
+        
+        return news
+    
+    # Get RSS feeds from config
+    feeds = news_config.get('feeds', [])
+    if not feeds:
+        # Fallback to default feeds if none specified
+        feeds = [
+            {
+                'name': 'Newsmax Finance',
+                'url': 'https://www.newsmax.com/rss/Finance/1/',
+                'category': 'finance'
+            },
+            {
+                'name': 'Newsmax Money',
+                'url': 'https://www.newsmax.com/rss/Money/118/',
+                'category': 'finance'
+            },
+            {
+                'name': 'Daily Wire News',
+                'url': 'https://www.dailywire.com/feeds/rss.xml',
+                'category': 'news'
+            }
+        ]
+    
+    # Filter by categories if specified
+    categories = news_config.get('categories', [])
+    if categories:
+        feeds = [feed for feed in feeds if feed.get('category', '') in categories]
+    
+    news = []
+    
+    try:
+        # Process each feed
+        for feed_config in feeds:
+            feed_name = feed_config.get('name', 'Unnamed Feed')
+            feed_url = feed_config.get('url', '')
+            feed_category = feed_config.get('category', 'uncategorized')
+            
+            if not feed_url:
+                continue
+                
+            try:
+                # Parse the RSS feed
+                feed = feedparser.parse(feed_url)
+                
+                # Debug info (only visible with --debug flag)
+                if hasattr(feed, 'status') and 'status' in dir(feed):
+                    print(f"Feed {feed_name} status: {feed.status}", file=sys.stderr)
+                if hasattr(feed, 'bozo') and feed.bozo:
+                    print(f"Feed {feed_name} bozo: {feed.bozo_exception}", file=sys.stderr)
+                
+                source_news = {
+                    'source': feed_name,
+                    'category': feed_category,
+                    'items': []
+                }
+                
+                # Process feed entries
+                for entry in feed.entries[:max_items]:
+                    # Clean up the title and summary
+                    title = html.unescape(entry.get('title', 'No Title'))
+                    
+                    # Get summary if available, or use description or content
+                    summary = ''
+                    if hasattr(entry, 'summary'):
+                        summary = entry.summary
+                    elif hasattr(entry, 'description'):
+                        summary = entry.description
+                    elif hasattr(entry, 'content') and hasattr(entry.content, '__getitem__'):
+                        summary = entry.content[0].value
+                    
+                    # Clean HTML tags from summary and unescape HTML entities
+                    summary = re.sub(r'<[^>]+>', '', summary)
+                    summary = html.unescape(summary)
+                    
+                    # Truncate summary if too long
+                    if len(summary) > 200:
+                        summary = summary[:197] + '...'
+                    
+                    # Get the URL
+                    url = entry.get('link', '')
+                    
+                    # Get published date
+                    published = entry.get('published', '')
+                    
+                    # Build the item
+                    item = {
+                        'title': title,
+                        'summary': summary,
+                        'url': url,
+                        'published': published,
+                        'category': feed_category
+                    }
+                    
+                    source_news['items'].append(item)
+                
+                # Only add sources that have items
+                if source_news['items']:
+                    news.append(source_news)
+                    
+            except Exception as feed_error:
+                print(f"Error fetching news from {feed_name}: {feed_error}", file=sys.stderr)
+        
+        # If we didn't get any news from any source, return mock data
+        if not news:
+            # Generate mock news data based on the configured feeds
+            for feed_config in feeds:
+                feed_name = feed_config.get('name', 'Unnamed Feed')
+                feed_category = feed_config.get('category', 'uncategorized')
+                
+                source_news = {
+                    'source': feed_name,
+                    'category': feed_category,
+                    'items': []
+                }
+                
+                for i in range(max_items):
+                    item = {
+                        'title': f"Sample {feed_name} article {i+1}",
+                        'summary': f"This is a sample summary for a {feed_category} article from {feed_name}.",
+                        'url': f"https://example.com/news/{feed_name.lower().replace(' ', '_')}/{i+1}",
+                        'published': datetime.datetime.now().strftime("%a, %d %b %Y %H:%M:%S %z"),
+                        'category': feed_category
+                    }
+                    source_news['items'].append(item)
+                
+                news.append(source_news)
+        
+        return news
+    except Exception as e:
+        print(f"Error fetching news: {e}", file=sys.stderr)
+        # Return mock data on error, but based on the configured feeds
+        news = []
+        
+        # Use the configured feeds if available, otherwise use defaults
+        mock_feeds = feeds if feeds else [
+            {'name': 'Financial News', 'category': 'finance'},
+            {'name': 'Market Updates', 'category': 'finance'},
+            {'name': 'Daily Headlines', 'category': 'news'}
+        ]
+        
+        for feed_config in mock_feeds:
+            feed_name = feed_config.get('name', 'Unnamed Feed')
+            feed_category = feed_config.get('category', 'uncategorized')
+            
+            source_news = {
+                'source': feed_name,
+                'category': feed_category,
+                'items': []
+            }
+            
+            for i in range(max_items):
+                item = {
+                    'title': f"Sample {feed_name} article {i+1} (error fallback)",
+                    'summary': f"This is a sample summary for a {feed_category} article.",
+                    'url': f"https://example.com/news/{feed_name.lower().replace(' ', '_')}/{i+1}",
+                    'published': datetime.datetime.now().strftime("%a, %d %b %Y %H:%M:%S %z"),
+                    'category': feed_category
+                }
+                source_news['items'].append(item)
+            
+            news.append(source_news)
+        
+        return news
+
+def get_relevant_notes(config, calendar_events=None):
+    """Find relevant notes from Second Brain based on calendar events and current date."""
+    sb_config = config.get('second_brain', {})
+    enabled = sb_config.get('enabled', True)
+    notes_dir = os.path.expanduser(sb_config.get('notes_dir', '~/Documents/notes'))
+    max_suggestions = sb_config.get('max_suggestions', 3)
+    
+    if not enabled:
+        return []
+    
+    # Get keywords from calendar events
+    keywords = []
+    if calendar_events:
+        for event in calendar_events:
+            # Add meeting title as keyword
+            if 'summary' in event:
+                keywords.extend(event['summary'].lower().split())
+            
+            # Add meeting description keywords
+            if 'description' in event:
+                keywords.extend(event['description'].lower().split())
+    
+    # If no keywords from calendar, add some based on current date
+    if not keywords:
+        # Add day of week and month as keywords
+        today = datetime.datetime.now()
+        keywords.extend([today.strftime('%A').lower(), today.strftime('%B').lower()])
+        
+        # Add some general keywords for daily tasks
+        keywords.extend(['daily', 'routine', 'agenda', 'plan', 'schedule', 'task', 'meeting'])
+    
+    # Remove common words, duplicates, and non-alphabetic words
+    stopwords = {'the', 'and', 'to', 'a', 'in', 'for', 'is', 'on', 'that', 'by', 'this', 'with', 'i', 'you', 'it',
+                 'of', 'am', 'pm', 'be', 'as', 'at', 'so', 'or', 'if', 'my', 'we', 'us', 'an', 'do', 'me', 'our',
+                 'can', 'who', 'get', 'see', 'all', 'has', 'had', 'was', 'are', 'what', 'when', 'where', 'why',
+                 'how', 'from', 'which', 'their', 'they', 'them', 'then', 'than', 'but', 'not', 'yes', 'no', 'his',
+                 'her', 'she', 'him', 'your', 'been', 'have', 'will', 'would', 'could', 'should', 'there'}
+    keywords = [word for word in keywords if word.isalpha() and len(word) > 3 and word.lower() not in stopwords]
+    keywords = list(set(keywords))  # Remove duplicates
+    
+    # Sort keywords by length (prioritize longer, more specific keywords)
+    keywords.sort(key=len, reverse=True)
+    
+    # Limit to reasonable number of keywords for searching
+    keywords = keywords[:10]
+    
+    if not keywords:
+        keywords = ["daily", "meeting", "important", "project"]  # Fallback keywords
+    
+    suggested_notes = []
+    search_count = 0
+    
+    try:
+        # Real implementation using ripgrep (rg) for searching
+        for keyword in keywords:
+            if len(suggested_notes) >= max_suggestions:
+                break
+                
+            # Skip very short keywords
+            if len(keyword) < 4:
+                continue
+                
+            try:
+                # Use ripgrep to search for keyword in notes directory
+                # -l: Only print filenames with matches
+                # -i: Case-insensitive search
+                # --max-count=1: Stop searching after first match in each file
+                # -g "*.{norg,md}": Only search in Neorg and Markdown files
+                cmd = [
+                    "rg", "-l", "-i", "--max-count=1",
+                    "-g", "*.norg", "-g", "*.md",
+                    keyword, notes_dir
+                ]
+                
+                process = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False  # Don't raise exception if search has no results
+                )
+                
+                search_count += 1
+                
+                # If no results or error, continue to next keyword
+                if process.returncode != 0 or not process.stdout.strip():
+                    continue
+                
+                # Get list of matching files
+                matching_files = process.stdout.strip().split('\n')
+                
+                # Add each matching file as a suggestion (up to max_suggestions)
+                for file_path in matching_files:
+                    # Skip if we've already reached max suggestions
+                    if len(suggested_notes) >= max_suggestions:
+                        break
+                        
+                    # Skip if we've already included this file
+                    if any(note['path'] == file_path for note in suggested_notes):
+                        continue
+                    
+                    # Get the title from the file (first heading line)
+                    title = os.path.basename(file_path)
+                    try:
+                        with open(file_path, 'r') as f:
+                            for line in f:
+                                # Look for markdown heading
+                                if line.startswith('# '):
+                                    title = line[2:].strip()
+                                    break
+                                # Look for neorg heading
+                                elif line.startswith('* '):
+                                    title = line[2:].strip()
+                                    break
+                    except Exception:
+                        # If we can't read the file, use the filename as title
+                        title = os.path.splitext(os.path.basename(file_path))[0]
+                    
+                    # Get context by running rg again to show matching lines
+                    context_cmd = [
+                        "rg", "-i", "-C", "1",  # Show 1 line of context
+                        "--max-count=3",       # Show at most 3 matches
+                        keyword, file_path
+                    ]
+                    
+                    try:
+                        context_process = subprocess.run(
+                            context_cmd,
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+                        context = context_process.stdout.strip()
+                        # Limit context length
+                        if len(context) > 200:
+                            context = context[:197] + "..."
+                    except Exception:
+                        context = f"Contains the keyword '{keyword}'"
+                    
+                    # Determine relevance based on how many matches in the file
+                    count_cmd = ["rg", "-i", "-c", keyword, file_path]
+                    try:
+                        count_process = subprocess.run(
+                            count_cmd,
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+                        match_count = int(count_process.stdout.strip())
+                        relevance = f"Contains {match_count} mentions of '{keyword}'"
+                    except Exception:
+                        relevance = f"Mentions '{keyword}'"
+                    
+                    # Determine if the file is in a PARA category
+                    path_parts = file_path.split('/')
+                    para_category = ""
+                    for part in path_parts:
+                        if part.startswith("00_"):
+                            para_category = "Inbox"
+                            break
+                        elif part.startswith("01_"):
+                            para_category = "Projects"
+                            break
+                        elif part.startswith("02_"):
+                            para_category = "Areas"
+                            break
+                        elif part.startswith("03_"):
+                            para_category = "Resources"
+                            break
+                        elif part.startswith("04_"):
+                            para_category = "Archive"
+                            break
+                    
+                    if para_category:
+                        relevance += f" [{para_category}]"
+                    
+                    note = {
+                        'title': title,
+                        'path': file_path,
+                        'relevance': relevance,
+                        'preview': context,
+                        'keyword': keyword
+                    }
+                    
+                    suggested_notes.append(note)
+            
+            except Exception as kw_error:
+                print(f"Error searching for keyword '{keyword}': {kw_error}", file=sys.stderr)
+                continue
+        
+        # If we didn't find any results after searching
+        if not suggested_notes and search_count > 0:
+            # Create a sample suggestion with instructions on using the Second Brain
+            note = {
+                'title': "Using Your Second Brain",
+                'path': f"{notes_dir}/03_resources/second_brain_usage.norg",
+                'relevance': "General guide to using your Second Brain",
+                'preview': "This guide provides information on how to effectively use your Second Brain for knowledge management and retrieval."
+            }
+            suggested_notes.append(note)
+            
+            # Add a suggestion to create a new note
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+            note = {
+                'title': f"Daily Note for {today}",
+                'path': f"{notes_dir}/00_inbox/daily_{today}.norg",
+                'relevance': "Create today's daily note",
+                'preview': "You haven't created a daily note for today yet. Click to create one."
+            }
+            suggested_notes.append(note)
+        
+        return suggested_notes
+    except Exception as e:
+        print(f"Error finding relevant notes: {e}", file=sys.stderr)
+        return []
+
+def get_quote_of_the_day(config):
+    """Get an inspirational quote of the day."""
+    quote_config = config.get('quote', {})
+    enabled = quote_config.get('enabled', True)
+    
+    if not enabled:
+        return None
+    
+    try:
+        # Try to fetch a quote from an API
+        response = requests.get("https://api.quotable.io/random", timeout=5)
+        response.raise_for_status()
+        
+        quote_data = response.json()
+        return {
+            'text': quote_data.get('content', ''),
+            'author': quote_data.get('author', '')
+        }
+    except Exception as e:
+        print(f"Error fetching quote: {e}", file=sys.stderr)
+        
+        # Fallback quotes
+        fallback_quotes = [
+            {"text": "The best time to plant a tree was 20 years ago. The second best time is now.", "author": "Chinese Proverb"},
+            {"text": "Life is what happens when you're busy making other plans.", "author": "John Lennon"},
+            {"text": "The future belongs to those who believe in the beauty of their dreams.", "author": "Eleanor Roosevelt"},
+            {"text": "The only way to do great work is to love what you do.", "author": "Steve Jobs"},
+            {"text": "It does not matter how slowly you go as long as you do not stop.", "author": "Confucius"}
+        ]
+        
+        import random
+        return random.choice(fallback_quotes)
+
+def format_briefing(briefing_data, config):
+    """Format the briefing data according to the specified output format."""
+    output_config = config.get('output', {})
+    format_type = output_config.get('format', 'text')
+    
+    if format_type == 'yaml':
+        return yaml.dump(briefing_data, default_flow_style=False, sort_keys=False)
+    elif format_type == 'markdown':
+        return format_markdown(briefing_data)
+    elif format_type == 'neorg':
+        return format_neorg(briefing_data)
+    elif format_type == 'html':
+        return format_html(briefing_data)
+    else:  # Default to text
+        return format_text(briefing_data)
+
+def format_text(data):
+    """Format briefing data as plain text."""
+    # Format data as plain text
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    result = f"=== DAILY BRIEFING ({today}) ===\n\n"
+    
+    # Date and time
+    now = datetime.datetime.now()
+    result += f"Date: {now.strftime('%A, %B %d, %Y')}\n"
+    result += f"Time: {now.strftime('%H:%M')}\n\n"
+    
+    # Weather
+    if data.get('weather'):
+        result += "=== WEATHER ===\n"
+        weather = data['weather']
+        current = weather.get('current', {})
+        units_info = current.get('units', {})
+        temp_unit = units_info.get('temperature', '°')
+        wind_unit = units_info.get('wind', 'km/h')
+        precip_unit = units_info.get('precipitation', 'mm')
+        
+        result += f"Current: {current.get('temperature')}{temp_unit}, {current.get('condition')}\n"
+        result += f"Feels like: {current.get('feels_like')}{temp_unit}\n"
+        result += f"Humidity: {current.get('humidity')}%\n"
+        result += f"Wind: {current.get('wind_speed')} {wind_unit}\n"
+        
+        if weather.get('forecast'):
+            result += "\nForecast:\n"
+            for day in weather['forecast']:
+                result += f"- {day.get('date')}: {day.get('min_temp')}{temp_unit} to {day.get('max_temp')}{temp_unit}, {day.get('condition')}\n"
+        result += "\n"
+    
+    # Calendar events
+    if data.get('calendar_events'):
+        result += "=== TODAY'S MEETINGS ===\n"
+        for event in data['calendar_events']:
+            result += f"- {event.get('start_time')}: {event.get('summary')}"
+            if event.get('duration_minutes'):
+                result += f" ({event.get('duration_minutes')} minutes)"
+            result += "\n"
+            if event.get('location'):
+                result += f"  Location: {event.get('location')}\n"
+            if event.get('meeting_links'):
+                for link in event.get('meeting_links', []):
+                    result += f"  Link: {link}\n"
+        result += "\n"
+    
+    # Todo items
+    if data.get('todo_items'):
+        result += "=== TODO ITEMS ===\n"
+        for item in data['todo_items']:
+            status = item.get('status', 'pending')
+            priority = item.get('priority', 'medium')
+            priority_marker = "!!!" if priority == "high" else ("!!" if priority == "medium" else "!")
+            status_marker = "[ ]" if status == "pending" else ("[x]" if status == "done" else "[~]")
+            result += f"- {status_marker} {priority_marker} {item.get('task', '')}\n"
+            if item.get('due'):
+                result += f"  Due: {item.get('due')}\n"
+        result += "\n"
+    
+    # News
+    if data.get('news_items'):
+        result += "=== NEWS ===\n"
+        
+        # Group news by category if available
+        categorized_news = {}
+        for source in data['news_items']:
+            category = source.get('category', 'general').capitalize()
+            if category not in categorized_news:
+                categorized_news[category] = []
+            categorized_news[category].append(source)
+            
+        # Display news by category
+        for category, sources in categorized_news.items():
+            result += f"--- {category} News ---\n"
+            for source in sources:
+                result += f"{source.get('source')}:\n"
+                for item in source.get('items', []):
+                    result += f"- {item.get('title')}\n"
+                    # Add publication date if available
+                    if item.get('published'):
+                        result += f"  Published: {item.get('published')}\n"
+            result += "\n"
+    
+    # Relevant notes
+    if data.get('relevant_notes'):
+        result += "=== RELEVANT NOTES ===\n"
+        for note in data['relevant_notes']:
+            result += f"- {note.get('title')}\n"
+            result += f"  Path: {note.get('path')}\n"
+            
+            if note.get('relevance'):
+                result += f"  Relevance: {note.get('relevance')}\n"
+            
+            if note.get('preview'):
+                # Format the preview with indentation for readability
+                preview_lines = note.get('preview').split('\n')
+                result += "  Preview:\n"
+                for line in preview_lines:
+                    result += f"    {line}\n"
+            
+            if note.get('keyword'):
+                result += f"  Keyword: {note.get('keyword')}\n"
+                
+            result += "\n"
+    
+    # Quote of the day
+    if data.get('quote'):
+        result += "=== QUOTE OF THE DAY ===\n"
+        result += f"\"{data['quote'].get('text')}\"\n"
+        result += f"- {data['quote'].get('author')}\n"
+    
+    return result
+
+def format_markdown(data):
+    """Format briefing data as markdown."""
+    # Get current date
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    result = f"# Daily Briefing ({today})\n\n"
+    
+    # Date and time
+    now = datetime.datetime.now()
+    result += f"**Date:** {now.strftime('%A, %B %d, %Y')}  \n"
+    result += f"**Time:** {now.strftime('%H:%M')}\n\n"
+    
+    # Weather
+    if data.get('weather'):
+        result += "## Weather\n\n"
+        weather = data['weather']
+        current = weather.get('current', {})
+        
+        units_info = current.get('units', {})
+        temp_unit = units_info.get('temperature', '°')
+        wind_unit = units_info.get('wind', 'km/h')
+        precip_unit = units_info.get('precipitation', 'mm')
+        
+        result += f"**Current:** {current.get('temperature')}{temp_unit}, {current.get('condition')}  \n"
+        result += f"**Feels like:** {current.get('feels_like')}{temp_unit}  \n"
+        result += f"**Humidity:** {current.get('humidity')}%  \n"
+        result += f"**Wind:** {current.get('wind_speed')} {wind_unit}\n\n"
+        
+        if weather.get('forecast'):
+            result += "### Forecast\n\n"
+            for day in weather['forecast']:
+                result += f"- **{day.get('date')}:** {day.get('min_temp')}{temp_unit} to {day.get('max_temp')}{temp_unit}, {day.get('condition')}\n"
+            result += "\n"
+    
+    # Calendar events
+    if data.get('calendar_events'):
+        result += "## Today's Meetings\n\n"
+        for event in data['calendar_events']:
+            result += f"### {event.get('summary')}\n"
+            result += f"**Time:** {event.get('start_time')}"
+            if event.get('duration_minutes'):
+                result += f" ({event.get('duration_minutes')} minutes)"
+            result += "  \n"
+            
+            if event.get('location'):
+                result += f"**Location:** {event.get('location')}  \n"
+            
+            if event.get('meeting_links'):
+                result += "**Meeting Links:**  \n"
+                for link in event.get('meeting_links', []):
+                    result += f"- [{link}]({link})  \n"
+            
+            if event.get('description'):
+                result += "\n**Description:**  \n"
+                result += f"{event.get('description')}  \n"
+            
+            result += "\n"
+    
+    # Todo items
+    if data.get('todo_items'):
+        result += "## Todo Items\n\n"
+        for item in data['todo_items']:
+            status = item.get('status', 'pending')
+            priority = item.get('priority', 'medium')
+            
+            # Priority indicators
+            priority_marker = "🔴" if priority == "high" else ("🟡" if priority == "medium" else "🟢")
+            
+            # Status indicators
+            status_marker = "[ ]" if status == "pending" else ("[x]" if status == "done" else "[~]")
+            
+            result += f"- {status_marker} {priority_marker} **{item.get('task', '')}**"
+            if item.get('due'):
+                result += f" (Due: {item.get('due')})"
+            result += "\n"
+        result += "\n"
+    
+    # News
+    if data.get('news_items'):
+        result += "## News\n\n"
+        
+        # Group news by category if available
+        categorized_news = {}
+        for source in data['news_items']:
+            category = source.get('category', 'general').capitalize()
+            if category not in categorized_news:
+                categorized_news[category] = []
+            categorized_news[category].append(source)
+        
+        # Display news by category
+        for category, sources in categorized_news.items():
+            result += f"### {category} News\n\n"
+            
+            for source in sources:
+                result += f"#### {source.get('source')}\n\n"
+                
+                for item in source.get('items', []):
+                    # Add title with link if available
+                    if item.get('url'):
+                        result += f"- [{item.get('title')}]({item.get('url')})"
+                    else:
+                        result += f"- **{item.get('title')}**"
+                    
+                    # Add summary if available
+                    if item.get('summary'):
+                        result += f": {item.get('summary')}"
+                        
+                    # Add publication date if available
+                    if item.get('published'):
+                        result += f"  \n  <small>Published: {item.get('published')}</small>"
+                        
+                    result += "\n"
+                
+                result += "\n"
+    
+    # Relevant notes
+    if data.get('relevant_notes'):
+        result += "## Relevant Notes\n\n"
+        for note in data['relevant_notes']:
+            file_path = note.get('path', '')
+            file_exists = os.path.exists(file_path)
+            
+            # Create a properly formatted markdown link
+            if file_exists:
+                # Convert to file:// URL for markdown linking
+                # Encode spaces and special characters in the path
+                file_url = "file://" + urllib.parse.quote(os.path.abspath(file_path))
+                result += f"- **[{note.get('title')}]({file_url})**  \n"
+            else:
+                result += f"- **{note.get('title')}**  \n"
+            
+            # Add path information (using code formatting)
+            result += f"  Path: `{file_path}`  \n"
+            
+            # Add relevance information if available
+            if note.get('relevance'):
+                result += f"  Relevance: {note.get('relevance')}  \n"
+            
+            # Add preview content if available
+            if note.get('preview'):
+                preview = note.get('preview').replace('\n', '\n  > ')
+                result += f"  > {preview}  \n"
+            
+            result += "\n"
+    
+    # Quote of the day
+    if data.get('quote'):
+        result += "## Quote of the Day\n\n"
+        result += f"> {data['quote'].get('text')}\n>\n> — *{data['quote'].get('author')}*\n"
+    
+    return result
+
+def format_neorg(data):
+    """Format briefing data as neorg."""
+    # Get current date
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    result = f"* Daily Briefing ({today})\n\n"
+    
+    # Date and time
+    now = datetime.datetime.now()
+    result += f"** Date: {now.strftime('%A, %B %d, %Y')}\n"
+    result += f"** Time: {now.strftime('%H:%M')}\n\n"
+    
+    # Weather
+    if data.get('weather'):
+        result += "** Weather\n"
+        weather = data['weather']
+        current = weather.get('current', {})
+        
+        units_info = current.get('units', {})
+        temp_unit = units_info.get('temperature', '°')
+        wind_unit = units_info.get('wind', 'km/h')
+        precip_unit = units_info.get('precipitation', 'mm')
+        
+        result += f"- Current: {current.get('temperature')}{temp_unit}, {current.get('condition')}\n"
+        result += f"- Feels like: {current.get('feels_like')}{temp_unit}\n"
+        result += f"- Humidity: {current.get('humidity')}%\n"
+        result += f"- Wind: {current.get('wind_speed')} {wind_unit}\n\n"
+        
+        if weather.get('forecast'):
+            result += "*** Forecast\n"
+            for day in weather['forecast']:
+                result += f"- {day.get('date')}: {day.get('min_temp')}{temp_unit} to {day.get('max_temp')}{temp_unit}, {day.get('condition')}\n"
+            result += "\n"
+    
+    # Calendar events
+    if data.get('calendar_events'):
+        result += "** Today's Meetings\n"
+        for i, event in enumerate(data['calendar_events']):
+            result += f"*** {event.get('summary')}\n"
+            result += f"- Time: {event.get('start_time')}"
+            if event.get('duration_minutes'):
+                result += f" ({event.get('duration_minutes')} minutes)"
+            result += "\n"
+            
+            if event.get('location'):
+                result += f"- Location: {event.get('location')}\n"
+            
+            if event.get('meeting_links'):
+                result += "- Meeting Links:\n"
+                for link in event.get('meeting_links', []):
+                    result += f"  - {{{link}}}[{link}]\n"
+            
+            if event.get('description'):
+                result += "- Description:\n"
+                # Format description with indentation
+                for line in event.get('description', '').split('\n'):
+                    result += f"  {line}\n"
+            
+            result += "\n"
+    
+    # Todo items
+    if data.get('todo_items'):
+        result += "** Todo Items\n"
+        for item in data['todo_items']:
+            status = item.get('status', 'pending')
+            priority = item.get('priority', 'medium')
+            
+            # Priority indicators in Neorg
+            priority_marker = "!!!" if priority == "high" else ("!!" if priority == "medium" else "!")
+            
+            # Status in Neorg using proper todo markup
+            if status == 'pending':
+                status_marker = " "  # Pending
+            elif status == 'done':
+                status_marker = "x"  # Done
+            else:
+                status_marker = "~"  # In progress
+                
+            result += f"- [{status_marker}] {priority_marker} {item.get('task', '')}"
+            if item.get('due'):
+                result += f" (Due: {item.get('due')})"
+            result += "\n"
+        result += "\n"
+    
+    # News
+    if data.get('news_items'):
+        result += "** News\n"
+        
+        # Group news by category if available
+        categorized_news = {}
+        for source in data['news_items']:
+            category = source.get('category', 'general').capitalize()
+            if category not in categorized_news:
+                categorized_news[category] = []
+            categorized_news[category].append(source)
+        
+        # Display news by category
+        for category, sources in categorized_news.items():
+            result += f"*** {category} News\n"
+            
+            for source in sources:
+                result += f"**** {source.get('source')}\n"
+                
+                for item in source.get('items', []):
+                    # Add title with link if available
+                    if item.get('url'):
+                        result += f"- {{{item.get('url')}}}[{item.get('title')}]"
+                    else:
+                        result += f"- *{item.get('title')}*"
+                    
+                    # Add summary if available
+                    if item.get('summary'):
+                        result += f": {item.get('summary')}"
+                        
+                    # Add publication date if available
+                    if item.get('published'):
+                        result += f"\n  - _Published: {item.get('published')}_"
+                        
+                    result += "\n"
+                
+                result += "\n"
+    
+    # Relevant notes
+    if data.get('relevant_notes'):
+        result += "** Relevant Notes\n"
+        for note in data['relevant_notes']:
+            file_path = note.get('path', '')
+            file_exists = os.path.exists(file_path)
+            
+            # Create a properly formatted Neorg link
+            title_text = note.get('title')
+            if file_exists:
+                # Use Neorg link format: {file:path}[title]
+                result += f"- {{{file_path}}}[{title_text}]\n"
+            else:
+                result += f"- *{title_text}*\n"
+            
+            # Add path information
+            result += f"  - Path: {file_path}\n"
+            
+            # Add relevance information if available
+            if note.get('relevance'):
+                result += f"  - Relevance: {note.get('relevance')}\n"
+            
+            # Add preview content if available (with proper Neorg formatting)
+            if note.get('preview'):
+                preview = note.get('preview').replace('\n', '\n    ')
+                result += f"  - Preview:\n    {preview}\n"
+            
+            # If the note contains a keyword, highlight it
+            if note.get('keyword'):
+                result += f"  - Keyword: _{note.get('keyword')}_\n"
+            
+            result += "\n"
+    
+    # Quote of the day
+    if data.get('quote'):
+        result += "** Quote of the Day\n"
+        result += f"@quote\n{data['quote'].get('text')}\n"
+        result += f"— {data['quote'].get('author')}\n@end\n"
+    
+    return result
+
+def format_html(data):
+    """Format briefing data as HTML."""
+    # Get current date
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    
+    # Create a template string without f-string for the style section
+    html_template = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Daily Briefing</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            color: #333;
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #2980b9;
+            margin-top: 30px;
+        }
+        h3 {
+            color: #3498db;
+        }
+        .date-time {
+            color: #7f8c8d;
+            font-style: italic;
+            margin-bottom: 25px;
+        }
+        .weather {
+            background-color: #f9f9f9;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .forecast {
+            margin-left: 20px;
+        }
+        .meeting {
+            border-left: 4px solid #3498db;
+            padding-left: 15px;
+            margin-bottom: 20px;
+        }
+        .meeting h3 {
+            margin-top: 0;
+        }
+        .todo-item {
+            margin-bottom: 10px;
+        }
+        .priority-high {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+        .priority-medium {
+            color: #f39c12;
+        }
+        .priority-low {
+            color: #27ae60;
+        }
+        .news-section h3 {
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 5px;
+        }
+        .news-item {
+            margin-bottom: 12px;
+        }
+        .news-category {
+            margin-bottom: 20px;
+        }
+        .news-published {
+            font-style: italic;
+            font-size: 0.8em;
+            color: #7f8c8d;
+            margin-top: 2px;
+        }
+        .note {
+            background-color: #fffde7;
+            padding: 10px;
+            border-radius: 3px;
+            margin-bottom: 10px;
+        }
+        .note pre {
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 3px;
+            overflow-x: auto;
+            font-family: monospace;
+            font-size: 0.9em;
+            border-left: 3px solid #3498db;
+        }
+        .highlight {
+            background-color: #fff59d;
+            padding: 2px 4px;
+            border-radius: 2px;
+            font-weight: bold;
+        }
+        .preview {
+            margin-top: 10px;
+            margin-bottom: 10px;
+        }
+        .quote {
+            font-style: italic;
+            border-left: 3px solid #3498db;
+            padding-left: 15px;
+            margin: 20px 0;
+        }
+        .quote-author {
+            font-weight: bold;
+            text-align: right;
+        }
+    </style>
+</head>
+<body>
+"""
+    
+    # Add the date to the title and heading
+    result = html_template.replace('<title>Daily Briefing</title>', f'<title>Daily Briefing ({today})</title>')
+    result += f'    <h1>Daily Briefing ({today})</h1>\n'
+    
+    # Date and time
+    now = datetime.datetime.now()
+    result += f'<div class="date-time">\n'
+    result += f'    <p>{now.strftime("%A, %B %d, %Y")} at {now.strftime("%H:%M")}</p>\n'
+    result += f'</div>\n\n'
+    
+    # Weather
+    if data.get('weather'):
+        result += '<section>\n'
+        result += '    <h2>Weather</h2>\n'
+        result += '    <div class="weather">\n'
+        
+        weather = data['weather']
+        current = weather.get('current', {})
+        
+        units_info = current.get('units', {})
+        temp_unit = units_info.get('temperature', '°')
+        wind_unit = units_info.get('wind', 'km/h')
+        precip_unit = units_info.get('precipitation', 'mm')
+        
+        result += f'        <p><strong>Current:</strong> {current.get("temperature")}{temp_unit}, {current.get("condition")}</p>\n'
+        result += f'        <p><strong>Feels like:</strong> {current.get("feels_like")}{temp_unit}</p>\n'
+        result += f'        <p><strong>Humidity:</strong> {current.get("humidity")}%</p>\n'
+        result += f'        <p><strong>Wind:</strong> {current.get("wind_speed")} {wind_unit}</p>\n'
+        
+        if weather.get('forecast'):
+            result += '        <h3>Forecast</h3>\n'
+            result += '        <ul class="forecast">\n'
+            for day in weather['forecast']:
+                result += f'            <li><strong>{day.get("date")}:</strong> {day.get("min_temp")}{temp_unit} to {day.get("max_temp")}{temp_unit}, {day.get("condition")}</li>\n'
+            result += '        </ul>\n'
+        
+        result += '    </div>\n'
+        result += '</section>\n\n'
+    
+    # Calendar events
+    if data.get('calendar_events'):
+        result += '<section>\n'
+        result += '    <h2>Today\'s Meetings</h2>\n'
+        
+        for event in data['calendar_events']:
+            result += '    <div class="meeting">\n'
+            result += f'        <h3>{event.get("summary")}</h3>\n'
+            result += f'        <p><strong>Time:</strong> {event.get("start_time")}'
+            
+            if event.get('duration_minutes'):
+                result += f' ({event.get("duration_minutes")} minutes)'
+            
+            result += '</p>\n'
+            
+            if event.get('location'):
+                result += f'        <p><strong>Location:</strong> {event.get("location")}</p>\n'
+            
+            if event.get('meeting_links'):
+                result += '        <p><strong>Meeting Links:</strong></p>\n'
+                result += '        <ul>\n'
+                for link in event.get('meeting_links', []):
+                    result += f'            <li><a href="{link}" target="_blank">{link}</a></li>\n'
+                result += '        </ul>\n'
+            
+            if event.get('description'):
+                result += '        <div>\n'
+                result += '            <p><strong>Description:</strong></p>\n'
+                result += f'            <p>{event.get("description")}</p>\n'
+                result += '        </div>\n'
+            
+            result += '    </div>\n'
+        
+        result += '</section>\n\n'
+    
+    # Todo items
+    if data.get('todo_items'):
+        result += '<section>\n'
+        result += '    <h2>Todo Items</h2>\n'
+        result += '    <ul>\n'
+        
+        for item in data['todo_items']:
+            status = item.get('status', 'pending')
+            priority = item.get('priority', 'medium')
+            
+            # Priority class
+            priority_class = f"priority-{priority}"
+            
+            # Status marker
+            if status == 'pending':
+                status_html = '&#9744;'  # Empty checkbox
+            elif status == 'done':
+                status_html = '&#9745;'  # Checked checkbox
+            else:
+                status_html = '&#9746;'  # Partially checked
+            
+            result += f'        <li class="todo-item"><span class="{priority_class}">{status_html} {item.get("task", "")}</span>'
+            
+            if item.get('due'):
+                result += f' <small>(Due: {item.get("due")})</small>'
+            
+            result += '</li>\n'
+        
+        result += '    </ul>\n'
+        result += '</section>\n\n'
+    
+    # News
+    if data.get('news_items'):
+        result += '<section>\n'
+        result += '    <h2>News</h2>\n'
+        
+        # Group news by category if available
+        categorized_news = {}
+        for source in data['news_items']:
+            category = source.get('category', 'general').capitalize()
+            if category not in categorized_news:
+                categorized_news[category] = []
+            categorized_news[category].append(source)
+        
+        # Display news by category
+        for category, sources in categorized_news.items():
+            result += f'    <div class="news-category">\n'
+            result += f'        <h3>{category} News</h3>\n'
+            
+            for source in sources:
+                result += '        <div class="news-section">\n'
+                result += f'            <h4>{source.get("source")}</h4>\n'
+                result += '            <ul>\n'
+                
+                for item in source.get('items', []):
+                    result += '                <li class="news-item">'
+                    
+                    # Title with link if available
+                    if item.get('url'):
+                        result += f'<a href="{item.get("url")}" target="_blank">{item.get("title")}</a>'
+                    else:
+                        result += f'<strong>{item.get("title")}</strong>'
+                    
+                    # Summary if available
+                    if item.get('summary'):
+                        result += f': {item.get("summary")}'
+                    
+                    # Publication date if available
+                    if item.get('published'):
+                        result += f'<div class="news-published">Published: {item.get("published")}</div>'
+                    
+                    result += '</li>\n'
+                
+                result += '            </ul>\n'
+                result += '        </div>\n'
+            
+            result += '    </div>\n'
+        
+        result += '</section>\n\n'
+    
+    # Relevant notes
+    if data.get('relevant_notes'):
+        result += '<section>\n'
+        result += '    <h2>Relevant Notes</h2>\n'
+        
+        for note in data['relevant_notes']:
+            file_path = note.get('path', '')
+            file_exists = os.path.exists(file_path)
+            
+            result += '    <div class="note">\n'
+            
+            # Use a link if the file exists
+            if file_exists:
+                # Create a proper file:// URL for linking
+                file_url = "file://" + urllib.parse.quote(os.path.abspath(file_path))
+                result += f'        <h3><a href="{file_url}" target="_blank">{note.get("title")}</a></h3>\n'
+            else:
+                result += f'        <h3>{note.get("title")}</h3>\n'
+            
+            # Add path info
+            result += f'        <p><strong>Path:</strong> <code>{file_path}</code></p>\n'
+            
+            # Add relevance info if available
+            if note.get('relevance'):
+                result += f'        <p><strong>Relevance:</strong> {note.get("relevance")}</p>\n'
+            
+            # Add preview if available
+            if note.get('preview'):
+                result += '        <div class="preview">\n'
+                result += '            <p><strong>Preview:</strong></p>\n'
+                result += f'            <pre>{note.get("preview")}</pre>\n'
+                result += '        </div>\n'
+            
+            # Add keyword highlighting if available
+            if note.get('keyword'):
+                result += f'        <p><strong>Keyword:</strong> <span class="highlight">{note.get("keyword")}</span></p>\n'
+            
+            result += '    </div>\n'
+        
+        result += '</section>\n\n'
+    
+    # Quote of the day
+    if data.get('quote'):
+        result += '<section>\n'
+        result += '    <h2>Quote of the Day</h2>\n'
+        result += '    <div class="quote">\n'
+        result += f'        <p>"{data["quote"].get("text")}"</p>\n'
+        result += f'        <p class="quote-author">— {data["quote"].get("author")}</p>\n'
+        result += '    </div>\n'
+        result += '</section>\n\n'
+    
+    # Close HTML
+    result += '</body>\n</html>'
+    
+    return result
+
+def main():
+    # Create a context manager to capture stderr
+    stderr_capture = StringIO()
+    
+    # Redirect stderr to our capture buffer
+    with contextlib.redirect_stderr(stderr_capture):
+        parser = argparse.ArgumentParser(description='Generate a personalized daily briefing with calendar, weather, todos, news, and Second Brain notes.')
+        parser.add_argument('-c', '--config', help='Path to config file (default: ~/.config/daily_briefing.yaml)')
+        parser.add_argument('-o', '--output', choices=['text', 'markdown', 'neorg', 'html', 'yaml'],
+                            help='Output format (overrides config setting)')
+        parser.add_argument('-w', '--weather-only', action='store_true', help='Show only weather information')
+        parser.add_argument('-e', '--events-only', action='store_true', help='Show only calendar events')
+        parser.add_argument('-t', '--todo-only', action='store_true', help='Show only todo items')
+        parser.add_argument('-n', '--news-only', action='store_true', help='Show only news items')
+        parser.add_argument('--wrap-sbi', action='store_true', help='Wrap output with sbi for note generation')
+        parser.add_argument('--debug', action='store_true', help=argparse.SUPPRESS)
+        
+        args = parser.parse_args()
+        
+        # Load configuration
+        config = load_config(args.config)
+        
+        # Override output format if specified
+        if args.output:
+            config['output']['format'] = args.output
+        
+        # Handle wrap-sbi flag
+        if args.wrap_sbi:
+            config['output']['wrap_sbi'] = True
+        
+        # Collect briefing data
+        briefing_data = {
+            'config': config
+        }
+        
+        # Only fetch data for requested sections or all if none specified
+        only_flags = [args.weather_only, args.events_only, args.todo_only, args.news_only]
+        fetch_all = not any(only_flags)
+        
+        # Get weather
+        if fetch_all or args.weather_only:
+            weather = get_weather_forecast(config)
+            if weather:
+                briefing_data['weather'] = weather
+        
+        # Get calendar events
+        if fetch_all or args.events_only:
+            calendar_events = get_calendar_events(config)
+            if calendar_events:
+                briefing_data['calendar_events'] = calendar_events
+        
+        # Get todo items
+        if fetch_all or args.todo_only:
+            todo_items = get_todo_items(config)
+            if todo_items:
+                briefing_data['todo_items'] = todo_items
+        
+        # Get news
+        if fetch_all or args.news_only:
+            news_items = get_news_items(config)
+            if news_items:
+                briefing_data['news_items'] = news_items
+            else:
+                # If no news items were returned, create fallback news data here
+                fallback_news = []
+                sources = ['Newsmax Finance', 'Newsmax Money', 'Dailywire News']
+                max_items = config.get('news', {}).get('max_items', 3)
+                
+                for source in sources:
+                    source_news = {
+                        'source': source,
+                        'items': []
+                    }
+                    
+                    for i in range(max_items):
+                        item = {
+                            'title': f"Sample {source} article {i+1}",
+                            'summary': f"This is a sample summary for a {source} financial article.",
+                            'url': f"https://example.com/news/{source.lower().replace(' ', '_')}/{i+1}"
+                        }
+                        source_news['items'].append(item)
+                    
+                    fallback_news.append(source_news)
+                
+                briefing_data['news_items'] = fallback_news
+        
+        # Get relevant notes
+        if fetch_all and not args.weather_only and not args.todo_only and not args.news_only:
+            relevant_notes = get_relevant_notes(config, briefing_data.get('calendar_events'))
+            if relevant_notes:
+                briefing_data['relevant_notes'] = relevant_notes
+        
+        # Get quote of the day
+        if fetch_all and not args.weather_only and not args.events_only and not args.todo_only and not args.news_only:
+            quote = get_quote_of_the_day(config)
+            if quote:
+                briefing_data['quote'] = quote
+        
+        # Format the briefing
+        formatted_briefing = format_briefing(briefing_data, config)
+    
+    # Now outside the context manager, stderr is back to normal
+    
+    # Get any error messages that were captured
+    stderr_content = stderr_capture.getvalue()
+    
+    # If there were error messages and we're in debug mode, print them to stderr
+    if stderr_content and args.debug:
+        print(stderr_content, file=sys.stderr)
+    
+    # Wrap with sbi if requested
+    if config.get('output', {}).get('wrap_sbi', False):
+        # This would normally pass the content to sbi for processing
+        # For now, we just output a message
+        print(f"# Wrapping with sbi would go here\n{formatted_briefing}")
+    else:
+        print(formatted_briefing)
+
+if __name__ == "__main__":
+    main()
