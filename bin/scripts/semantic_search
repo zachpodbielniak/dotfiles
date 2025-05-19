@@ -696,6 +696,27 @@ def _generate_embedding_via_prompt(text, provider, model, script, config, silent
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
+def file_exists_on_disk(file_path):
+    """Check if a file exists on disk.
+    
+    Args:
+        file_path: Path object or string representing the file path
+        
+    Returns:
+        bool: True if the file exists, False otherwise
+    """
+    try:
+        path_obj = Path(file_path) if not isinstance(file_path, Path) else file_path
+        return path_obj.exists() and path_obj.is_file()
+    except Exception:
+        # In case of any errors, try a different approach
+        try:
+            # Using os.path
+            return os.path.isfile(str(file_path))
+        except Exception:
+            # If all checking methods fail, assume file doesn't exist
+            return False
+
 def get_file_content(file_path):
     """Read and return the content of a file, handling different encodings."""
     try:
@@ -798,6 +819,66 @@ def check_file_exists(conn, table_name, file_id, provider, model, file_path=None
     
     return exists, is_current
 
+def delete_missing_files(conn, table_name, base_path, provider=None, model=None, silent_print=print):
+    """Delete database entries for files that no longer exist on disk.
+    
+    Args:
+        conn: Database connection
+        table_name: Name of the vector table
+        base_path: Base path of the second brain
+        provider: Optional filter by provider
+        model: Optional filter by model
+        silent_print: Function for printing messages (supports silent mode)
+        
+    Returns:
+        int: Number of entries deleted
+    """
+    deleted_count = 0
+    try:
+        with conn.cursor() as cur:
+            # Get all files from the database (optionally filtered by provider/model)
+            if provider and model:
+                cur.execute(
+                    f"SELECT id, path FROM {table_name} WHERE provider = %s AND model = %s",
+                    (provider, model)
+                )
+            else:
+                cur.execute(f"SELECT id, path FROM {table_name}")
+                
+            results = cur.fetchall()
+            
+            if not results:
+                silent_print("No indexed files found to check.")
+                return 0
+                
+            silent_print(f"Checking {len(results)} indexed files for existence on disk...")
+            
+            # Check each file and delete if it doesn't exist
+            for result in results:
+                file_id = result["id"]
+                file_path = os.path.join(base_path, result["path"])
+                
+                if not file_exists_on_disk(file_path):
+                    # File doesn't exist on disk anymore
+                    silent_print(f"Removing {result['path']} from index (file no longer exists)")
+                    cur.execute(
+                        f"DELETE FROM {table_name} WHERE id = %s",
+                        (file_id,)
+                    )
+                    deleted_count += 1
+            
+            # Commit all deletions
+            if deleted_count > 0:
+                conn.commit()
+                silent_print(f"Removed {deleted_count} entries for files that no longer exist")
+            else:
+                silent_print("All indexed files still exist on disk")
+                
+        return deleted_count
+    except Exception as e:
+        print(f"Error cleaning up missing files: {e}")
+        return 0
+
 def save_to_database(conn, table_name, result, provider, model):
     """Save processed embedding result to the database."""
     file_id = result["file_id"]
@@ -869,6 +950,14 @@ def index_files(args, conn, table_name):
     provider = args.provider
     model = args.model or PROVIDER_CONFIGS[provider]["model"]
     print(f"Using {provider} provider with model {model}")
+    
+    # Create print function for silent mode
+    def silent_print(*message, **kwargs):
+        if not args.silent:
+            print(*message, **kwargs)
+    
+    # First, clean up entries for files that no longer exist
+    deleted_count = delete_missing_files(conn, table_name, base_path, provider, model, silent_print)
     
     # Find all files matching the criteria
     files_to_index = []
