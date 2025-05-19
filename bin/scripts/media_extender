@@ -1,0 +1,829 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# media_extender - Content Expansion Utility
+# ==============================================================================
+#
+# Description:
+# A utility to expand short-form content like bullet points, outlines, and notes
+# into comprehensive documents using AI. This tool helps flesh out concepts with
+# examples, explanations, and potential research to create cohesive, detailed
+# documents from minimal inputs.
+#
+# Features:
+# - Multiple expansion levels (light, moderate, comprehensive)
+# - Customizable expansion types (examples, research, explanations, analogies)
+# - Tone and style configuration
+# - Integration of relevant content from Second Brain
+# - Source citation for added research
+# - Preview and selective application of expansions
+# - Domain-specific expansion modes (academic, technical, creative)
+# - Support for both Neorg and Markdown formats
+# - Integration with SBI for storage
+#
+# Dependencies:
+# - AI wrapper scripts (claudpy, perpy, grokpy, ollampy, geminpy, openpy)
+# - sbi: For storing expanded content
+# - mton/ntom: For format conversion between Markdown and Neorg
+#
+# Usage: See the show_help() function or run with --help flag
+# ==============================================================================
+
+# Configuration
+DEBUG_MODE=false
+SILENT_MODE=false
+PREVIEW_MODE=false
+INTERACTIVE_MODE=false
+MARKDOWN_MODE=false
+NO_HEADER_MODE=false
+FROM_STDIN=false
+SANITIZE_MODE=false
+FORMAT_OUTPUT="neorg"
+OUTPUT_TO_SBI=false
+EXPANSION_LEVEL="geminpy"
+EXPANSION_TYPES=()
+TONE=""
+STYLE=""
+DOMAIN=""
+PROVIDER="perpy"
+MODEL=""
+NOTES_DIR="$HOME/Documents/notes"
+PARA_CATEGORY="00_inbox"
+CATEGORY=""
+INPUT_FILE=""
+OUTPUT_FILE=""
+NAME_SEED=""
+INTEGRATE_SOURCES=false
+SEMANTIC_SEARCH_QUERY=""
+NUM_SEMANTIC_RESULTS=3
+
+# Error types and exit codes
+# Exit codes follow a logical categorization to help with scripting and automation
+readonly EXIT_SUCCESS=0            # Successful execution
+readonly EXIT_GENERAL_ERROR=1      # General/unspecified error
+readonly EXIT_USAGE_ERROR=2        # Command line usage error
+readonly EXIT_FILE_NOT_FOUND=3     # File or directory not found
+readonly EXIT_PERMISSION_DENIED=4  # Permission denied
+readonly EXIT_NETWORK_ERROR=5      # Network-related error
+readonly EXIT_DEPENDENCY_ERROR=6   # Missing dependency
+readonly EXIT_CONVERSION_ERROR=7   # Format conversion error
+readonly EXIT_EXTERNAL_TOOL_ERROR=8 # External tool failure
+readonly EXIT_PROCESSING_ERROR=9   # Content processing error
+
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+# Function: show_help
+# Description: Display usage information and command line options
+show_help() {
+    cat << EOF
+Usage: media_extender [OPTIONS] [FILE]
+
+media_extender takes short-form content (bullet points, outlines, notes) and 
+expands them into comprehensive documents using AI assistance.
+
+General Options:
+  -h, --help                 Display this help message and exit
+  -d, --debug                Enable debug mode for verbose output
+  -s, --silent               Suppress non-essential output
+  -p, --preview              Preview expansion without saving
+  -i, --interactive          Interactive mode with TUI selection of expansions
+  -o, --output FILE          Write output to FILE instead of stdout
+  --markdown                 Output in Markdown format (default is Neorg)
+  --no-header                Omit Neorg document header metadata
+  --sbi                      Store expanded content using sbi
+  --para CATEGORY            PARA category for sbi storage (default: 00_inbox)
+  --category CATEGORY        Alternative to --para for sbi storage
+  --name-seed TEXT           Seed text for generating a filename with sbi
+
+Expansion Control:
+  -l, --level LEVEL          Expansion level: light, moderate, comprehensive
+                                (default: moderate)
+  -t, --type TYPE            Expansion types to include (can specify multiple):
+                                examples, research, explanations, analogies, all
+  --tone TONE                Tone of the expanded content:
+                                formal, casual, technical, enthusiastic
+  --style STYLE              Writing style:
+                                concise, detailed, narrative, instructional
+  --domain DOMAIN            Domain-specific mode:
+                                academic, technical, creative, business
+
+AI Provider Options:
+  --provider PROVIDER        AI provider: claudpy, perpy, grokpy, ollampy, geminpy, openpy
+                                (default: geminpy)
+  --model MODEL              Specific model to use with the provider
+
+Integration Options:
+  --integrate-sources        Integrate relevant content from Second Brain
+  --search QUERY             Semantic search query for finding relevant content
+  --num-results N            Number of semantic search results to use (default: 3)
+  --sanitize                 Sanitize data by running all content through sanitize_data
+                               before sending to AI providers for privacy protection
+
+Examples:
+  # Basic usage with a file
+  media_extender notes.txt > expanded.txt
+
+  # Specify expansion level and store in Second Brain
+  media_extender --level comprehensive --sbi --para 02_areas outline.txt
+
+  # Generate examples and explanations in a technical tone
+  media_extender --type examples --type explanations --tone technical notes.txt
+
+  # Interactive expansion with preview
+  media_extender --interactive --preview brainstorm.txt
+
+  # Output to Markdown and customize filename in Second Brain
+  media_extender --markdown --sbi --name-seed "Project Proposal" outline.txt
+
+  # Store in Second Brain with category instead of para
+  media_extender --sbi --category "Personal Notes" notes.txt
+
+  # Use specific AI provider
+  media_extender --provider grokpy ideas.txt
+  
+  # Process content from stdin with no header
+  cat notes.txt | media_extender --no-header > expanded.txt
+  
+  # Integrate content from Second Brain using semantic search
+  media_extender --integrate-sources --search "project management" bullets.txt
+  
+  # Use sanitize_data to remove sensitive information before AI processing
+  media_extender --sanitize --provider claudpy meeting_notes.txt
+EOF
+}
+
+# Function: debug_log
+# Description: Output debug information if debug mode is enabled
+debug_log() {
+    if [[ "$DEBUG_MODE" == true ]]; then
+        echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') - $1" >&2
+    fi
+}
+
+# Function: error_exit
+# Description: Display error message and exit with specified code
+error_exit() {
+    local error_msg="$1"
+    local error_code="${2:-$EXIT_GENERAL_ERROR}"
+    
+    if [[ "$SILENT_MODE" != true ]]; then
+        echo "[ERROR] $error_msg" >&2
+    fi
+    
+    debug_log "Exiting with code $error_code: $error_msg"
+    exit "$error_code"
+}
+
+# Function: check_dependencies
+# Description: Ensure all required dependencies are available
+check_dependencies() {
+    local missing_deps=()
+    
+    # Check AI providers
+    for cmd in "claudpy" "perpy" "grokpy" "ollampy"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    # Check other required tools
+    for cmd in "sbi" "mton" "ntom" "semantic_search"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    # Check sanitize_data if sanitize mode is enabled
+    if [[ "$SANITIZE_MODE" == true ]]; then
+        if ! command -v "sanitize_data" &>/dev/null; then
+            missing_deps+=("sanitize_data")
+        fi
+    }
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        error_exit "Missing dependencies: ${missing_deps[*]}" "$EXIT_DEPENDENCY_ERROR"
+    fi
+    
+    debug_log "All dependencies are available"
+}
+
+# Function: parse_arguments
+# Description: Process command line arguments
+parse_arguments() {
+    # Handle no arguments
+    if [[ $# -eq 0 ]]; then
+        if [[ -t 0 ]]; then  # If stdin is a terminal
+            show_help
+            exit "$EXIT_SUCCESS"
+        fi
+        # Otherwise, continue with stdin as input
+    fi
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit "$EXIT_SUCCESS"
+                ;;
+            -d|--debug)
+                DEBUG_MODE=true
+                debug_log "Debug mode enabled"
+                ;;
+            -s|--silent)
+                SILENT_MODE=true
+                ;;
+            -p|--preview)
+                PREVIEW_MODE=true
+                ;;
+            -i|--interactive)
+                INTERACTIVE_MODE=true
+                ;;
+            -o|--output)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --output requires a file path" "$EXIT_USAGE_ERROR"
+                fi
+                OUTPUT_FILE="$2"
+                shift
+                ;;
+            --markdown)
+                MARKDOWN_MODE=true
+                FORMAT_OUTPUT="markdown"
+                ;;
+            --no-header)
+                NO_HEADER_MODE=true
+                ;;
+            --sbi)
+                OUTPUT_TO_SBI=true
+                ;;
+            --para)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --para requires a PARA category" "$EXIT_USAGE_ERROR"
+                fi
+                PARA_CATEGORY="$2"
+                shift
+                ;;
+            --category)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --category requires a category value" "$EXIT_USAGE_ERROR"
+                fi
+                CATEGORY="$2"
+                shift
+                ;;
+            --name-seed)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --name-seed requires text" "$EXIT_USAGE_ERROR"
+                fi
+                NAME_SEED="$2"
+                shift
+                ;;
+            -l|--level)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --level requires a value: light, moderate, or comprehensive" "$EXIT_USAGE_ERROR"
+                fi
+                if [[ "$2" != "light" && "$2" != "moderate" && "$2" != "comprehensive" ]]; then
+                    error_exit "Invalid expansion level: $2. Choose from: light, moderate, comprehensive" "$EXIT_USAGE_ERROR"
+                fi
+                EXPANSION_LEVEL="$2"
+                shift
+                ;;
+            -t|--type)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --type requires a value: examples, research, explanations, analogies, or all" "$EXIT_USAGE_ERROR"
+                fi
+                if [[ "$2" == "all" ]]; then
+                    EXPANSION_TYPES=("examples" "research" "explanations" "analogies")
+                elif [[ "$2" == "examples" || "$2" == "research" || "$2" == "explanations" || "$2" == "analogies" ]]; then
+                    EXPANSION_TYPES+=("$2")
+                else
+                    error_exit "Invalid expansion type: $2. Choose from: examples, research, explanations, analogies, all" "$EXIT_USAGE_ERROR"
+                fi
+                shift
+                ;;
+            --tone)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --tone requires a value" "$EXIT_USAGE_ERROR"
+                fi
+                TONE="$2"
+                shift
+                ;;
+            --style)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --style requires a value" "$EXIT_USAGE_ERROR"
+                fi
+                STYLE="$2"
+                shift
+                ;;
+            --domain)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --domain requires a value" "$EXIT_USAGE_ERROR"
+                fi
+                DOMAIN="$2"
+                shift
+                ;;
+            --provider)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --provider requires a value" "$EXIT_USAGE_ERROR"
+                fi
+                if [[ "$2" != "claudpy" && "$2" != "perpy" && "$2" != "grokpy" && "$2" != "ollampy" && "$2" != "geminpy" && "$2" != "openpy" ]]; then
+                    error_exit "Invalid provider: $2. Choose from: claudpy, perpy, grokpy, ollampy" "$EXIT_USAGE_ERROR"
+                fi
+                PROVIDER="$2"
+                shift
+                ;;
+            --model)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --model requires a value" "$EXIT_USAGE_ERROR"
+                fi
+                MODEL="$2"
+                shift
+                ;;
+            --integrate-sources)
+                INTEGRATE_SOURCES=true
+                ;;
+            --search)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --search requires a query string" "$EXIT_USAGE_ERROR"
+                fi
+                SEMANTIC_SEARCH_QUERY="$2"
+                shift
+                ;;
+            --num-results)
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    error_exit "Option --num-results requires a number" "$EXIT_USAGE_ERROR"
+                fi
+                if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    error_exit "Invalid number of results: $2. Must be a positive integer" "$EXIT_USAGE_ERROR"
+                fi
+                NUM_SEMANTIC_RESULTS="$2"
+                shift
+                ;;
+            --sanitize)
+                SANITIZE_MODE=true
+                debug_log "Sanitize mode enabled"
+                ;;
+            -*)
+                error_exit "Unknown option: $1" "$EXIT_USAGE_ERROR"
+                ;;
+            *)
+                if [[ -n "$INPUT_FILE" ]]; then
+                    error_exit "Only one input file can be specified" "$EXIT_USAGE_ERROR"
+                fi
+                INPUT_FILE="$1"
+                ;;
+        esac
+        shift
+    done
+    
+    # Set default expansion types if none specified
+    if [[ ${#EXPANSION_TYPES[@]} -eq 0 ]]; then
+        EXPANSION_TYPES=("examples" "explanations")
+    fi
+    
+    # Validate file input if provided
+    if [[ -n "$INPUT_FILE" && ! -f "$INPUT_FILE" ]]; then
+        error_exit "Input file not found: $INPUT_FILE" "$EXIT_FILE_NOT_FOUND"
+    fi
+    
+    debug_log "Arguments parsed: EXPANSION_LEVEL=$EXPANSION_LEVEL, FORMAT_OUTPUT=$FORMAT_OUTPUT, PROVIDER=$PROVIDER, OUTPUT_TO_SBI=$OUTPUT_TO_SBI"
+}
+
+# Function: read_input_content
+# Description: Read content from file or stdin
+read_input_content() {
+    local content=""
+    local temp_file=""
+    
+    if [[ -n "$INPUT_FILE" ]]; then
+        debug_log "Reading from file: $INPUT_FILE"
+        # Use tr to filter out null bytes
+        content=$(cat "$INPUT_FILE" | tr -d '\000')
+    else
+        debug_log "Reading from stdin"
+        # Create a temporary file to store stdin content and process it safely
+        temp_file=$(mktemp)
+        cat > "$temp_file"
+        # Use tr to filter out null bytes
+        content=$(cat "$temp_file" | tr -d '\000')
+        rm -f "$temp_file"
+    fi
+    
+    # Sanitize the content if sanitize mode is enabled
+    if [[ "$SANITIZE_MODE" == true ]]; then
+        debug_log "Sanitizing input content"
+        content=$(echo "$content" | sanitize_data)
+    fi
+    
+    echo "$content"
+}
+
+# Function: fetch_semantic_sources
+# Description: Retrieve relevant content from Second Brain using semantic search
+fetch_semantic_sources() {
+    local query="$1"
+    local results="$2"
+    local sources_content=""
+    
+    debug_log "Performing semantic search with query: $query, results: $results"
+    
+    if [[ -z "$query" ]]; then
+        query=$(echo "$INPUT_CONTENT" | head -n 10)
+        debug_log "Generated search query from input content"
+    fi
+    
+    sources_content=$(semantic_search --query "$query" --limit "$results" --format "content")
+    
+    if [[ -z "$sources_content" ]]; then
+        debug_log "No relevant sources found"
+        echo ""
+    else
+        debug_log "Retrieved ${results} sources from Second Brain"
+        
+        # Sanitize the retrieved content if sanitize mode is enabled
+        if [[ "$SANITIZE_MODE" == true ]]; then
+            debug_log "Sanitizing retrieved content from Second Brain"
+            sources_content=$(echo "$sources_content" | sanitize_data)
+        fi
+        
+        echo "$sources_content"
+    fi
+}
+
+# Function: build_expansion_prompt
+# Description: Create the custom prompt for the AI based on parameters
+build_expansion_prompt() {
+    local input_content="$1"
+    local sources_content="$2"
+    local prompt=""
+    
+    # Base prompt template
+    prompt="You are an expert content developer with advanced skills in expanding concise ideas into comprehensive documents while maintaining the original intent and accuracy. I will provide you with short-form content (notes, bullet points, or an outline) that needs to be expanded into a more comprehensive document.
+
+TASK: Transform the following short-form content into an expanded, well-structured document that develops each point thoroughly.
+
+"
+    
+    # Add expansion level instruction
+    prompt+="EXPANSION LEVEL: "
+    case "$EXPANSION_LEVEL" in
+        "light")
+            prompt+="Light - Provide modest expansion of key points while keeping the document concise and to the point. Maintain brevity while adding just enough detail to clarify concepts.\n\n"
+            ;;
+        "comprehensive")
+            prompt+="Comprehensive - Create a thorough, in-depth expansion with substantial detail, extensive examples, and comprehensive coverage of each point. Develop concepts fully with rich detail and nuance.\n\n"
+            ;;
+        *)  # moderate (default)
+            prompt+="Moderate - Provide a balanced expansion with sufficient detail to explain concepts clearly while avoiding excessive verbosity. Include helpful examples and explanations where appropriate.\n\n"
+            ;;
+    esac
+    
+    # Add expansion types
+    prompt+="EXPANSION TYPES:\n"
+    for type in "${EXPANSION_TYPES[@]}"; do
+        case "$type" in
+            "examples")
+                prompt+="- Include relevant, concrete examples that illustrate key concepts\n"
+                ;;
+            "research")
+                prompt+="- Integrate research data, evidence, or supporting information for claims\n"
+                ;;
+            "explanations")
+                prompt+="- Provide clear explanations of concepts, terms, and ideas\n"
+                ;;
+            "analogies")
+                prompt+="- Use analogies or metaphors to explain complex ideas in relatable terms\n"
+                ;;
+        esac
+    done
+    prompt+="\n"
+    
+    # Add tone and style if specified
+    if [[ -n "$TONE" ]]; then
+        prompt+="TONE: $TONE\n"
+    fi
+    
+    if [[ -n "$STYLE" ]]; then
+        prompt+="STYLE: $STYLE\n"
+    fi
+    
+    # Add domain-specific instructions if specified
+    if [[ -n "$DOMAIN" ]]; then
+        prompt+="DOMAIN: $DOMAIN\n"
+        case "$DOMAIN" in
+            "academic")
+                prompt+="Follow academic writing conventions with proper citation format, scholarly tone, and rigorous logical structure. Use appropriate terminology for an academic audience.\n"
+                ;;
+            "technical")
+                prompt+="Use precise technical language with clear definitions, logical organization, and systematic explanation of concepts. Include practical applications where relevant.\n"
+                ;;
+            "creative")
+                prompt+="Incorporate creative elements like storytelling, vivid descriptions, and engaging hooks. Use varied sentence structure and evocative language.\n"
+                ;;
+            "business")
+                prompt+="Focus on actionable insights, concrete examples, and clear value propositions. Use concise business language and highlight practical applications.\n"
+                ;;
+        esac
+        prompt+="\n"
+    fi
+    
+    # Add format instructions
+    prompt+="OUTPUT FORMAT: "
+    if [[ "$FORMAT_OUTPUT" == "neorg" ]]; then
+        prompt+="Structure the output in Neorg format with appropriate headings, bullet points, and formatting.\n\n"
+    else
+        prompt+="Structure the output in Markdown format with appropriate headings, bullet points, and formatting.\n\n"
+    fi
+    
+    # Add integration instructions if sources are provided
+    if [[ -n "$sources_content" ]]; then
+        prompt+="INTEGRATION: In addition to expanding the content, integrate insights from the provided reference material where relevant, but maintain the original structure and focus of the input content. Here is the reference material to consider:\n\n"
+        prompt+="REFERENCE MATERIAL:\n$sources_content\n\n"
+    fi
+    
+    # Add general guidance
+    prompt+="GENERAL GUIDELINES:
+- Maintain the original structure and organization when expanding
+- Preserve the original intent and meaning of each point
+- Create logical transitions between sections
+- Ensure factual accuracy throughout the expansion
+- Avoid adding information that contradicts the original content
+- Keep the expanded content coherent and well-organized
+
+INPUT CONTENT TO EXPAND:
+
+$input_content"
+    
+    echo "$prompt"
+}
+
+# Function: process_expansion
+# Description: Process content expansion using the selected AI provider
+process_expansion() {
+    local prompt="$1"
+    local result=""
+    local provider_cmd="$PROVIDER"
+    local temp_file=""
+    
+    debug_log "Using AI provider: $provider_cmd"
+    
+    # Add model parameter if specified
+    if [[ -n "$MODEL" ]]; then
+        provider_cmd+=" --model $MODEL"
+        debug_log "Using model: $MODEL"
+    fi
+    
+    # Process expansion with the selected provider using temporary file to avoid null byte issues
+    debug_log "Sending prompt to AI provider"
+    temp_file=$(mktemp)
+    echo "$prompt" > "$temp_file"
+    
+    # If sanitize mode is enabled, pipe through sanitize_data before sending to AI
+    if [[ "$SANITIZE_MODE" == true ]]; then
+        debug_log "Sanitizing prompt before sending to AI provider"
+        result=$(cat "$temp_file" | tr -d '\000' | sanitize_data | eval "$provider_cmd")
+    else
+        result=$(cat "$temp_file" | tr -d '\000' | eval "$provider_cmd")
+    fi
+    
+    rm -f "$temp_file"
+    
+    echo "$result"
+}
+
+# Function: format_output
+# Description: Convert content to the desired format
+format_output() {
+    local content="$1"
+    local result=""
+    local temp_file=""
+    
+    if [[ "$FORMAT_OUTPUT" == "neorg" && "$MARKDOWN_MODE" != true ]]; then
+        debug_log "Converting to Neorg format"
+        
+        # First convert the content to Neorg format using a temp file to avoid null byte issues
+        temp_file=$(mktemp)
+        echo "$content" | tr -d '\000' > "$temp_file"
+        result=$(cat "$temp_file" | mton)
+        rm -f "$temp_file"
+        
+        # If no-header mode is enabled, strip the header
+        if [[ "$NO_HEADER_MODE" == true ]]; then
+            debug_log "No-header mode enabled, skipping document header"
+            # Create a temporary file to process the header stripping properly
+            temp_file=$(mktemp)
+            echo "$result" > "$temp_file"
+            # Use sed to remove the document header section
+            result=$(sed '/@document.meta/,/@end/d' "$temp_file")
+            # Clean up temporary file
+            rm -f "$temp_file"
+        else
+            debug_log "Including document header"
+        fi
+    else
+        debug_log "Using Markdown format"
+        result="$content"
+    fi
+    
+    echo "$result"
+}
+
+# Function: save_output
+# Description: Save the expanded content to a file or Second Brain
+save_output() {
+    local content="$1"
+    local temp_file=""
+    
+    if [[ "$OUTPUT_TO_SBI" == true ]]; then
+        debug_log "Saving to Second Brain with sbi"
+        
+        local sbi_cmd="sbi"
+        
+        # Add PARA category or category parameter
+        if [[ -n "$CATEGORY" ]]; then
+            sbi_cmd+=" --category $CATEGORY"
+            debug_log "Using sbi with --category $CATEGORY"
+        else
+            sbi_cmd+=" --para $PARA_CATEGORY"
+            debug_log "Using sbi with --para $PARA_CATEGORY"
+        fi
+        
+        if [[ -n "$NAME_SEED" ]]; then
+            sbi_cmd+=" --name-seed \"$NAME_SEED\""
+        fi
+        
+        if [[ "$MARKDOWN_MODE" == true ]]; then
+            sbi_cmd+=" --markdown"
+        fi
+        
+        # Use temporary file to avoid null byte issues
+        temp_file=$(mktemp)
+        echo "$content" | tr -d '\000' > "$temp_file"
+        cat "$temp_file" | eval "$sbi_cmd"
+        rm -f "$temp_file"
+        
+        if [[ "$SILENT_MODE" != true ]]; then
+            echo "Content saved to Second Brain in category: $PARA_CATEGORY"
+        fi
+    elif [[ -n "$OUTPUT_FILE" ]]; then
+        debug_log "Saving to file: $OUTPUT_FILE"
+        echo "$content" | tr -d '\000' > "$OUTPUT_FILE"
+        
+        if [[ "$SILENT_MODE" != true ]]; then
+            echo "Content saved to: $OUTPUT_FILE"
+        fi
+    else
+        # Output to stdout (filter null bytes)
+        echo "$content" | tr -d '\000'
+    fi
+}
+
+# Function: interactive_preview
+# Description: Show a preview in interactive mode and get user confirmation
+interactive_preview() {
+    local content="$1"
+    local proceed=false
+    local response=""
+    
+    # Create a temporary file for the preview
+    local temp_file
+    temp_file=$(mktemp)
+    trap 'rm -f "$temp_file"' EXIT
+    
+    echo "$content" > "$temp_file"
+    
+    # Display preview message
+    echo "=================================================="
+    echo "PREVIEW OF EXPANDED CONTENT"
+    echo "=================================================="
+    echo
+    
+    # Display first few lines (optional)
+    head -n 20 "$temp_file"
+    echo
+    echo "... (content continues) ..."
+    echo
+    
+    # Prompt for action
+    echo "Options:"
+    echo "  (v) View full content in pager"
+    echo "  (y) Yes, proceed with this expansion"
+    echo "  (n) No, cancel operation"
+    echo "  (e) Edit and then proceed"
+    echo
+    read -r -p "What would you like to do? [v/y/n/e] " response
+    
+    case "$response" in
+        v|V)
+            # View in pager, then ask again
+            less "$temp_file"
+            interactive_preview "$content"
+            ;;
+        y|Y)
+            proceed=true
+            ;;
+        n|N)
+            if [[ "$SILENT_MODE" != true ]]; then
+                echo "Operation canceled."
+            fi
+            exit "$EXIT_SUCCESS"
+            ;;
+        e|E)
+            # Edit content with default editor
+            if [[ -z "$EDITOR" ]]; then
+                EDITOR="nano"
+            fi
+            $EDITOR "$temp_file"
+            content=$(cat "$temp_file")
+            echo "$content"  # Return edited content
+            ;;
+        *)
+            if [[ "$SILENT_MODE" != true ]]; then
+                echo "Invalid option. Please try again."
+            fi
+            interactive_preview "$content"
+            ;;
+    esac
+    
+    return 0
+}
+
+# ==============================================================================
+# Main Script Logic
+# ==============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_arguments "$@"
+    
+    # Check for required dependencies
+    check_dependencies
+    
+    # Check if input is coming from stdin
+    if [[ ! -t 0 && -z "$INPUT_FILE" ]]; then
+        FROM_STDIN=true
+        
+        # Default to no header for stdin input unless explicitly set otherwise
+        if [[ "$NO_HEADER_MODE" != true ]]; then
+            debug_log "Automatically enabling no-header mode for stdin input"
+            NO_HEADER_MODE=true
+        fi
+        
+        # Default to silent mode for stdin input unless explicitly disabled
+        if [[ "$SILENT_MODE" != true ]]; then
+            debug_log "Automatically enabling silent mode for stdin input"
+            SILENT_MODE=true
+        fi
+    fi
+    
+    # Read input content
+    INPUT_CONTENT=$(read_input_content)
+    if [[ -z "$INPUT_CONTENT" ]]; then
+        error_exit "No input content provided" "$EXIT_USAGE_ERROR"
+    fi
+    
+    # Fetch relevant sources from Second Brain if requested
+    if [[ "$INTEGRATE_SOURCES" == true ]]; then
+        SOURCES_CONTENT=$(fetch_semantic_sources "$SEMANTIC_SEARCH_QUERY" "$NUM_SEMANTIC_RESULTS")
+    else
+        SOURCES_CONTENT=""
+    fi
+    
+    # Build the expansion prompt
+    EXPANSION_PROMPT=$(build_expansion_prompt "$INPUT_CONTENT" "$SOURCES_CONTENT")
+    debug_log "Prompt built successfully"
+    
+    # Process the expansion
+    if [[ "$SILENT_MODE" != true ]]; then
+        echo "Expanding content..."
+    fi
+    
+    EXPANDED_CONTENT=$(process_expansion "$EXPANSION_PROMPT")
+    debug_log "Content expanded successfully"
+    
+    # Format output to desired format
+    FORMATTED_CONTENT=$(format_output "$EXPANDED_CONTENT")
+    
+    # Handle preview and interactive modes
+    if [[ "$PREVIEW_MODE" == true || "$INTERACTIVE_MODE" == true ]]; then
+        debug_log "Preview/interactive mode activated"
+        
+        if [[ "$INTERACTIVE_MODE" == true ]]; then
+            # Interactive mode with user options
+            FORMATTED_CONTENT=$(interactive_preview "$FORMATTED_CONTENT")
+        else
+            # Simple preview mode - display and exit
+            echo "$FORMATTED_CONTENT"
+            exit "$EXIT_SUCCESS"
+        fi
+    fi
+    
+    # Save or output the expanded content
+    save_output "$FORMATTED_CONTENT"
+    
+    exit "$EXIT_SUCCESS"
+}
+
+# Execute main function
+main "$@"
