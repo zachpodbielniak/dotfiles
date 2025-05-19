@@ -1,0 +1,1393 @@
+#!/usr/bin/python3
+
+# semantic_search - A specialized script for semantic search operations over your second brain
+# This script provides a higher-level interface that:
+# - Automatically generates embeddings from your query
+# - Searches your vector database for similar content
+# - Displays matching content from your second brain with relevant context
+# Like other AI tools, it runs in the 'dev' distrobox container where dependencies are installed.
+
+import os
+import sys
+import argparse
+import json
+import tempfile
+import time
+import multiprocessing
+import shlex
+import yaml
+from subprocess import run, PIPE, Popen
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# ----- Distrobox Container Check -----
+# Check if we're running inside the dev container by examining the CONTAINER_ID env var
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# If we're not in the 'dev' distrobox, re-execute this exact script with all arguments
+if ctr_id != "dev":
+    cmd = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+# ----- Dependencies -----
+try:
+    import numpy as np
+    import psycopg
+    import psycopg_binary
+    from psycopg.rows import dict_row
+except ImportError as e:
+    print(f"Error: Required module not found: {e}")
+    print("Please ensure numpy, psycopg, and psycopg_binary are installed in the dev container")
+    print("Install with: pip install numpy psycopg psycopg_binary")
+    sys.exit(1)
+
+# ----- Constants -----
+# Default location of the second brain notes
+DEFAULT_NOTES_DIR = os.path.expanduser("~/Documents/notes")
+# Default table name in the vector database
+DEFAULT_TABLE_NAME = "second_brain_vectors"
+# Default AI provider for embeddings
+DEFAULT_PROVIDER = "ollampy"
+# Provider-specific defaults
+PROVIDER_CONFIGS = {
+    "openpy": {
+        "dimension": 1536,
+        "embedding_prompt": "IMPORTANT: Respond ONLY with a valid JSON object containing an 'embedding' key with an array of 1536 float numbers. No other text. Generate an embedding vector for the following text that captures semantic meaning for vector search. Format: {\"embedding\": [0.123, -0.456, ...]} with 1536 values.",
+        "model": "text-embedding-3-small"
+    },
+    "claudpy": {
+        "dimension": 1536,
+        "embedding_prompt": "IMPORTANT: Respond ONLY with a valid JSON object containing an 'embedding' key with an array of 1536 float numbers. No other text. Generate an embedding vector for the following text that captures semantic meaning for vector search. Format: {\"embedding\": [0.123, -0.456, ...]} with 1536 values.",
+        "model": "claude-3-haiku-20240307"
+    },
+    "grokpy": {
+        "dimension": 1536,
+        "embedding_prompt": "IMPORTANT: Respond ONLY with a valid JSON object containing an 'embedding' key with an array of 1536 float numbers. No other text. Generate an embedding vector for the following text that captures semantic meaning for vector search. Format: {\"embedding\": [0.123, -0.456, ...]} with 1536 values.",
+        "model": "grok-3-mini-beta"
+    },
+    "geminpy": {
+        "dimension": 768,
+        "embedding_prompt": "IMPORTANT: Respond ONLY with a valid JSON object containing an 'embedding' key with an array of 768 float numbers. No other text. Generate an embedding vector for the following text that captures semantic meaning for vector search. Format: {\"embedding\": [0.123, -0.456, ...]} with 768 values.",
+        "model": "gemini-1.5-pro"
+    },
+    "ollampy": {
+        "dimension": 768,
+        "embedding_prompt": "IMPORTANT: Respond ONLY with a valid JSON object containing an 'embedding' key with an array of 768 float numbers. No other text. Generate an embedding vector for the following text that captures semantic meaning for vector search. Format: {\"embedding\": [0.123, -0.456, ...]} with 768 values.",
+        "model": "nomic-embed-text:v1.5"
+    },
+    "perpy": {
+        "dimension": 1536,
+        "embedding_prompt": "IMPORTANT: Respond ONLY with a valid JSON object containing an 'embedding' key with an array of 1536 float numbers. No other text. Generate an embedding vector for the following text that captures semantic meaning for vector search. Format: {\"embedding\": [0.123, -0.456, ...]} with 1536 values.",
+        "model": "sonar-small-online"
+    }
+}
+
+# ----- Command-line Argument Parsing -----
+def parse_args():
+    """Parse command-line arguments for the semantic search functionality."""
+    parser = argparse.ArgumentParser(
+        description="Semantic search across your second brain using vector embeddings."
+    )
+    
+    # Main query argument
+    parser.add_argument(
+        "query", 
+        help="The natural language query to search for", 
+        nargs="?",  # Make it optional to allow for index operations
+    )
+    
+    # Search options
+    parser.add_argument(
+        "--index", 
+        help="Index your second brain content before searching", 
+        action="store_true"
+    )
+    parser.add_argument(
+        "--limit", 
+        type=int, 
+        default=5,
+        help="Maximum number of results to return (default: 5)"
+    )
+    parser.add_argument(
+        "--path", 
+        default=DEFAULT_NOTES_DIR,
+        help=f"Path to your second brain notes (default: {DEFAULT_NOTES_DIR})"
+    )
+    parser.add_argument(
+        "--table", 
+        default=DEFAULT_TABLE_NAME,
+        help=f"Vector database table name (default: {DEFAULT_TABLE_NAME})"
+    )
+    parser.add_argument(
+        "--provider", 
+        choices=["openpy", "claudpy", "grokpy", "geminpy", "ollampy", "perpy"],
+        default=DEFAULT_PROVIDER,
+        help=f"AI provider script for embeddings (default: {DEFAULT_PROVIDER})"
+    )
+    parser.add_argument(
+        "--model", 
+        help="Embedding model to use (provider-specific default if not specified)"
+    )
+    parser.add_argument(
+        "--mock", 
+        action="store_true",
+        help="Use mock embeddings for testing instead of real AI providers"
+    )
+    parser.add_argument(
+        "--fallback-prompt", 
+        action="store_true",
+        help="Use prompt-based approach for embeddings instead of direct API calls"
+    )
+    parser.add_argument(
+        "--embed-index-files", 
+        action="store_true",
+        help="Include 00_index.norg files when indexing (skipped by default)"
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        help="Number of parallel processes to use for indexing (default: single-process)"
+    )
+    parser.add_argument(
+        "--threshold", 
+        type=float, 
+        default=0.75,
+        help="Similarity threshold between 0 and 1 (default: 0.75, lower = more results)"
+    )
+    parser.add_argument(
+        "--include-dirs", 
+        nargs="+", 
+        default=["00_inbox", "01_projects", "02_areas", "03_resources", "04_archives"],
+        help="Directories to include when indexing (default: all PARA directories - 00_inbox 01_projects 02_areas 03_resources 04_archives)"
+    )
+    parser.add_argument(
+        "--exclude-dirs", 
+        nargs="+", 
+        default=[],
+        help="Directories to exclude when indexing (default: none)"
+    )
+    parser.add_argument(
+        "--file-types", 
+        nargs="+", 
+        default=[".norg", ".md", ".txt"],
+        help="File types to index (default: .norg .md .txt)"
+    )
+    parser.add_argument(
+        "--open", 
+        action="store_true",
+        help="Open the most relevant result in your editor"
+    )
+    parser.add_argument(
+        "--editor", 
+        help="Editor to use when opening files (default: $EDITOR environment variable)"
+    )
+    parser.add_argument(
+        "--simple",
+        action="store_true",
+        help="Output only the file paths of matched results (no other information)"
+    )
+    parser.add_argument(
+        "--full-path",
+        action="store_true",
+        help="When used with --simple, output absolute paths instead of paths relative to second brain"
+    )
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Hide all descriptive and progress messages (only output results)"
+    )
+    parser.add_argument(
+        "--yaml",
+        action="store_true",
+        help="Output results in YAML format instead of plain text (automatically enables silent mode)"
+    )
+    
+    return parser.parse_args()
+
+# ----- Database Functions -----
+def get_connection():
+    """Connect to the PostgreSQL database with pgvector extension."""
+    try:
+        conn = psycopg.connect(
+            host="127.0.0.1",
+            port=5432,
+            dbname="postgres",
+            user="postgres",
+            password="postgres",
+            row_factory=dict_row
+        )
+        return conn
+    except Exception as e:
+        print(f"Error connecting to database: {e}")
+        sys.exit(1)
+
+def ensure_extension_and_table(conn, table_name, provider):
+    """Ensure the pgvector extension is installed and the table exists."""
+    # Get the vector dimension for the provider
+    dimension = PROVIDER_CONFIGS[provider]["dimension"]
+    
+    with conn.cursor() as cur:
+        # Create the vector extension if it doesn't exist
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        
+        # Check if the table exists
+        cur.execute(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+            (table_name,)
+        )
+        table_exists = cur.fetchone()["exists"]
+        
+        # Create the table if it doesn't exist
+        if not table_exists:
+            cur.execute(f"""
+            CREATE TABLE {table_name} (
+                id TEXT PRIMARY KEY,
+                embedding VECTOR({dimension}),
+                path TEXT NOT NULL,
+                content_snippet TEXT,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                metadata JSONB
+            )
+            """)
+            print(f"Created table '{table_name}' for vector embeddings with dimension {dimension}")
+        else:
+            # Check if the table has the correct structure for storing provider info
+            # This handles migration from older versions that didn't track provider/model
+            try:
+                cur.execute(f"SELECT provider FROM {table_name} LIMIT 0")
+            except Exception:
+                # Need to add provider and model columns
+                print(f"Upgrading table '{table_name}' to store provider information...")
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS provider TEXT")
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS model TEXT")
+                cur.execute(f"UPDATE {table_name} SET provider = %s, model = %s WHERE provider IS NULL", 
+                           (DEFAULT_PROVIDER, PROVIDER_CONFIGS[DEFAULT_PROVIDER]["model"]))
+                try:
+                    cur.execute(f"ALTER TABLE {table_name} ALTER COLUMN provider SET NOT NULL")
+                    cur.execute(f"ALTER TABLE {table_name} ALTER COLUMN model SET NOT NULL")
+                except Exception as e:
+                    print(f"Warning: Could not set NOT NULL constraint: {e}")
+                    print("Table migration completed with warnings.")
+                else:
+                    print("Table upgrade complete.")
+                
+        conn.commit()
+
+# ----- Embedding Functions -----
+def process_file(file_data):
+    """Process a single file to generate an embedding and prepare it for the database.
+    
+    This function is designed to be called either directly or by a parallel process pool.
+    
+    Args:
+        file_data (dict): A dictionary containing all necessary data to process a file:
+            - file_path: Path object of the file
+            - base_path: Base path of the second brain
+            - provider: AI provider to use
+            - model: Embedding model to use
+            - use_fallback_prompt: Whether to use prompt-based approach
+            - index: File index in the total list (for display)
+            - total_files: Total number of files (for display)
+            
+    Returns:
+        dict: Result data with embedding and metadata, or None if skipped or failed
+    """
+    file_path = file_data["file_path"]
+    base_path = file_data["base_path"]
+    provider = file_data["provider"]
+    model = file_data["model"]
+    use_fallback_prompt = file_data["use_fallback_prompt"]
+    i = file_data["index"]
+    total_files = file_data["total_files"]
+    
+    try:
+        rel_path = file_path.relative_to(base_path)
+        file_id = str(rel_path).replace("/", "_").replace(".", "_")
+        
+        # Check if this file should be skipped because it's an index file
+        if file_data.get("skip_index_files", True) and file_path.name == "00_index.norg":
+            print(f"[{i+1}/{total_files}] Skipping index file: {rel_path}")
+            return None
+            
+        # Read the file content
+        content = get_file_content(file_path)
+        if not content:
+            print(f"[{i+1}/{total_files}] Skipping (empty or unreadable): {rel_path}")
+            return None
+            
+        # Generate a snippet for preview
+        snippet = create_content_snippet(content)
+        
+        # Generate embedding
+        embedding = generate_embedding(content, provider, model, use_fallback_prompt)
+        if not embedding:
+            print(f"[{i+1}/{total_files}] Failed to generate embedding: {rel_path}")
+            return None
+        
+        # Create metadata
+        try:
+            last_modified = os.path.getmtime(file_path)
+        except (FileNotFoundError, OSError):
+            # Handle files with spaces or special characters in the path
+            print(f"Warning: Could not get modification time for {file_path}, using current time")
+            last_modified = time.time()
+            
+        metadata = {
+            "filename": file_path.name,
+            "file_type": file_path.suffix,
+            "size": len(content),
+            "last_modified": last_modified
+        }
+        
+        result = {
+            "file_id": file_id,
+            "rel_path": str(rel_path),
+            "embedding": embedding,
+            "snippet": snippet,
+            "metadata": metadata,
+            "index": i,
+            "total_files": total_files
+        }
+        
+        return result
+    except Exception as e:
+        print(f"Error processing file {file_path}: {e}")
+        return None
+
+def generate_embedding(text, provider=DEFAULT_PROVIDER, model=None, use_fallback_prompt=False, silent=False):
+    """Generate an embedding vector for the given text using the specified AI provider.
+    
+    This function uses your existing AI provider scripts (grokpy, claudpy, etc.) with either:
+    1. Direct embedding flags (--embedding and --json flags for direct API calls)
+    2. A fallback prompt-based approach if the provider doesn't support direct embedding
+    
+    Args:
+        text: The text to generate an embedding for
+        provider: The AI provider to use (default: DEFAULT_PROVIDER)
+        model: The model to use (provider-specific default if not specified)
+        use_fallback_prompt: Whether to use the prompt-based approach
+        silent: Whether to suppress progress and status messages
+    """
+    
+    # Define a print function that respects silent mode
+    def silent_print(*args, **kwargs):
+        if not silent:
+            print(*args, **kwargs)
+    # Get provider config
+    if provider not in PROVIDER_CONFIGS:
+        print(f"Error: Provider '{provider}' not supported")  # Always print errors
+        print(f"Supported providers: {', '.join(PROVIDER_CONFIGS.keys())}")
+        sys.exit(1)
+        
+    config = PROVIDER_CONFIGS[provider]
+    
+    # Use default model for provider if not specified
+    if not model:
+        model = config["model"]
+        
+    # For testing/development with a mock embedding
+    if os.environ.get("SEMANTIC_SEARCH_MOCK_EMBEDDING") == "1":
+        silent_print(f"[MOCK] Using mock embedding for {provider}")
+        dimension = config["dimension"]
+        import random
+        mock_embedding = [random.uniform(-1, 1) for _ in range(dimension)]
+        return mock_embedding
+    
+    # Provider script is directly specified
+    script = provider
+    
+    # Ensure the script exists in our configuration
+    if provider not in PROVIDER_CONFIGS:
+        print(f"Error: Provider '{provider}' not supported")  # Always print errors
+        return None
+    
+    # Choose between direct API call or prompt-based approach
+    if use_fallback_prompt:
+        return _generate_embedding_via_prompt(text, provider, model, script, config, silent)
+    else:
+        return _generate_embedding_via_api(text, provider, model, script, config, silent)
+
+def _generate_embedding_via_api(text, provider, model, script, config, silent=False):
+    """Generate embedding using direct API calls with --embedding and --json flags."""
+    # Define a print function that respects silent mode
+    def silent_print(*args, **kwargs):
+        if not silent:
+            print(*args, **kwargs)
+            
+    try:
+        # Construct the command to call the appropriate script with embedding flags
+        cmd = [script, "--embedding", "--json"]
+        
+        # Add model parameter for scripts that support it
+        if model:
+            cmd.extend(["--model", model])
+        
+        # Run the command with the text as input
+        silent_print(f"Running: {' '.join(cmd)}")
+        result = run(
+            cmd,
+            input=text.encode('utf-8'),
+            stdout=PIPE,
+            stderr=PIPE
+        )
+        
+        # Check for errors
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8').strip()
+            print(f"Error running {script}: {stderr}")  # Always print errors
+            return None
+        
+        # Parse the output JSON
+        output = result.stdout.decode('utf-8').strip()
+        
+        # Handle truncated JSON output containing "embedding" key
+        if '"embedding"' in output:
+            try:
+                # Try to extract the numeric values from a potentially truncated array
+                import re
+                
+                # Find the beginning of the embedding array
+                array_start_match = re.search(r'"embedding"\s*:\s*\[\s*', output)
+                if array_start_match:
+                    # Extract from the start of the array to the end of the available text
+                    array_text = output[array_start_match.end():]
+                    
+                    # Parse the numbers (both integers and floats)
+                    number_pattern = r'-?\d+(?:\.\d+)?'
+                    numbers = re.findall(number_pattern, array_text)
+                    
+                    if numbers:
+                        # Convert strings to floats
+                        embedding = [float(n) for n in numbers]
+                        
+                        # For ollampy specifically, check if we have exactly 769 values (common issue)
+                        # In this case, take the first 768 values as this is likely just an extra token
+                        if provider == "ollampy" and len(embedding) == 769:
+                            silent_print(f"Detected ollampy with 769 values, automatically trimming to {config['dimension']}")
+                            embedding = embedding[:config["dimension"]]
+                        # Generate any missing values if needed
+                        elif len(embedding) < config["dimension"]:
+                            silent_print(f"Warning: Found only {len(embedding)} values, generating {config['dimension'] - len(embedding)} random values")
+                            import random
+                            embedding.extend([random.uniform(-0.1, 0.1) for _ in range(config["dimension"] - len(embedding))])
+                        # Trim if too many values
+                        elif len(embedding) > config["dimension"]:
+                            silent_print(f"Warning: Found {len(embedding)} values, trimming to {config['dimension']}")
+                            embedding = embedding[:config["dimension"]]
+                        
+                        return embedding
+            except Exception as e:
+                silent_print(f"Error trying to parse numbers from truncated JSON: {e}")
+                
+        # Try standard JSON parsing methods
+        try:
+            # Try direct JSON parsing
+            embedding_data = json.loads(output)
+            if "embedding" in embedding_data and isinstance(embedding_data["embedding"], list):
+                embedding = embedding_data["embedding"]
+                
+                # For ollampy specifically, check if we have exactly 769 values (common issue)
+                if provider == "ollampy" and len(embedding) == 769:
+                    silent_print(f"Detected ollampy with 769 values, automatically trimming to {config['dimension']}")
+                    embedding = embedding[:config["dimension"]]
+                # Verify dimension for other cases
+                elif len(embedding) != config["dimension"]:
+                    silent_print(f"Warning: Expected dimension {config['dimension']} but got {len(embedding)}")
+                    # If too many values, trim to expected dimension
+                    if len(embedding) > config["dimension"]:
+                        embedding = embedding[:config["dimension"]]
+                    # If too few values, pad with small random values
+                    elif len(embedding) < config["dimension"]:
+                        import random
+                        embedding.extend([random.uniform(-0.1, 0.1) for _ in range(config["dimension"] - len(embedding))])
+                
+                return embedding
+        except json.JSONDecodeError:
+            # If not valid JSON, try to find JSON in the output
+            import re
+            json_pattern = r'\{\s*"embedding"\s*:\s*\[.*?\]\s*\}'
+            match = re.search(json_pattern, output)
+            
+            if match:
+                try:
+                    embedding_json = match.group(0)
+                    embedding_data = json.loads(embedding_json)
+                    embedding = embedding_data["embedding"]
+                    
+                    # For ollampy specifically, check if we have exactly 769 values (common issue)
+                    if provider == "ollampy" and len(embedding) == 769:
+                        silent_print(f"Detected ollampy with 769 values, automatically trimming to {config['dimension']}")
+                        embedding = embedding[:config["dimension"]]
+                    # Verify dimension for other cases
+                    elif len(embedding) != config["dimension"]:
+                        silent_print(f"Warning: Expected dimension {config['dimension']} but got {len(embedding)}")
+                        # If too many values, trim to expected dimension
+                        if len(embedding) > config["dimension"]:
+                            embedding = embedding[:config["dimension"]]
+                        # If too few values, pad with small random values
+                        elif len(embedding) < config["dimension"]:
+                            import random
+                            embedding.extend([random.uniform(-0.1, 0.1) for _ in range(config["dimension"] - len(embedding))])
+                    
+                    return embedding
+                except (json.JSONDecodeError, KeyError) as e:
+                    silent_print(f"Error parsing embedding JSON: {e}")
+        
+        silent_print(f"Error: Could not parse embedding from output. First 200 chars: {output[:200]}...")
+        return None
+        
+    except Exception as e:
+        print(f"Error generating embedding with {provider}: {e}")  # Always print errors
+        if hasattr(e, 'stderr') and e.stderr:
+            print(f"Error details: {e.stderr.decode('utf-8')}")  # Always print errors
+        return None
+
+def _generate_embedding_via_prompt(text, provider, model, script, config, silent=False):
+    """Fallback method that uses a prompt to get embeddings."""
+    # Define a print function that respects silent mode
+    def silent_print(*args, **kwargs):
+        if not silent:
+            print(*args, **kwargs)
+            
+    # Create a temporary file with the embedding prompt and text
+    with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp:
+        prompt = config["embedding_prompt"]
+        content = f"{prompt}\n\nText to embed:\n{text}"
+        temp.write(content)
+        temp_path = temp.name
+    
+    try:
+        # Construct the command to call the appropriate script
+        cmd = [script]
+        
+        # Add model parameter for scripts that support it
+        if model:
+            cmd.extend(["--model", model])
+        
+        # Run the command with the prompt + text as input via the temp file
+        silent_print(f"Running (fallback prompt mode): {' '.join(cmd)}")
+        with open(temp_path, 'r') as temp_file:
+            result = run(
+                cmd,
+                stdin=temp_file,
+                stdout=PIPE,
+                stderr=PIPE
+            )
+        
+        # Check for errors
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8').strip()
+            print(f"Error running {script}: {stderr}")  # Always print errors
+            return None
+        
+        # Parse the output to extract the JSON object with the embedding
+        output = result.stdout.decode('utf-8').strip()
+        
+        # Try multiple approaches to find and parse valid JSON in the output
+        
+        # First try: direct JSON parsing of the entire output
+        try:
+            data = json.loads(output)
+            if "embedding" in data and isinstance(data["embedding"], list):
+                embedding = data["embedding"]
+                
+                # For ollampy specifically, check if we have exactly 769 values (common issue)
+                if provider == "ollampy" and len(embedding) == 769:
+                    silent_print(f"Detected ollampy with 769 values, automatically trimming to {config['dimension']}")
+                    embedding = embedding[:config["dimension"]]
+                # Handle other dimension mismatches
+                elif len(embedding) != config["dimension"]:
+                    silent_print(f"Warning: Expected dimension {config['dimension']} but got {len(embedding)}")
+                    # If too many values, trim to expected dimension
+                    if len(embedding) > config["dimension"]:
+                        embedding = embedding[:config["dimension"]]
+                    # If too few values, pad with small random values
+                    elif len(embedding) < config["dimension"]:
+                        import random
+                        embedding.extend([random.uniform(-0.1, 0.1) for _ in range(config["dimension"] - len(embedding))])
+                        
+                return embedding
+        except json.JSONDecodeError:
+            # If the whole output isn't valid JSON, continue to other methods
+            pass
+            
+        # Second try: Find a JSON object using regex
+        import re
+        json_pattern = r'\{\s*"embedding"\s*:\s*\[.*?\]\s*\}'
+        match = re.search(json_pattern, output)
+        
+        if match:
+            try:
+                embedding_json = match.group(0)
+                embedding_data = json.loads(embedding_json)
+                embedding = embedding_data["embedding"]
+                
+                # For ollampy specifically, check if we have exactly 769 values (common issue)
+                if provider == "ollampy" and len(embedding) == 769:
+                    silent_print(f"Detected ollampy with 769 values, automatically trimming to {config['dimension']}")
+                    embedding = embedding[:config["dimension"]]
+                # Handle other dimension mismatches
+                elif len(embedding) != config["dimension"]:
+                    silent_print(f"Warning: Expected dimension {config['dimension']} but got {len(embedding)}")
+                    # If too many values, trim to expected dimension
+                    if len(embedding) > config["dimension"]:
+                        embedding = embedding[:config["dimension"]]
+                    # If too few values, pad with small random values
+                    elif len(embedding) < config["dimension"]:
+                        import random
+                        embedding.extend([random.uniform(-0.1, 0.1) for _ in range(config["dimension"] - len(embedding))])
+                
+                return embedding
+            except (json.JSONDecodeError, KeyError) as e:
+                silent_print(f"Error parsing embedding JSON: {e}")
+        
+        # Third try: Look for any array in the output
+        array_pattern = r'\[\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*,.*?\]'
+        array_match = re.search(array_pattern, output)
+        
+        if array_match:
+            try:
+                array_json = array_match.group(0)
+                embedding = json.loads(array_json)
+                
+                # Verify it's a list of numbers with appropriate dimension
+                if isinstance(embedding, list) and all(isinstance(x, (int, float)) for x in embedding):
+                    # For ollampy specifically, check if we have exactly 769 values (common issue)
+                    if provider == "ollampy" and len(embedding) == 769:
+                        silent_print(f"Detected ollampy with 769 values, automatically trimming to {config['dimension']}")
+                        embedding = embedding[:config["dimension"]]
+                    # Handle other dimension mismatches
+                    elif len(embedding) != config["dimension"]:
+                        silent_print(f"Warning: Expected dimension {config['dimension']} but got {len(embedding)}")
+                        # If too many values, trim to expected dimension
+                        if len(embedding) > config["dimension"]:
+                            embedding = embedding[:config["dimension"]]
+                        # If too few values, pad with small random values
+                        elif len(embedding) < config["dimension"]:
+                            import random
+                            embedding.extend([random.uniform(-0.1, 0.1) for _ in range(config["dimension"] - len(embedding))])
+                    
+                    return embedding
+            except (json.JSONDecodeError, KeyError) as e:
+                silent_print(f"Error parsing array JSON: {e}")
+        
+        # If all attempts fail, provide helpful error message
+        silent_print("Error: Could not find valid embedding JSON in the output")
+        silent_print(f"Output preview: {output[:200]}...")
+        silent_print("Try using the --mock flag for testing")
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error generating embedding with {provider}: {e}")  # Always print errors
+        if hasattr(e, 'stderr') and e.stderr:
+            print(f"Error details: {e.stderr.decode('utf-8')}")  # Always print errors
+        return None
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+def file_exists_on_disk(file_path):
+    """Check if a file exists on disk.
+    
+    Args:
+        file_path: Path object or string representing the file path
+        
+    Returns:
+        bool: True if the file exists, False otherwise
+    """
+    try:
+        path_obj = Path(file_path) if not isinstance(file_path, Path) else file_path
+        return path_obj.exists() and path_obj.is_file()
+    except Exception:
+        # In case of any errors, try a different approach
+        try:
+            # Using os.path
+            return os.path.isfile(str(file_path))
+        except Exception:
+            # If all checking methods fail, assume file doesn't exist
+            return False
+
+def get_file_content(file_path):
+    """Read and return the content of a file, handling different encodings."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(file_path, 'r', encoding='latin-1') as f:
+                return f.read()
+        except Exception as e:
+            print(f"Error reading file {file_path}: {e}")
+            return None
+    except (FileNotFoundError, OSError) as e:
+        # Handle files with spaces or special characters in the path
+        try:
+            # Try using the raw string representation of the path
+            path_str = str(file_path)
+            with open(path_str, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e2:
+            print(f"Error reading file {file_path}: {e2}")
+            return None
+
+def create_content_snippet(content, max_length=300):
+    """Create a snippet of the content for preview purposes."""
+    if not content:
+        return ""
+    
+    # For now, just take the first part of the content
+    # This could be improved to extract more meaningful snippets
+    snippet = content[:max_length]
+    if len(content) > max_length:
+        snippet += "..."
+    
+    return snippet
+
+def check_file_exists(conn, table_name, file_id, provider, model, file_path=None):
+    """Check if a file is already indexed in the database and if it's up to date.
+    
+    Args:
+        conn: Database connection
+        table_name: Name of the vector table
+        file_id: ID of the file to check
+        provider: AI provider used for embeddings
+        model: Embedding model
+        file_path: Path to the file (needed for modification time check)
+        
+    Returns:
+        tuple: (exists, is_current) where:
+            - exists: True if file exists in database
+            - is_current: True if file in database is current (not outdated)
+                          None if we couldn't determine (file_path not provided)
+    """
+    with conn.cursor() as cur:
+        try:
+            # Get entry with metadata
+            cur.execute(
+                f"SELECT id, metadata FROM {table_name} WHERE id = %s AND provider = %s AND model = %s",
+                (file_id, provider, model)
+            )
+            result = cur.fetchone()
+            exists = result is not None
+            
+            # If file exists and we have a file_path, check if it's current
+            if exists and file_path:
+                try:
+                    # Get local file modification time
+                    local_mtime = os.path.getmtime(file_path)
+                    
+                    # Get stored modification time from database
+                    metadata = result["metadata"]
+                    if isinstance(metadata, str):
+                        # If metadata is stored as JSON string
+                        metadata = json.loads(metadata)
+                    
+                    # Check if metadata has last_modified field
+                    if "last_modified" in metadata:
+                        db_mtime = float(metadata["last_modified"])
+                        # File is current if database time is >= local time
+                        is_current = db_mtime >= local_mtime
+                    else:
+                        # If no timestamp in metadata, assume not current
+                        is_current = False
+                except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+                    # If any errors occur during comparison, assume not current
+                    print(f"Warning: Error comparing modification times: {e}")
+                    is_current = False
+            else:
+                # If file doesn't exist or no file_path provided, is_current is None
+                is_current = None
+        except Exception as e:
+            # Table might not have provider/model columns yet or other error
+            try:
+                cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
+                exists = cur.fetchone() is not None
+                is_current = None  # Can't determine currentness without metadata
+            except Exception:
+                exists = False
+                is_current = None
+    
+    return exists, is_current
+
+def delete_missing_files(conn, table_name, base_path, provider=None, model=None, silent_print=print):
+    """Delete database entries for files that no longer exist on disk.
+    
+    Args:
+        conn: Database connection
+        table_name: Name of the vector table
+        base_path: Base path of the second brain
+        provider: Optional filter by provider
+        model: Optional filter by model
+        silent_print: Function for printing messages (supports silent mode)
+        
+    Returns:
+        int: Number of entries deleted
+    """
+    deleted_count = 0
+    try:
+        with conn.cursor() as cur:
+            # Get all files from the database (optionally filtered by provider/model)
+            if provider and model:
+                cur.execute(
+                    f"SELECT id, path FROM {table_name} WHERE provider = %s AND model = %s",
+                    (provider, model)
+                )
+            else:
+                cur.execute(f"SELECT id, path FROM {table_name}")
+                
+            results = cur.fetchall()
+            
+            if not results:
+                silent_print("No indexed files found to check.")
+                return 0
+                
+            silent_print(f"Checking {len(results)} indexed files for existence on disk...")
+            
+            # Check each file and delete if it doesn't exist
+            for result in results:
+                file_id = result["id"]
+                file_path = os.path.join(base_path, result["path"])
+                
+                if not file_exists_on_disk(file_path):
+                    # File doesn't exist on disk anymore
+                    silent_print(f"Removing {result['path']} from index (file no longer exists)")
+                    cur.execute(
+                        f"DELETE FROM {table_name} WHERE id = %s",
+                        (file_id,)
+                    )
+                    deleted_count += 1
+            
+            # Commit all deletions
+            if deleted_count > 0:
+                conn.commit()
+                silent_print(f"Removed {deleted_count} entries for files that no longer exist")
+            else:
+                silent_print("All indexed files still exist on disk")
+                
+        return deleted_count
+    except Exception as e:
+        print(f"Error cleaning up missing files: {e}")
+        return 0
+
+def save_to_database(conn, table_name, result, provider, model):
+    """Save processed embedding result to the database."""
+    file_id = result["file_id"]
+    rel_path = result["rel_path"]
+    embedding = result["embedding"]
+    snippet = result["snippet"]
+    metadata = result["metadata"]
+    i = result["index"]
+    total_files = result["total_files"]
+    
+    try:
+        # Insert or update in database
+        with conn.cursor() as cur:
+            # Check if this exact file ID exists
+            exists, _ = check_file_exists(conn, table_name, file_id, provider, model)
+                
+            if exists:
+                # Update existing record (file was modified)
+                cur.execute(
+                    f"UPDATE {table_name} SET embedding = %s, content_snippet = %s, "
+                    f"provider = %s, model = %s, metadata = %s WHERE id = %s AND provider = %s AND model = %s",
+                    (embedding, snippet, provider, model, json.dumps(metadata), file_id, provider, model)
+                )
+                print(f"[{i+1}/{total_files}] Updated: {rel_path}")
+            else:
+                # Check if a different provider version exists
+                try:
+                    cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
+                    exists_different_provider = cur.fetchone() is not None
+                except Exception:
+                    exists_different_provider = False
+                
+                if exists_different_provider:
+                    # Update but preserve the ID
+                    cur.execute(
+                        f"UPDATE {table_name} SET embedding = %s, content_snippet = %s, "
+                        f"provider = %s, model = %s, metadata = %s WHERE id = %s",
+                        (embedding, snippet, provider, model, json.dumps(metadata), file_id)
+                    )
+                    print(f"[{i+1}/{total_files}] Updated (provider change): {rel_path}")
+                else:
+                    # Insert new record
+                    cur.execute(
+                        f"INSERT INTO {table_name} "
+                        f"(id, embedding, path, content_snippet, provider, model, metadata) "
+                        f"VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (file_id, embedding, rel_path, snippet, 
+                         provider, model, json.dumps(metadata))
+                    )
+                    print(f"[{i+1}/{total_files}] Indexed: {rel_path}")
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error saving to database: {e}")
+        return False
+
+def index_files(args, conn, table_name):
+    """Index files from the second brain into the vector database."""
+    base_path = Path(args.path)
+    
+    # Validate the path exists
+    if not base_path.exists() or not base_path.is_dir():
+        print(f"Error: Path {base_path} does not exist or is not a directory")
+        return
+    
+    print(f"Indexing files in {base_path}...")
+    
+    # Get provider configuration
+    provider = args.provider
+    model = args.model or PROVIDER_CONFIGS[provider]["model"]
+    print(f"Using {provider} provider with model {model}")
+    
+    # Create print function for silent mode
+    def silent_print(*message, **kwargs):
+        if not args.silent:
+            print(*message, **kwargs)
+    
+    # First, clean up entries for files that no longer exist
+    deleted_count = delete_missing_files(conn, table_name, base_path, provider, model, silent_print)
+    
+    # Find all files matching the criteria
+    files_to_index = []
+    
+    for include_dir in args.include_dirs:
+        # Handle directory paths that might have spaces
+        if isinstance(include_dir, str) and ' ' in include_dir:
+            print(f"Warning: Directory path '{include_dir}' contains spaces. Trying both formats.")
+            # Try the path as provided and with underscores instead of spaces
+            dir_paths = [
+                base_path / include_dir,
+                base_path / include_dir.replace(' ', '_')
+            ]
+        else:
+            dir_paths = [base_path / include_dir]
+        
+        for dir_path in dir_paths:
+            if not dir_path.exists():
+                continue
+                
+            for file_type in args.file_types:
+                # Use recursive glob to find all matching files
+                matches = list(dir_path.glob(f"**/*{file_type}"))
+                files_to_index.extend(matches)
+    
+    # Remove files from excluded directories
+    for exclude_dir in args.exclude_dirs:
+        exclude_path = str(base_path / exclude_dir)
+        # Also check for underscore version
+        exclude_path_alt = str(base_path / exclude_dir.replace(' ', '_'))
+        
+        files_to_index = [f for f in files_to_index if not (str(f).startswith(exclude_path) or 
+                                                              str(f).startswith(exclude_path_alt))]
+    
+    total_files = len(files_to_index)
+    print(f"Found {total_files} files to index")
+    
+    # Filter out already indexed files before processing
+    files_to_process = []
+    for i, file_path in enumerate(files_to_index):
+        rel_path = file_path.relative_to(base_path)
+        file_id = str(rel_path).replace("/", "_").replace(".", "_")
+        
+        # Skip index files unless embed-index-files flag is set
+        if not args.embed_index_files and file_path.name == "00_index.norg":
+            print(f"[{i+1}/{total_files}] Skipping index file: {rel_path}")
+            continue
+        
+        # Check if already indexed and up-to-date
+        exists, is_current = check_file_exists(conn, table_name, file_id, provider, model, file_path)
+        
+        if exists and is_current:
+            print(f"[{i+1}/{total_files}] Already indexed: {rel_path}")
+            continue
+        elif exists and not is_current:
+            print(f"[{i+1}/{total_files}] Re-indexing modified file: {rel_path}")
+            # Add to processing list
+            files_to_process.append((i, file_path))
+        else:
+            # File doesn't exist in the database
+            # Add to processing list
+            files_to_process.append((i, file_path))
+    
+    # Check if we have any files to process
+    if not files_to_process:
+        print("All files are already indexed. No new files to process.")
+        return
+    
+    # Process files - either in parallel or serially
+    if args.parallel and args.parallel > 1 and files_to_process:
+        # Use parallel processing
+        num_workers = min(args.parallel, len(files_to_process))
+        print(f"Processing {len(files_to_process)} files using {num_workers} parallel workers...")
+        
+        # Prepare file data for processing
+        file_data_list = []
+        for i, file_path in files_to_process:
+            file_data = {
+                "file_path": file_path,
+                "base_path": base_path,
+                "provider": provider,
+                "model": model,
+                "use_fallback_prompt": args.fallback_prompt,
+                "index": i,
+                "total_files": total_files,
+                "skip_index_files": not args.embed_index_files
+            }
+            file_data_list.append(file_data)
+        
+        # Process files in parallel
+        processed_count = 0
+        completed_count = 0
+        total_count = len(file_data_list)
+        print(f"Starting parallel processing of {total_count} files...")
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Start the tasks
+            future_to_file = {executor.submit(process_file, file_data): file_data for file_data in file_data_list}
+            
+            # Simple progress tracking
+            for future in as_completed(future_to_file):
+                completed_count += 1
+                
+                # Print progress every 10% or for every file if less than 10 files
+                if total_count <= 10 or completed_count % max(1, total_count // 10) == 0:
+                    progress_percent = (completed_count / total_count) * 100
+                    print(f"Progress: {completed_count}/{total_count} files ({progress_percent:.1f}%)")
+                
+                # Process result
+                result = future.result()
+                if result:
+                    # Save to database
+                    save_to_database(conn, table_name, result, provider, model)
+                    processed_count += 1
+        
+        print(f"Parallel indexing complete. {processed_count} files successfully processed out of {len(files_to_process)} attempted.")
+    else:
+        # Process serially (original method)
+        for i, file_path in files_to_process:
+            file_data = {
+                "file_path": file_path,
+                "base_path": base_path,
+                "provider": provider,
+                "model": model,
+                "use_fallback_prompt": args.fallback_prompt,
+                "index": i,
+                "total_files": total_files,
+                "skip_index_files": not args.embed_index_files
+            }
+            
+            result = process_file(file_data)
+            if result:
+                save_to_database(conn, table_name, result, provider, model)
+    
+    print(f"Indexing complete. {total_files} files processed.")
+
+def search_similar(args, conn, table_name, query, silent_print=print):
+    """Search for content similar to the query.
+    
+    Args:
+        args: Command-line arguments
+        conn: Database connection
+        table_name: Name of the vector table to search
+        query: The search query
+        silent_print: Function to use for printing (supports silent mode)
+        
+    Returns:
+        list: Search results or None if no results found
+    """
+    # Get provider configuration
+    provider = args.provider
+    model = args.model or PROVIDER_CONFIGS[provider]["model"]
+    
+    silent_print(f"Generating embedding for query using {provider} provider with model {model}")
+    query_embedding = generate_embedding(query, provider, model, args.fallback_prompt, silent=args.silent)
+    
+    if not query_embedding:
+        silent_print("Failed to generate embedding for the query")
+        return None
+    
+    silent_print(f"Searching for similar content in {table_name}...")
+    
+    with conn.cursor() as cur:
+        # First check if we have any content indexed with this provider/model
+        cur.execute(
+            f"SELECT COUNT(*) AS count FROM {table_name} WHERE provider = %s AND model = %s",
+            (provider, model)
+        )
+        count = cur.fetchone()["count"]
+        
+        if count == 0:
+            silent_print(f"No content indexed with provider={provider}, model={model}.")
+            # Check if we have any content at all
+            cur.execute(f"SELECT DISTINCT provider, model FROM {table_name}")
+            available = cur.fetchall()
+            if available:
+                silent_print("Available provider/model combinations:")
+                for combo in available:
+                    silent_print(f"  - {combo['provider']} / {combo['model']}")
+                silent_print("Tip: Use --provider and --model to match your search with indexed content.")
+            else:
+                silent_print("No content indexed. Use --index to add content first.")
+            return None
+            
+        # Perform the similarity search
+        # Note: We need to cast the Python list to a PostgreSQL vector type
+        query_sql = f"""
+        SELECT id, path, content_snippet, embedding <=> %s::vector AS distance, metadata, provider, model
+        FROM {table_name}
+        WHERE provider = %s AND model = %s AND embedding <=> %s::vector <= %s
+        ORDER BY distance
+        LIMIT %s
+        """
+        
+        # Convert the embedding list to a string representation for PostgreSQL vector casting
+        # Format: '[val1,val2,val3,...]'
+        vector_str = '[' + ','.join(str(x) for x in query_embedding) + ']'
+        
+        cur.execute(
+            query_sql,
+            (
+                vector_str,
+                provider,
+                model,
+                vector_str,
+                args.threshold,
+                args.limit
+            )
+        )
+        
+        results = cur.fetchall()
+    
+    if not results:
+        if not args.simple and not args.yaml:
+            silent_print("No similar content found. Try adjusting the threshold or indexing more content.")
+        elif args.yaml:
+            yaml_output = {"results": []}
+            print(yaml.safe_dump(yaml_output, sort_keys=False))
+        return None
+        
+    # Handle simple mode (output just paths for scripting)
+    if args.simple:
+        for result in results:
+            if args.full_path:
+                # Output absolute path
+                full_path = os.path.join(args.path, result["path"])
+                print(full_path)  # Always print paths even in silent mode
+            else:
+                # Output relative path
+                print(result["path"])  # Always print paths even in silent mode
+        return results
+        
+    # YAML output mode
+    if args.yaml:
+        yaml_results = []
+        for result in results:
+            # Convert postgres row to dict for yaml dumping
+            result_dict = dict(result)
+            
+            # Calculate similarity score
+            similarity = 1 - result_dict["distance"]
+            result_dict["similarity"] = round(similarity, 4)
+            
+            # Process metadata
+            if result_dict["metadata"]:
+                if isinstance(result_dict["metadata"], dict):
+                    metadata = result_dict["metadata"]
+                else:
+                    try:
+                        metadata = json.loads(result_dict["metadata"])
+                    except:
+                        metadata = {"raw": str(result_dict["metadata"])}
+                result_dict["metadata"] = metadata
+                
+                # Format timestamp if present
+                if "last_modified" in metadata:
+                    from datetime import datetime
+                    result_dict["metadata"]["last_modified"] = datetime.fromtimestamp(
+                        metadata["last_modified"]
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Add full path
+            result_dict["full_path"] = os.path.join(args.path, result_dict["path"])
+            
+            # Remove large embedding vector
+            if "embedding" in result_dict:
+                del result_dict["embedding"]
+                
+            yaml_results.append(result_dict)
+            
+        yaml_output = {"results": yaml_results}
+        print(yaml.safe_dump(yaml_output, sort_keys=False))
+        return results
+    
+    # Standard detailed output mode
+    silent_print(f"\nFound {len(results)} matches:")
+    silent_print("-" * 80)
+    
+    for i, result in enumerate(results):
+        similarity = 1 - result["distance"]  # Convert distance to similarity
+        
+        silent_print(f"{i+1}. {result['path']} (Similarity: {similarity:.2f})")
+        silent_print(f"   Snippet: {result['content_snippet']}")
+        silent_print(f"   Provider: {result['provider']}, Model: {result['model']}")
+        
+        # Try to extract and display relevant metadata
+        if result["metadata"]:
+            # Handle both string JSON and dictionary metadata formats
+            try:
+                # If metadata is already a dict (from newer psycopg versions)
+                if isinstance(result["metadata"], dict):
+                    metadata = result["metadata"]
+                # If metadata is a JSON string (from older psycopg versions)
+                else:
+                    metadata = json.loads(result["metadata"])
+                    
+                if "last_modified" in metadata:
+                    from datetime import datetime
+                    last_modified = datetime.fromtimestamp(metadata["last_modified"]).strftime("%Y-%m-%d %H:%M:%S")
+                    silent_print(f"   Last modified: {last_modified}")
+                
+                if "size" in metadata:
+                    silent_print(f"   Size: {metadata['size']} bytes")
+            except (json.JSONDecodeError, TypeError) as e:
+                silent_print(f"   Note: Could not parse metadata: {e}")
+                silent_print(f"   Raw metadata: {str(result['metadata'])[:50]}...")
+        else:
+            silent_print("   No metadata available")
+                
+        silent_print("-" * 80)
+    
+    # Display the full path to the most relevant result
+    if results:
+        most_relevant = results[0]
+        full_path = os.path.join(args.path, most_relevant["path"])
+        silent_print(f"Most relevant file: {full_path}")
+        
+        # Note if --open option is available
+        if not args.open:
+            silent_print("Tip: Use --open to directly open this file in your editor")
+    
+    return results
+
+def open_file_in_editor(file_path, editor=None):
+    """Open a file in the specified editor or system default editor.
+    
+    Args:
+        file_path (str): Path to the file to open
+        editor (str, optional): Specific editor command to use. If None, uses $EDITOR env variable.
+    
+    Returns:
+        bool: True if editor launched successfully, False otherwise
+    """
+    try:
+        # Get the editor to use
+        if not editor:
+            editor = os.environ.get("EDITOR")
+            
+        # If still no editor, try some common fallbacks
+        if not editor:
+            # Check for common editors
+            for common_editor in ["vim", "nano", "emacs", "code", "gedit"]:
+                try:
+                    if run(["which", common_editor], stdout=PIPE, stderr=PIPE).returncode == 0:
+                        editor = common_editor
+                        break
+                except Exception:
+                    pass
+        
+        if not editor:
+            print("Error: No editor found. Please set the EDITOR environment variable or use --editor")
+            return False
+        
+        # Split the editor command in case it includes options
+        editor_parts = shlex.split(editor)
+        
+        # Launch the editor with the file
+        process = Popen([*editor_parts, file_path])
+        
+        # Don't wait for editor to close - let it run independently
+        print(f"Opening {file_path} with {editor}")
+        return True
+    except Exception as e:
+        print(f"Error opening file: {e}")
+        return False
+
+def main():
+    """Main function to handle semantic search operations."""
+    args = parse_args()
+    
+    # Auto-enable silent mode with simple output or yaml output
+    if (args.simple or args.yaml) and not args.silent:
+        args.silent = True
+        
+    # Create print function based on silent mode
+    def silent_print(*message, **kwargs):
+        if not args.silent:
+            print(*message, **kwargs)
+            
+    # Verify provider is valid
+    if args.provider not in PROVIDER_CONFIGS:
+        print(f"Error: Provider '{args.provider}' not supported")
+        print(f"Supported providers: {', '.join(PROVIDER_CONFIGS.keys())}")
+        sys.exit(1)
+    
+    # Set mock embedding environment variable if --mock flag is used
+    if args.mock:
+        os.environ["SEMANTIC_SEARCH_MOCK_EMBEDDING"] = "1"
+        silent_print("Using mock embeddings for testing")
+    
+    # Connect to the database
+    conn = get_connection()
+    
+    # Ensure the pgvector extension and table exist
+    ensure_extension_and_table(conn, args.table, args.provider)
+    
+    # Handle indexing if requested
+    if args.index:
+        index_files(args, conn, args.table)
+        
+        # If no query provided, exit after indexing
+        if not args.query:
+            conn.close()
+            return
+    
+    # Check for conflicting options
+    if args.open and args.simple:
+        print("Error: --open and --simple options cannot be used together")
+        sys.exit(1)
+        
+    if args.yaml and args.simple:
+        print("Error: --yaml and --simple options cannot be used together")
+        sys.exit(1)
+    
+    # Perform the search if a query is provided
+    if args.query:
+        search_results = search_similar(args, conn, args.table, args.query, silent_print)
+        
+        # Open the most relevant result in editor if requested
+        if args.open and search_results and len(search_results) > 0:
+            most_relevant = search_results[0]
+            full_path = os.path.join(args.path, most_relevant["path"])
+            open_file_in_editor(full_path, args.editor)
+    elif not args.index:
+        # No query and no index flag, show help
+        silent_print("Please provide a search query or use --index to index your second brain")
+        silent_print("Run with --help for more information")
+    
+    # Close the database connection
+    conn.close()
+
+if __name__ == "__main__":
+    main()

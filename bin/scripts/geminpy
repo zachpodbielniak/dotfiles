@@ -44,6 +44,8 @@ parser.add_argument("--prompt", help="Prompt to prepend to the input")
 parser.add_argument("--model", default="gemini-2.5-pro-preview-05-06",
                     help="Model to use (default: gemini-2.5-pro-preview-05-06). Available models: gemini-2.5-pro-preview-05-06, gemini-2.5-flash-preview-04-17, gemini-2.0-flash, gemini-2.0-flash-preview-image-generation, gemini-2.0-flash-lite, gemini-1.5-flash, gemini-1.5-flash-8b, gemini-1.5-pro, gemini-embedding-exp, imagen-3.0-generate-002, veo-2.0-generate-001, gemini-2.0-flash-live-001, text-embedding-004, embedding-001, models/aqa")
 parser.add_argument("--debug", action="store_true", help="Enable debug mode (shows request details)")
+parser.add_argument("--json", action="store_true", help="Return a clean JSON response without streaming")
+parser.add_argument("--embedding", action="store_true", help="Generate an embedding vector instead of a text response")
 args = parser.parse_args()
 
 # Since outside of the distrobox we may not have these modules
@@ -65,24 +67,42 @@ try:
         "Content-Type": "application/json"
     }
 
-    # Use the Gemini API endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{args.model}:streamGenerateContent"
-
-    data = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": query
-                    }
-                ]
+    # Set the API endpoint based on the request type
+    if args.embedding:
+        # Use the embeddings API for Gemini
+        embedding_model = "embedding-001"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{embedding_model}:embedContent"
+        data = {
+            "model": embedding_model,
+            "content": {
+                "parts": [{
+                    "text": query
+                }]
             }
-        ],
-        "generation_config": {
-            "max_output_tokens": 4096
         }
-    }
+    else:
+        # Use standard generation endpoint
+        endpoint = "generateContent"
+        if not args.json:
+            endpoint = "streamGenerateContent"
+            
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{args.model}:{endpoint}"
+        
+        data = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": query
+                        }
+                    ]
+                }
+            ],
+            "generation_config": {
+                "max_output_tokens": 4096
+            }
+        }
 
     # Print debug info if requested
     if args.debug:
@@ -91,12 +111,14 @@ try:
         print(f"Debug: Data: {json.dumps(data)}", file=sys.stderr)
 
     try:
-        # Send request to Gemini API with streaming 
+        # Send request to Gemini API
         if args.debug:
             print(f"Debug: Sending request to {url}", file=sys.stderr)
             print(f"Debug: Request data: {json.dumps(data)}", file=sys.stderr)
-            
-        response = requests.post(url, headers=headers, json=data, stream=True)
+        
+        # Stream only for non-embedding, non-JSON requests
+        stream_mode = not (args.embedding or args.json)
+        response = requests.post(url, headers=headers, json=data, stream=stream_mode)
         
         if args.debug:
             print(f"Debug: Response status: {response.status_code}", file=sys.stderr)
@@ -110,102 +132,124 @@ try:
         print(f"Error sending request: {e}", file=sys.stderr)
         exit(1)
     
-    # Process the response with streaming
+    # Handle the response based on request type
     try:
-        import re
-        import json
-        
-        # This pattern will look for text fields in JSON chunks
-        text_pattern = re.compile(r'"text":\s*"((?:\\.|[^"\\])*)"')
-        
-        # Initialize buffer to capture partial JSON chunks
-        buffer = ""
-        parsed_text_segments = set()  # To avoid duplicates
-        last_printed_text = ""  # Keep track of the last segment we printed
-        
-        if args.debug:
-            print(f"Debug: Beginning streaming response processing", file=sys.stderr)
-        
-        # Process the response chunks as they arrive
-        for chunk in response.iter_content(chunk_size=1024):
-            if not chunk:
-                continue
+        # Process embeddings response
+        if args.embedding:
+            response_data = response.json()
+            if "embedding" in response_data:
+                # Extract the embedding values and format as JSON
+                embedding = response_data["embedding"]["values"]
+                print(json.dumps({"embedding": embedding}))
+            else:
+                print(json.dumps(response_data))
                 
-            # Decode chunk and add to buffer
-            chunk_text = chunk.decode('utf-8')
-            buffer += chunk_text
+        # Process non-streaming JSON response
+        elif args.json:
+            response_data = response.json()
+            if "candidates" in response_data and len(response_data["candidates"]) > 0:
+                for candidate in response_data["candidates"]:
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        for part in candidate["content"]["parts"]:
+                            if "text" in part:
+                                print(part["text"])
+            else:
+                print(json.dumps(response_data))
+                
+        # Process streaming response
+        else:
+            import re
+            
+            # This pattern will look for text fields in JSON chunks
+            text_pattern = re.compile(r'"text":\s*"((?:\\.|[^"\\])*)"')
+            
+            # Initialize buffer to capture partial JSON chunks
+            buffer = ""
+            parsed_text_segments = set()  # To avoid duplicates
+            last_printed_text = ""  # Keep track of the last segment we printed
             
             if args.debug:
-                print(f"Debug: Received chunk of size {len(chunk_text)}", file=sys.stderr)
+                print(f"Debug: Beginning streaming response processing", file=sys.stderr)
             
-            # Extract any complete text segments
-            matches = text_pattern.findall(buffer)
-            if matches:
-                for match in matches:
-                    # Unescape JSON string and fix unicode characters
-                    text = match.encode('utf-8').decode('unicode_escape').replace('\u00a0', ' ')
+            # Process the response chunks as they arrive
+            for chunk in response.iter_content(chunk_size=1024):
+                if not chunk:
+                    continue
                     
-                    # Only print text we haven't seen before
-                    # Simple duplicate detection - just make sure we're not printing the same thing twice
-                    if text != last_printed_text and text not in parsed_text_segments:
-                        print(text, end="", flush=True)
-                        parsed_text_segments.add(text)
-                        last_printed_text = text
-            
-            # Try to find complete JSON objects and remove them from buffer
-            try:
-                # Look for complete JSON objects (starts with { and ends with })
-                while buffer:
-                    json_start = buffer.find('{')
-                    if json_start == -1:
-                        break
-                        
-                    json_depth = 0
-                    json_end = -1
-                    
-                    # Find the matching closing brace
-                    for i, char in enumerate(buffer[json_start:]):
-                        if char == '{':
-                            json_depth += 1
-                        elif char == '}':
-                            json_depth -= 1
-                            if json_depth == 0:
-                                json_end = json_start + i + 1
-                                break
-                    
-                    if json_end != -1:
-                        # Extract a complete JSON object
-                        json_obj = buffer[json_start:json_end]
-                        buffer = buffer[json_end:]
-                        
-                        # Try to parse and extract text from the complete JSON object
-                        try:
-                            data = json.loads(json_obj)
-                            if "candidates" in data and len(data["candidates"]) > 0:
-                                for candidate in data["candidates"]:
-                                    if "content" in candidate and "parts" in candidate["content"]:
-                                        for part in candidate["content"]["parts"]:
-                                            if "text" in part:
-                                                text = part["text"].replace('\u00a0', ' ')
-                                                # Simple duplicate detection for consistency
-                                                if text != last_printed_text and text not in parsed_text_segments:
-                                                    print(text, end="", flush=True)
-                                                    parsed_text_segments.add(text)
-                                                    last_printed_text = text
-                        except json.JSONDecodeError:
-                            pass  # Incomplete or invalid JSON, continue processing
-                    else:
-                        # No complete JSON object found, keep buffer for next chunk
-                        break
-            except Exception as e:
+                # Decode chunk and add to buffer
+                chunk_text = chunk.decode('utf-8')
+                buffer += chunk_text
+                
                 if args.debug:
-                    print(f"Debug: Error processing JSON: {e}", file=sys.stderr)
-        
-        # Print a newline at the end for better formatting
-        print("", flush=True)
-        
-        if args.debug:
-            print(f"Debug: Completed streaming response. Found {len(parsed_text_segments)} text segments", file=sys.stderr)
+                    print(f"Debug: Received chunk of size {len(chunk_text)}", file=sys.stderr)
+                
+                # Extract any complete text segments
+                matches = text_pattern.findall(buffer)
+                if matches:
+                    for match in matches:
+                        # Unescape JSON string and fix unicode characters
+                        text = match.encode('utf-8').decode('unicode_escape').replace('\u00a0', ' ')
+                        
+                        # Only print text we haven't seen before
+                        if text != last_printed_text and text not in parsed_text_segments:
+                            print(text, end="", flush=True)
+                            parsed_text_segments.add(text)
+                            last_printed_text = text
+                
+                # Try to find complete JSON objects and remove them from buffer
+                try:
+                    # Look for complete JSON objects (starts with { and ends with })
+                    while buffer:
+                        json_start = buffer.find('{')
+                        if json_start == -1:
+                            break
+                            
+                        json_depth = 0
+                        json_end = -1
+                        
+                        # Find the matching closing brace
+                        for i, char in enumerate(buffer[json_start:]):
+                            if char == '{':
+                                json_depth += 1
+                            elif char == '}':
+                                json_depth -= 1
+                                if json_depth == 0:
+                                    json_end = json_start + i + 1
+                                    break
+                        
+                        if json_end != -1:
+                            # Extract a complete JSON object
+                            json_obj = buffer[json_start:json_end]
+                            buffer = buffer[json_end:]
+                            
+                            # Try to parse and extract text from the complete JSON object
+                            try:
+                                data = json.loads(json_obj)
+                                if "candidates" in data and len(data["candidates"]) > 0:
+                                    for candidate in data["candidates"]:
+                                        if "content" in candidate and "parts" in candidate["content"]:
+                                            for part in candidate["content"]["parts"]:
+                                                if "text" in part:
+                                                    text = part["text"].replace('\u00a0', ' ')
+                                                    # Simple duplicate detection for consistency
+                                                    if text != last_printed_text and text not in parsed_text_segments:
+                                                        print(text, end="", flush=True)
+                                                        parsed_text_segments.add(text)
+                                                        last_printed_text = text
+                            except json.JSONDecodeError:
+                                pass  # Incomplete or invalid JSON, continue processing
+                        else:
+                            # No complete JSON object found, keep buffer for next chunk
+                            break
+                except Exception as e:
+                    if args.debug:
+                        print(f"Debug: Error processing JSON: {e}", file=sys.stderr)
+            
+            # Print a newline at the end for better formatting
+            print("", flush=True)
+            
+            if args.debug:
+                print(f"Debug: Completed streaming response. Found {len(parsed_text_segments)} text segments", file=sys.stderr)
         
     except Exception as e:
         print(f"Error processing response: {e}", file=sys.stderr)
