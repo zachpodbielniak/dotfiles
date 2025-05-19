@@ -732,23 +732,71 @@ def create_content_snippet(content, max_length=300):
     
     return snippet
 
-def check_file_exists(conn, table_name, file_id, provider, model):
-    """Check if a file is already indexed in the database."""
+def check_file_exists(conn, table_name, file_id, provider, model, file_path=None):
+    """Check if a file is already indexed in the database and if it's up to date.
+    
+    Args:
+        conn: Database connection
+        table_name: Name of the vector table
+        file_id: ID of the file to check
+        provider: AI provider used for embeddings
+        model: Embedding model
+        file_path: Path to the file (needed for modification time check)
+        
+    Returns:
+        tuple: (exists, is_current) where:
+            - exists: True if file exists in database
+            - is_current: True if file in database is current (not outdated)
+                          None if we couldn't determine (file_path not provided)
+    """
     with conn.cursor() as cur:
         try:
+            # Get entry with metadata
             cur.execute(
-                f"SELECT id FROM {table_name} WHERE id = %s AND provider = %s AND model = %s",
+                f"SELECT id, metadata FROM {table_name} WHERE id = %s AND provider = %s AND model = %s",
                 (file_id, provider, model)
             )
-            exists = cur.fetchone() is not None
-        except Exception:
-            # Table might not have provider/model columns yet
+            result = cur.fetchone()
+            exists = result is not None
+            
+            # If file exists and we have a file_path, check if it's current
+            if exists and file_path:
+                try:
+                    # Get local file modification time
+                    local_mtime = os.path.getmtime(file_path)
+                    
+                    # Get stored modification time from database
+                    metadata = result["metadata"]
+                    if isinstance(metadata, str):
+                        # If metadata is stored as JSON string
+                        metadata = json.loads(metadata)
+                    
+                    # Check if metadata has last_modified field
+                    if "last_modified" in metadata:
+                        db_mtime = float(metadata["last_modified"])
+                        # File is current if database time is >= local time
+                        is_current = db_mtime >= local_mtime
+                    else:
+                        # If no timestamp in metadata, assume not current
+                        is_current = False
+                except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+                    # If any errors occur during comparison, assume not current
+                    print(f"Warning: Error comparing modification times: {e}")
+                    is_current = False
+            else:
+                # If file doesn't exist or no file_path provided, is_current is None
+                is_current = None
+        except Exception as e:
+            # Table might not have provider/model columns yet or other error
             try:
                 cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
                 exists = cur.fetchone() is not None
+                is_current = None  # Can't determine currentness without metadata
             except Exception:
                 exists = False
-    return exists
+                is_current = None
+    
+    return exists, is_current
 
 def save_to_database(conn, table_name, result, provider, model):
     """Save processed embedding result to the database."""
@@ -763,31 +811,43 @@ def save_to_database(conn, table_name, result, provider, model):
     try:
         # Insert or update in database
         with conn.cursor() as cur:
-            # Check if we have this file with a different provider/model
-            try:
-                cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
-                exists_with_diff_provider = cur.fetchone() is not None
-            except Exception:
-                exists_with_diff_provider = False
+            # Check if this exact file ID exists
+            exists, _ = check_file_exists(conn, table_name, file_id, provider, model)
                 
-            if exists_with_diff_provider:
-                # Update existing record
+            if exists:
+                # Update existing record (file was modified)
                 cur.execute(
                     f"UPDATE {table_name} SET embedding = %s, content_snippet = %s, "
-                    f"provider = %s, model = %s, metadata = %s WHERE id = %s",
-                    (embedding, snippet, provider, model, json.dumps(metadata), file_id)
+                    f"provider = %s, model = %s, metadata = %s WHERE id = %s AND provider = %s AND model = %s",
+                    (embedding, snippet, provider, model, json.dumps(metadata), file_id, provider, model)
                 )
                 print(f"[{i+1}/{total_files}] Updated: {rel_path}")
             else:
-                # Insert new record
-                cur.execute(
-                    f"INSERT INTO {table_name} "
-                    f"(id, embedding, path, content_snippet, provider, model, metadata) "
-                    f"VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (file_id, embedding, rel_path, snippet, 
-                     provider, model, json.dumps(metadata))
-                )
-                print(f"[{i+1}/{total_files}] Indexed: {rel_path}")
+                # Check if a different provider version exists
+                try:
+                    cur.execute(f"SELECT id FROM {table_name} WHERE id = %s", (file_id,))
+                    exists_different_provider = cur.fetchone() is not None
+                except Exception:
+                    exists_different_provider = False
+                
+                if exists_different_provider:
+                    # Update but preserve the ID
+                    cur.execute(
+                        f"UPDATE {table_name} SET embedding = %s, content_snippet = %s, "
+                        f"provider = %s, model = %s, metadata = %s WHERE id = %s",
+                        (embedding, snippet, provider, model, json.dumps(metadata), file_id)
+                    )
+                    print(f"[{i+1}/{total_files}] Updated (provider change): {rel_path}")
+                else:
+                    # Insert new record
+                    cur.execute(
+                        f"INSERT INTO {table_name} "
+                        f"(id, embedding, path, content_snippet, provider, model, metadata) "
+                        f"VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (file_id, embedding, rel_path, snippet, 
+                         provider, model, json.dumps(metadata))
+                    )
+                    print(f"[{i+1}/{total_files}] Indexed: {rel_path}")
             conn.commit()
         return True
     except Exception as e:
@@ -857,13 +917,20 @@ def index_files(args, conn, table_name):
             print(f"[{i+1}/{total_files}] Skipping index file: {rel_path}")
             continue
         
-        # Check if already indexed
-        if check_file_exists(conn, table_name, file_id, provider, model):
+        # Check if already indexed and up-to-date
+        exists, is_current = check_file_exists(conn, table_name, file_id, provider, model, file_path)
+        
+        if exists and is_current:
             print(f"[{i+1}/{total_files}] Already indexed: {rel_path}")
             continue
-            
-        # Add to processing list
-        files_to_process.append((i, file_path))
+        elif exists and not is_current:
+            print(f"[{i+1}/{total_files}] Re-indexing modified file: {rel_path}")
+            # Add to processing list
+            files_to_process.append((i, file_path))
+        else:
+            # File doesn't exist in the database
+            # Add to processing list
+            files_to_process.append((i, file_path))
     
     # Check if we have any files to process
     if not files_to_process:
