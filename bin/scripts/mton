@@ -1,364 +1,348 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
 
 #------------------------------------------------------------------------------
-# mton - Markdown to Neorg converter
+# mton_ast - AST-based Markdown to Neorg converter
 #------------------------------------------------------------------------------
 # 
 # This script converts Markdown formatted text to Neorg format.
-# It processes input line by line and handles various Markdown elements,
-# converting them to their Neorg equivalents.
-#
-# Features:
-# - Headers: Converts # headers to * headers (Neorg format)
-# - Lists: Keeps - lists, converts 1. lists to # lists
-# - Task Lists: Converts [ ] and [x] to ( ) and (x)
-# - Code Blocks: Converts ```lang to @code lang and ``` to @end
-# - Block Quotes: Converts > text to @quote blocks
-# - Tables: Handles tables with a simple wrapper
-# - Inline formatting: **bold** -> *bold*, *italic* -> /italic/
-# - Links: [text](url) -> {(url)}[text]
-# - Images: ![alt](url) -> {(url)}[image: alt]
-# - Horizontal Rules: ---, ___, *** -> ---
-#
-# Known bugs:
-# - Bold text with double asterisks (**text**) is sometimes converted to /text/ (italic)
-#   instead of *text* (bold)
-# - Complex nested formatting might not always convert correctly
+# It uses a block-by-block approach to handle Markdown structures.
 
-usage() {
-    # Display usage information and exit
-    echo "Usage: $(basename "$0") [OPTIONS]"
-    echo "Convert Markdown to Neorg format"
-    echo ""
-    echo "Options:"
-    echo "  -i, --input FILE   Read input from FILE (default: stdin)"
-    echo "  -o, --output FILE  Write output to FILE (default: stdout)"
-    echo "  -h, --help         Display this help message and exit"
-    echo ""
-    echo "Examples:"
-    echo "  $(basename "$0") -i input.md -o output.norg"
-    echo "  cat input.md | $(basename "$0") > output.norg"
-    echo "  $(basename "$0") < input.md > output.norg"
-    exit 1
+# Options
+my $input_file = '';
+my $output_file = '';
+my $help = 0;
+my $debug = 0;
+
+# Process command line arguments
+GetOptions(
+    "input|i=s" => \$input_file,
+    "output|o=s" => \$output_file,
+    "help|h" => \$help,
+    "debug|d" => \$debug
+) or pod2usage(1);
+
+pod2usage(1) if $help;
+
+# Set up input/output filehandles
+my $input_fh = $input_file ? do { open my $fh, '<', $input_file or die "Can't open $input_file: $!"; $fh } : \*STDIN;
+my $output_fh = $output_file ? do { open my $fh, '>', $output_file or die "Can't open $output_file for writing: $!"; $fh } : \*STDOUT;
+
+# Read the entire input
+my $input = do { local $/; <$input_fh> };
+
+# Pre-process reference-style links
+my %reference_links;
+$input =~ s/^\s*\[([^\]]+)\]:\s+(\S+)(?:\s+["'](.+?)["'])?\s*$/{
+    $reference_links{lc($1)} = {url => $2, title => $3 || ''};
+    '';
+}/egm;
+
+# Parse blocks
+my @blocks = split_into_blocks($input);
+my $output = '';
+
+foreach my $block (@blocks) {
+    $output .= process_block($block, \%reference_links);
 }
 
-#------------------------------------------------------------------------------
-# Command line arguments parsing
-#------------------------------------------------------------------------------
-# Initialize variables for input and output files
-input=""
-output=""
+# Write output
+print $output_fh $output;
 
-# Process command-line options
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -i|--input)
-            # Handle input file parameter
-            if [[ -n "${2:-}" ]]; then
-                input="$2"
-                shift 2
-            else
-                echo "Error: Argument for $1 is missing" >&2
-                usage
-            fi
-            ;;
-        -o|--output)
-            # Handle output file parameter
-            if [[ -n "${2:-}" ]]; then
-                output="$2"
-                shift 2
-            else
-                echo "Error: Argument for $1 is missing" >&2
-                usage
-            fi
-            ;;
-        -h|--help)
-            # Show help and exit
-            usage
-            ;;
-        *)
-            # Catch any unrecognized options
-            echo "Error: Unknown option: $1" >&2
-            usage
-            ;;
-    esac
-done
+# Close filehandles
+close($input_fh) if $input_file;
+close($output_fh) if $output_file;
+
+exit 0;
 
 #------------------------------------------------------------------------------
-# Main conversion function
+# Parsing Functions
 #------------------------------------------------------------------------------
-markdown_to_neorg() {
-    # This function processes Markdown input line by line, converting each element
-    # to its Neorg equivalent. It handles block elements (headers, lists, code blocks,
-    # quotes, tables) and inline formatting (bold, italic, links, images).
+sub split_into_blocks {
+    my ($text) = @_;
+    my @blocks;
+    my $current_block = '';
+    my $in_code_block = 0;
     
-    # State tracking variables for multi-line blocks
-    local in_code_block=0  # Flag: currently inside a code block (0=no, 1=yes)
-    local in_quote_block=0 # Flag: currently inside a blockquote (0=no, 1=yes)
-    local in_table=0       # Flag: currently inside a table (0=no, 1=yes)
+    # Normalize line endings
+    $text =~ s/\r\n/\n/g;
+    $text =~ s/\r/\n/g;
     
-    # Main processing loop - reads input line by line with proper EOF handling
-    # The || [[ -n "$line" ]] part ensures the last line is processed even without a newline
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        #----------------------------------------------------------------------
-        # Code Block Processing
-        #----------------------------------------------------------------------
-        # Check for code block markers ```
-        if [[ "$line" =~ ^'```' ]]; then
-            if [[ $in_code_block -eq 0 ]]; then
+    foreach my $line (split /\n/, $text) {
+        # Handle code blocks
+        if ($line =~ /^(```|~~~)/) {
+            if (!$in_code_block) {
                 # Start of code block
-                # Extract language specifier if present (e.g., ```python -> python)
-                local lang=$(echo "$line" | sed -E 's/^```(.*)/\1/')
-                if [[ -n "$lang" ]]; then
-                    # If language is specified, include it in the tag
-                    echo "@code $lang"
-                else
-                    # Otherwise use a simple code tag
-                    echo "@code"
-                fi
-                in_code_block=1
-            else
+                push @blocks, $current_block if $current_block =~ /\S/;
+                $current_block = $line . "\n";
+                $in_code_block = 1;
+            } else {
                 # End of code block
-                echo "@end"
-                in_code_block=0
-            fi
-            continue  # Process next line
-        fi
+                $current_block .= $line . "\n";
+                push @blocks, $current_block;
+                $current_block = '';
+                $in_code_block = 0;
+            }
+            next;
+        }
         
-        # If inside a code block, pass content through unchanged
-        if [[ $in_code_block -eq 1 ]]; then
-            echo "$line"
-            continue  # Process next line
-        fi
+        # Inside code block - collect lines
+        if ($in_code_block) {
+            $current_block .= $line . "\n";
+            next;
+        }
         
-        #----------------------------------------------------------------------
-        # Table Processing 
-        #----------------------------------------------------------------------
-        # Detect table rows by looking for lines starting and ending with pipe characters
-        if [[ "$line" =~ ^'\|'.*'\|'$ ]]; then
-            if [[ $in_table -eq 0 ]]; then
-                # Start of table - Neorg uses a @table tag to wrap tables
-                echo "@table"
-                in_table=1
-            fi
-            # Pass the table row through unchanged (Neorg uses Markdown-like table syntax)
-            echo "$line"
-            continue  # Process next line
-        elif [[ $in_table -eq 1 && ! "$line" =~ ^'\|'.*'\|'$ ]]; then
-            # End of table detected when a non-table line is encountered
-            echo "@end"
-            in_table=0
-            # Don't continue - continue processing this line through the rest of the loop
-        fi
+        # Empty line - end current block
+        if ($line =~ /^\s*$/) {
+            push @blocks, $current_block if $current_block =~ /\S/;
+            $current_block = '';
+            next;
+        }
         
-        #----------------------------------------------------------------------
-        # Blockquote Processing
-        #----------------------------------------------------------------------
-        # Detect blockquotes by the > prefix
-        if [[ "$line" =~ ^'> ' ]]; then
-            if [[ $in_quote_block -eq 0 ]]; then
-                # Start of blockquote
-                echo "@quote"
-                in_quote_block=1
-            fi
-            # Remove the '> ' prefix from the line and output the content
-            echo "${line#> }"
-            continue  # Process next line
-        elif [[ $in_quote_block -eq 1 && ! "$line" =~ ^'> ' ]]; then
-            # End of blockquote detected when a non-blockquote line is encountered
-            echo "@end"
-            in_quote_block=0
-            # Don't continue - continue processing this line through the rest of the loop
-        fi
-        
-        #----------------------------------------------------------------------
-        # Header Processing
-        #----------------------------------------------------------------------
-        # Convert Markdown headers (# Style) to Neorg headers (* Style)
-        # The number of # or * indicates the heading level
-        if [[ "$line" =~ ^'# ' ]]; then
-            # Level 1 heading: # Heading -> * Heading (Neorg format)
-            # In Neorg, headings use asterisks instead of hash symbols
-            local content="${line#\# }"
-            echo "* $content"
-            continue
-        elif [[ "$line" =~ ^'## ' ]]; then
-            # Level 2 heading: ## Heading -> ** Heading
-            local content="${line#\#\# }"
-            echo "** $content"
-            continue
-        elif [[ "$line" =~ ^'### ' ]]; then
-            # Level 3 heading: ### Heading -> *** Heading
-            local content="${line#\#\#\# }"
-            echo "*** $content"
-            continue
-        elif [[ "$line" =~ ^'#### ' ]]; then
-            # Level 4 heading: #### Heading -> **** Heading
-            local content="${line#\#\#\#\# }"
-            echo "**** $content"
-            continue
-        elif [[ "$line" =~ ^'##### ' ]]; then
-            # Level 5 heading: ##### Heading -> ***** Heading
-            local content="${line#\#\#\#\#\# }"
-            echo "***** $content"
-            continue
-        elif [[ "$line" =~ ^'###### ' ]]; then
-            # Level 6 heading: ###### Heading -> ****** Heading
-            local content="${line#\#\#\#\#\#\# }"
-            echo "****** $content"
-            continue
-        fi
-        
-        #----------------------------------------------------------------------
-        # Task List Processing
-        #----------------------------------------------------------------------
-        # Convert Markdown task list items to Neorg format
-        # Markdown: - [ ] Task Item -> Neorg: - ( ) Task Item
-        # Markdown: - [x] Task Item -> Neorg: - (x) Task Item
-        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[[[:space:]]\] ]]; then
-            # Unchecked task: - [ ] Task -> - ( ) Task
-            # Extract indentation to preserve it
-            local indent=$(echo "$line" | sed -E 's/^([[:space:]]*)-.*/\1/')
-            # Extract the task content
-            local content=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]*\[[[:space:]]\][[:space:]]*(.*)/\1/')
-            # Output with Neorg format
-            echo "${indent}- ( ) ${content}"
-            continue
-        elif [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[x\] ]]; then
-            # Checked task: - [x] Task -> - (x) Task
-            # Extract indentation to preserve it
-            local indent=$(echo "$line" | sed -E 's/^([[:space:]]*)-.*/\1/')
-            # Extract the task content
-            local content=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]*\[x\][[:space:]]*(.*)/\1/')
-            # Output with Neorg format
-            echo "${indent}- (x) ${content}"
-            continue
-        fi
-        
-        #----------------------------------------------------------------------
-        # List Processing
-        #----------------------------------------------------------------------
-        # Handle both unordered (-) and ordered (1.) lists
-        if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
-            # Unordered list items: Markdown uses - or *, Neorg uses -
-            # Pass unordered list items through unchanged
-            echo "$line"
-            continue
-        elif [[ "$line" =~ ^[[:space:]]*[0-9]+[[:space:]]*\. ]]; then
-            # Ordered list items: 1. Item -> # Item (Neorg format)
-            # Extract indentation
-            local indent=$(echo "$line" | sed -E 's/^([[:space:]]*).*$/\1/')
-            # Extract the list item content
-            local content=$(echo "$line" | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]*\.[[:space:]]*(.*)/\1/')
-            # Output in Neorg format
-            echo "${indent}# ${content}"
-            continue
-        fi
-        
-        #----------------------------------------------------------------------
-        # Horizontal Rule Processing
-        #----------------------------------------------------------------------
-        # Convert Markdown horizontal rules (---, ___, ***) to Neorg format (---)
-        if [[ "$line" =~ ^'---'+$ || "$line" =~ ^'___'+$ || "$line" =~ ^'\*\*\*'+$ ]]; then
-            echo "---"
-            continue
-        fi
-        
-        #----------------------------------------------------------------------
-        # Empty Line Handling
-        #----------------------------------------------------------------------
-        # Pass empty lines through unchanged - both formats use empty lines similarly
-        if [[ -z "$line" ]]; then
-            echo ""
-            continue
-        fi
-        
-        # Format line with Neorg inline formatting
-        # Using temporary files to handle special characters better
-        temp_file=$(mktemp)
-        echo "$line" > "$temp_file"
-        
-        # Links: [text](url) -> {(url)}[text]
-        sed -i 's/\[\([^]]*\)\](\([^)]*\))/{(\2)}[\1]/g' "$temp_file"
-        
-        # Images: ![alt](url) -> {(url)}[image: alt]
-        sed -i 's/!\[\([^]]*\)\](\([^)]*\))/{(\2)}[image: \1]/g' "$temp_file"
-        
-        # Bold and italic combined: ***text*** -> */text/*
-        sed -i 's/\*\*\*\([^*]*\)\*\*\*/*\/\1\//g' "$temp_file"
-        
-        # Bold: **text** -> *text*
-        sed -i 's/\*\*\([^*]*\)\*\*/*\1*/g' "$temp_file"
-        
-        # Italic: *text* -> /text/
-        sed -i 's/\*\([^*]*\)\*/\/\1\//g' "$temp_file"
-        
-        # Bold with underscores: __text__ -> *text*
-        sed -i 's/__\([^_]*\)__/*\1*/g' "$temp_file"
-        
-        # Italic with underscores: _text_ -> /text/
-        sed -i 's/_\([^_]*\)_/\/\1\//g' "$temp_file"
-        
-        # Strikethrough: ~~text~~ -> -text-
-        sed -i 's/~~\([^~]*\)~~/-\1-/g' "$temp_file"
-        
-        cat "$temp_file"
-        rm "$temp_file"
-    done
+        # Add to current block
+        $current_block .= $line . "\n";
+    }
     
-    #----------------------------------------------------------------------
-    # Final Cleanup - Ensure all blocks are properly closed
-    #----------------------------------------------------------------------
-    # Close any open blocks that might be left open at the end of input
-    if [[ $in_quote_block -eq 1 ]]; then
-        # Close open blockquote block
-        echo "@end"
-    fi
-    if [[ $in_table -eq 1 ]]; then
-        # Close open table block
-        echo "@end"
-    fi
-    if [[ $in_code_block -eq 1 ]]; then
-        # Close open code block
-        echo "@end"
-    fi
+    # Add the last block if any
+    push @blocks, $current_block if $current_block =~ /\S/;
+    
+    return @blocks;
 }
 
-#------------------------------------------------------------------------------
-# Main Program Execution
-#------------------------------------------------------------------------------
-# Handle the four possible combinations of input/output:
-# 1. Input file → Output file
-# 2. Input file → Stdout
-# 3. Stdin → Output file
-# 4. Stdin → Stdout
-
-if [[ -n "$input" ]]; then
-    # Input from file
-    if [[ ! -f "$input" ]]; then
-        # Error handling: Ensure input file exists
-        echo "Error: Input file '$input' does not exist" >&2
-        exit 1
-    fi
+sub process_block {
+    my ($block, $references) = @_;
+    my $result = '';
     
-    if [[ -n "$output" ]]; then
-        # Case 1: Input file → Output file
-        cat "$input" | markdown_to_neorg > "$output"
-    else
-        # Case 2: Input file → Stdout
-        cat "$input" | markdown_to_neorg
-    fi
-else
-    # Input from stdin
-    if [[ -n "$output" ]]; then
-        # Case 3: Stdin → Output file
-        markdown_to_neorg > "$output"
-    else
-        # Case 4: Stdin → Stdout
-        markdown_to_neorg
-    fi
-fi
+    # Trim trailing newlines
+    $block =~ s/\n+$//;
+    
+    # Headings (ATX style: # Heading)
+    if ($block =~ /^(#{1,6})\s+(.+?)(?:\s+#{0,6})?$/) {
+        my $level = length($1);
+        my $content = $2;
+        $result = ('*' x $level) . ' ' . process_inline($content, $references) . "\n\n";
+    }
+    # Alternative Headings (=== or --- style)
+    elsif ($block =~ /^(.+?)\n([=]+|[-]+)\s*$/) {
+        my $content = $1;
+        my $level = ($2 =~ /^=/) ? 1 : 2;
+        $result = ('*' x $level) . ' ' . process_inline($content, $references) . "\n\n";
+    }
+    # Code blocks
+    elsif ($block =~ /^(```|~~~)(.*)$(.*?)^\1$/ms) {
+        my $lang = $2;
+        my $code = $3;
+        $code =~ s/^\n//; # Remove leading newline
+        $result = "\@code";
+        $result .= " $lang" if $lang =~ /\S/;
+        $result .= "\n$code\n\@end\n\n";
+    }
+    # Blockquotes
+    elsif ($block =~ /^>\s/) {
+        $result = "\@quote\n";
+        my @lines = split(/\n/, $block);
+        foreach my $line (@lines) {
+            $line =~ s/^>\s?//;
+            $result .= process_inline($line, $references) . "\n";
+        }
+        $result .= "\@end\n\n";
+    }
+    # Unordered lists with task items
+    elsif ($block =~ /^[-*+]\s+\[[ xX]\]/) {
+        my @lines = split(/\n/, $block);
+        foreach my $line (@lines) {
+            if ($line =~ /^([ \t]*)[-*+]\s+\[([ xX])\]\s+(.*)$/) {
+                my $indent = $1;
+                my $status = lc($2);
+                my $content = $3;
+                $result .= "$indent- " . (($status eq 'x') ? "(x) " : "( ) ") . process_inline($content, $references) . "\n";
+            } else {
+                $result .= $line . "\n";
+            }
+        }
+        $result .= "\n";
+    }
+    # Regular unordered lists
+    elsif ($block =~ /^[-*+]\s/) {
+        my @lines = split(/\n/, $block);
+        foreach my $line (@lines) {
+            if ($line =~ /^([ \t]*)[-*+]\s+(.*)$/) {
+                my $indent = $1;
+                my $content = $2;
+                $result .= "$indent- " . process_inline($content, $references) . "\n";
+            } else {
+                $result .= $line . "\n";
+            }
+        }
+        $result .= "\n";
+    }
+    # Ordered lists
+    elsif ($block =~ /^\d+\.\s/) {
+        my @lines = split(/\n/, $block);
+        foreach my $line (@lines) {
+            if ($line =~ /^([ \t]*)\d+\.\s+(.*)$/) {
+                my $indent = $1;
+                my $content = $2;
+                $result .= "$indent# " . process_inline($content, $references) . "\n";
+            } else {
+                $result .= $line . "\n";
+            }
+        }
+        $result .= "\n";
+    }
+    # Tables
+    elsif ($block =~ /^\|.*\|$/m && $block =~ /\|[\s:-]+\|/m) {
+        $result = "\@table\n$block\n\@end\n\n";
+    }
+    # Horizontal rule
+    elsif ($block =~ /^([-*_])\1{2,}$/) {
+        $result = "---\n\n";
+    }
+    # Definition lists (simplified)
+    elsif ($block =~ /^.+\n:\s/) {
+        my @lines = split(/\n/, $block);
+        my $term = shift @lines;
+        $result = "\$ " . process_inline($term, $references) . "\n";
+        
+        foreach my $line (@lines) {
+            if ($line =~ /^:\s+(.*)$/) {
+                $result .= "  " . process_inline($1, $references) . "\n";
+            } else {
+                $result .= "  $line\n";
+            }
+        }
+        $result .= "\n";
+    }
+    # Default - paragraph
+    else {
+        $result = process_inline($block, $references) . "\n\n";
+    }
+    
+    return $result;
+}
 
-# Exit with success status
-exit 0
+sub process_inline {
+    my ($text, $references) = @_;
+    
+    # Protect and store code spans
+    my @code_spans;
+    $text =~ s/`([^`]+)`/push @code_spans, $1; "CODE_SPAN_" . $#code_spans . "_"/ge;
+    
+    # Process links and images
+    # Reference-style links [text][id]
+    $text =~ s/\[([^\]]+)\]\[([^\]]*)\]/handle_reference_link($1, $2, $references)/ge;
+    
+    # Inline links: [text](url)
+    $text =~ s/\[([^\]]+)\]\(([^)]+)\)/"{($2)}[$1]"/ge;
+    
+    # Reference-style images: ![alt][id]
+    $text =~ s/!\[([^\]]+)\]\[([^\]]*)\]/handle_reference_image($1, $2, $references)/ge;
+    
+    # Inline images: ![alt](url)
+    $text =~ s/!\[([^\]]+)\]\(([^)]+)\)/"{($2)}[image: $1]"/ge;
+    
+    # Bold+italic combined: ***text*** -> */text/*
+    $text =~ s/\*\*\*([^*]+?)\*\*\*/*\/$1\//g;
+    
+    # Bold: **text** -> *text*
+    $text =~ s/\*\*([^*]+?)\*\*/*$1*/g;
+    
+    # Bold with underscore: __text__ -> *text*
+    $text =~ s/__([^_]+?)__/*$1*/g;
+    
+    # Italic: *text* -> /text/
+    $text =~ s/(?<!\*)\*([^*]+?)\*(?!\*)/\/$1\//g;
+    
+    # Italic with underscore: _text_ -> /text/
+    $text =~ s/_([^_]+?)_/\/$1\//g;
+    
+    # Strikethrough: ~~text~~ -> -text-
+    $text =~ s/~~([^~]+?)~~/-$1-/g;
+    
+    # Footnote references: [^id] -> ^[id]
+    $text =~ s/\[\^([^\]]+?)\]/\^\[$1\]/g;
+    
+    # Restore code spans
+    $text =~ s/CODE_SPAN_(\d+)_/"`" . $code_spans[$1] . "`"/ge;
+    
+    return $text;
+}
+
+sub handle_reference_link {
+    my ($text, $id, $references) = @_;
+    $id = $text if $id eq '';  # Empty reference uses text as id
+    $id = lc($id);
+    
+    if (exists $references->{$id}) {
+        my $url = $references->{$id}{url};
+        return "{($url)}[$text]";
+    } else {
+        return "[$text][$id]";
+    }
+}
+
+sub handle_reference_image {
+    my ($alt, $id, $references) = @_;
+    $id = $alt if $id eq '';  # Empty reference uses alt as id
+    $id = lc($id);
+    
+    if (exists $references->{$id}) {
+        my $url = $references->{$id}{url};
+        return "{($url)}[image: $alt]";
+    } else {
+        return "![$alt][$id]";
+    }
+}
+
+sub debug_print {
+    my ($message) = @_;
+    print STDERR "DEBUG: $message\n" if $debug;
+}
+
+__END__
+
+=head1 NAME
+
+mton_ast - Markdown to Neorg converter
+
+=head1 SYNOPSIS
+
+mton_ast [options]
+
+ Options:
+   -i, --input FILE    Read input from FILE (default: stdin)
+   -o, --output FILE   Write output to FILE (default: stdout)
+   -h, --help          Display this help message and exit
+   -d, --debug         Enable debug output for diagnostics
+
+ Examples:
+   mton_ast -i input.md -o output.norg
+   cat input.md | mton_ast > output.norg
+   mton_ast < input.md > output.norg
+
+=head1 DESCRIPTION
+
+This script converts Markdown formatted text to Neorg format.
+It uses a block-based approach to handle Markdown structures.
+
+Features:
+ - Headers: Converts # headers to * headers (Neorg format)
+ - Lists: Converts - lists to - lists, and 1. lists to # lists
+ - Task Lists: Converts [ ] and [x] to ( ) and (x)
+ - Code Blocks: Converts ```lang to @code lang and ``` to @end
+ - Block Quotes: Converts > text to @quote blocks
+ - Tables: Handles tables with proper formatting
+ - Inline formatting: **bold** -> *bold*, *italic* -> /italic/
+ - Links: [text](url) -> {(url)}[text]
+ - Images: ![alt](url) -> {(url)}[image: alt]
+ - Footnotes: [^id] -> ^[id]
+ - Horizontal Rules: ---, ___, *** -> ---
+
+=head1 AUTHOR
+
+Zach Podbielniak
+
+=cut
