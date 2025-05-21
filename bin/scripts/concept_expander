@@ -1,0 +1,720 @@
+#!/usr/bin/python3
+#
+# Concept Expander
+# ===============
+# A tool that expands understanding of concepts using multiple AI providers
+# to deepen understanding, generate questions, and create learning roadmaps.
+#
+# Author: Claude (with guidance from Zach)
+# License: N/A
+#
+# Usage:
+#   concept_expander [options] CONCEPT|FILE_PATH
+#
+# Options:
+#   --extract               Extract concepts from a note file instead of using direct concept input
+#   --providers PROVIDERS   Comma-separated list of AI providers to use (default: claudpy,perpy,grokpy)
+#   --output FORMAT         Output format (neorg or markdown, default: neorg)
+#   --integrate             Integrate with existing notes instead of creating a new one
+#   --para PARA             PARA category to use when --integrate is specified (default: resource)
+#   --category CATEGORY     Subcategory path within the PARA category (e.g., 'technology/ai')
+#   --name-seed NAME        Custom filename seed to use instead of the concept name
+#   --max-concurrent N      Maximum number of concurrent AI queries (default: CPU count)
+#   --summary               Generate an additional summary file of the expanded concept
+#   --summary-provider      Provider to use for summary generation (default: grokpy)
+#   --principle             Focus on principles rather than literal details in summary
+#   --type TYPE             Summary type (e.g., 'book', 'meeting', 'research', etc.)
+#   --debug                 Toggle debug logging
+#   --default PROVIDER      Default provider to use when only one is needed (default: grokpy)
+#
+# Examples:
+#   concept_expander "Generative AI"
+#   concept_expander --extract ~/Documents/notes/03_resources/technology/llms.norg
+#   concept_expander --providers "claudpy,perpy,geminpy" "Quantum Computing"
+#   concept_expander --output markdown "Blockchain"
+#   concept_expander --integrate --para resource --category technology/ai "Neural Networks"
+#   concept_expander --integrate --name-seed "deep_learning_foundations" "Neural Networks"
+#   concept_expander --max-concurrent 10 "Artificial Intelligence"
+#   concept_expander --summary --summary-provider claudpy "Machine Learning"
+#   concept_expander --summary --principle --type research "Quantum Physics"
+#
+
+import os
+import sys
+import argparse
+import logging
+import json
+import tempfile
+import subprocess
+import re
+import time
+import concurrent.futures
+import multiprocessing
+from typing import Dict, List, Optional, Set, Tuple, Any, Union
+from pathlib import Path
+
+# Constants
+DEFAULT_PROVIDERS = ["claudpy", "perpy", "grokpy"]
+DEFAULT_PROVIDER = "grokpy"
+ALL_PROVIDERS = ["claudpy", "perpy", "grokpy", "ollampy", "geminpy", "openpy"]
+NEORG_OUTPUT_TYPE = "neorg"
+MARKDOWN_OUTPUT_TYPE = "markdown"
+SECOND_BRAIN_DIR = os.path.expanduser("~/Documents/notes")
+PARA_CATEGORIES = ["00_inbox", "01_projects", "02_areas", "03_resources", "04_archives"]
+DEFAULT_PARA = "03_resources"
+
+# Configure logging
+def setup_logging(debug: bool) -> None:
+    """Configure logging based on debug flag"""
+    if debug:
+        log_file = os.path.expanduser("~/concept_expander_debug.log")
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.DEBUG,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        logging.debug("Debug logging initialized")
+    else:
+        # Disable logging if not in debug mode
+        logging.getLogger().disabled = True
+
+# Check if we're in the dev distrobox container and re-exec if not
+def ensure_distrobox() -> None:
+    """Check if we're in the dev distrobox, if not re-exec the script inside it"""
+    ctr_id = os.environ.get("CONTAINER_ID", "")
+    
+    if ctr_id != "dev":
+        logging.debug("Not in dev container, re-execing inside distrobox")
+        cmd = [
+            "distrobox",
+            "enter",
+            "dev",
+            "--",
+            *sys.argv
+        ]
+        subprocess.run(cmd)
+        sys.exit(0)
+
+# Extract concepts from a file
+def extract_concepts_from_file(file_path: str, debug: bool) -> List[str]:
+    """
+    Extract key concepts from a file using NLP or direct parsing
+    
+    Args:
+        file_path: Path to the note file
+        debug: Whether to enable debug logging
+    
+    Returns:
+        List of extracted concepts
+    """
+    if debug:
+        logging.debug(f"Extracting concepts from file: {file_path}")
+    
+    # Read the file contents
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        logging.error(f"Error reading file: {e}")
+        sys.stderr.write(f"Error: Could not read file {file_path}: {e}\n")
+        sys.exit(1)
+    
+    # Use claudpy to extract concepts - this gives us a powerful NLP approach
+    # that can identify key concepts from both plain text and structured notes
+    with tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8', delete=False) as temp:
+        temp.write(content)
+        temp_path = temp.name
+    
+    extraction_prompt = """
+    Extract the main concepts from the provided text. Focus on:
+    1. Technical terms and specialized vocabulary
+    2. Key theories, frameworks, or methodologies
+    3. Central themes and subject areas
+    4. Core principles or fundamental ideas
+    
+    Format your response as a simple comma-separated list of concepts.
+    Do not include explanations, bullet points, or any formatting - just the raw list of concepts.
+    """
+    
+    try:
+        result = subprocess.run(
+            ["claudpy", "--prompt", extraction_prompt],
+            input=content.encode('utf-8'),
+            capture_output=True,
+            check=True
+        )
+        concepts_text = result.stdout.decode('utf-8').strip()
+        
+        # Clean up and parse the comma-separated list
+        concepts = [concept.strip() for concept in concepts_text.split(',')]
+        
+        # Filter out empty strings
+        concepts = [concept for concept in concepts if concept]
+        
+        if debug:
+            logging.debug(f"Extracted concepts: {concepts}")
+            
+        return concepts
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error extracting concepts: {e}")
+        sys.stderr.write(f"Error: Could not extract concepts from file: {e}\n")
+        sys.exit(1)
+    finally:
+        # Clean up the temporary file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+
+# Generate prompt for a specific aspect of concept expansion
+def generate_aspect_prompt(concept: str, aspect: str) -> str:
+    """
+    Generate a prompt for a specific aspect of concept expansion
+    
+    Args:
+        concept: The concept to expand
+        aspect: The aspect to focus on (fundamentals, misconceptions, etc.)
+    
+    Returns:
+        Prompt string for the AI provider
+    """
+    prompts = {
+        "fundamentals": f"""
+        Provide a clear explanation of the fundamental principles of {concept}.
+        Focus on the core ideas, components, and mechanisms that define this concept.
+        Explain it as if teaching someone with no prior knowledge of the subject.
+        """,
+        
+        "misconceptions": f"""
+        Identify and correct the most common misconceptions about {concept}.
+        For each misconception:
+        1. State the misconception clearly
+        2. Explain why it's incorrect
+        3. Provide the correct understanding
+        Cover at least 3-5 significant misconceptions that people often have.
+        """,
+        
+        "advanced": f"""
+        Explain advanced aspects of {concept} that are rarely covered in introductory materials.
+        Focus on:
+        1. Nuanced details that experts understand
+        2. Edge cases and exceptions to the general rules
+        3. Recent developments or cutting-edge research
+        4. Theoretical frameworks that provide deeper insight
+        Assume the reader already has basic familiarity with {concept}.
+        """,
+        
+        "related": f"""
+        Identify and explain key concepts related to {concept}.
+        For each related concept:
+        1. Name the concept
+        2. Explain how it connects to {concept}
+        3. Briefly describe why understanding this related concept would enhance knowledge of {concept}
+        Cover 5-7 closely related concepts that form the broader knowledge context.
+        """,
+        
+        "questions": f"""
+        Generate thought-provoking questions about {concept} at different levels of understanding.
+        Provide:
+        1. Basic questions for beginners
+        2. Intermediate questions that require deeper analysis
+        3. Advanced questions that explore edge cases and theoretical implications
+        4. Expert-level questions that connect to broader systems and implications
+        Each question should reveal important aspects of {concept} when answered.
+        """,
+        
+        "roadmap": f"""
+        Create a learning roadmap for {concept}.
+        Structure it as:
+        1. Prerequisites - what should someone know before learning this concept
+        2. Beginner level - first principles and foundational knowledge
+        3. Intermediate level - practical applications and common patterns
+        4. Advanced level - specialized knowledge and deeper theory
+        5. Expert level - cutting-edge research and innovations
+        For each level, suggest specific resources (books, courses, papers) that would be most helpful.
+        """,
+        
+        "resources": f"""
+        Recommend the best resources for learning about {concept}.
+        Include:
+        1. Books (2-3 recommendations with brief descriptions)
+        2. Online courses (2-3 options from platforms like Coursera, edX, etc.)
+        3. Academic papers (2-3 seminal or recent important papers)
+        4. Videos/lectures (2-3 high-quality presentations)
+        5. Websites/blogs (2-3 reliable sources of ongoing information)
+        For each resource, explain why it's valuable and who would benefit most from it.
+        """
+    }
+    
+    return prompts.get(aspect, "")
+
+# Query an AI provider with a prompt
+def query_provider(provider: str, prompt: str, debug: bool) -> str:
+    """
+    Send a prompt to an AI provider and get the response
+    
+    Args:
+        provider: The AI provider to use
+        prompt: The prompt to send
+        debug: Whether to enable debug logging
+    
+    Returns:
+        The response from the AI provider
+    """
+    if debug:
+        logging.debug(f"Querying provider: {provider}")
+        logging.debug(f"Prompt: {prompt[:100]}...")
+    
+    try:
+        result = subprocess.run(
+            [provider],
+            input=prompt.encode('utf-8'),
+            capture_output=True,
+            check=True
+        )
+        response = result.stdout.decode('utf-8').strip()
+        
+        if debug:
+            logging.debug(f"Got response from {provider} ({len(response)} chars)")
+        
+        return response
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
+        logging.error(f"Error querying provider {provider}: {error_msg}")
+        return f"Error from {provider}: {error_msg}"
+
+# Format output in Neorg format
+def format_as_neorg(concept: str, aspects: Dict[str, Dict[str, str]]) -> str:
+    """
+    Format the expanded concept information in Neorg format
+    
+    Args:
+        concept: The main concept
+        aspects: Dictionary of aspect -> provider -> content
+    
+    Returns:
+        Formatted Neorg document
+    """
+    # Start with the document header
+    neorg_content = f"@document.meta\ntitle: {concept} - Expanded Concept\nauthors: concept_expander\ncreated: {time.strftime('%Y-%m-%d')}\nversion: 0.1\n@end\n\n"
+    
+    # Add the main concept header
+    neorg_content += f"* {concept}\n\n"
+    
+    # Add a brief introduction section
+    neorg_content += "** Introduction\n\n"
+    
+    # Add section for each aspect
+    aspect_headers = {
+        "fundamentals": "Fundamental Principles",
+        "misconceptions": "Common Misconceptions",
+        "advanced": "Advanced Aspects",
+        "related": "Related Concepts",
+        "questions": "Thought-Provoking Questions",
+        "roadmap": "Learning Roadmap",
+        "resources": "Recommended Resources"
+    }
+    
+    for aspect, providers_content in aspects.items():
+        header = aspect_headers.get(aspect, aspect.capitalize())
+        neorg_content += f"** {header}\n\n"
+        
+        # Add content from each provider
+        for provider, content in providers_content.items():
+            provider_name = provider.replace("py", "").capitalize()
+            neorg_content += f"*** Perspective from {provider_name}\n\n"
+            
+            # Process the content for Neorg format (handle lists, code blocks, etc.)
+            formatted_content = content.replace("```", "@code")
+            formatted_content = re.sub(r'(?m)^(\d+\.\s)', '- # ', formatted_content)
+            formatted_content = re.sub(r'(?m)^(\*\s)', '- ', formatted_content)
+            formatted_content = re.sub(r'(?m)^(\-\s)', '- ', formatted_content)
+            
+            neorg_content += f"{formatted_content}\n\n"
+    
+    return neorg_content
+
+# Format output in Markdown format
+def format_as_markdown(concept: str, aspects: Dict[str, Dict[str, str]]) -> str:
+    """
+    Format the expanded concept information in Markdown format
+    
+    Args:
+        concept: The main concept
+        aspects: Dictionary of aspect -> provider -> content
+    
+    Returns:
+        Formatted Markdown document
+    """
+    # Start with the document header
+    md_content = f"# {concept} - Expanded Concept\n\n"
+    md_content += f"*Generated on: {time.strftime('%Y-%m-%d')}*\n\n"
+    
+    # Add a brief introduction section
+    md_content += "## Introduction\n\n"
+    
+    # Add section for each aspect
+    aspect_headers = {
+        "fundamentals": "Fundamental Principles",
+        "misconceptions": "Common Misconceptions",
+        "advanced": "Advanced Aspects",
+        "related": "Related Concepts",
+        "questions": "Thought-Provoking Questions",
+        "roadmap": "Learning Roadmap",
+        "resources": "Recommended Resources"
+    }
+    
+    for aspect, providers_content in aspects.items():
+        header = aspect_headers.get(aspect, aspect.capitalize())
+        md_content += f"## {header}\n\n"
+        
+        # Add content from each provider
+        for provider, content in providers_content.items():
+            provider_name = provider.replace("py", "").capitalize()
+            md_content += f"### Perspective from {provider_name}\n\n"
+            
+            # Add the content directly (Markdown formatting should be preserved)
+            md_content += f"{content}\n\n"
+    
+    return md_content
+
+# Main function
+def main():
+    # Set up argument parser with detailed description and examples
+    parser = argparse.ArgumentParser(
+        description="Expand understanding of concepts using multiple AI providers to deepen understanding, generate questions, and create learning roadmaps.",
+        epilog="""Examples:
+  # Expand a concept directly
+  concept_expander "Generative AI"
+  
+  # Extract concepts from an existing note
+  concept_expander --extract ~/Documents/notes/03_resources/technology/llms.norg
+  
+  # Specify which AI providers to use
+  concept_expander --providers "claudpy,perpy,geminpy" "Quantum Computing"
+  
+  # Output in markdown format instead of neorg
+  concept_expander --output markdown "Blockchain"
+  
+  # Integrate with existing notes with PARA category and subcategory
+  concept_expander --integrate --para resource --category technology/ai "Neural Networks"
+  
+  # Use custom filename with the name-seed parameter
+  concept_expander --integrate --name-seed "deep_learning_foundations" "Neural Networks"
+  
+  # Control parallel processing with max-concurrent
+  concept_expander --max-concurrent 10 "Artificial Intelligence"
+  
+  # Generate a summary along with the expanded concept
+  concept_expander --summary "Machine Learning"
+  
+  # Specify a different provider for the summary
+  concept_expander --summary --summary-provider claudpy "Machine Learning"
+  
+  # Use summary options for principles and specific summary type
+  concept_expander --summary --principle --type research "Quantum Physics"
+  
+  # Enable debug logging
+  concept_expander --debug "Reinforcement Learning"
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    
+    # Define available command-line arguments
+    parser.add_argument("input", help="Concept name or path to note file")
+    parser.add_argument("--extract", action="store_true", required=False, default=False,
+                      help="Extract concepts from a note file instead of using direct concept input")
+    parser.add_argument("--providers", required=False, default=",".join(DEFAULT_PROVIDERS),
+                      help=f"Comma-separated list of AI providers to use (default: {','.join(DEFAULT_PROVIDERS)})")
+    parser.add_argument("--output", choices=[NEORG_OUTPUT_TYPE, MARKDOWN_OUTPUT_TYPE], default=NEORG_OUTPUT_TYPE,
+                      help=f"Output format (default: {NEORG_OUTPUT_TYPE})")
+    parser.add_argument("--integrate", action="store_true", required=False, default=False,
+                      help="Integrate with existing notes instead of creating a new one")
+    parser.add_argument("--para", choices=["project", "area", "resource", "archive", "detect"], 
+                      default="resource", help="PARA category to use when --integrate is specified (default: resource)")
+    parser.add_argument("--category", required=False, help="Subcategory path within the PARA category (e.g., 'technology/ai')")
+    parser.add_argument("--name-seed", required=False, help="Custom filename seed to use instead of the concept name")
+    parser.add_argument("--max-concurrent", type=int, default=multiprocessing.cpu_count(),
+                      help=f"Maximum number of concurrent AI queries (default: {multiprocessing.cpu_count()}, system CPU count)")
+    parser.add_argument("--summary", action="store_true", required=False, default=False,
+                      help="Generate an additional summary file of the expanded concept")
+    parser.add_argument("--summary-provider", choices=ALL_PROVIDERS, default="grokpy",
+                      help="Provider to use for summary generation (default: grokpy)")
+    parser.add_argument("--principle", action="store_true", required=False, default=False,
+                      help="Focus on principles rather than literal details in summary")
+    parser.add_argument("--type", required=False, 
+                      help="Summary type (e.g., 'book', 'meeting', 'research', etc.)")
+    parser.add_argument("--debug", action="store_true", required=False, default=False,
+                      help="Print debug logging")
+    parser.add_argument("--default", choices=ALL_PROVIDERS, default=DEFAULT_PROVIDER,
+                      help=f"Default provider to use when only one is needed (default: {DEFAULT_PROVIDER})")
+    
+    # Parse the arguments provided by the user
+    args = parser.parse_args()
+    
+    # Set up logging if debug mode is enabled
+    setup_logging(args.debug)
+    
+    # Ensure we're in the dev distrobox container
+    ensure_distrobox()
+    
+    # Parse the providers list
+    providers = [p.strip() for p in args.providers.split(',') if p.strip() in ALL_PROVIDERS]
+    if not providers:
+        providers = DEFAULT_PROVIDERS
+        if args.debug:
+            logging.debug(f"No valid providers specified, using defaults: {providers}")
+    
+    # Process the input based on extract flag
+    concepts = []
+    if args.extract:
+        # Extract concepts from the given file
+        concepts = extract_concepts_from_file(args.input, args.debug)
+        if not concepts:
+            sys.stderr.write(f"Error: No concepts could be extracted from {args.input}\n")
+            sys.exit(1)
+    else:
+        # Use the input directly as a concept
+        concepts = [args.input]
+    
+    # Process each concept
+    for concept in concepts:
+        if args.debug:
+            logging.debug(f"Processing concept: {concept}")
+        
+        # The aspects to explore for each concept
+        aspects = ["fundamentals", "misconceptions", "advanced", "related", "questions", "roadmap", "resources"]
+        
+        # Store the results for each aspect from each provider
+        results = {}
+        for aspect in aspects:
+            results[aspect] = {}
+        
+        # Create a list of all tasks to run
+        tasks = []
+        for aspect in aspects:
+            # Generate the prompt for this aspect
+            prompt = generate_aspect_prompt(concept, aspect)
+            for provider in providers:
+                tasks.append((aspect, provider, prompt))
+        
+        # Process all queries in parallel
+        if args.debug:
+            logging.debug(f"Processing {len(tasks)} queries with up to {args.max_concurrent} concurrent threads")
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrent) as executor:
+            # Map each task to a future
+            future_to_task = {
+                executor.submit(query_provider, provider, prompt, args.debug): (aspect, provider)
+                for aspect, provider, prompt in tasks
+            }
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_task):
+                aspect, provider = future_to_task[future]
+                try:
+                    response = future.result()
+                    results[aspect][provider] = response
+                    if args.debug:
+                        logging.debug(f"Completed {aspect} from {provider}")
+                except Exception as e:
+                    logging.error(f"Error getting {aspect} from {provider}: {e}")
+                    results[aspect][provider] = f"Error from {provider}: {str(e)}"
+        
+        # Format the output based on the specified format
+        if args.output == NEORG_OUTPUT_TYPE:
+            output_content = format_as_neorg(concept, results)
+        else:  # MARKDOWN_OUTPUT_TYPE
+            output_content = format_as_markdown(concept, results)
+        
+        # Generate output filename from concept name
+        safe_concept = re.sub(r'[^a-zA-Z0-9_]', '_', concept.lower())
+        file_name = f"{safe_concept}_expanded"
+        
+        if args.output == NEORG_OUTPUT_TYPE:
+            file_name += ".norg"
+        else:  # MARKDOWN_OUTPUT_TYPE
+            file_name += ".md"
+            
+        # Generate summary file if requested
+        summary_content = None
+        summary_file_name = None
+        if args.summary:
+            if args.debug:
+                logging.debug(f"Generating summary of expanded concept using {args.summary_provider}")
+                
+            # Create summary filename
+            summary_file_name = f"{safe_concept}_expanded_summary"
+            if args.output == NEORG_OUTPUT_TYPE:
+                summary_file_name += ".norg"
+                summary_script = "ai_summary_as_neorg"
+            else:  # MARKDOWN_OUTPUT_TYPE
+                summary_file_name += ".md" 
+                summary_script = "ai_summary_as_markdown"
+                
+            # Generate summary using the specified provider
+            try:
+                if args.debug:
+                    logging.debug(f"Running {summary_script} with {args.summary_provider}")
+                    
+                # Build the command with all applicable options
+                summary_cmd = [summary_script, "--provider", args.summary_provider]
+                
+                # Add principle flag if specified
+                if args.principle:
+                    summary_cmd.append("--principle")
+                
+                # Add type parameter if specified
+                if args.type:
+                    summary_cmd.extend(["--type", args.type])
+                
+                if args.debug:
+                    logging.debug(f"Summary command: {' '.join(summary_cmd)}")
+                
+                # Run the appropriate summary script on the expanded content    
+                result = subprocess.run(
+                    summary_cmd,
+                    input=output_content.encode('utf-8'),
+                    capture_output=True,
+                    check=True
+                )
+                summary_content = result.stdout.decode('utf-8').strip()
+                
+                if args.debug:
+                    logging.debug(f"Generated summary of {len(summary_content)} characters")
+            except subprocess.CalledProcessError as e:
+                error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
+                logging.error(f"Error generating summary: {error_msg}")
+                sys.stderr.write(f"Warning: Could not generate summary: {error_msg}\n")
+                summary_content = None
+        
+        # Handle the output based on integration option
+        if args.integrate:
+            # Generate the content as usual - already done above
+            if args.output == NEORG_OUTPUT_TYPE:
+                format_arg = "norg"
+            else:  # MARKDOWN_OUTPUT_TYPE
+                format_arg = "md"
+            
+            # First, save the main file
+            # Build sbi command
+            sbi_cmd = ["sbi", "--no-summary", "--format", format_arg]
+            
+            # Add para parameter (already set to default "resource" if not specified)
+            sbi_cmd.extend(["--para", args.para])
+            
+            # Add category parameter only if specified
+            if args.category:
+                sbi_cmd.extend(["--category", args.category])
+            
+            # Add name-seed parameter if specified
+            if args.name_seed:
+                sbi_cmd.extend(["--name-seed", args.name_seed])
+            
+            # Log the command if in debug mode
+            if args.debug:
+                logging.debug(f"Executing sbi integration command: {' '.join(sbi_cmd)}")
+            
+            try:
+                # Execute sbi command with our content
+                result = subprocess.run(
+                    sbi_cmd,
+                    input=output_content.encode('utf-8'),
+                    capture_output=True,
+                    check=True
+                )
+                
+                # Extract the path from sbi output to show where the file was saved
+                output_msg = result.stdout.decode('utf-8').strip()
+                
+                # Try to extract file path from sbi output
+                file_path_match = re.search(r'saved to: ([^\n]+)', output_msg)
+                if file_path_match:
+                    saved_path = file_path_match.group(1)
+                    print(f"Expanded concept integrated: {saved_path}")
+                else:
+                    print(f"Concept expanded and integrated successfully")
+                    
+                if args.debug:
+                    logging.debug(f"Full sbi output: {output_msg}")
+                
+                # If summary was generated, also save that with sbi
+                if args.summary and summary_content:
+                    # Modify the sbi command for summary if needed
+                    sbi_cmd_summary = sbi_cmd.copy()
+                    
+                    # If name-seed was provided, append _summary to it
+                    if args.name_seed:
+                        name_seed_index = sbi_cmd_summary.index("--name-seed")
+                        # Replace the name-seed value with the summary version
+                        sbi_cmd_summary[name_seed_index + 1] = f"{sbi_cmd_summary[name_seed_index + 1]}_summary"
+                    else:
+                        # Add a name-seed parameter based on the concept name
+                        sbi_cmd_summary.extend(["--name-seed", f"{safe_concept}_expanded_summary"])
+                    
+                    if args.debug:
+                        logging.debug(f"Executing sbi integration command for summary: {' '.join(sbi_cmd_summary)}")
+                    
+                    # Execute sbi command with the summary content
+                    result_summary = subprocess.run(
+                        sbi_cmd_summary,
+                        input=summary_content.encode('utf-8'),
+                        capture_output=True,
+                        check=True
+                    )
+                    
+                    # Extract the path from sbi output for summary
+                    output_msg_summary = result_summary.stdout.decode('utf-8').strip()
+                    
+                    # Try to extract file path from sbi output
+                    file_path_match_summary = re.search(r'saved to: ([^\n]+)', output_msg_summary)
+                    if file_path_match_summary:
+                        saved_path_summary = file_path_match_summary.group(1)
+                        print(f"Summary integrated: {saved_path_summary}")
+                    else:
+                        print(f"Summary integrated successfully")
+                        
+                    if args.debug:
+                        logging.debug(f"Full sbi output for summary: {output_msg_summary}")
+                    
+            except subprocess.CalledProcessError as e:
+                error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
+                logging.error(f"Error integrating with sbi: {error_msg}")
+                sys.stderr.write(f"Error: Could not integrate with sbi: {e}\n")
+                sys.exit(1)
+        else:
+            # Save files in the current directory
+            
+            # Save main output file
+            output_path = os.path.join(os.getcwd(), file_name)
+            try:
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(output_content)
+                
+                print(f"Expanded concept saved to: {output_path}")
+            except Exception as e:
+                logging.error(f"Error writing output file: {e}")
+                sys.stderr.write(f"Error: Could not write output file {output_path}: {e}\n")
+                sys.exit(1)
+            
+            # Save summary file if generated
+            if args.summary and summary_content and summary_file_name:
+                summary_path = os.path.join(os.getcwd(), summary_file_name)
+                try:
+                    with open(summary_path, 'w', encoding='utf-8') as f:
+                        f.write(summary_content)
+                    
+                    print(f"Summary saved to: {summary_path}")
+                except Exception as e:
+                    logging.error(f"Error writing summary file: {e}")
+                    sys.stderr.write(f"Error: Could not write summary file {summary_path}: {e}\n")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nOperation interrupted by user\n")
+        sys.exit(130)
+    except Exception as e:
+        sys.stderr.write(f"Error: {e}\n")
+        sys.exit(1)
