@@ -1,0 +1,2435 @@
+#!/usr/bin/perl
+# knowledge_api - A RESTful API server for accessing your Second Brain knowledge base
+#
+# This script implements a lightweight API server that provides programmatic access
+# to your Second Brain notes collection, enabling integration with other tools and services.
+#
+# Features:
+# - RESTful API for searching, retrieving, and managing notes
+# - Authentication and authorization controls
+# - Content format transformation (Neorg, Markdown, plain text)
+# - Query language for complex information retrieval
+# - Integration with existing semantic_search infrastructure
+# - Compatible with PARA organization structure
+# - Self-hosted with full privacy control
+#
+# Deps installation:
+# - cpan FindBin Mojolicious JSON File::Spec
+
+use strict;
+use warnings;
+use feature qw(say signatures switch);
+no warnings qw(experimental::signatures experimental::smartmatch);
+
+# Core modules
+use Getopt::Long;
+use Pod::Usage;
+use JSON ();
+use File::Spec;
+use File::Basename;
+use File::Find;
+use Cwd qw(abs_path);
+use POSIX qw(strftime);
+use Encode qw(decode encode);
+use Data::Dumper;
+use IPC::Open3;
+use Symbol qw(gensym);
+use Digest::SHA qw(sha256_hex);
+
+# Web server modules
+use Mojolicious::Lite;
+use Mojo::File;
+use Mojo::JSON qw(encode_json decode_json);
+use Mojo::Util qw(url_escape url_unescape trim);
+
+# Constants
+use constant {
+    # Server settings
+    DEFAULT_PORT => 8080,
+    DEFAULT_HOST => '127.0.0.1',
+    
+    # File paths
+    DEFAULT_NOTES_DIR => "$ENV{HOME}/Documents/notes",
+    CONFIG_FILE => "$ENV{HOME}/.config/knowledge_api/config.json",
+    LOG_FILE => "$ENV{HOME}/.config/knowledge_api/api.log",
+    
+    # Security
+    API_KEY_LENGTH => 32,
+    DEFAULT_TOKEN_EXPIRY => 86400, # 24 hours
+    
+    # Rate limiting
+    DEFAULT_RATE_LIMIT => 60, # Requests per minute
+    
+    # Content transformation
+    FORMAT_NEORG => 'neorg',
+    FORMAT_MARKDOWN => 'markdown',
+    FORMAT_TEXT => 'text',
+    
+    # PARA directories
+    PARA_INBOX => '00_inbox',
+    PARA_PROJECTS => '01_projects',
+    PARA_AREAS => '02_areas',
+    PARA_RESOURCES => '03_resources',
+    PARA_ARCHIVES => '04_archives',
+};
+
+# Global configuration
+my $CONFIG = {
+    port => DEFAULT_PORT,
+    host => DEFAULT_HOST,
+    notes_dir => DEFAULT_NOTES_DIR,
+    api_keys => {},
+    rate_limits => {},
+    tokens => {},
+    para_dirs => [
+        PARA_INBOX,
+        PARA_PROJECTS,
+        PARA_AREAS,
+        PARA_RESOURCES,
+        PARA_ARCHIVES
+    ],
+    file_types => ['.norg', '.md', '.txt'],
+    semantic_search_provider => 'ollampy',
+};
+
+# Command-line options
+my $PORT = DEFAULT_PORT;
+my $HOST = DEFAULT_HOST;
+my $NOTES_DIR = DEFAULT_NOTES_DIR;
+my $DEBUG = 0;
+my $HELP = 0;
+my $ADD_API_KEY = '';
+my $REMOVE_API_KEY = '';
+my $LIST_API_KEYS = 0;
+my $INIT_CONFIG = 0;
+my $NO_API_KEY = 0;
+my $ENABLE_MCP = 0;
+
+# Active rate limiting data (in-memory)
+my %RATE_LIMIT_COUNTERS;
+my %RATE_LIMIT_WINDOWS;
+
+# Parse command-line arguments
+GetOptions(
+    'port|p=i' => \$PORT,
+    'host|h=s' => \$HOST,
+    'dir|d=s' => \$NOTES_DIR,
+    'debug' => \$DEBUG,
+    'help' => \$HELP,
+    'add-key=s' => \$ADD_API_KEY,
+    'remove-key=s' => \$REMOVE_API_KEY,
+    'list-keys' => \$LIST_API_KEYS,
+    'init-config' => \$INIT_CONFIG,
+    'no-api-key' => \$NO_API_KEY,
+    'mcp' => \$ENABLE_MCP,
+) or pod2usage(2);
+
+pod2usage(1) if $HELP;
+
+# Ensure config directory exists
+my $config_dir = dirname(CONFIG_FILE);
+unless (-d $config_dir) {
+    system("mkdir", "-p", $config_dir);
+}
+
+# Initialize or load configuration
+if ($INIT_CONFIG || !-f CONFIG_FILE) {
+    initialize_config();
+} else {
+    load_config();
+}
+
+# Apply command-line overrides
+$CONFIG->{port} = $PORT if $PORT != DEFAULT_PORT;
+$CONFIG->{host} = $HOST if $HOST ne DEFAULT_HOST;
+$CONFIG->{notes_dir} = $NOTES_DIR if $NOTES_DIR ne DEFAULT_NOTES_DIR;
+$CONFIG->{debug} = $DEBUG;
+
+# Handle API key management
+if ($ADD_API_KEY) {
+    add_api_key($ADD_API_KEY);
+    exit;
+}
+
+if ($REMOVE_API_KEY) {
+    remove_api_key($REMOVE_API_KEY);
+    exit;
+}
+
+if ($LIST_API_KEYS) {
+    list_api_keys();
+    exit;
+}
+
+# Configure Mojolicious
+app->log->level('debug') if $DEBUG;
+app->secrets([$CONFIG->{secret} || sha256_hex(time() . rand() . $$)]);
+
+# Validate notes directory
+die "Notes directory not found: $CONFIG->{notes_dir}" unless -d $CONFIG->{notes_dir};
+
+# Add CORS support for all routes
+app->hook(after_dispatch => sub {
+    my $c = shift;
+    $c->res->headers->header('Access-Control-Allow-Origin' => '*');
+    $c->res->headers->header('Access-Control-Allow-Methods' => 'GET, POST, PUT, DELETE, OPTIONS');
+    $c->res->headers->header('Access-Control-Allow-Headers' => 'Content-Type, Authorization, X-Requested-With');
+});
+
+# Handle OPTIONS requests for CORS preflight
+options '/*' => sub {
+    my $c = shift;
+    $c->render(text => '', status => 204);
+};
+
+# Authentication middleware
+app->hook(before_dispatch => sub {
+    my $c = shift;
+    
+    # Skip auth if no-api-key mode is enabled
+    return if $NO_API_KEY;
+    
+    # Skip auth for OPTIONS and auth endpoint
+    my $path = $c->req->url->path;
+    return if $c->req->method eq 'OPTIONS';
+    return if $path =~ m{^/auth};
+    
+    # Get token from Authorization header
+    my $auth_header = $c->req->headers->authorization || '';
+    my $token = '';
+    
+    if ($auth_header =~ /^Bearer\s+(.+)$/i) {
+        $token = $1;
+    } elsif ($c->req->query_params->param('token')) {
+        # Fallback to query parameter
+        $token = $c->req->query_params->param('token');
+    }
+    
+    # Validate token
+    unless (validate_token($token)) {
+        $c->render(json => {error => 'Unauthorized: Invalid or expired token'}, status => 401);
+        return 0;
+    }
+    
+    # Rate limiting
+    my $api_key = $CONFIG->{tokens}->{$token}->{api_key};
+    my $rate_limit = $CONFIG->{rate_limits}->{$api_key} || DEFAULT_RATE_LIMIT;
+    
+    # Initialize rate limit window if needed
+    unless (exists $RATE_LIMIT_WINDOWS{$api_key}) {
+        $RATE_LIMIT_WINDOWS{$api_key} = time();
+        $RATE_LIMIT_COUNTERS{$api_key} = 0;
+    }
+    
+    # Reset counter if window has passed
+    my $now = time();
+    if ($now - $RATE_LIMIT_WINDOWS{$api_key} >= 60) {
+        $RATE_LIMIT_WINDOWS{$api_key} = $now;
+        $RATE_LIMIT_COUNTERS{$api_key} = 0;
+    }
+    
+    # Increment counter and check limit
+    $RATE_LIMIT_COUNTERS{$api_key}++;
+    if ($RATE_LIMIT_COUNTERS{$api_key} > $rate_limit) {
+        $c->render(json => {error => 'Rate limit exceeded'}, status => 429);
+        return 0;
+    }
+    
+    # Add rate limit headers
+    $c->res->headers->header('X-RateLimit-Limit' => $rate_limit);
+    $c->res->headers->header('X-RateLimit-Remaining' => $rate_limit - $RATE_LIMIT_COUNTERS{$api_key});
+    $c->res->headers->header('X-RateLimit-Reset' => $RATE_LIMIT_WINDOWS{$api_key} + 60);
+    
+    return 1;
+});
+
+# --------------------------------------------------
+# API Routes
+# --------------------------------------------------
+
+# API Documentation
+get '/' => sub {
+    my $c = shift;
+    $c->render(template => 'api_docs');
+};
+
+# Authentication endpoint
+post '/auth' => sub {
+    my $c = shift;
+    
+    my $api_key = $c->req->json->{api_key} || '';
+    
+    unless ($api_key && exists $CONFIG->{api_keys}->{$api_key}) {
+        $c->render(json => {error => 'Invalid API key'}, status => 401);
+        return;
+    }
+    
+    my $token = generate_token($api_key);
+    my $expires = $CONFIG->{tokens}->{$token}->{expires};
+    
+    $c->render(json => {
+        token => $token,
+        expires => $expires,
+        type => 'Bearer'
+    });
+};
+
+# List available PARA categories
+get '/para' => sub {
+    my $c = shift;
+    
+    $c->render(json => {
+        categories => $CONFIG->{para_dirs}
+    });
+};
+
+# Get all directories in a PARA category
+get '/para/:category' => sub {
+    my $c = shift;
+    my $category = $c->param('category');
+    
+    unless (grep { $_ eq $category } @{$CONFIG->{para_dirs}}) {
+        $c->render(json => {error => "Invalid PARA category: $category"}, status => 400);
+        return;
+    }
+    
+    my $dir = File::Spec->catdir($CONFIG->{notes_dir}, $category);
+    unless (-d $dir) {
+        $c->render(json => {error => "Category directory not found: $category"}, status => 404);
+        return;
+    }
+    
+    my @directories = list_directories($dir);
+    $c->render(json => {
+        category => $category,
+        directories => \@directories
+    });
+};
+
+# Search notes using semantic search
+get '/search' => sub {
+    my $c = shift;
+    
+    my $query = $c->param('q') || '';
+    my $limit = $c->param('limit') || 5;
+    my $provider = $c->param('provider') || $CONFIG->{semantic_search_provider};
+    my $include_content = $c->param('include_content') || 0;
+    my $debug_mode = $c->param('debug') || $DEBUG;
+    
+    unless ($query) {
+        $c->render(json => {error => 'Missing required parameter: q'}, status => 400);
+        return;
+    }
+    
+    # Enable temporary debug for this request if requested
+    my $old_debug = $DEBUG;
+    $DEBUG = 1 if $debug_mode;
+    
+    # Fetch search results
+    my $results = semantic_search($query, $limit, $provider);
+    
+    # Add content if requested
+    if ($results && $include_content) {
+        foreach my $result (@$results) {
+            # Skip if content is already included
+            next if exists $result->{content};
+            
+            # Get file path and read content if file exists
+            if ($result->{path}) {
+                my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $result->{path});
+                $result->{content} = read_file($file_path) if -f $file_path;
+            }
+        }
+    }
+    
+    # Add debug info if in debug mode
+    my $response = {
+        query => $query,
+        results => $results || []
+    };
+    
+    if ($debug_mode) {
+        $response->{debug} = {
+            timestamp => scalar localtime,
+            provider => $provider,
+            limit => $limit,
+            notes_dir => $CONFIG->{notes_dir},
+            result_count => scalar @$results,
+            server_info => {
+                perl_version => $],
+                os => $^O,
+                mojolicious_version => $Mojolicious::VERSION
+            }
+        };
+    }
+    
+    # Restore debug setting
+    $DEBUG = $old_debug;
+    
+    $c->render(json => $response);
+};
+
+# Get a specific note by path
+get '/notes/*note_path' => sub {
+    my $c = shift;
+    my $path = $c->param('note_path') || '';
+    my $format = $c->param('format') || '';
+    
+    $path = url_unescape($path);
+    my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+    
+    unless (-f $file_path) {
+        $c->render(json => {error => "Note not found: $path"}, status => 404);
+        return;
+    }
+    
+    my $content = read_file($file_path);
+    my $transformed_content = $content;
+    
+    # Transform content if requested
+    if ($format) {
+        $transformed_content = transform_content($content, determine_format($file_path), $format);
+    }
+    
+    my $meta = get_file_metadata($file_path);
+    
+    $c->render(json => {
+        path => $path,
+        content => $transformed_content,
+        format => $format || determine_format($file_path),
+        metadata => $meta
+    });
+};
+
+# List all notes (with optional filtering)
+get '/notes' => sub {
+    my $c = shift;
+    
+    my $category = $c->param('category') || '';
+    my $directory = $c->param('directory') || '';
+    my $format = $c->param('format') || '';
+    my $limit = $c->param('limit') || 100;
+    my $offset = $c->param('offset') || 0;
+    
+    my @files;
+    
+    if ($category && $directory) {
+        # List files in a specific directory
+        my $dir_path = File::Spec->catdir($CONFIG->{notes_dir}, $category, $directory);
+        if (-d $dir_path) {
+            @files = list_files($dir_path, $CONFIG->{file_types});
+        }
+    } elsif ($category) {
+        # List all files in a category
+        my $cat_path = File::Spec->catdir($CONFIG->{notes_dir}, $category);
+        if (-d $cat_path) {
+            @files = list_files_recursive($cat_path, $CONFIG->{file_types});
+        }
+    } else {
+        # List all notes
+        @files = list_files_recursive($CONFIG->{notes_dir}, $CONFIG->{file_types});
+    }
+    
+    # Filter by format if requested
+    if ($format) {
+        @files = grep {
+            determine_format($_) eq $format
+        } @files;
+    }
+    
+    # Apply pagination
+    my $total = scalar @files;
+    @files = @files[$offset .. ($offset + $limit - 1)] if $offset < $total;
+    @files = @files[0 .. $limit - 1] if scalar @files > $limit;
+    
+    # Convert to relative paths
+    my $notes_dir_length = length($CONFIG->{notes_dir}) + 1; # +1 for the trailing slash
+    @files = map { 
+        substr($_, $notes_dir_length) 
+    } @files;
+    
+    $c->render(json => {
+        notes => \@files,
+        total => $total,
+        limit => $limit,
+        offset => $offset
+    });
+};
+
+# Create a new note
+post '/notes/*note_path' => sub {
+    my $c = shift;
+    my $path = $c->param('note_path') || '';
+    my $content = $c->req->json->{content} || '';
+    my $format = $c->req->json->{format} || determine_format($path);
+    
+    $path = url_unescape($path);
+    my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+    
+    # Check if the file already exists
+    if (-f $file_path) {
+        $c->render(json => {error => "Note already exists: $path"}, status => 409);
+        return;
+    }
+    
+    # Ensure directory exists
+    my $dir = dirname($file_path);
+    system("mkdir", "-p", $dir) unless -d $dir;
+    
+    # Transform content if needed
+    if ($format ne determine_format($file_path)) {
+        $content = transform_content($content, $format, determine_format($file_path));
+    }
+    
+    # Write the file
+    if (write_file($file_path, $content)) {
+        $c->render(json => {
+            path => $path,
+            created => 1,
+            format => determine_format($file_path)
+        });
+    } else {
+        $c->render(json => {error => "Failed to create note: $!"}, status => 500);
+    }
+};
+
+# Update an existing note
+put '/notes/*note_path' => sub {
+    my $c = shift;
+    my $path = $c->param('note_path') || '';
+    my $content = $c->req->json->{content} || '';
+    my $format = $c->req->json->{format} || '';
+    
+    $path = url_unescape($path);
+    my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+    
+    # Check if the file exists
+    unless (-f $file_path) {
+        $c->render(json => {error => "Note not found: $path"}, status => 404);
+        return;
+    }
+    
+    # Transform content if format specified
+    if ($format && $format ne determine_format($file_path)) {
+        $content = transform_content($content, $format, determine_format($file_path));
+    }
+    
+    # Write the file
+    if (write_file($file_path, $content)) {
+        $c->render(json => {
+            path => $path,
+            updated => 1,
+            format => determine_format($file_path)
+        });
+    } else {
+        $c->render(json => {error => "Failed to update note: $!"}, status => 500);
+    }
+};
+
+# Delete a note
+del '/notes/*note_path' => sub {
+    my $c = shift;
+    my $path = $c->param('note_path') || '';
+    
+    $path = url_unescape($path);
+    my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+    
+    # Check if the file exists
+    unless (-f $file_path) {
+        $c->render(json => {error => "Note not found: $path"}, status => 404);
+        return;
+    }
+    
+    # Delete the file
+    if (unlink $file_path) {
+        $c->render(json => {
+            path => $path,
+            deleted => 1
+        });
+    } else {
+        $c->render(json => {error => "Failed to delete note: $!"}, status => 500);
+    }
+};
+
+# Add a file to the Second Brain using SBI
+post '/ingest' => sub {
+    my $c = shift;
+    
+    my $content = $c->req->json->{content} || '';
+    my $category = $c->req->json->{category} || PARA_INBOX;
+    my $title = $c->req->json->{title} || 'API Ingested Note';
+    my $format = $c->req->json->{format} || FORMAT_NEORG;
+    
+    unless ($content) {
+        $c->render(json => {error => 'Missing required parameter: content'}, status => 400);
+        return;
+    }
+    
+    # Validate category
+    unless (grep { $_ eq $category } @{$CONFIG->{para_dirs}}) {
+        $c->render(json => {error => "Invalid PARA category: $category"}, status => 400);
+        return;
+    }
+    
+    # Create a temporary file with the content
+    my ($fh, $tmp_file) = File::Temp::tempfile();
+    print $fh $content;
+    close $fh;
+    
+    # Use SBI to ingest the content if available
+    my $sbi_result;
+    if (system("which sbi >/dev/null 2>&1") == 0) {
+        $sbi_result = ingest_with_sbi($tmp_file, $category, $title, $format);
+    } else {
+        # Fallback to manual ingestion if SBI is not available
+        $sbi_result = manual_ingest($tmp_file, $category, $title, $format);
+    }
+    
+    # Clean up temp file
+    unlink $tmp_file;
+    
+    if ($sbi_result->{success}) {
+        $c->render(json => {
+            path => $sbi_result->{path},
+            ingested => 1,
+            format => $format
+        });
+    } else {
+        $c->render(json => {error => $sbi_result->{error}}, status => 500);
+    }
+};
+
+# Get server status and statistics
+get '/status' => sub {
+    my $c = shift;
+    
+    my $status = {
+        server => {
+            version => '1.0.0',
+            uptime => time() - $^T,
+            hostname => $CONFIG->{host},
+            port => $CONFIG->{port}
+        },
+        notes => {
+            directory => $CONFIG->{notes_dir},
+            para_categories => $CONFIG->{para_dirs},
+            supported_formats => ['neorg', 'markdown', 'text'],
+            semantic_search_provider => $CONFIG->{semantic_search_provider}
+        },
+        statistics => {
+            total_notes => count_files_recursive($CONFIG->{notes_dir}, $CONFIG->{file_types}),
+            api_keys => scalar keys %{$CONFIG->{api_keys}},
+            active_tokens => scalar keys %{$CONFIG->{tokens}}
+        }
+    };
+    
+    $c->render(json => $status);
+};
+
+# --------------------------------------------------
+# Helper Functions
+# --------------------------------------------------
+
+# Initialize the configuration file
+sub initialize_config {
+    my $secret = sha256_hex(time() . rand() . $$);
+    my $api_key = generate_api_key();
+    
+    $CONFIG = {
+        port => DEFAULT_PORT,
+        host => DEFAULT_HOST,
+        notes_dir => DEFAULT_NOTES_DIR,
+        secret => $secret,
+        api_keys => {
+            $api_key => {
+                name => 'Default API Key',
+                created => time()
+            }
+        },
+        rate_limits => {
+            $api_key => DEFAULT_RATE_LIMIT
+        },
+        tokens => {},
+        para_dirs => [
+            PARA_INBOX,
+            PARA_PROJECTS,
+            PARA_AREAS,
+            PARA_RESOURCES,
+            PARA_ARCHIVES
+        ],
+        file_types => ['.norg', '.md', '.txt'],
+        semantic_search_provider => 'ollampy',
+    };
+    
+    save_config();
+    
+    say "Initialized configuration file: " . CONFIG_FILE;
+    say "Generated API key: $api_key";
+}
+
+# Load configuration from file
+sub load_config {
+    open my $fh, '<', CONFIG_FILE or die "Cannot open config file: $!";
+    local $/;
+    my $json = <$fh>;
+    close $fh;
+    
+    $CONFIG = JSON::decode_json($json);
+}
+
+# Save configuration to file
+sub save_config {
+    open my $fh, '>', CONFIG_FILE or die "Cannot write config file: $!";
+    print $fh JSON::encode_json($CONFIG);
+    close $fh;
+}
+
+# Generate a new random API key
+sub generate_api_key {
+    my @chars = ('0'..'9', 'A'..'Z', 'a'..'z');
+    my $key = '';
+    $key .= $chars[rand @chars] for 1..API_KEY_LENGTH;
+    return "kb_" . $key;
+}
+
+# Add a new API key
+sub add_api_key($name = 'API Key') {
+    my $api_key = generate_api_key();
+    
+    $CONFIG->{api_keys}->{$api_key} = {
+        name => $name,
+        created => time()
+    };
+    
+    $CONFIG->{rate_limits}->{$api_key} = DEFAULT_RATE_LIMIT;
+    
+    save_config();
+    
+    say "Added new API key: $api_key";
+    return $api_key;
+}
+
+# Remove an existing API key
+sub remove_api_key($api_key) {
+    unless (exists $CONFIG->{api_keys}->{$api_key}) {
+        say "API key not found: $api_key";
+        return 0;
+    }
+    
+    delete $CONFIG->{api_keys}->{$api_key};
+    delete $CONFIG->{rate_limits}->{$api_key};
+    
+    # Invalidate any tokens using this key
+    foreach my $token (keys %{$CONFIG->{tokens}}) {
+        if ($CONFIG->{tokens}->{$token}->{api_key} eq $api_key) {
+            delete $CONFIG->{tokens}->{$token};
+        }
+    }
+    
+    save_config();
+    
+    say "Removed API key: $api_key";
+    return 1;
+}
+
+# List all API keys
+sub list_api_keys {
+    my @keys = keys %{$CONFIG->{api_keys}};
+    
+    if (@keys) {
+        say "API Keys:";
+        foreach my $key (@keys) {
+            my $name = $CONFIG->{api_keys}->{$key}->{name};
+            my $created = scalar localtime($CONFIG->{api_keys}->{$key}->{created});
+            my $rate_limit = $CONFIG->{rate_limits}->{$key} || DEFAULT_RATE_LIMIT;
+            
+            say "- $key";
+            say "  Name: $name";
+            say "  Created: $created";
+            say "  Rate Limit: $rate_limit requests per minute";
+        }
+    } else {
+        say "No API keys found. Add one with --add-key";
+    }
+}
+
+# Generate a new authentication token
+sub generate_token($api_key) {
+    # Generate a random token
+    my @chars = ('0'..'9', 'A'..'Z', 'a'..'z');
+    my $token = '';
+    $token .= $chars[rand @chars] for 1..API_KEY_LENGTH;
+    
+    # Store token with expiry time
+    my $expires = time() + DEFAULT_TOKEN_EXPIRY;
+    $CONFIG->{tokens}->{$token} = {
+        api_key => $api_key,
+        created => time(),
+        expires => $expires
+    };
+    
+    save_config();
+    
+    return $token;
+}
+
+# Validate an authentication token
+sub validate_token($token) {
+    # Check if token exists
+    return 0 unless exists $CONFIG->{tokens}->{$token};
+    
+    # Check if token is expired
+    my $expires = $CONFIG->{tokens}->{$token}->{expires};
+    if (time() > $expires) {
+        # Clean up expired token
+        delete $CONFIG->{tokens}->{$token};
+        save_config();
+        return 0;
+    }
+    
+    # Check if the API key is still valid
+    my $api_key = $CONFIG->{tokens}->{$token}->{api_key};
+    return 0 unless exists $CONFIG->{api_keys}->{$api_key};
+    
+    return 1;
+}
+
+# List directories in a path
+sub list_directories($dir) {
+    opendir my $dh, $dir or return ();
+    my @dirs = grep { -d File::Spec->catdir($dir, $_) && !/^\./ } readdir $dh;
+    closedir $dh;
+    return sort @dirs;
+}
+
+# List files in a directory (non-recursive)
+sub list_files($dir, $extensions = []) {
+    opendir my $dh, $dir or return ();
+    my @files;
+    
+    while (my $file = readdir $dh) {
+        next if $file =~ /^\./;
+        my $path = File::Spec->catfile($dir, $file);
+        next unless -f $path;
+        
+        if (@$extensions) {
+            my ($ext) = $file =~ /(\.[^.]+)$/;
+            next unless $ext && grep { $_ eq $ext } @$extensions;
+        }
+        
+        push @files, $path;
+    }
+    
+    closedir $dh;
+    return sort @files;
+}
+
+# List files recursively
+sub list_files_recursive($dir, $extensions = []) {
+    my @files;
+    
+    File::Find::find(
+        {
+            wanted => sub {
+                return unless -f $_;
+                return if /^\./;
+                
+                if (@$extensions) {
+                    my ($ext) = $_ =~ /(\.[^.]+)$/;
+                    return unless $ext && grep { $_ eq $ext } @$extensions;
+                }
+                
+                push @files, $File::Find::name;
+            },
+            no_chdir => 1
+        },
+        $dir
+    );
+    
+    return sort @files;
+}
+
+# Count files recursively
+sub count_files_recursive($dir, $extensions = []) {
+    my $count = 0;
+    
+    File::Find::find(
+        {
+            wanted => sub {
+                return unless -f $_;
+                return if /^\./;
+                
+                if (@$extensions) {
+                    my ($ext) = $_ =~ /(\.[^.]+)$/;
+                    return unless $ext && grep { $_ eq $ext } @$extensions;
+                }
+                
+                $count++;
+            },
+            no_chdir => 1
+        },
+        $dir
+    );
+    
+    return $count;
+}
+
+# Read file content
+sub read_file($file_path) {
+    open my $fh, '<:encoding(UTF-8)', $file_path or return '';
+    local $/;
+    my $content = <$fh>;
+    close $fh;
+    return $content;
+}
+
+# Write file content
+sub write_file($file_path, $content) {
+    open my $fh, '>:encoding(UTF-8)', $file_path or return 0;
+    print $fh $content;
+    close $fh;
+    return 1;
+}
+
+# Determine the format of a file based on extension
+sub determine_format($file_path) {
+    if ($file_path =~ /\.norg$/i) {
+        return FORMAT_NEORG;
+    } elsif ($file_path =~ /\.md$/i) {
+        return FORMAT_MARKDOWN;
+    } else {
+        return FORMAT_TEXT;
+    }
+}
+
+# Transform content between formats
+sub transform_content($content, $from_format, $to_format) {
+    # No transformation needed if formats are the same
+    return $content if $from_format eq $to_format;
+    
+    if ($from_format eq FORMAT_NEORG && $to_format eq FORMAT_MARKDOWN) {
+        # Neorg to Markdown using external script if available
+        if (system("which norg_to_md >/dev/null 2>&1") == 0) {
+            return run_command_with_input('norg_to_md', $content);
+        } else {
+            # Fallback to basic transformation
+            return basic_neorg_to_markdown($content);
+        }
+    } elsif ($from_format eq FORMAT_MARKDOWN && $to_format eq FORMAT_NEORG) {
+        # Markdown to Neorg using external script if available
+        if (system("which mton >/dev/null 2>&1") == 0) {
+            return run_command_with_input('mton', $content);
+        } else {
+            # Fallback to basic transformation
+            return basic_markdown_to_neorg($content);
+        }
+    } elsif ($to_format eq FORMAT_TEXT) {
+        # Strip all markup for plain text
+        my $text = $content;
+        $text =~ s/\*+\s*([^\n]+)/$1/g;          # Headers
+        $text =~ s/\[([^\]]+)\]\([^\)]+\)/$1/g;  # Markdown links
+        $text =~ s/\{[^}]+\}//g;                 # Neorg links
+        $text =~ s/`([^`]+)`/$1/g;               # Inline code
+        $text =~ s/```.*?```//gs;                # Code blocks
+        $text =~ s/\@code.*?\@end//gs;           # Neorg code blocks
+        return $text;
+    }
+    
+    # Default to returning original content
+    return $content;
+}
+
+# MCP Request Handler
+sub handle_mcp_request($c, $request) {
+    my $action = $request->{action} || '';
+    my $params = $request->{params} || {};
+    my $request_id = $request->{request_id} || rand();
+    
+    # For debugging
+    app->log->debug("MCP request: action=$action, request_id=$request_id");
+    
+    # Helper function to send response
+    my $send_response = sub {
+        my ($result, $error) = @_;
+        my $response = {
+            request_id => $request_id,
+            status => $error ? "error" : "success"
+        };
+        
+        if ($error) {
+            $response->{error} = $error;
+        } else {
+            $response->{result} = $result;
+        }
+        
+        # Check if we're using WebSocket or SSE response object
+        if (ref($c) eq 'HASH' && exists $c->{send} && ref($c->{send}) eq 'CODE') {
+            # SSE response object with custom send method
+            $c->{send}->($response);
+        } else {
+            # Standard WebSocket connection
+            $c->send(encode_json($response));
+        }
+    };
+    
+    # Strip 'knowledge__' prefix if present for backward compatibility
+    my $original_action = $action;
+    $action =~ s/^knowledge__//;
+    
+    # Replace 'notes_' with 'notes.' for compatibility with the new naming scheme
+    $action =~ s/^notes_/notes./;
+    
+    # Replace 'para_' with 'para.' for compatibility
+    $action =~ s/^para_/para./;
+    
+    # Log the action mapping for debugging
+    app->log->debug("MCP action mapping: $original_action -> $action");
+    
+    # Dispatch based on action
+    if ($action eq 'auth') {
+        # Auth action - get token
+        my $api_key = $params->{api_key} || '';
+        
+        unless ($api_key && exists $CONFIG->{api_keys}->{$api_key}) {
+            $send_response->(undef, "Invalid API key");
+            return;
+        }
+        
+        my $token = generate_token($api_key);
+        my $expires = $CONFIG->{tokens}->{$token}->{expires};
+        
+        $send_response->({
+            token => $token,
+            expires => $expires,
+            type => 'Bearer'
+        });
+    }
+    elsif ($action eq 'para.list') {
+        # List PARA categories
+        $send_response->({
+            categories => $CONFIG->{para_dirs}
+        });
+    }
+    elsif ($action eq 'para.listDirectories') {
+        # List directories in a specific PARA category
+        my $category = $params->{category} || '';
+        
+        unless (grep { $_ eq $category } @{$CONFIG->{para_dirs}}) {
+            $send_response->(undef, "Invalid PARA category: $category");
+            return;
+        }
+        
+        my $dir = File::Spec->catdir($CONFIG->{notes_dir}, $category);
+        unless (-d $dir) {
+            $send_response->(undef, "Category directory not found: $category");
+            return;
+        }
+        
+        my @directories = list_directories($dir);
+        $send_response->({
+            category => $category,
+            directories => \@directories
+        });
+    }
+    elsif ($action eq 'search') {
+        # Search notes
+        my $query = $params->{query} || '';
+        my $limit = $params->{limit} || 5;
+        my $provider = $params->{provider} || $CONFIG->{semantic_search_provider};
+        my $include_content = $params->{include_content} || 0;
+        
+        unless ($query) {
+            $send_response->(undef, "Missing required parameter: query");
+            return;
+        }
+        
+        my $results = semantic_search($query, $limit, $provider);
+        
+        if ($results && $include_content) {
+            # Add file content if requested
+            foreach my $result (@$results) {
+                next if exists $result->{content};
+                if ($result->{path}) {
+                    my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $result->{path});
+                    $result->{content} = read_file($file_path) if -f $file_path;
+                }
+            }
+        }
+        
+        $send_response->({
+            query => $query,
+            results => $results || []
+        });
+    }
+    elsif ($action eq 'notes.list') {
+        # List notes
+        my $category = $params->{category} || '';
+        my $directory = $params->{directory} || '';
+        my $format = $params->{format} || '';
+        my $limit = $params->{limit} || 100;
+        my $offset = $params->{offset} || 0;
+        
+        my @files;
+        
+        if ($category && $directory) {
+            # List files in a specific directory
+            my $dir_path = File::Spec->catdir($CONFIG->{notes_dir}, $category, $directory);
+            if (-d $dir_path) {
+                @files = list_files($dir_path, $CONFIG->{file_types});
+            }
+        } elsif ($category) {
+            # List all files in a category
+            my $cat_path = File::Spec->catdir($CONFIG->{notes_dir}, $category);
+            if (-d $cat_path) {
+                @files = list_files_recursive($cat_path, $CONFIG->{file_types});
+            }
+        } else {
+            # List all notes
+            @files = list_files_recursive($CONFIG->{notes_dir}, $CONFIG->{file_types});
+        }
+        
+        # Filter by format if requested
+        if ($format) {
+            @files = grep {
+                determine_format($_) eq $format
+            } @files;
+        }
+        
+        # Apply pagination
+        my $total = scalar @files;
+        @files = @files[$offset .. ($offset + $limit - 1)] if $offset < $total;
+        @files = @files[0 .. $limit - 1] if scalar @files > $limit;
+        
+        # Convert to relative paths
+        my $notes_dir_length = length($CONFIG->{notes_dir}) + 1; # +1 for the trailing slash
+        @files = map { 
+            substr($_, $notes_dir_length) 
+        } @files;
+        
+        $send_response->({
+            notes => \@files,
+            total => $total,
+            limit => $limit,
+            offset => $offset
+        });
+    }
+    elsif ($action eq 'notes.get') {
+        # Get a specific note
+        my $path = $params->{path} || '';
+        my $format = $params->{format} || '';
+        
+        unless ($path) {
+            $send_response->(undef, "Missing required parameter: path");
+            return;
+        }
+        
+        my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+        
+        unless (-f $file_path) {
+            $send_response->(undef, "Note not found: $path");
+            return;
+        }
+        
+        my $content = read_file($file_path);
+        my $transformed_content = $content;
+        
+        # Transform content if requested
+        if ($format) {
+            $transformed_content = transform_content($content, determine_format($file_path), $format);
+        }
+        
+        my $meta = get_file_metadata($file_path);
+        
+        $send_response->({
+            path => $path,
+            content => $transformed_content,
+            format => $format || determine_format($file_path),
+            metadata => $meta
+        });
+    }
+    elsif ($action eq 'notes.create') {
+        # Create a new note
+        my $path = $params->{path} || '';
+        my $content = $params->{content} || '';
+        my $format = $params->{format} || determine_format($path);
+        
+        unless ($path && $content) {
+            $send_response->(undef, "Missing required parameters: path and content");
+            return;
+        }
+        
+        my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+        
+        # Check if the file already exists
+        if (-f $file_path) {
+            $send_response->(undef, "Note already exists: $path");
+            return;
+        }
+        
+        # Ensure directory exists
+        my $dir = dirname($file_path);
+        system("mkdir", "-p", $dir) unless -d $dir;
+        
+        # Transform content if needed
+        if ($format ne determine_format($file_path)) {
+            $content = transform_content($content, $format, determine_format($file_path));
+        }
+        
+        # Write the file
+        if (write_file($file_path, $content)) {
+            $send_response->({
+                path => $path,
+                created => 1,
+                format => determine_format($file_path)
+            });
+        } else {
+            $send_response->(undef, "Failed to create note: $!");
+        }
+    }
+    elsif ($action eq 'notes.update') {
+        # Update an existing note
+        my $path = $params->{path} || '';
+        my $content = $params->{content} || '';
+        my $format = $params->{format} || '';
+        
+        unless ($path && $content) {
+            $send_response->(undef, "Missing required parameters: path and content");
+            return;
+        }
+        
+        my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+        
+        # Check if the file exists
+        unless (-f $file_path) {
+            $send_response->(undef, "Note not found: $path");
+            return;
+        }
+        
+        # Transform content if format specified
+        if ($format && $format ne determine_format($file_path)) {
+            $content = transform_content($content, $format, determine_format($file_path));
+        }
+        
+        # Write the file
+        if (write_file($file_path, $content)) {
+            $send_response->({
+                path => $path,
+                updated => 1,
+                format => determine_format($file_path)
+            });
+        } else {
+            $send_response->(undef, "Failed to update note: $!");
+        }
+    }
+    elsif ($action eq 'notes.delete') {
+        # Delete a note
+        my $path = $params->{path} || '';
+        
+        unless ($path) {
+            $send_response->(undef, "Missing required parameter: path");
+            return;
+        }
+        
+        my $file_path = File::Spec->catfile($CONFIG->{notes_dir}, $path);
+        
+        # Check if the file exists
+        unless (-f $file_path) {
+            $send_response->(undef, "Note not found: $path");
+            return;
+        }
+        
+        # Delete the file
+        if (unlink $file_path) {
+            $send_response->({
+                path => $path,
+                deleted => 1
+            });
+        } else {
+            $send_response->(undef, "Failed to delete note: $!");
+        }
+    }
+    elsif ($action eq 'ingest') {
+        # Ingest content
+        my $content = $params->{content} || '';
+        my $category = $params->{category} || PARA_INBOX;
+        my $title = $params->{title} || 'API Ingested Note';
+        my $format = $params->{format} || FORMAT_NEORG;
+        
+        unless ($content) {
+            $send_response->(undef, "Missing required parameter: content");
+            return;
+        }
+        
+        # Validate category
+        unless (grep { $_ eq $category } @{$CONFIG->{para_dirs}}) {
+            $send_response->(undef, "Invalid PARA category: $category");
+            return;
+        }
+        
+        # Create a temporary file with the content
+        my ($fh, $tmp_file) = File::Temp::tempfile();
+        print $fh $content;
+        close $fh;
+        
+        # Use SBI to ingest the content if available
+        my $sbi_result;
+        if (system("which sbi >/dev/null 2>&1") == 0) {
+            $sbi_result = ingest_with_sbi($tmp_file, $category, $title, $format);
+        } else {
+            # Fallback to manual ingestion if SBI is not available
+            $sbi_result = manual_ingest($tmp_file, $category, $title, $format);
+        }
+        
+        # Clean up temp file
+        unlink $tmp_file;
+        
+        if ($sbi_result->{success}) {
+            $send_response->({
+                path => $sbi_result->{path},
+                ingested => 1,
+                format => $format
+            });
+        } else {
+            $send_response->(undef, $sbi_result->{error});
+        }
+    }
+    elsif ($action eq 'status') {
+        # Server status
+        my $status = {
+            server => {
+                version => '1.0.0',
+                uptime => time() - $^T,
+                hostname => $CONFIG->{host},
+                port => $CONFIG->{port},
+                mcp_enabled => $ENABLE_MCP ? 1 : 0
+            },
+            notes => {
+                directory => $CONFIG->{notes_dir},
+                para_categories => $CONFIG->{para_dirs},
+                supported_formats => ['neorg', 'markdown', 'text'],
+                semantic_search_provider => $CONFIG->{semantic_search_provider}
+            },
+            statistics => {
+                total_notes => count_files_recursive($CONFIG->{notes_dir}, $CONFIG->{file_types}),
+                api_keys => scalar keys %{$CONFIG->{api_keys}},
+                active_tokens => scalar keys %{$CONFIG->{tokens}}
+            }
+        };
+        
+        $send_response->($status);
+    }
+    else {
+        # Unknown action
+        $send_response->(undef, "Unknown action: $original_action");
+    }
+}
+
+# Basic conversion from Neorg to Markdown
+sub basic_neorg_to_markdown($content) {
+    my $md = $content;
+    
+    # Headers
+    $md =~ s/^\*\s+(.+)$/# $1/gm;
+    $md =~ s/^\*\*\s+(.+)$/## $1/gm;
+    $md =~ s/^\*\*\*\s+(.+)$/### $1/gm;
+    
+    # Lists
+    $md =~ s/^-\s+(.+)$/- $1/gm;
+    $md =~ s/^--\s+(.+)$/  - $1/gm;
+    $md =~ s/^---\s+(.+)$/    - $1/gm;
+    
+    # Code blocks
+    $md =~ s/\@code\s+(\w+)(.*?)\@end/```$1$2```/gs;
+    $md =~ s/\@code(.*?)\@end/```$1```/gs;
+    
+    # Links
+    $md =~ s/\{[^|]+\|([^}]+)\}/[$1]($1)/g;
+    
+    return $md;
+}
+
+# Basic conversion from Markdown to Neorg
+sub basic_markdown_to_neorg($content) {
+    my $neorg = $content;
+    
+    # Headers
+    $neorg =~ s/^#\s+(.+)$/* $1/gm;
+    $neorg =~ s/^##\s+(.+)$/** $1/gm;
+    $neorg =~ s/^###\s+(.+)$/*** $1/gm;
+    
+    # Code blocks
+    $neorg =~ s/```(\w+)(.*?)```/\@code $1$2\@end/gs;
+    $neorg =~ s/```(.*?)```/\@code$1\@end/gs;
+    
+    # Links
+    $neorg =~ s/\[([^\]]+)\]\(([^\)]+)\)/{$2|$1}/g;
+    
+    return $neorg;
+}
+
+# Run a command with input and capture output
+sub run_command_with_input($cmd, $input) {
+    my $output = '';
+    
+    eval {
+        my ($writer, $reader, $error) = (gensym, gensym, gensym);
+        my $pid = open3($writer, $reader, $error, $cmd);
+        
+        print $writer $input;
+        close $writer;
+        
+        local $/;
+        $output = <$reader>;
+        my $err = <$error>;
+        
+        waitpid $pid, 0;
+    };
+    
+    if ($@) {
+        warn "Error running command '$cmd': $@";
+        return $input;  # Return original input on error
+    }
+    
+    return $output || $input;
+}
+
+# Run semantic_search and parse results
+sub semantic_search($query, $limit = 5, $provider = 'ollampy') {
+    # Directly run semantic_search with debugging output
+    my $cmd = "semantic_search --limit $limit --provider $provider --simple --full-path '$query' 2>&1";
+    
+    warn "Executing: $cmd" if $DEBUG;
+    my $output = `$cmd`;
+    
+    warn "Raw output: [$output]" if $DEBUG;
+    return [] unless $output;
+    
+    # Create a simple parser to extract paths from the raw output
+    my @results;
+    my @paths = split /\n/, $output;
+    
+    # Build manually if no proper YAML/JSON parsing
+    foreach my $path (@paths) {
+        next unless $path && $path =~ /\S/;  # Skip empty lines
+        
+        my $file_exists = -f $path;
+        my $rel_path = $path;
+        
+        # Make the path relative to notes directory if needed
+        if ($path =~ /^$CONFIG->{notes_dir}/) {
+            $rel_path = substr($path, length($CONFIG->{notes_dir}) + 1);
+        }
+        
+        my ($filename) = $path =~ m|/([^/]+)$|;
+        
+        # Get file info if it exists
+        my $size = 0;
+        my $last_modified = time();
+        if ($file_exists) {
+            $size = -s $path || 0;
+            $last_modified = (stat($path))[9] || time();
+        }
+        
+        push @results, {
+            path => $rel_path,
+            similarity => 0.8,  # Default similarity
+            metadata => {
+                filename => $filename || basename($path),
+                size => $size,
+                last_modified => scalar localtime($last_modified)
+            }
+        };
+    }
+    
+    # Return the manually built results if any were found
+    return \@results if @results;
+    
+    # If manual parsing found nothing, try detecting special output formats
+    
+    # Check for JSON output
+    if ($output =~ /^\s*\{/ || $output =~ /^\s*\[/) {
+        eval {
+            my $json_results = JSON::decode_json($output);
+            if ($json_results) {
+                # Handle different JSON structures
+                if (ref $json_results eq 'HASH' && exists $json_results->{results}) {
+                    return $json_results->{results};
+                } elsif (ref $json_results eq 'ARRAY') {
+                    return $json_results;
+                }
+            }
+        };
+        warn "JSON parsing attempt: $@" if $DEBUG && $@;
+    }
+    
+    # Try YAML as a last resort
+    eval {
+        require YAML;
+        my $yaml_results = YAML::Load($output);
+        if ($yaml_results) {
+            if (ref $yaml_results eq 'HASH' && exists $yaml_results->{results}) {
+                return $yaml_results->{results};
+            } elsif (ref $yaml_results eq 'ARRAY') {
+                return $yaml_results;
+            }
+        }
+    };
+    warn "YAML parsing attempt: $@" if $DEBUG && $@;
+    
+    # If we couldn't parse any structured data, create a simple result
+    if ($output =~ /\S/) {
+        # Just create a single result with the raw output as a note
+        return [{
+            path => "search_result_for_$query.txt",
+            similarity => 1.0,
+            content => $output,
+            metadata => {
+                filename => "search_result_for_$query.txt",
+                source => "semantic_search output",
+                raw_output => $output
+            }
+        }];
+    }
+    
+    return [];
+}
+
+# Get metadata for a file
+sub get_file_metadata($file_path) {
+    my %meta;
+    
+    # Basic file stats
+    my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size, $atime, $mtime, $ctime) = stat($file_path);
+    
+    $meta{size} = $size || 0;
+    $meta{modified} = $mtime || 0;
+    $meta{created} = $ctime || 0;
+    $meta{format} = determine_format($file_path);
+    $meta{filename} = basename($file_path);
+    
+    # Extract title from content
+    my $content = read_file($file_path);
+    my $title = extract_title($content, $meta{format});
+    $meta{title} = $title if $title;
+    
+    return \%meta;
+}
+
+# Extract title from content based on format
+sub extract_title($content, $format) {
+    if ($format eq FORMAT_NEORG) {
+        # Look for Neorg header
+        if ($content =~ /^\s*\*\s+(.+)$/m) {
+            return $1;
+        }
+    } elsif ($format eq FORMAT_MARKDOWN) {
+        # Look for Markdown header
+        if ($content =~ /^\s*#\s+(.+)$/m) {
+            return $1;
+        }
+    }
+    
+    # Fallback to first line
+    my ($first_line) = $content =~ /^(.+)$/m;
+    return $first_line;
+}
+
+# Use SBI to ingest content
+sub ingest_with_sbi($file_path, $category, $title, $format) {
+    my $output_format = $format eq FORMAT_MARKDOWN ? '--md' : '';
+    my $cmd = "sbi $output_format --file '$file_path' --category $category --name-seed '$title'";
+    
+    my $output = `$cmd 2>&1`;
+    if ($? == 0) {
+        # Try to extract the path from the output
+        my ($path) = $output =~ /Ingested to: (.+)$/m;
+        
+        if ($path) {
+            # Make path relative to notes directory
+            my $notes_dir_length = length($CONFIG->{notes_dir}) + 1;
+            $path = substr($path, $notes_dir_length) if index($path, $CONFIG->{notes_dir}) == 0;
+            
+            return {
+                success => 1,
+                path => $path
+            };
+        }
+    }
+    
+    return {
+        success => 0,
+        error => "Failed to ingest with SBI: $output"
+    };
+}
+
+# Manual file ingestion (fallback if SBI is not available)
+sub manual_ingest($file_path, $category, $title, $format) {
+    # Sanitize title for filename
+    my $safe_title = $title;
+    $safe_title =~ s/[^a-zA-Z0-9_\-]/_/g;
+    
+    # Create timestamp
+    my $timestamp = strftime("%Y%m%d%H%M%S", localtime);
+    
+    # Determine file extension
+    my $extension = $format eq FORMAT_NEORG ? '.norg' : 
+                    $format eq FORMAT_MARKDOWN ? '.md' : '.txt';
+    
+    # Construct filename
+    my $filename = "${timestamp}_${safe_title}${extension}";
+    
+    # Construct directory path
+    my $dir_path = File::Spec->catdir($CONFIG->{notes_dir}, $category);
+    system("mkdir", "-p", $dir_path) unless -d $dir_path;
+    
+    # Construct file path
+    my $dest_path = File::Spec->catfile($dir_path, $filename);
+    
+    # Read content
+    my $content = read_file($file_path);
+    
+    # Add title if needed
+    if ($format eq FORMAT_NEORG && $content !~ /^\s*\*\s+/m) {
+        $content = "* $title\n\n$content";
+    } elsif ($format eq FORMAT_MARKDOWN && $content !~ /^\s*#\s+/m) {
+        $content = "# $title\n\n$content";
+    }
+    
+    # Write file
+    if (write_file($dest_path, $content)) {
+        my $rel_path = File::Spec->catfile($category, $filename);
+        return {
+            success => 1,
+            path => $rel_path
+        };
+    } else {
+        return {
+            success => 0,
+            error => "Failed to write file: $!"
+        };
+    }
+}
+
+# MCP Handlers
+if ($ENABLE_MCP) {
+    # Enable WebSockets for MCP
+    websocket '/mcp' => sub {
+        my $c = shift;
+        my $client_id = sha256_hex(rand() . time());
+        
+        # Client connected
+        $c->app->log->info("MCP WebSocket client connected: $client_id");
+        
+        # Send the MCP protocol initialization message
+        $c->send(encode_json({
+            type => "mcp.transport.connect",
+            transport => "websocket",
+            status => "connected",
+            client_id => $client_id
+        }));
+        
+        # Send API definition
+        $c->send(encode_json({
+            type => "mcp.api.definitions",
+            schema_version => "1.0",
+            server_version => "1.0.0",
+            name => "Knowledge API",
+            description => "Second Brain Knowledge API",
+            tools => {
+                # Tool definitions here (same structure as SSE definitions)
+                # ...
+            }
+        }));
+        
+        # Send ready message
+        $c->send(encode_json({
+            type => "mcp.ready",
+            ready => JSON::true
+        }));
+        
+        # Set up the WebSocket connection
+        $c->on(message => sub {
+            my ($c, $msg) = @_;
+            
+            # Parse incoming JSON message
+            my $request;
+            eval {
+                $request = decode_json($msg);
+            };
+            
+            if ($@ || !$request) {
+                $c->send(encode_json({
+                    error => "Invalid JSON request: $@",
+                    status => "error"
+                }));
+                return;
+            }
+            
+            # Skip authentication if no-api-key mode is enabled
+            unless ($NO_API_KEY) {
+                # Check for API token
+                my $token = $request->{token} || '';
+                
+                # Validate token
+                unless (validate_token($token)) {
+                    $c->send(encode_json({
+                        error => "Unauthorized: Invalid or expired token",
+                        status => "error"
+                    }));
+                    return;
+                }
+            }
+            
+            # Process MCP request
+            handle_mcp_request($c, $request);
+        });
+        
+        # Set up a periodic ping to keep connection alive
+        state $ping_timers = {};
+        $ping_timers->{$client_id} = Mojo::IOLoop->recurring(30 => sub {
+            eval {
+                $c->send(encode_json({type => "ping", time => time()}));
+            };
+            if ($@) {
+                Mojo::IOLoop->remove($ping_timers->{$client_id}) if $ping_timers->{$client_id};
+                delete $ping_timers->{$client_id};
+                $c->app->log->info("MCP WebSocket client ping failed: $client_id");
+            }
+        });
+        
+        # Handle client disconnect
+        $c->on(finish => sub {
+            my ($c, $code, $reason) = @_;
+            Mojo::IOLoop->remove($ping_timers->{$client_id}) if $ping_timers->{$client_id};
+            delete $ping_timers->{$client_id};
+            $c->app->log->info("MCP WebSocket client disconnected: $client_id, code=$code" . ($reason ? ", reason=$reason" : ""));
+        });
+    };
+    
+    # Enable SSE for MCP (Server-Sent Events)
+    get '/mcp-sse' => sub {
+        my $c = shift;
+        
+        # Client connected
+        $c->app->log->info("MCP SSE client connected");
+        
+        # Set response headers for SSE
+        $c->res->headers->content_type('text/event-stream');
+        $c->res->headers->header('Cache-Control' => 'no-cache');
+        $c->res->headers->header('Connection' => 'keep-alive');
+        $c->res->headers->header('Access-Control-Allow-Origin' => '*');
+        
+        # Store SSE connection in application
+        state $sse_clients ||= {};
+        my $client_id = sha256_hex(rand() . time());
+        
+        # Write initial SSE comment to establish connection
+        $c->write(":" . (" " x 2048) . "\n");  # Padding for IE
+        $c->write(": connected\n\n");  # Hello message
+        
+        # Skip authentication if no-api-key mode is enabled
+        my $token = $c->param('token') || '';
+        unless ($NO_API_KEY) {
+            # Validate token
+            unless (validate_token($token)) {
+                $c->write("event: error\n");
+                $c->write("data: " . JSON::encode_json({
+                    error => "Unauthorized: Invalid or expired token",
+                    status => "error"
+                }) . "\n\n");
+                $c->finish;
+                return;
+            }
+        }
+        
+        # Store connection in clients hash
+        $sse_clients->{$client_id} = {
+            connection => $c,
+            token => $token,
+            last_activity => time()
+        };
+        
+        # Set up a custom response writer for SSE
+        my $sse_writer = sub {
+            my ($event_name, $data) = @_;
+            my $client = $sse_clients->{$client_id};
+            
+            return unless $client;
+            
+            my $conn = $client->{connection};
+            $conn->write("event: $event_name\n");
+            $conn->write("data: " . encode_json($data) . "\n\n");
+            
+            # Update last activity time
+            $client->{last_activity} = time();
+        };
+        
+        # First event must be the SSE connection event
+        $c->write("event: connected\n");
+        $c->write("data: " . encode_json({
+            connected => JSON::true
+        }) . "\n\n");
+
+        # Then send standard MCP initialization message
+        $c->write("event: mcp.transport.sse.init\n");
+        $c->write("data: " . encode_json({
+            transport => "sse",
+            client_id => $client_id,
+            status => "connected"  
+        }) . "\n\n");
+        
+        # Then send API definition event with proper schema
+        $c->write("event: mcp.api.definitions\n");
+        $c->write("data: " . encode_json({
+            schema_version => "1.0",
+            server_version => "1.0.0",
+            name => "Knowledge API",
+            description => "Second Brain Knowledge API",
+            tools => {
+                "knowledge__auth" => {
+                    function => {
+                        name => "knowledge__auth",
+                        description => "Get authentication token",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                api_key => { type => "string", description => "API key" }
+                            },
+                            required => ["api_key"]
+                        }
+                    }
+                },
+                "knowledge__para_list" => {
+                    function => {
+                        name => "knowledge__para_list",
+                        description => "List PARA categories",
+                        parameters => {
+                            type => "object",
+                            properties => {},
+                            required => []
+                        }
+                    }
+                },
+                "knowledge__para_listDirectories" => {
+                    function => {
+                        name => "knowledge__para_listDirectories",
+                        description => "List directories in a PARA category",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                category => { type => "string", description => "PARA category name" }
+                            },
+                            required => ["category"]
+                        }
+                    }
+                },
+                "knowledge__search" => {
+                    function => {
+                        name => "knowledge__search",
+                        description => "Search knowledge base",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                query => { type => "string", description => "Search query" },
+                                limit => { type => "integer", description => "Maximum number of results" },
+                                provider => { type => "string", description => "Semantic search provider" },
+                                include_content => { type => "boolean", description => "Include note content in results" }
+                            },
+                            required => ["query"]
+                        }
+                    }
+                },
+                "knowledge__notes_list" => {
+                    function => {
+                        name => "knowledge__notes_list",
+                        description => "List notes",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                category => { type => "string", description => "PARA category" },
+                                directory => { type => "string", description => "Directory within category" },
+                                format => { type => "string", description => "Filter by format (neorg, markdown, text)" },
+                                limit => { type => "integer", description => "Maximum number of notes" },
+                                offset => { type => "integer", description => "Pagination offset" }
+                            },
+                            required => []
+                        }
+                    }
+                },
+                "knowledge__notes_get" => {
+                    function => {
+                        name => "knowledge__notes_get",
+                        description => "Get a note by path",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                path => { type => "string", description => "Path to note" },
+                                format => { type => "string", description => "Transform to format (neorg, markdown, text)" }
+                            },
+                            required => ["path"]
+                        }
+                    }
+                },
+                "knowledge__notes_create" => {
+                    function => {
+                        name => "knowledge__notes_create",
+                        description => "Create a new note",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                path => { type => "string", description => "Path for new note" },
+                                content => { type => "string", description => "Note content" },
+                                format => { type => "string", description => "Content format (neorg, markdown, text)" }
+                            },
+                            required => ["path", "content"]
+                        }
+                    }
+                },
+                "knowledge__notes_update" => {
+                    function => {
+                        name => "knowledge__notes_update",
+                        description => "Update an existing note",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                path => { type => "string", description => "Path to note" },
+                                content => { type => "string", description => "New content" },
+                                format => { type => "string", description => "Content format (neorg, markdown, text)" }
+                            },
+                            required => ["path", "content"]
+                        }
+                    }
+                },
+                "knowledge__notes_delete" => {
+                    function => {
+                        name => "knowledge__notes_delete",
+                        description => "Delete a note",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                path => { type => "string", description => "Path to note" }
+                            },
+                            required => ["path"]
+                        }
+                    }
+                },
+                "knowledge__ingest" => {
+                    function => {
+                        name => "knowledge__ingest",
+                        description => "Add content to Second Brain",
+                        parameters => {
+                            type => "object",
+                            properties => {
+                                content => { type => "string", description => "Content to ingest" },
+                                category => { type => "string", description => "PARA category" },
+                                title => { type => "string", description => "Note title" },
+                                format => { type => "string", description => "Content format (neorg, markdown, text)" }
+                            },
+                            required => ["content"]
+                        }
+                    }
+                },
+                "knowledge__status" => {
+                    function => {
+                        name => "knowledge__status",
+                        description => "Get server status",
+                        parameters => {
+                            type => "object",
+                            properties => {},
+                            required => []
+                        }
+                    }
+                }
+            }
+        }) . "\n\n");
+        
+        # Now send the ready event that Claude Code needs
+        $c->write("event: mcp.ready\n");
+        $c->write("data: " . encode_json({
+            ready => JSON::true
+        }) . "\n\n");
+        
+        # Handle incoming SSE requests via query parameter
+        my $action = $c->param('action') || '';
+        my $params_json = $c->param('params') || '{}';
+        my $request_id = $c->param('request_id') || rand();
+        
+        if ($action) {
+            # Parse params
+            my $params;
+            eval {
+                $params = decode_json($params_json);
+            };
+            
+            if ($@) {
+                $sse_writer->('error', {
+                    request_id => $request_id,
+                    error => "Invalid JSON params: $@",
+                    status => "error"
+                });
+            } else {
+                # Create a response object that works with SSE
+                my $sse_response = {
+                    send => sub {
+                        my ($result) = @_;
+                        $sse_writer->('response', $result);
+                    }
+                };
+                
+                # Process the request
+                my $request = {
+                    action => $action,
+                    params => $params,
+                    request_id => $request_id
+                };
+                
+                handle_mcp_request($sse_response, $request);
+            }
+        }
+        
+        # Set up a timer to send keep-alive pings every 10 seconds
+        my $keep_alive_timer;
+        $keep_alive_timer = Mojo::IOLoop->recurring(10 => sub {
+            # Send a ping comment to keep the connection alive
+            eval {
+                # First send a comment (invisible to client)
+                $c->write(": ping\n\n");
+                
+                # Then send a proper event that Claude Code can recognize
+                $c->write("event: ping\n");
+                $c->write("data: " . encode_json({
+                    timestamp => time(),
+                    client_id => $client_id
+                }) . "\n\n");
+                
+                $c->app->log->debug("Sent keep-alive ping to SSE client: $client_id");
+            };
+            
+            if ($@) {
+                Mojo::IOLoop->remove($keep_alive_timer) if $keep_alive_timer;
+                delete $sse_clients->{$client_id};
+                $c->app->log->info("SSE client disconnected (ping failed): $client_id");
+            }
+        });
+        
+        # Cleanup handler when client disconnects
+        $c->on(finish => sub {
+            my ($c) = @_;
+            Mojo::IOLoop->remove($keep_alive_timer) if $keep_alive_timer;
+            delete $sse_clients->{$client_id};
+            $c->app->log->info("MCP SSE client disconnected: $client_id");
+        });
+    };
+    
+    # Also add a POST endpoint for receiving commands in the SSE context
+    post '/mcp-sse/command' => sub {
+        my $c = shift;
+        
+        # Access the stored SSE clients
+        state $sse_clients ||= {};
+        
+        # Get client ID from request
+        my $client_id = $c->param('client_id') || '';
+        
+        # If client_id is missing, try to get it from the JSON request
+        unless ($client_id) {
+            eval {
+                my $req_data = $c->req->json;
+                $client_id = $req_data->{client_id} if $req_data->{client_id};
+            };
+        }
+        
+        # If client_id is still missing or invalid, return error
+        unless ($client_id && exists $sse_clients->{$client_id}) {
+            $c->app->log->error("SSE command: Invalid client ID: $client_id");
+            $c->render(json => {
+                error => "Invalid or expired client ID",
+                status => "error"
+            }, status => 404);
+            return;
+        }
+        
+        # Parse request JSON
+        my $request;
+        eval {
+            $request = $c->req->json;
+        };
+        
+        if ($@ || !$request) {
+            $c->app->log->error("SSE command: Invalid JSON request: $@");
+            $c->render(json => {
+                error => "Invalid JSON request: $@",
+                status => "error"
+            }, status => 400);
+            return;
+        }
+        
+        # Get the SSE client connection
+        my $sse_conn = $sse_clients->{$client_id}->{connection};
+        
+        # Log the incoming request for debugging
+        $c->app->log->debug("SSE command for client $client_id: " . encode_json($request));
+        
+        # Update client last activity time
+        $sse_clients->{$client_id}->{last_activity} = time();
+        
+        # Create a response object that works with SSE
+        my $sse_response = {
+            send => sub {
+                my ($result) = @_;
+                # Send the response as an SSE event
+                $sse_conn->write("event: result\n");
+                $sse_conn->write("data: " . encode_json($result) . "\n\n");
+                $c->app->log->debug("SSE response sent to client $client_id");
+            }
+        };
+        
+        # Process the request
+        handle_mcp_request($sse_response, $request);
+        
+        # Return acknowledgment for the HTTP POST
+        $c->render(json => {
+            status => "success",
+            message => "Command received and being processed",
+            client_id => $client_id
+        });
+    };
+    
+    print "\n";
+    print "MCP WebSocket endpoint enabled at ws://$CONFIG->{host}:$CONFIG->{port}/mcp\n";
+    print "MCP SSE endpoint enabled at http://$CONFIG->{host}:$CONFIG->{port}/mcp-sse\n";
+}
+
+# Print warnings if using insecure modes
+if ($NO_API_KEY) {
+    print "\n";
+    print "WARNING: Running in no-api-key mode. All API endpoints are accessible without authentication!\n";
+    print "This mode should only be used for testing or in trusted environments.\n";
+    print "\n";
+}
+
+app->start('daemon', '-l', "http://$CONFIG->{host}:$CONFIG->{port}");
+
+__DATA__
+
+@@ api_docs.html.ep
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Knowledge API Documentation</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; line-height: 1.6; }
+        h1 { color: #333; }
+        h2 { color: #444; margin-top: 30px; }
+        h3 { color: #555; }
+        pre { background: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; }
+        .endpoint { background: #e9f7fe; padding: 10px; margin: 10px 0; border-left: 4px solid #0099cc; }
+        .method { font-weight: bold; }
+        .path { font-family: monospace; }
+        .description { margin: 10px 0; }
+        .param { margin-left: 20px; }
+        .param-name { font-weight: bold; }
+        .param-req { color: #cc0000; }
+        .param-opt { color: #666; }
+        .example { margin-top: 10px; }
+        .response { margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Knowledge API Documentation</h1>
+    
+    <p>This RESTful API provides programmatic access to your Second Brain knowledge base.</p>
+    
+    <h2>Authentication</h2>
+    
+    <div class="endpoint">
+        <div><span class="method">POST</span> <span class="path">/auth</span></div>
+        <div class="description">Authenticate and get an access token</div>
+        <div class="param"><span class="param-name">api_key</span> <span class="param-req">(required)</span> - Your API key</div>
+        <div class="example">Example request: <pre>POST /auth
+Content-Type: application/json
+
+{
+  "api_key": "kb_your_api_key"
+}</pre></div>
+        <div class="response">Example response: <pre>{
+  "token": "your_access_token",
+  "expires": 1627824000,
+  "type": "Bearer"
+}</pre></div>
+    </div>
+    
+    <p>All other endpoints require authentication via Bearer token in the Authorization header or <code>token</code> query parameter.</p>
+    
+    <h2>Endpoints</h2>
+    
+    <h3>PARA Structure</h3>
+    
+    <div class="endpoint">
+        <div><span class="method">GET</span> <span class="path">/para</span></div>
+        <div class="description">List all PARA categories</div>
+        <div class="response">Example response: <pre>{
+  "categories": [
+    "00_inbox",
+    "01_projects",
+    "02_areas",
+    "03_resources",
+    "04_archives"
+  ]
+}</pre></div>
+    </div>
+    
+    <div class="endpoint">
+        <div><span class="method">GET</span> <span class="path">/para/:category</span></div>
+        <div class="description">List directories in a PARA category</div>
+        <div class="param"><span class="param-name">category</span> <span class="param-req">(required)</span> - PARA category name</div>
+        <div class="response">Example response: <pre>{
+  "category": "02_areas",
+  "directories": [
+    "health",
+    "work",
+    "personal"
+  ]
+}</pre></div>
+    </div>
+    
+    <h3>Search</h3>
+    
+    <div class="endpoint">
+        <div><span class="method">GET</span> <span class="path">/search</span></div>
+        <div class="description">Semantic search across your Second Brain</div>
+        <div class="param"><span class="param-name">q</span> <span class="param-req">(required)</span> - Query string</div>
+        <div class="param"><span class="param-name">limit</span> <span class="param-opt">(optional)</span> - Maximum number of results (default: 5)</div>
+        <div class="param"><span class="param-name">provider</span> <span class="param-opt">(optional)</span> - AI provider for embeddings</div>
+        <div class="param"><span class="param-name">include_content</span> <span class="param-opt">(optional)</span> - Include file content in results (0/1)</div>
+        <div class="response">Example response: <pre>{
+  "query": "knowledge management",
+  "results": [
+    {
+      "path": "03_resources/pkm/zettelkasten.norg",
+      "similarity": 0.85,
+      "snippet": "# Zettelkasten Method...",
+      "metadata": {
+        "filename": "zettelkasten.norg",
+        "size": 1543,
+        "last_modified": "2023-08-15 10:30:15"
+      }
+    },
+    ...
+  ]
+}</pre></div>
+    </div>
+    
+    <h3>Notes</h3>
+    
+    <div class="endpoint">
+        <div><span class="method">GET</span> <span class="path">/notes</span></div>
+        <div class="description">List all notes (with optional filtering)</div>
+        <div class="param"><span class="param-name">category</span> <span class="param-opt">(optional)</span> - Filter by PARA category</div>
+        <div class="param"><span class="param-name">directory</span> <span class="param-opt">(optional)</span> - Filter by directory (requires category)</div>
+        <div class="param"><span class="param-name">format</span> <span class="param-opt">(optional)</span> - Filter by format (neorg, markdown, text)</div>
+        <div class="param"><span class="param-name">limit</span> <span class="param-opt">(optional)</span> - Maximum number of results (default: 100)</div>
+        <div class="param"><span class="param-name">offset</span> <span class="param-opt">(optional)</span> - Pagination offset (default: 0)</div>
+        <div class="response">Example response: <pre>{
+  "notes": [
+    "01_projects/website/plan.md",
+    "02_areas/health/exercise_log.norg",
+    ...
+  ],
+  "total": 156,
+  "limit": 100,
+  "offset": 0
+}</pre></div>
+    </div>
+    
+    <div class="endpoint">
+        <div><span class="method">GET</span> <span class="path">/notes/:path</span></div>
+        <div class="description">Get a specific note</div>
+        <div class="param"><span class="param-name">path</span> <span class="param-req">(required)</span> - Path to the note (relative to notes directory)</div>
+        <div class="param"><span class="param-name">format</span> <span class="param-opt">(optional)</span> - Transform content to format (neorg, markdown, text)</div>
+        <div class="response">Example response: <pre>{
+  "path": "02_areas/health/exercise_log.norg",
+  "content": "* Exercise Log\n\n...",
+  "format": "neorg",
+  "metadata": {
+    "size": 2345,
+    "modified": 1660556400,
+    "created": 1660470000,
+    "format": "neorg",
+    "filename": "exercise_log.norg",
+    "title": "Exercise Log"
+  }
+}</pre></div>
+    </div>
+    
+    <div class="endpoint">
+        <div><span class="method">POST</span> <span class="path">/notes/:path</span></div>
+        <div class="description">Create a new note</div>
+        <div class="param"><span class="param-name">path</span> <span class="param-req">(required)</span> - Path to the note (relative to notes directory)</div>
+        <div class="param"><span class="param-name">content</span> <span class="param-req">(required)</span> - Note content</div>
+        <div class="param"><span class="param-name">format</span> <span class="param-opt">(optional)</span> - Content format (neorg, markdown, text)</div>
+        <div class="example">Example request: <pre>POST /notes/03_resources/api/rest_principles.md
+Content-Type: application/json
+
+{
+  "content": "# REST Principles\n\nArchitectural constraints...",
+  "format": "markdown"
+}</pre></div>
+        <div class="response">Example response: <pre>{
+  "path": "03_resources/api/rest_principles.md",
+  "created": true,
+  "format": "markdown"
+}</pre></div>
+    </div>
+    
+    <div class="endpoint">
+        <div><span class="method">PUT</span> <span class="path">/notes/:path</span></div>
+        <div class="description">Update an existing note</div>
+        <div class="param"><span class="param-name">path</span> <span class="param-req">(required)</span> - Path to the note (relative to notes directory)</div>
+        <div class="param"><span class="param-name">content</span> <span class="param-req">(required)</span> - New note content</div>
+        <div class="param"><span class="param-name">format</span> <span class="param-opt">(optional)</span> - Content format (neorg, markdown, text)</div>
+        <div class="response">Example response: <pre>{
+  "path": "03_resources/api/rest_principles.md",
+  "updated": true,
+  "format": "markdown"
+}</pre></div>
+    </div>
+    
+    <div class="endpoint">
+        <div><span class="method">DELETE</span> <span class="path">/notes/:path</span></div>
+        <div class="description">Delete a note</div>
+        <div class="param"><span class="param-name">path</span> <span class="param-req">(required)</span> - Path to the note (relative to notes directory)</div>
+        <div class="response">Example response: <pre>{
+  "path": "03_resources/api/rest_principles.md",
+  "deleted": true
+}</pre></div>
+    </div>
+    
+    <h3>Content Ingestion</h3>
+    
+    <div class="endpoint">
+        <div><span class="method">POST</span> <span class="path">/ingest</span></div>
+        <div class="description">Add new content to your Second Brain</div>
+        <div class="param"><span class="param-name">content</span> <span class="param-req">(required)</span> - Content to ingest</div>
+        <div class="param"><span class="param-name">category</span> <span class="param-opt">(optional)</span> - PARA category (default: 00_inbox)</div>
+        <div class="param"><span class="param-name">title</span> <span class="param-opt">(optional)</span> - Title for the note (default: API Ingested Note)</div>
+        <div class="param"><span class="param-name">format</span> <span class="param-opt">(optional)</span> - Content format (default: neorg)</div>
+        <div class="example">Example request: <pre>POST /ingest
+Content-Type: application/json
+
+{
+  "content": "# API Integration Notes\n\nKey points about integrating with external APIs...",
+  "category": "03_resources",
+  "title": "API Integration Notes",
+  "format": "markdown"
+}</pre></div>
+        <div class="response">Example response: <pre>{
+  "path": "03_resources/20230815123045_API_Integration_Notes.md",
+  "ingested": true,
+  "format": "markdown"
+}</pre></div>
+    </div>
+    
+    <h3>Server Status</h3>
+    
+    <div class="endpoint">
+        <div><span class="method">GET</span> <span class="path">/status</span></div>
+        <div class="description">Get server status and statistics</div>
+        <div class="response">Example response: <pre>{
+  "server": {
+    "version": "1.0.0",
+    "uptime": 86400,
+    "hostname": "127.0.0.1",
+    "port": 8080
+  },
+  "notes": {
+    "directory": "/home/user/Documents/notes",
+    "para_categories": ["00_inbox", "01_projects", "02_areas", "03_resources", "04_archives"],
+    "supported_formats": ["neorg", "markdown", "text"],
+    "semantic_search_provider": "ollampy"
+  },
+  "statistics": {
+    "total_notes": 250,
+    "api_keys": 3,
+    "active_tokens": 2
+  }
+}</pre></div>
+    </div>
+    
+    <h2>Error Responses</h2>
+    
+    <p>All errors follow this format:</p>
+    
+    <pre>{
+  "error": "Error description"
+}</pre>
+    
+    <p>Common HTTP status codes:</p>
+    
+    <ul>
+        <li><strong>400</strong> - Bad Request (invalid parameters)</li>
+        <li><strong>401</strong> - Unauthorized (invalid or missing token)</li>
+        <li><strong>404</strong> - Not Found (resource not found)</li>
+        <li><strong>409</strong> - Conflict (resource already exists)</li>
+        <li><strong>429</strong> - Too Many Requests (rate limit exceeded)</li>
+        <li><strong>500</strong> - Internal Server Error</li>
+    </ul>
+    
+</body>
+</html>
+
+=pod
+
+=head1 NAME
+
+knowledge_api - RESTful API server for accessing your Second Brain
+
+=head1 SYNOPSIS
+
+  knowledge_api [options]
+
+  Options:
+    --port, -p      Server port (default: 8080)
+    --host, -h      Server host (default: 127.0.0.1)
+    --dir, -d       Notes directory (default: ~/Documents/notes)
+    --debug         Enable debug mode
+    --help          Display this help message
+    --no-api-key    Run without API key authentication (not secure)
+    --mcp           Enable MCP WebSocket endpoint for AI tool integration
+    
+    --add-key NAME  Add a new API key with optional name
+    --remove-key KEY Remove an API key
+    --list-keys     List all API keys
+    --init-config   Initialize/reset configuration file
+
+=head1 DESCRIPTION
+
+This script implements a lightweight API server that provides programmatic access
+to your Second Brain notes collection, enabling integration with other tools and services.
+
+=head1 REQUIREMENTS
+
+Required Perl modules:
+  - Mojolicious
+  - JSON
+  - YAML (optional, for semantic search parsing)
+
+=head1 EXAMPLES
+
+  # Start the server on default port (8080)
+  knowledge_api
+  
+  # Start on a different port
+  knowledge_api --port 3000
+  
+  # Add a new API key
+  knowledge_api --add-key "My Application"
+  
+  # List all API keys
+  knowledge_api --list-keys
+
+=head1 AUTHOR
+
+Zach Podbielniak
+
+=cut

@@ -1,0 +1,1008 @@
+#!/usr/bin/perl
+# knowledge_client - Command line client for the Knowledge API
+#
+# This script provides a CLI interface for interacting with the Knowledge API server,
+# allowing for direct access to Second Brain notes and search functionality.
+# It also includes MCP stdio server support for integration with Claude Code.
+#
+# Usage:
+#   knowledge_client [options] <command> [args...]
+#
+# Options:
+#   --host, -h    API server host (default: 127.0.0.1)
+#   --port, -p    API server port (default: 8080)
+#   --token, -t   API token (if required)
+#   --format, -f  Output format (json, text, markdown, neorg)
+#   --debug, -d   Enable debug output
+#   --help        Show this help message
+#   --mcp         Start as an MCP stdio server
+#
+# Commands:
+#   search <query>                  Search knowledge base
+#   list [category] [directory]     List notes
+#   read <path>                     Read a specific note
+#   create <path> <content>         Create a new note
+#   update <path> <content>         Update an existing note
+#   delete <path>                   Delete a note
+#   ingest <content> [category]     Ingest content into Second Brain
+#   status                          Get API server status
+#   auth <api_key>                  Get authentication token
+#   para                            List PARA categories
+#   para <category>                 List directories in a PARA category
+
+use strict;
+use warnings;
+use feature qw(say signatures);
+no warnings qw(experimental::signatures experimental::smartmatch);
+
+# Core modules
+use Getopt::Long;
+use Pod::Usage;
+use JSON ();
+use File::Spec;
+use File::Basename;
+use POSIX qw(strftime);
+use Encode qw(decode encode);
+use Data::Dumper;
+use IO::Select;
+use IO::Handle;
+
+# HTTP modules (optional, check availability)
+BEGIN {
+    eval "use LWP::UserAgent; 1" or do {
+        eval "use HTTP::Tiny; 1" or do {
+            die "Please install LWP::UserAgent or HTTP::Tiny for HTTP requests\n";
+        };
+    };
+}
+
+# Constants
+use constant {
+    DEFAULT_HOST => '127.0.0.1',
+    DEFAULT_PORT => 8080,
+    DEFAULT_FORMAT => 'text',
+    DEFAULT_TIMEOUT => 30,
+    
+    FORMAT_JSON => 'json',
+    FORMAT_TEXT => 'text',
+    FORMAT_MARKDOWN => 'markdown',
+    FORMAT_NEORG => 'neorg',
+    
+    MCP_VERSION => '1.0.0',
+    CLIENT_ID_PREFIX => 'kb_client_',
+};
+
+# Global configuration
+my $CONFIG = {
+    host => DEFAULT_HOST,
+    port => DEFAULT_PORT,
+    token => '',
+    format => DEFAULT_FORMAT,
+    debug => 0,
+    mcp => 0,
+    last_client_id => '',
+};
+
+# Command-line options
+GetOptions(
+    'host|h=s' => \$CONFIG->{host},
+    'port|p=i' => \$CONFIG->{port},
+    'token|t=s' => \$CONFIG->{token},
+    'format|f=s' => \$CONFIG->{format},
+    'debug|d' => \$CONFIG->{debug},
+    'help' => sub { pod2usage(1) },
+    'mcp' => \$CONFIG->{mcp},
+) or pod2usage(2);
+
+# If MCP mode is enabled, start the MCP stdio server
+if ($CONFIG->{mcp}) {
+    run_mcp_server();
+    exit;
+}
+
+# Process commands
+my $command = shift @ARGV or pod2usage(1);
+
+# Dispatch based on command
+if ($command eq 'search') {
+    cmd_search(@ARGV);
+} elsif ($command eq 'list') {
+    cmd_list(@ARGV);
+} elsif ($command eq 'read') {
+    cmd_read(@ARGV);
+} elsif ($command eq 'create') {
+    cmd_create(@ARGV);
+} elsif ($command eq 'update') {
+    cmd_update(@ARGV);
+} elsif ($command eq 'delete') {
+    cmd_delete(@ARGV);
+} elsif ($command eq 'ingest') {
+    cmd_ingest(@ARGV);
+} elsif ($command eq 'status') {
+    cmd_status(@ARGV);
+} elsif ($command eq 'auth') {
+    cmd_auth(@ARGV);
+} elsif ($command eq 'para') {
+    cmd_para(@ARGV);
+} else {
+    say "Unknown command: $command";
+    pod2usage(1);
+}
+
+# --------------------------------------------------
+# Command Implementations
+# --------------------------------------------------
+
+# Search the knowledge base
+sub cmd_search (@args) {
+    my $query = shift @args or die "Missing query parameter\n";
+    my $limit = shift @args || 5;
+    my $include_content = shift @args || 0;
+    
+    my $params = {
+        q => $query,
+        limit => $limit,
+        include_content => $include_content
+    };
+    
+    my $result = api_get('/search', $params);
+    output_result($result);
+}
+
+# List notes in the knowledge base
+sub cmd_list (@args) {
+    my $category = shift @args || '';
+    my $directory = shift @args || '';
+    
+    my $params = {};
+    $params->{category} = $category if $category;
+    $params->{directory} = $directory if $directory;
+    
+    my $result = api_get('/notes', $params);
+    output_result($result);
+}
+
+# Read a specific note
+sub cmd_read (@args) {
+    my $path = shift @args or die "Missing path parameter\n";
+    my $format = shift @args || '';
+    
+    my $params = {};
+    $params->{format} = $format if $format;
+    
+    my $result = api_get("/notes/$path", $params);
+    output_result($result);
+}
+
+# Create a new note
+sub cmd_create (@args) {
+    my $path = shift @args or die "Missing path parameter\n";
+    my $content = join(' ', @args) or die "Missing content parameter\n";
+    
+    # If content starts with @, treat it as a file path
+    if ($content =~ /^@(.+)$/) {
+        my $file_path = $1;
+        open my $fh, '<', $file_path or die "Cannot open file $file_path: $!\n";
+        local $/;
+        $content = <$fh>;
+        close $fh;
+    }
+    
+    my $data = {
+        content => $content,
+        format => determine_format($path)
+    };
+    
+    my $result = api_post("/notes/$path", $data);
+    output_result($result);
+}
+
+# Update an existing note
+sub cmd_update (@args) {
+    my $path = shift @args or die "Missing path parameter\n";
+    my $content = join(' ', @args) or die "Missing content parameter\n";
+    
+    # If content starts with @, treat it as a file path
+    if ($content =~ /^@(.+)$/) {
+        my $file_path = $1;
+        open my $fh, '<', $file_path or die "Cannot open file $file_path: $!\n";
+        local $/;
+        $content = <$fh>;
+        close $fh;
+    }
+    
+    my $data = {
+        content => $content,
+        format => determine_format($path)
+    };
+    
+    my $result = api_put("/notes/$path", $data);
+    output_result($result);
+}
+
+# Delete a note
+sub cmd_delete (@args) {
+    my $path = shift @args or die "Missing path parameter\n";
+    
+    my $result = api_delete("/notes/$path");
+    output_result($result);
+}
+
+# Ingest content into the Second Brain
+sub cmd_ingest (@args) {
+    my $content = shift @args or die "Missing content parameter\n";
+    my $category = shift @args || '00_inbox';
+    my $title = shift @args || 'CLI Ingested Note';
+    
+    # If content starts with @, treat it as a file path
+    if ($content =~ /^@(.+)$/) {
+        my $file_path = $1;
+        open my $fh, '<', $file_path or die "Cannot open file $file_path: $!\n";
+        local $/;
+        $content = <$fh>;
+        close $fh;
+    }
+    
+    my $data = {
+        content => $content,
+        category => $category,
+        title => $title,
+        format => 'neorg'
+    };
+    
+    my $result = api_post("/ingest", $data);
+    output_result($result);
+}
+
+# Get API server status
+sub cmd_status (@args) {
+    my $result = api_get("/status");
+    output_result($result);
+}
+
+# Authenticate and get a token
+sub cmd_auth (@args) {
+    my $api_key = shift @args or die "Missing API key parameter\n";
+    
+    my $data = {
+        api_key => $api_key
+    };
+    
+    my $result = api_post("/auth", $data);
+    if ($result && $result->{token}) {
+        $CONFIG->{token} = $result->{token};
+        say "Token: $result->{token}";
+        say "Expires: " . localtime($result->{expires});
+    } else {
+        say "Authentication failed";
+    }
+}
+
+# List PARA categories or directories
+sub cmd_para (@args) {
+    my $category = shift @args || '';
+    
+    if ($category) {
+        my $result = api_get("/para/$category");
+        output_result($result);
+    } else {
+        my $result = api_get("/para");
+        output_result($result);
+    }
+}
+
+# --------------------------------------------------
+# API Helpers
+# --------------------------------------------------
+
+# Make a GET request to the API
+sub api_get ($endpoint, $params = {}) {
+    my $url = build_url($endpoint, $params);
+    return make_request('GET', $url);
+}
+
+# Make a POST request to the API
+sub api_post ($endpoint, $data = {}) {
+    my $url = build_url($endpoint);
+    return make_request('POST', $url, $data);
+}
+
+# Make a PUT request to the API
+sub api_put ($endpoint, $data = {}) {
+    my $url = build_url($endpoint);
+    return make_request('PUT', $url, $data);
+}
+
+# Make a DELETE request to the API
+sub api_delete ($endpoint, $params = {}) {
+    my $url = build_url($endpoint, $params);
+    return make_request('DELETE', $url);
+}
+
+# Build a URL for the API request
+sub build_url ($endpoint, $params = {}) {
+    my $url = "http://$CONFIG->{host}:$CONFIG->{port}$endpoint";
+    
+    # Add query parameters if any
+    if (%$params) {
+        my @parts;
+        foreach my $key (sort keys %$params) {
+            push @parts, "$key=" . url_escape($params->{$key});
+        }
+        $url .= '?' . join('&', @parts);
+    }
+    
+    return $url;
+}
+
+# Make an HTTP request to the API
+sub make_request ($method, $url, $data = undef) {
+    my $result;
+    
+    # Debug output
+    if ($CONFIG->{debug}) {
+        say "[$method] $url";
+        say "Data: " . JSON::encode_json($data) if defined $data;
+    }
+    
+    # Use LWP::UserAgent if available
+    if (defined &LWP::UserAgent::new) {
+        $result = make_request_lwp($method, $url, $data);
+    } else {
+        # Fallback to HTTP::Tiny
+        $result = make_request_tiny($method, $url, $data);
+    }
+    
+    return $result;
+}
+
+# Make a request using LWP::UserAgent
+sub make_request_lwp ($method, $url, $data = undef) {
+    # Create user agent
+    my $ua = LWP::UserAgent->new(timeout => DEFAULT_TIMEOUT);
+    
+    # Prepare request
+    my $req;
+    if ($method eq 'GET' || $method eq 'DELETE') {
+        $req = HTTP::Request->new($method => $url);
+    } else {
+        $req = HTTP::Request->new($method => $url);
+        $req->content_type('application/json');
+        $req->content(JSON::encode_json($data)) if defined $data;
+    }
+    
+    # Add authorization header if token is available
+    if ($CONFIG->{token}) {
+        $req->header('Authorization' => "Bearer $CONFIG->{token}");
+    }
+    
+    # Make request
+    my $res = $ua->request($req);
+    
+    # Process response
+    if ($res->is_success) {
+        if ($res->content) {
+            return JSON::decode_json($res->content);
+        } else {
+            return {};
+        }
+    } else {
+        warn "Error: " . $res->status_line . "\n";
+        if ($res->content) {
+            eval {
+                my $error = JSON::decode_json($res->content);
+                warn "API Error: " . $error->{error} . "\n" if $error->{error};
+            };
+        }
+        return undef;
+    }
+}
+
+# Make a request using HTTP::Tiny
+sub make_request_tiny ($method, $url, $data = undef) {
+    # Create client
+    my $http = HTTP::Tiny->new(timeout => DEFAULT_TIMEOUT);
+    
+    # Prepare headers and options
+    my $options = {
+        headers => {
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json'
+        }
+    };
+    
+    # Add authorization header if token is available
+    if ($CONFIG->{token}) {
+        $options->{headers}->{Authorization} = "Bearer $CONFIG->{token}";
+    }
+    
+    # Add content if provided
+    $options->{content} = JSON::encode_json($data) if defined $data && ($method eq 'POST' || $method eq 'PUT');
+    
+    # Make request
+    my $res = $http->request($method, $url, $options);
+    
+    # Process response
+    if ($res->{success}) {
+        if ($res->{content}) {
+            return JSON::decode_json($res->{content});
+        } else {
+            return {};
+        }
+    } else {
+        warn "Error: $res->{status} $res->{reason}\n";
+        if ($res->{content}) {
+            eval {
+                my $error = JSON::decode_json($res->{content});
+                warn "API Error: " . $error->{error} . "\n" if $error->{error};
+            };
+        }
+        return undef;
+    }
+}
+
+# URL escape a string
+sub url_escape ($string) {
+    $string =~ s/([^A-Za-z0-9\-\._~])/sprintf("%%%02X", ord($1))/eg;
+    return $string;
+}
+
+# Determine format from file extension
+sub determine_format ($path) {
+    if ($path =~ /\.norg$/i) {
+        return FORMAT_NEORG;
+    } elsif ($path =~ /\.md$/i) {
+        return FORMAT_MARKDOWN;
+    } else {
+        return FORMAT_TEXT;
+    }
+}
+
+# Output result in the specified format
+sub output_result ($result) {
+    return unless defined $result;
+    
+    if ($CONFIG->{format} eq FORMAT_JSON) {
+        say JSON::encode_json($result);
+    } else {
+        # Handle various result structures
+        if (ref($result) eq 'HASH') {
+            if (exists $result->{content}) {
+                # Note content
+                say $result->{content};
+            } elsif (exists $result->{categories}) {
+                # PARA categories
+                say "PARA Categories:";
+                say "- $_" for @{$result->{categories}};
+            } elsif (exists $result->{directories}) {
+                # Directories in a category
+                say "Directories in $result->{category}:";
+                say "- $_" for @{$result->{directories}};
+            } elsif (exists $result->{notes}) {
+                # Note listing
+                say "Notes ($result->{total} total):";
+                say "- $_" for @{$result->{notes}};
+            } elsif (exists $result->{results}) {
+                # Search results
+                say "Search results for '$result->{query}':";
+                my $i = 1;
+                for my $item (@{$result->{results}}) {
+                    say "[$i] $item->{path}";
+                    say "    Similarity: " . sprintf("%.2f", $item->{similarity}) if exists $item->{similarity};
+                    say "    $item->{content}" if exists $item->{content};
+                    $i++;
+                }
+            } elsif (exists $result->{server}) {
+                # Status information
+                say "Server Status:";
+                say "- Version: $result->{server}->{version}";
+                say "- Uptime: " . format_duration($result->{server}->{uptime});
+                say "- Host: $result->{server}->{hostname}:$result->{server}->{port}";
+                say "- Notes Directory: $result->{notes}->{directory}";
+                say "- Total Notes: $result->{statistics}->{total_notes}";
+            } else {
+                # Unknown structure, just dump as JSON
+                say JSON::encode_json($result);
+            }
+        } elsif (ref($result) eq 'ARRAY') {
+            # Array of results
+            say "- $_" for @$result;
+        } else {
+            # Scalar value
+            say $result;
+        }
+    }
+}
+
+# Format duration in seconds to human-readable string
+sub format_duration ($seconds) {
+    my $days = int($seconds / 86400);
+    $seconds %= 86400;
+    my $hours = int($seconds / 3600);
+    $seconds %= 3600;
+    my $minutes = int($seconds / 60);
+    $seconds %= 60;
+    
+    my @parts;
+    push @parts, "$days days" if $days;
+    push @parts, "$hours hours" if $hours;
+    push @parts, "$minutes minutes" if $minutes;
+    push @parts, "$seconds seconds" if $seconds || !@parts;
+    
+    return join(', ', @parts);
+}
+
+# --------------------------------------------------
+# MCP Server Implementation
+# --------------------------------------------------
+
+# Run the MCP stdio server
+sub run_mcp_server {
+    # Set up stdio
+    STDOUT->autoflush(1);
+    STDIN->blocking(0);
+    
+    # Create a selector for non-blocking IO
+    my $selector = IO::Select->new();
+    $selector->add(\*STDIN);
+    
+    # Initialize MCP server
+    mcp_initialize();
+    
+    # Main event loop
+    while (1) {
+        if ($selector->can_read(0.1)) {
+            my $line = <STDIN>;
+            if (defined $line) {
+                chomp $line;
+                if ($CONFIG->{debug}) {
+                    warn "Received: $line\n";
+                }
+                handle_mcp_request($line);
+            }
+        }
+    }
+}
+
+# Initialize the MCP server
+sub mcp_initialize {
+    # Send initialization messages
+    my $client_id = CLIENT_ID_PREFIX . int(rand(1000000));
+    $CONFIG->{last_client_id} = $client_id;
+    
+    # Send connected event
+    send_event('connected', {
+        connected => JSON::true
+    });
+    
+    # Send transport initialization
+    send_event('mcp.transport.stdio.init', {
+        transport => 'stdio',
+        client_id => $client_id,
+        status => 'connected'
+    });
+    
+    # Send API definitions
+    send_event('mcp.api.definitions', {
+        schema_version => '1.0',
+        server_version => MCP_VERSION,
+        name => 'Knowledge API Client',
+        description => 'Access your Second Brain knowledge base',
+        tools => {
+            'kb_search' => {
+                function => {
+                    name => 'kb_search',
+                    description => 'Search the knowledge base',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            query => { type => 'string', description => 'Search query' },
+                            limit => { type => 'integer', description => 'Maximum number of results', default => 5 },
+                            include_content => { type => 'boolean', description => 'Include note content in results', default => JSON::false }
+                        },
+                        required => ['query']
+                    }
+                }
+            },
+            'kb_list' => {
+                function => {
+                    name => 'kb_list',
+                    description => 'List notes in the knowledge base',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            category => { type => 'string', description => 'PARA category' },
+                            directory => { type => 'string', description => 'Directory within category' }
+                        }
+                    }
+                }
+            },
+            'kb_read' => {
+                function => {
+                    name => 'kb_read',
+                    description => 'Read a specific note',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            path => { type => 'string', description => 'Path to note' },
+                            format => { type => 'string', description => 'Transform to format (neorg, markdown, text)' }
+                        },
+                        required => ['path']
+                    }
+                }
+            },
+            'kb_create' => {
+                function => {
+                    name => 'kb_create',
+                    description => 'Create a new note',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            path => { type => 'string', description => 'Path for new note' },
+                            content => { type => 'string', description => 'Note content' },
+                            format => { type => 'string', description => 'Content format (neorg, markdown, text)' }
+                        },
+                        required => ['path', 'content']
+                    }
+                }
+            },
+            'kb_update' => {
+                function => {
+                    name => 'kb_update',
+                    description => 'Update an existing note',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            path => { type => 'string', description => 'Path to note' },
+                            content => { type => 'string', description => 'New content' },
+                            format => { type => 'string', description => 'Content format (neorg, markdown, text)' }
+                        },
+                        required => ['path', 'content']
+                    }
+                }
+            },
+            'kb_delete' => {
+                function => {
+                    name => 'kb_delete',
+                    description => 'Delete a note',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            path => { type => 'string', description => 'Path to note' }
+                        },
+                        required => ['path']
+                    }
+                }
+            },
+            'kb_ingest' => {
+                function => {
+                    name => 'kb_ingest',
+                    description => 'Ingest content into Second Brain',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            content => { type => 'string', description => 'Content to ingest' },
+                            category => { type => 'string', description => 'PARA category', default => '00_inbox' },
+                            title => { type => 'string', description => 'Note title', default => 'API Ingested Note' }
+                        },
+                        required => ['content']
+                    }
+                }
+            },
+            'kb_status' => {
+                function => {
+                    name => 'kb_status',
+                    description => 'Get API server status',
+                    parameters => {
+                        type => 'object',
+                        properties => {}
+                    }
+                }
+            },
+            'kb_para_list' => {
+                function => {
+                    name => 'kb_para_list',
+                    description => 'List PARA categories',
+                    parameters => {
+                        type => 'object',
+                        properties => {}
+                    }
+                }
+            },
+            'kb_para_directories' => {
+                function => {
+                    name => 'kb_para_directories',
+                    description => 'List directories in a PARA category',
+                    parameters => {
+                        type => 'object',
+                        properties => {
+                            category => { type => 'string', description => 'PARA category name' }
+                        },
+                        required => ['category']
+                    }
+                }
+            }
+        }
+    });
+    
+    # Send ready event
+    send_event('mcp.ready', {
+        ready => JSON::true
+    });
+    
+    # Start ping timer
+    if ($CONFIG->{debug}) {
+        warn "MCP server initialized\n";
+    }
+}
+
+# Handle an MCP request
+sub handle_mcp_request ($line) {
+    # Parse the request
+    my $request;
+    eval {
+        $request = JSON::decode_json($line);
+    };
+    
+    if ($@ || !$request) {
+        send_error("Invalid JSON request: $@");
+        return;
+    }
+    
+    # Extract request details
+    my $action = $request->{action} || '';
+    my $params = $request->{params} || {};
+    my $request_id = $request->{request_id} || 'unknown';
+    
+    if ($CONFIG->{debug}) {
+        warn "Processing action: $action\n";
+    }
+    
+    # Dispatch the action
+    if ($action eq 'kb_search') {
+        # Search the knowledge base
+        my $query = $params->{query} || '';
+        my $limit = $params->{limit} || 5;
+        my $include_content = $params->{include_content} || 0;
+        
+        unless ($query) {
+            send_error("Missing required parameter: query", $request_id);
+            return;
+        }
+        
+        my $api_params = {
+            q => $query,
+            limit => $limit,
+            include_content => $include_content ? 1 : 0
+        };
+        
+        my $result = api_get('/search', $api_params);
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_list') {
+        # List notes in the knowledge base
+        my $category = $params->{category} || '';
+        my $directory = $params->{directory} || '';
+        
+        my $api_params = {};
+        $api_params->{category} = $category if $category;
+        $api_params->{directory} = $directory if $directory;
+        
+        my $result = api_get('/notes', $api_params);
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_read') {
+        # Read a specific note
+        my $path = $params->{path} || '';
+        my $format = $params->{format} || '';
+        
+        unless ($path) {
+            send_error("Missing required parameter: path", $request_id);
+            return;
+        }
+        
+        my $api_params = {};
+        $api_params->{format} = $format if $format;
+        
+        my $result = api_get("/notes/$path", $api_params);
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_create') {
+        # Create a new note
+        my $path = $params->{path} || '';
+        my $content = $params->{content} || '';
+        my $format = $params->{format} || determine_format($path);
+        
+        unless ($path && $content) {
+            send_error("Missing required parameters: path and content", $request_id);
+            return;
+        }
+        
+        my $data = {
+            content => $content,
+            format => $format
+        };
+        
+        my $result = api_post("/notes/$path", $data);
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_update') {
+        # Update an existing note
+        my $path = $params->{path} || '';
+        my $content = $params->{content} || '';
+        my $format = $params->{format} || determine_format($path);
+        
+        unless ($path && $content) {
+            send_error("Missing required parameters: path and content", $request_id);
+            return;
+        }
+        
+        my $data = {
+            content => $content,
+            format => $format
+        };
+        
+        my $result = api_put("/notes/$path", $data);
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_delete') {
+        # Delete a note
+        my $path = $params->{path} || '';
+        
+        unless ($path) {
+            send_error("Missing required parameter: path", $request_id);
+            return;
+        }
+        
+        my $result = api_delete("/notes/$path");
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_ingest') {
+        # Ingest content into the Second Brain
+        my $content = $params->{content} || '';
+        my $category = $params->{category} || '00_inbox';
+        my $title = $params->{title} || 'MCP Ingested Note';
+        
+        unless ($content) {
+            send_error("Missing required parameter: content", $request_id);
+            return;
+        }
+        
+        my $data = {
+            content => $content,
+            category => $category,
+            title => $title,
+            format => 'neorg'
+        };
+        
+        my $result = api_post("/ingest", $data);
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_status') {
+        # Get API server status
+        my $result = api_get("/status");
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_para_list') {
+        # List PARA categories
+        my $result = api_get("/para");
+        send_result($result, $request_id);
+    }
+    elsif ($action eq 'kb_para_directories') {
+        # List directories in a PARA category
+        my $category = $params->{category} || '';
+        
+        unless ($category) {
+            send_error("Missing required parameter: category", $request_id);
+            return;
+        }
+        
+        my $result = api_get("/para/$category");
+        send_result($result, $request_id);
+    }
+    else {
+        # Unknown action
+        send_error("Unknown action: $action", $request_id);
+    }
+}
+
+# Send an MCP event
+sub send_event ($event_type, $data) {
+    my $output = "event: $event_type\n";
+    $output .= "data: " . JSON::encode_json($data) . "\n\n";
+    print $output;
+    
+    if ($CONFIG->{debug}) {
+        warn "Sent event: $event_type\n";
+    }
+}
+
+# Send an MCP result
+sub send_result ($result, $request_id) {
+    my $response = {
+        request_id => $request_id,
+        status => "success",
+        result => $result
+    };
+    
+    send_event('result', $response);
+}
+
+# Send an MCP error
+sub send_error ($error_message, $request_id = 'unknown') {
+    my $response = {
+        request_id => $request_id,
+        status => "error",
+        error => $error_message
+    };
+    
+    send_event('result', $response);
+}
+
+# --------------------------------------------------
+# Documentation
+# --------------------------------------------------
+
+=head1 NAME
+
+knowledge_client - Command line client for the Knowledge API
+
+=head1 SYNOPSIS
+
+    knowledge_client [options] <command> [args...]
+
+    Options:
+      --host, -h    API server host (default: 127.0.0.1)
+      --port, -p    API server port (default: 8080)
+      --token, -t   API token (if required)
+      --format, -f  Output format (json, text, markdown, neorg)
+      --debug, -d   Enable debug output
+      --help        Show this help message
+      --mcp         Start as an MCP stdio server
+
+    Commands:
+      search <query>                  Search knowledge base
+      list [category] [directory]     List notes
+      read <path>                     Read a specific note
+      create <path> <content>         Create a new note
+      update <path> <content>         Update an existing note
+      delete <path>                   Delete a note
+      ingest <content> [category]     Ingest content into Second Brain
+      status                          Get API server status
+      auth <api_key>                  Get authentication token
+      para                            List PARA categories
+      para <category>                 List directories in a PARA category
+
+=head1 DESCRIPTION
+
+This script provides a command-line interface for interacting with the Knowledge API server,
+allowing for easy access to your Second Brain notes and search functionality.
+
+When used with the --mcp flag, it starts an MCP stdio server that can be used with Claude Code
+for seamless integration with your knowledge base.
+
+=head1 EXAMPLES
+
+    # Search the knowledge base
+    knowledge_client search "productivity techniques" 10
+
+    # List all notes in the inbox
+    knowledge_client list 00_inbox
+
+    # Read a specific note
+    knowledge_client read 02_areas/health/exercise_log.norg
+
+    # Create a new note
+    knowledge_client create 03_resources/articles/new_article.norg "# New Article\n\nContent here..."
+
+    # Or create from a file
+    knowledge_client create 03_resources/articles/new_article.norg @/path/to/content.md
+
+    # Start as an MCP server for Claude Code
+    knowledge_client --mcp
+
+=head1 AUTHOR
+
+Zach Podbielniak
+
+=cut
