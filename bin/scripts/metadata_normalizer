@@ -1,0 +1,2718 @@
+#!/usr/bin/perl
+# metadata_normalizer - Ensure consistent metadata across knowledge systems
+#
+# This script synchronizes tags, labels, and categories across different tools,
+# maintains a central taxonomy that maps to tool-specific formats, and prevents
+# metadata fragmentation and inconsistency, making cross-tool searches and filters more reliable.
+#
+# Features:
+# - Centralized taxonomy management
+# - Bidirectional metadata synchronization
+# - Conflict detection and resolution
+# - Metadata validation and linting
+# - Tag hierarchy and relationship mapping
+# - Automatic normalization of inconsistent tags
+# - Metadata visualization and browsing
+# - Unused metadata cleanup
+# - Migration tools for system changes
+# - Batch metadata operations
+# - Search by normalized metadata across tools
+
+use strict;
+use warnings;
+use feature qw(say signatures switch);
+no warnings qw(experimental::signatures experimental::smartmatch);
+
+# Core modules
+use Getopt::Long;
+use Pod::Usage;
+use FindBin qw($Bin);
+use JSON ();
+use File::Spec;
+use File::Basename;
+use File::Path qw(make_path);
+use Cwd qw(abs_path);
+use POSIX qw(strftime);
+use Encode qw(decode encode);
+use Data::Dumper;
+use Text::ParseWords;
+
+# Constants
+use constant {
+    # File paths
+    DEFAULT_NOTES_DIR => "$ENV{HOME}/Documents/notes",
+    CONFIG_DIR => "$ENV{HOME}/.config/metadata_normalizer",
+    REGISTRY_FILE => "$ENV{HOME}/.config/metadata_normalizer/registry.json",
+    LOG_FILE => "$ENV{HOME}/.config/metadata_normalizer/log.txt",
+    
+    # Supported file types
+    FILE_TYPE_NEORG => '.norg',
+    FILE_TYPE_MARKDOWN => '.md',
+    FILE_TYPE_TEXT => '.txt',
+    
+    # Supported metadata formats
+    FORMAT_NEORG => 'neorg',
+    FORMAT_MARKDOWN => 'markdown',
+    FORMAT_YAML => 'yaml',
+    FORMAT_JSON => 'json',
+    FORMAT_TEXT => 'text',
+    
+    # PARA directories
+    PARA_INBOX => '00_inbox',
+    PARA_PROJECTS => '01_projects',
+    PARA_AREAS => '02_areas',
+    PARA_RESOURCES => '03_resources',
+    PARA_ARCHIVES => '04_archives',
+    
+    # Operation modes
+    MODE_SCAN => 'scan',
+    MODE_NORMALIZE => 'normalize',
+    MODE_SYNC => 'sync',
+    MODE_VALIDATE => 'validate',
+    MODE_LINT => 'lint',
+    MODE_VISUALIZE => 'visualize',
+    MODE_CLEANUP => 'cleanup',
+    MODE_MIGRATE => 'migrate',
+    MODE_BATCH => 'batch',
+    MODE_SEARCH => 'search',
+};
+
+# Global configuration
+my $CONFIG = {
+    notes_dir => DEFAULT_NOTES_DIR,
+    registry_file => REGISTRY_FILE,
+    file_types => [FILE_TYPE_NEORG, FILE_TYPE_MARKDOWN, FILE_TYPE_TEXT],
+    para_dirs => [
+        PARA_INBOX,
+        PARA_PROJECTS,
+        PARA_AREAS,
+        PARA_RESOURCES,
+        PARA_ARCHIVES
+    ],
+    dry_run => 0,
+    verbose => 0,
+    debug => 0,
+};
+
+# Metadata registry
+my $REGISTRY = {
+    version => 1,
+    last_updated => time(),
+    taxonomy => {
+        tags => {},
+        categories => {},
+        attributes => {},
+    },
+    mappings => {
+        neorg => {},
+        markdown => {},
+        yaml => {},
+        json => {},
+    },
+    rules => {
+        conflicts => [],
+        normalization => [],
+    },
+    hierarchy => {
+        root => {},
+    },
+    stats => {
+        total_files => 0,
+        total_tags => 0,
+        total_categories => 0,
+        total_attributes => 0,
+    },
+};
+
+# Command-line arguments
+my $MODE = ''; # Operation mode
+my $HELP = 0;
+my $CONFIG_FILE = '';
+my $OUTPUT_FILE = '';
+my $INPUT_FILE = '';
+my $QUERY = '';
+my $FORMAT = '';
+my $INCLUDE_PATTERN = '';
+my $EXCLUDE_PATTERN = '';
+my $INCLUDE_DIRS = '';
+my $EXCLUDE_DIRS = '';
+my $BATCH_FILE = '';
+my $LIST_ONLY = 0;
+
+# Parse command-line arguments
+GetOptions(
+    # Main options
+    'mode|m=s' => \$MODE,
+    'notes-dir|dir|d=s' => \$CONFIG->{notes_dir},
+    'registry|r=s' => \$CONFIG->{registry_file},
+    'config|c=s' => \$CONFIG_FILE,
+    'output|o=s' => \$OUTPUT_FILE,
+    'input|i=s' => \$INPUT_FILE,
+    'format|f=s' => \$FORMAT,
+    'query|q=s' => \$QUERY,
+    
+    # File selection options
+    'include=s' => \$INCLUDE_PATTERN,
+    'exclude=s' => \$EXCLUDE_PATTERN,
+    'include-dirs=s' => \$INCLUDE_DIRS,
+    'exclude-dirs=s' => \$EXCLUDE_DIRS,
+    'file-types=s' => sub { $CONFIG->{file_types} = [split(/,/, $_[1])] },
+    
+    # Operation control options
+    'batch=s' => \$BATCH_FILE,
+    'dry-run|n' => \$CONFIG->{dry_run},
+    'verbose|v' => \$CONFIG->{verbose},
+    'debug' => \$CONFIG->{debug},
+    'list' => \$LIST_ONLY,
+    
+    # Help
+    'help|h' => \$HELP,
+) or pod2usage(2);
+
+# Show help if requested
+pod2usage(1) if $HELP;
+
+# Validate and process arguments
+if (!$MODE) {
+    say "Error: Operation mode (-m, --mode) is required";
+    pod2usage(1);
+}
+
+# Load custom config if specified
+if ($CONFIG_FILE && -f $CONFIG_FILE) {
+    load_config($CONFIG_FILE);
+}
+
+# Create registry directory if it doesn't exist
+my $registry_dir = dirname($CONFIG->{registry_file});
+unless (-d $registry_dir) {
+    make_path($registry_dir) or die "Failed to create registry directory $registry_dir: $!";
+}
+
+# Process the batch file if specified
+if ($BATCH_FILE && -f $BATCH_FILE) {
+    process_batch_file($BATCH_FILE);
+    exit 0;
+}
+
+# Load the registry if exists
+if (-f $CONFIG->{registry_file}) {
+    load_registry($CONFIG->{registry_file});
+} else {
+    # Initialize a new registry if it doesn't exist
+    init_registry();
+    save_registry($CONFIG->{registry_file});
+}
+
+# Process include/exclude directories
+my @include_dirs = $INCLUDE_DIRS ? split(/,/, $INCLUDE_DIRS) : @{$CONFIG->{para_dirs}};
+my @exclude_dirs = $EXCLUDE_DIRS ? split(/,/, $EXCLUDE_DIRS) : ();
+
+# Set up directory filters based on include/exclude patterns
+my $include_pattern = $INCLUDE_PATTERN ? qr/$INCLUDE_PATTERN/ : undef;
+my $exclude_pattern = $EXCLUDE_PATTERN ? qr/$EXCLUDE_PATTERN/ : undef;
+
+# For debugging
+if ($CONFIG->{debug}) {
+    print "Notes directory: $CONFIG->{notes_dir}\n";
+    print "Include directories: " . join(", ", @include_dirs) . "\n";
+    print "Exclude directories: " . join(", ", @exclude_dirs) . "\n";
+    print "File types: " . join(", ", @{$CONFIG->{file_types}}) . "\n";
+    print "Include pattern: " . ($include_pattern // "none") . "\n";
+    print "Exclude pattern: " . ($exclude_pattern // "none") . "\n";
+}
+
+# Main operations based on mode
+if ($MODE eq MODE_SCAN) {
+    scan_metadata();
+} elsif ($MODE eq MODE_NORMALIZE) {
+    normalize_metadata_across_files();
+} elsif ($MODE eq MODE_SYNC) {
+    sync_metadata();
+} elsif ($MODE eq MODE_VALIDATE) {
+    validate_metadata();
+} elsif ($MODE eq MODE_LINT) {
+    lint_metadata();
+} elsif ($MODE eq MODE_VISUALIZE) {
+    visualize_metadata();
+} elsif ($MODE eq MODE_CLEANUP) {
+    cleanup_metadata();
+} elsif ($MODE eq MODE_MIGRATE) {
+    migrate_metadata();
+} elsif ($MODE eq MODE_BATCH) {
+    if (!$BATCH_FILE) {
+        say "Error: Batch file (-b, --batch) is required for batch mode";
+        exit 1;
+    }
+} elsif ($MODE eq MODE_SEARCH) {
+    if (!$QUERY) {
+        say "Error: Query (-q, --query) is required for search mode";
+        exit 1;
+    }
+    search_metadata($QUERY);
+} else {
+    say "Error: Invalid mode: $MODE";
+    pod2usage(1);
+}
+
+# --------------------------------------------------
+# Registry Functions
+# --------------------------------------------------
+
+# Initialize a new metadata registry
+sub init_registry {
+    $REGISTRY = {
+        version => 1,
+        last_updated => time(),
+        taxonomy => {
+            tags => {},
+            categories => {},
+            attributes => {},
+        },
+        mappings => {
+            neorg => {
+                tags => {},
+                categories => {},
+                attributes => {},
+                format_specific => {
+                    # Neorg-specific mapping details
+                    tag_prefix => '#',
+                    tag_format => 'inline',
+                    category_format => 'meta',
+                },
+            },
+            markdown => {
+                tags => {},
+                categories => {},
+                attributes => {},
+                format_specific => {
+                    # Markdown-specific mapping details
+                    tag_prefix => '#',
+                    tag_format => 'inline',
+                    category_format => 'frontmatter',
+                },
+            },
+            yaml => {
+                tags => {},
+                categories => {},
+                attributes => {},
+                format_specific => {
+                    # YAML-specific mapping details
+                    tag_key => 'tags',
+                    category_key => 'categories',
+                },
+            },
+            json => {
+                tags => {},
+                categories => {},
+                attributes => {},
+                format_specific => {
+                    # JSON-specific mapping details
+                    tag_key => 'tags',
+                    category_key => 'categories',
+                },
+            },
+        },
+        rules => {
+            conflicts => [
+                # Example conflict rule: prefer more specific tag over general
+                #{
+                #    tags => ['programming', 'python'],
+                #    resolution => 'prefer',
+                #    preferred => 'python',
+                #    description => 'Prefer specific language over general programming tag',
+                #},
+            ],
+            normalization => [
+                # Example normalization rule: standardize casing
+                #{
+                #    pattern => qr/javascript/i,
+                #    replacement => 'JavaScript',
+                #    description => 'Standardize JavaScript casing',
+                #},
+            ],
+            synonyms => {
+                tags => {
+                    # Example tag synonyms
+                    #'js' => 'JavaScript',
+                    #'py' => 'Python',
+                },
+                categories => {
+                    # Example category synonyms
+                    #'prog' => 'Programming',
+                    #'dev' => 'Development',
+                },
+            },
+        },
+        hierarchy => {
+            root => {
+                # Example hierarchy: categories form a hierarchy
+                #'Technology' => {
+                #    'Programming' => {
+                #        'Web' => {
+                #            'Frontend' => {},
+                #            'Backend' => {},
+                #        },
+                #        'Mobile' => {},
+                #    },
+                #},
+            },
+        },
+        stats => {
+            total_files => 0,
+            total_tags => 0,
+            total_categories => 0,
+            total_attributes => 0,
+            last_scan => time(),
+        },
+        files => {}, # File-specific metadata cache
+    };
+    
+    print "Initialized new metadata registry\n" if $CONFIG->{verbose};
+}
+
+# Load registry from file
+sub load_registry($file) {
+    eval {
+        open my $fh, '<', $file or die "Cannot open registry file: $!";
+        local $/;
+        my $json = <$fh>;
+        close $fh;
+        
+        my $registry = JSON::decode_json($json);
+        
+        # Check registry version for potential upgrades
+        if (exists $registry->{version} && $registry->{version} < $REGISTRY->{version}) {
+            print "Upgrading registry from version $registry->{version} to $REGISTRY->{version}...\n" 
+                if $CONFIG->{verbose};
+            
+            $registry = upgrade_registry($registry);
+        }
+        
+        # Update the global registry
+        $REGISTRY = $registry;
+        
+        # Ensure required fields exist (for backward compatibility)
+        $REGISTRY->{files} ||= {};
+        $REGISTRY->{stats}{last_scan} ||= time();
+        
+        print "Loaded metadata registry from $file\n" if $CONFIG->{verbose};
+        
+        # Print basic statistics if verbose
+        if ($CONFIG->{verbose}) {
+            print "Registry statistics:\n";
+            print "- Tags: $REGISTRY->{stats}{total_tags}\n";
+            print "- Categories: $REGISTRY->{stats}{total_categories}\n";
+            print "- Attributes: $REGISTRY->{stats}{total_attributes}\n";
+            print "- Files: $REGISTRY->{stats}{total_files}\n";
+            print "- Last updated: " . scalar(localtime($REGISTRY->{last_updated})) . "\n";
+        }
+    };
+    
+    if ($@) {
+        warn "Error loading registry: $@";
+        # Initialize a new registry if loading fails
+        init_registry();
+    }
+}
+
+# Upgrade registry from an older version
+sub upgrade_registry($old_registry) {
+    my $current_version = $REGISTRY->{version};
+    my $old_version = $old_registry->{version} || 0;
+    
+    print "Performing registry upgrade from v$old_version to v$current_version\n" 
+        if $CONFIG->{verbose};
+    
+    # Copy the basic registry structure
+    my $new_registry = {
+        %$REGISTRY,  # Start with current structure
+        taxonomy => $old_registry->{taxonomy} || $REGISTRY->{taxonomy},
+        last_updated => $old_registry->{last_updated} || time(),
+    };
+    
+    # Upgrade based on specific version changes
+    if ($old_version < 1) {
+        # Upgrading to version 1 (initial structure)
+        # Nothing specific to upgrade, just ensure structure
+        $new_registry->{mappings} ||= $REGISTRY->{mappings};
+        $new_registry->{rules} ||= $REGISTRY->{rules};
+        $new_registry->{hierarchy} ||= $REGISTRY->{hierarchy};
+        $new_registry->{stats} ||= $REGISTRY->{stats};
+    }
+    
+    # For future versions, add additional upgrade logic here
+    # ...
+    
+    # Ensure latest version number
+    $new_registry->{version} = $current_version;
+    
+    return $new_registry;
+}
+
+# Save registry to file
+sub save_registry($file) {
+    # Update timestamp
+    $REGISTRY->{last_updated} = time();
+    
+    # Create a backup first if the file exists
+    if (-f $file && !$CONFIG->{dry_run}) {
+        my $backup_file = $file . '.bak';
+        eval {
+            open my $in, '<', $file or die "Cannot open registry file for backup: $!";
+            open my $out, '>', $backup_file or die "Cannot create backup file: $!";
+            local $/;
+            my $content = <$in>;
+            print $out $content;
+            close $in;
+            close $out;
+            
+            print "Created backup of registry at $backup_file\n" if $CONFIG->{verbose};
+        };
+        
+        if ($@) {
+            warn "Error creating backup: $@";
+            # Continue with saving if the user wants to
+            print "Warning: Failed to create backup. Continue with save? (y/n) ";
+            my $answer = <STDIN>;
+            chomp $answer;
+            if ($answer !~ /^y/i) {
+                print "Save aborted by user.\n";
+                return;
+            }
+        }
+    }
+    
+    # Don't save in dry-run mode
+    if ($CONFIG->{dry_run}) {
+        print "Dry run: Would save registry to $file\n";
+        return;
+    }
+    
+    eval {
+        # Ensure directory exists
+        my $dir = dirname($file);
+        make_path($dir) unless -d $dir;
+        
+        open my $fh, '>', $file or die "Cannot write registry file: $!";
+        print $fh JSON::encode_json($REGISTRY);
+        close $fh;
+        
+        print "Saved metadata registry to $file\n" if $CONFIG->{verbose};
+    };
+    
+    if ($@) {
+        warn "Error saving registry: $@";
+    }
+}
+
+# Get metadata for a specific file
+sub get_file_metadata($file) {
+    my $rel_path = get_relative_path($file);
+    
+    # Return cached metadata if available
+    if (exists $REGISTRY->{files}{$rel_path}) {
+        return $REGISTRY->{files}{$rel_path};
+    }
+    
+    return undef;
+}
+
+# Add or update file metadata in the registry
+sub update_file_metadata($file, $metadata) {
+    my $rel_path = get_relative_path($file);
+    
+    # Get existing metadata for conflict detection
+    my $existing = $REGISTRY->{files}{$rel_path};
+    
+    # Check for conflicts if updating existing metadata
+    if ($existing) {
+        my $conflicts = detect_metadata_conflicts($existing, $metadata);
+        
+        # Resolve conflicts if any
+        if (@$conflicts) {
+            $metadata = resolve_metadata_conflicts($existing, $metadata, $conflicts);
+        }
+    }
+    
+    # Store metadata
+    $REGISTRY->{files}{$rel_path} = {
+        %$metadata,
+        last_updated => time(),
+    };
+    
+    return 1;
+}
+
+# Detect conflicts between two metadata structures
+sub detect_metadata_conflicts($old_metadata, $new_metadata) {
+    my @conflicts;
+    
+    # Check for tag conflicts (using existing conflict rules)
+    foreach my $rule (@{$REGISTRY->{rules}{conflicts}}) {
+        next unless $rule->{tags};
+        
+        # Skip if rule doesn't apply to this file
+        my $tags_match = 1;
+        foreach my $tag (@{$rule->{tags}}) {
+            # Convert tags to a hash for easier lookup
+            my %old_tags = map { $_ => 1 } @{$old_metadata->{tags}};
+            my %new_tags = map { $_ => 1 } @{$new_metadata->{tags}};
+            
+            # Check if all required tags exist in both old and new metadata
+            if (!exists $old_tags{$tag} && !exists $new_tags{$tag}) {
+                $tags_match = 0;
+                last;
+            }
+        }
+        
+        # If rule applies, record the conflict
+        if ($tags_match) {
+            push @conflicts, {
+                type => 'tags',
+                rule => $rule,
+            };
+        }
+    }
+    
+    # Check for conflicting categories
+    my %old_categories = map { $_ => 1 } @{$old_metadata->{categories}};
+    my %new_categories = map { $_ => 1 } @{$new_metadata->{categories}};
+    
+    # Look for categories that exist in new but not old (additions)
+    my @added_categories;
+    foreach my $cat (@{$new_metadata->{categories}}) {
+        push @added_categories, $cat if !exists $old_categories{$cat};
+    }
+    
+    # Look for categories that exist in old but not new (removals)
+    my @removed_categories;
+    foreach my $cat (@{$old_metadata->{categories}}) {
+        push @removed_categories, $cat if !exists $new_categories{$cat};
+    }
+    
+    # Report a conflict if categories changed and in different hierarchical groups
+    if (@added_categories || @removed_categories) {
+        # Check if the categories belong to different hierarchy groups
+        my $conflict_detected = 0;
+        
+        # TODO: Implement hierarchy conflict detection (for now, just log changes)
+        if (@added_categories && @removed_categories) {
+            push @conflicts, {
+                type => 'categories',
+                added => \@added_categories,
+                removed => \@removed_categories,
+                resolution => 'merge', # Default resolution
+            };
+        }
+    }
+    
+    # Check for attribute conflicts (focusing on dates, etc.)
+    foreach my $key (keys %{$new_metadata->{attributes}}) {
+        next if $key =~ /^(?:file_path|file_type|source_format|source_file|last_updated)$/;
+        
+        if (exists $old_metadata->{attributes}{$key} && 
+            $old_metadata->{attributes}{$key} ne $new_metadata->{attributes}{$key}) {
+            # Conflict in attribute values
+            push @conflicts, {
+                type => 'attribute',
+                key => $key,
+                old_value => $old_metadata->{attributes}{$key},
+                new_value => $new_metadata->{attributes}{$key},
+                resolution => 'newer', # Default: keep newer value
+            };
+        }
+    }
+    
+    return \@conflicts;
+}
+
+# Resolve conflicts between metadata
+sub resolve_metadata_conflicts($old_metadata, $new_metadata, $conflicts) {
+    my $resolved = {
+        # Start with new metadata
+        tags => [@{$new_metadata->{tags}}],
+        categories => [@{$new_metadata->{categories}}],
+        attributes => {%{$new_metadata->{attributes}}},
+        source_format => $new_metadata->{source_format},
+        source_file => $new_metadata->{source_file},
+        last_updated => time(),
+    };
+    
+    # Process each conflict
+    foreach my $conflict (@$conflicts) {
+        if ($conflict->{type} eq 'tags') {
+            # Apply tag conflict resolution based on rule
+            my $rule = $conflict->{rule};
+            
+            if ($rule->{resolution} eq 'prefer') {
+                # Prefer specific tag over general tag
+                my $preferred = $rule->{preferred};
+                my @other_tags = grep { $_ ne $preferred } @{$rule->{tags}};
+                
+                # Keep the preferred tag, remove others
+                $resolved->{tags} = [
+                    grep { 
+                        my $tag = $_; 
+                        !(grep { $tag eq $_ } @other_tags)
+                    } @{$resolved->{tags}}
+                ];
+                
+                # Ensure preferred tag is included
+                push @{$resolved->{tags}}, $preferred 
+                    unless grep { $_ eq $preferred } @{$resolved->{tags}};
+                
+                print "Resolved tag conflict: Preferred '$preferred' over " . 
+                      join(', ', @other_tags) . "\n" if $CONFIG->{verbose};
+            }
+            elsif ($rule->{resolution} eq 'merge') {
+                # Keep all tags (default behavior)
+                print "Resolved tag conflict: Keeping all tags\n" if $CONFIG->{verbose};
+            }
+            elsif ($rule->{resolution} eq 'newer') {
+                # Prefer tags from newer metadata (already using new metadata)
+                print "Resolved tag conflict: Using newer tags\n" if $CONFIG->{verbose};
+            }
+            elsif ($rule->{resolution} eq 'older') {
+                # Prefer tags from older metadata
+                $resolved->{tags} = [@{$old_metadata->{tags}}];
+                print "Resolved tag conflict: Using older tags\n" if $CONFIG->{verbose};
+            }
+            
+            # Remove duplicates and sort
+            $resolved->{tags} = [sort keys %{{ map { $_ => 1 } @{$resolved->{tags}} }}];
+        }
+        elsif ($conflict->{type} eq 'categories') {
+            # Apply category conflict resolution
+            if ($conflict->{resolution} eq 'merge') {
+                # Merge categories from both old and new
+                my @merged = (@{$old_metadata->{categories}}, @{$new_metadata->{categories}});
+                $resolved->{categories} = [sort keys %{{ map { $_ => 1 } @merged }}];
+                
+                print "Resolved category conflict: Merged categories\n" if $CONFIG->{verbose};
+            }
+            else {
+                # Default: keep new categories
+                print "Resolved category conflict: Using newer categories\n" if $CONFIG->{verbose};
+            }
+        }
+        elsif ($conflict->{type} eq 'attribute') {
+            # Apply attribute conflict resolution
+            my $key = $conflict->{key};
+            
+            if ($conflict->{resolution} eq 'newer') {
+                # Already using newer value
+                print "Resolved attribute conflict for '$key': Using newer value\n" if $CONFIG->{verbose};
+            }
+            elsif ($conflict->{resolution} eq 'older') {
+                # Use older value
+                $resolved->{attributes}{$key} = $old_metadata->{attributes}{$key};
+                print "Resolved attribute conflict for '$key': Using older value\n" if $CONFIG->{verbose};
+            }
+            elsif ($conflict->{resolution} eq 'combine') {
+                # Combine values (for list-like attributes)
+                my $combined = $old_metadata->{attributes}{$key} . "; " . $new_metadata->{attributes}{$key};
+                $resolved->{attributes}{$key} = $combined;
+                
+                print "Resolved attribute conflict for '$key': Combined values\n" if $CONFIG->{verbose};
+            }
+        }
+    }
+    
+    return $resolved;
+}
+
+# Remove file metadata from the registry
+sub remove_file_metadata($file) {
+    my $rel_path = get_relative_path($file);
+    
+    # Remove file from registry
+    if (exists $REGISTRY->{files}{$rel_path}) {
+        delete $REGISTRY->{files}{$rel_path};
+        return 1;
+    }
+    
+    return 0;
+}
+
+# Get relative path from notes directory
+sub get_relative_path($file) {
+    my $abs_path = abs_path($file);
+    my $notes_dir = abs_path($CONFIG->{notes_dir});
+    
+    # Make path relative to notes directory
+    my $rel_path = $abs_path;
+    $rel_path =~ s/^\Q$notes_dir\E\/?//;
+    
+    return $rel_path;
+}
+
+# Load custom configuration from file
+sub load_config($file) {
+    eval {
+        open my $fh, '<', $file or die "Cannot open config file: $!";
+        local $/;
+        my $json = <$fh>;
+        close $fh;
+        
+        my $config = JSON::decode_json($json);
+        
+        # Update the global configuration
+        foreach my $key (keys %$config) {
+            $CONFIG->{$key} = $config->{$key};
+        }
+        
+        print "Loaded configuration from $file\n" if $CONFIG->{verbose};
+    };
+    
+    if ($@) {
+        warn "Error loading config: $@";
+    }
+}
+
+# Process a batch file
+sub process_batch_file($file) {
+    print "Processing batch file: $file\n" if $CONFIG->{verbose};
+    
+    eval {
+        open my $fh, '<', $file or die "Cannot open batch file: $!";
+        
+        while (my $line = <$fh>) {
+            chomp $line;
+            
+            # Skip empty lines and comments
+            next if $line =~ /^\s*$/ || $line =~ /^\s*#/;
+            
+            # Parse the line as a command with arguments
+            my @args = parse_line('\s+', 0, $line);
+            
+            # First argument is the sub-mode
+            my $sub_mode = shift @args;
+            
+            # Process based on sub-mode
+            if ($sub_mode eq MODE_SCAN) {
+                scan_metadata(@args);
+            } elsif ($sub_mode eq MODE_NORMALIZE) {
+                normalize_metadata(@args);
+            } elsif ($sub_mode eq MODE_SYNC) {
+                sync_metadata(@args);
+            } elsif ($sub_mode eq MODE_VALIDATE) {
+                validate_metadata(@args);
+            } elsif ($sub_mode eq MODE_LINT) {
+                lint_metadata(@args);
+            } elsif ($sub_mode eq MODE_VISUALIZE) {
+                visualize_metadata(@args);
+            } elsif ($sub_mode eq MODE_CLEANUP) {
+                cleanup_metadata(@args);
+            } elsif ($sub_mode eq MODE_MIGRATE) {
+                migrate_metadata(@args);
+            } elsif ($sub_mode eq MODE_SEARCH) {
+                search_metadata(@args);
+            } else {
+                warn "Unknown sub-mode in batch file: $sub_mode";
+            }
+        }
+        
+        close $fh;
+    };
+    
+    if ($@) {
+        warn "Error processing batch file: $@";
+    }
+}
+
+# --------------------------------------------------
+# Main Operation Functions
+# --------------------------------------------------
+
+# Scan metadata from files
+sub scan_metadata {
+    print "Scanning metadata from files...\n" if $CONFIG->{verbose};
+    # TODO: Implement full scanning logic
+    
+    # Find files to scan
+    my @files = find_files();
+    
+    # Update stats
+    $REGISTRY->{stats}{total_files} = scalar @files;
+    
+    # Scan each file
+    foreach my $file (@files) {
+        print "Scanning $file...\n" if $CONFIG->{verbose};
+        scan_file_metadata($file);
+    }
+    
+    # Save the updated registry
+    save_registry($CONFIG->{registry_file});
+    
+    print "Scan complete. Processed " . scalar(@files) . " files.\n" if $CONFIG->{verbose};
+}
+
+# Normalize metadata across files
+sub normalize_metadata_across_files {
+    print "Normalizing metadata...\n" if $CONFIG->{verbose};
+    
+    # Find files to normalize
+    my @files = find_files();
+    
+    # Normalize each file
+    foreach my $file (@files) {
+        print "Normalizing $file...\n" if $CONFIG->{verbose};
+        normalize_file_metadata($file);
+    }
+    
+    print "Normalization complete. Processed " . scalar(@files) . " files.\n" if $CONFIG->{verbose};
+}
+
+# Synchronize metadata between different systems
+sub sync_metadata {
+    print "Synchronizing metadata across files...\n" if $CONFIG->{verbose};
+    
+    # Find files to synchronize
+    my @files = find_files();
+    my $total_files = scalar @files;
+    
+    print "Found $total_files files to synchronize\n" if $CONFIG->{verbose};
+    
+    # First, scan all files to build the registry if it's empty
+    if ($REGISTRY->{stats}{total_tags} == 0 && $REGISTRY->{stats}{total_categories} == 0) {
+        print "Registry is empty. Scanning files first...\n" if $CONFIG->{verbose};
+        scan_metadata();
+    }
+    
+    # Track synchronization stats
+    my $sync_stats = {
+        processed => 0,
+        updated => 0,
+        skipped => 0,
+        errors => 0,
+    };
+    
+    # Process each file for synchronization
+    foreach my $file (@files) {
+        $sync_stats->{processed}++;
+        
+        eval {
+            # Synchronize metadata for this file
+            my $result = sync_file_metadata($file);
+            
+            if ($result == 1) {
+                $sync_stats->{updated}++;
+            } elsif ($result == 0) {
+                $sync_stats->{skipped}++;
+            } else {
+                $sync_stats->{errors}++;
+            }
+        };
+        
+        if ($@) {
+            warn "Error synchronizing $file: $@";
+            $sync_stats->{errors}++;
+        }
+        
+        # Show progress
+        if ($CONFIG->{verbose} && $sync_stats->{processed} % 10 == 0) {
+            print "Progress: $sync_stats->{processed}/$total_files files processed\n";
+        }
+    }
+    
+    # Save the updated registry
+    save_registry($CONFIG->{registry_file}) unless $CONFIG->{dry_run};
+    
+    # Output summary
+    print "Synchronization complete:\n";
+    print "- Total files processed: $sync_stats->{processed}\n";
+    print "- Files updated: $sync_stats->{updated}\n";
+    print "- Files skipped: $sync_stats->{skipped}\n";
+    print "- Errors encountered: $sync_stats->{errors}\n";
+}
+
+# Synchronize metadata for a single file
+sub sync_file_metadata($file) {
+    if ($CONFIG->{verbose}) {
+        print "Synchronizing metadata for $file...\n";
+    }
+    
+    # Determine file type
+    my $file_type = determine_file_type($file);
+    
+    # Skip unsupported file types
+    return -1 unless $file_type;
+    
+    # Read the file content
+    my $content = read_file_content($file);
+    return -1 unless defined $content;
+    
+    # Parse current metadata
+    my $current_metadata;
+    
+    if ($file_type eq FILE_TYPE_NEORG) {
+        $current_metadata = parse_neorg_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_MARKDOWN) {
+        $current_metadata = parse_markdown_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_TEXT) {
+        $current_metadata = parse_text_metadata($content, $file);
+    }
+    
+    # Skip if no metadata found
+    return 0 unless $current_metadata;
+    
+    # Get the file's canonical path relative to the notes directory
+    my $rel_path = get_relative_path($file);
+    
+    # Look up global metadata for this file in the registry
+    my $registry_metadata = get_file_metadata($file);
+    
+    # If no metadata found in registry, update registry with current metadata
+    if (!$registry_metadata) {
+        update_file_metadata($file, $current_metadata);
+        return 0; # No sync needed
+    }
+    
+    # Check if synchronization is needed
+    my $need_sync = 0;
+    my $sync_metadata = {
+        tags => [@{$current_metadata->{tags}}],
+        categories => [@{$current_metadata->{categories}}],
+        attributes => {%{$current_metadata->{attributes}}},
+        source_format => $current_metadata->{source_format},
+        source_file => $current_metadata->{source_file},
+        last_updated => time(),
+    };
+    
+    # Identify missing tags from registry
+    my %registry_tags = map { $_ => 1 } @{$registry_metadata->{tags}};
+    foreach my $tag (@{$registry_metadata->{tags}}) {
+        if (!grep { $_ eq $tag } @{$current_metadata->{tags}}) {
+            # Tag is in registry but not in file
+            push @{$sync_metadata->{tags}}, $tag;
+            $need_sync = 1;
+            
+            if ($CONFIG->{verbose}) {
+                print "  Adding missing tag: $tag\n";
+            }
+        }
+    }
+    
+    # Identify missing categories from registry
+    my %registry_categories = map { $_ => 1 } @{$registry_metadata->{categories}};
+    foreach my $category (@{$registry_metadata->{categories}}) {
+        if (!grep { $_ eq $category } @{$current_metadata->{categories}}) {
+            # Category is in registry but not in file
+            push @{$sync_metadata->{categories}}, $category;
+            $need_sync = 1;
+            
+            if ($CONFIG->{verbose}) {
+                print "  Adding missing category: $category\n";
+            }
+        }
+    }
+    
+    # Identify missing attributes from registry
+    foreach my $key (keys %{$registry_metadata->{attributes}}) {
+        # Skip internal/system attributes
+        next if $key =~ /^(?:file_path|file_type|source_format|source_file|last_updated)$/;
+        
+        if (!exists $current_metadata->{attributes}{$key}) {
+            # Attribute is in registry but not in file
+            $sync_metadata->{attributes}{$key} = $registry_metadata->{attributes}{$key};
+            $need_sync = 1;
+            
+            if ($CONFIG->{verbose}) {
+                print "  Adding missing attribute: $key = " . $registry_metadata->{attributes}{$key} . "\n";
+            }
+        }
+    }
+    
+    # Remove duplicates and sort
+    $sync_metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$sync_metadata->{tags}} }}];
+    $sync_metadata->{categories} = [sort keys %{{ map { $_ => 1 } @{$sync_metadata->{categories}} }}];
+    
+    # Skip if no changes needed
+    return 0 unless $need_sync;
+    
+    # Apply changes to the file
+    if (!$CONFIG->{dry_run}) {
+        update_file_with_metadata($file, $content, $sync_metadata);
+        
+        # Update registry with synchronized metadata
+        update_file_metadata($file, $sync_metadata);
+        
+        if ($CONFIG->{verbose}) {
+            print "  Updated metadata in $file\n";
+        }
+    } else {
+        if ($CONFIG->{verbose}) {
+            print "  Dry run: Would update metadata in $file\n";
+            print "  Current metadata: " . metadata_to_string($current_metadata) . "\n";
+            print "  Synchronized metadata: " . metadata_to_string($sync_metadata) . "\n";
+        }
+    }
+    
+    return 1; # Sync was performed
+}
+
+# Validate metadata across files
+sub validate_metadata {
+    print "Validating metadata...\n" if $CONFIG->{verbose};
+    # TODO: Implement validation logic
+    
+    # Find files to validate
+    my @files = find_files();
+    
+    # Track validation errors
+    my @errors;
+    
+    # Validate each file
+    foreach my $file (@files) {
+        print "Validating $file...\n" if $CONFIG->{verbose};
+        my $file_errors = validate_file_metadata($file);
+        push @errors, @$file_errors if $file_errors && @$file_errors;
+    }
+    
+    # Output validation results
+    my $error_count = scalar @errors;
+    if ($error_count > 0) {
+        print "Validation found $error_count errors:\n";
+        foreach my $error (@errors) {
+            print "- $error\n";
+        }
+    } else {
+        print "Validation complete. No errors found.\n" if $CONFIG->{verbose};
+    }
+}
+
+# Lint metadata for style and consistency
+sub lint_metadata {
+    print "Linting metadata...\n" if $CONFIG->{verbose};
+    # TODO: Implement linting logic
+    
+    # Find files to lint
+    my @files = find_files();
+    
+    # Track linting warnings
+    my @warnings;
+    
+    # Lint each file
+    foreach my $file (@files) {
+        print "Linting $file...\n" if $CONFIG->{verbose};
+        my $file_warnings = lint_file_metadata($file);
+        push @warnings, @$file_warnings if $file_warnings && @$file_warnings;
+    }
+    
+    # Output linting results
+    my $warning_count = scalar @warnings;
+    if ($warning_count > 0) {
+        print "Linting found $warning_count warnings:\n";
+        foreach my $warning (@warnings) {
+            print "- $warning\n";
+        }
+    } else {
+        print "Linting complete. No warnings found.\n" if $CONFIG->{verbose};
+    }
+}
+
+# Visualize metadata structure
+sub visualize_metadata {
+    print "Visualizing metadata structure...\n" if $CONFIG->{verbose};
+    # TODO: Implement visualization logic
+    
+    # Output basic stats
+    print "Metadata Registry Statistics:\n";
+    print "- Total files: $REGISTRY->{stats}{total_files}\n";
+    print "- Total tags: $REGISTRY->{stats}{total_tags}\n";
+    print "- Total categories: $REGISTRY->{stats}{total_categories}\n";
+    print "- Total attributes: $REGISTRY->{stats}{total_attributes}\n";
+    print "- Last updated: " . scalar(localtime($REGISTRY->{last_updated})) . "\n";
+    
+    # Output to file if specified
+    if ($OUTPUT_FILE) {
+        print "Saving visualization to $OUTPUT_FILE...\n" if $CONFIG->{verbose};
+        # TODO: Implement visualization file export
+    }
+}
+
+# Clean up unused metadata
+sub cleanup_metadata {
+    print "Cleaning up unused metadata...\n" if $CONFIG->{verbose};
+    # TODO: Implement cleanup logic
+    
+    # Find files to analyze
+    my @files = find_files();
+    
+    # Analyze metadata usage
+    my %used_metadata;
+    foreach my $file (@files) {
+        print "Analyzing $file...\n" if $CONFIG->{verbose};
+        analyze_file_metadata_usage($file, \%used_metadata);
+    }
+    
+    # Identify unused metadata
+    my @unused_tags;
+    my @unused_categories;
+    my @unused_attributes;
+    
+    # TODO: Implement identification of unused metadata
+    
+    # Remove unused metadata if not in dry-run mode
+    if (!$CONFIG->{dry_run}) {
+        # TODO: Implement removal of unused metadata
+        save_registry($CONFIG->{registry_file});
+    } else {
+        print "Dry run: Would clean up " . 
+              (scalar(@unused_tags) + scalar(@unused_categories) + scalar(@unused_attributes)) . 
+              " unused metadata items.\n";
+    }
+    
+    print "Cleanup complete.\n" if $CONFIG->{verbose};
+}
+
+# Migrate metadata between systems
+sub migrate_metadata {
+    print "Migrating metadata...\n" if $CONFIG->{verbose};
+    # TODO: Implement migration logic
+    
+    # Validate source and target
+    if (!$INPUT_FILE || !$OUTPUT_FILE) {
+        die "Migration requires both input (-i) and output (-o) files";
+    }
+    
+    # Read source metadata
+    print "Reading source metadata from $INPUT_FILE...\n" if $CONFIG->{verbose};
+    
+    # Transform metadata
+    print "Transforming metadata...\n" if $CONFIG->{verbose};
+    
+    # Write target metadata
+    print "Writing target metadata to $OUTPUT_FILE...\n" if $CONFIG->{verbose};
+    
+    print "Migration complete.\n" if $CONFIG->{verbose};
+}
+
+# Search by metadata
+sub search_metadata($query) {
+    print "Searching by metadata: $query\n" if $CONFIG->{verbose};
+    # TODO: Implement search logic
+    
+    # Find all files
+    my @files = find_files();
+    
+    # Search for files matching the query
+    my @matches;
+    foreach my $file (@files) {
+        if (file_matches_query($file, $query)) {
+            push @matches, $file;
+        }
+    }
+    
+    # Output search results
+    my $match_count = scalar @matches;
+    print "Found $match_count matches for query: $query\n";
+    foreach my $match (@matches) {
+        print "$match\n";
+    }
+}
+
+# --------------------------------------------------
+# File Processing Functions
+# --------------------------------------------------
+
+# Find files to process based on configuration
+sub find_files {
+    my @files;
+    
+    # Base path
+    my $base_path = $CONFIG->{notes_dir};
+    
+    # Process each include directory
+    foreach my $include_dir (@include_dirs) {
+        my $dir_path = File::Spec->catdir($base_path, $include_dir);
+        next unless -d $dir_path;
+        
+        # Skip if directory is in exclude list
+        next if grep { $include_dir eq $_ } @exclude_dirs;
+        
+        # Add files from this directory
+        push @files, find_files_in_dir($dir_path);
+    }
+    
+    # Apply include/exclude patterns if specified
+    if ($include_pattern || $exclude_pattern) {
+        @files = grep {
+            my $file = $_;
+            
+            # Include pattern check
+            my $include = !$include_pattern || $file =~ $include_pattern;
+            
+            # Exclude pattern check
+            my $exclude = $exclude_pattern && $file =~ $exclude_pattern;
+            
+            $include && !$exclude;
+        } @files;
+    }
+    
+    # Apply file type filter
+    my $file_types_regex = join('|', map { quotemeta($_) } @{$CONFIG->{file_types}});
+    @files = grep { /\.($file_types_regex)$/i } @files;
+    
+    return @files;
+}
+
+# Find files in a directory recursively
+sub find_files_in_dir($dir) {
+    my @files;
+    
+    if ($CONFIG->{debug}) {
+        print "Scanning directory: $dir\n";
+    }
+    
+    eval {
+        opendir(my $dh, $dir) or die "Cannot open directory $dir: $!";
+        while (my $entry = readdir($dh)) {
+            next if $entry eq '.' || $entry eq '..';
+            
+            my $path = File::Spec->catfile($dir, $entry);
+            
+            if (-d $path) {
+                # Skip if directory is in exclude list
+                my $rel_path = abs_path($path);
+                $rel_path =~ s/^\Q$CONFIG->{notes_dir}\E\/?//;
+                
+                if (grep { $rel_path eq $_ } @exclude_dirs) {
+                    print "Skipping excluded directory: $path\n" if $CONFIG->{debug};
+                    next;
+                }
+                
+                # Recursively process subdirectory
+                push @files, find_files_in_dir($path);
+            } elsif (-f $path) {
+                # Check if the file has one of the supported file types
+                my $ext = lc((File::Basename::fileparse($path, qr/\.[^.]*$/))[2]);
+                if (grep { $ext eq $_ } @{$CONFIG->{file_types}}) {
+                    print "Found file: $path ($ext)\n" if $CONFIG->{debug};
+                    push @files, $path;
+                } else {
+                    print "Skipping unsupported file type: $path ($ext)\n" if $CONFIG->{debug};
+                }
+            }
+        }
+        closedir($dh);
+    };
+    
+    if ($@) {
+        warn "Error finding files in $dir: $@";
+    }
+    
+    return @files;
+}
+
+# Scan metadata from a single file
+sub scan_file_metadata($file) {
+    # Determine file type
+    my $file_type = determine_file_type($file);
+    
+    # Skip unsupported file types
+    return unless $file_type;
+    
+    # Read file content
+    my $content = read_file_content($file);
+    return unless defined $content;
+    
+    # Parse metadata based on file type
+    my $metadata;
+    if ($file_type eq FILE_TYPE_NEORG) {
+        $metadata = parse_neorg_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_MARKDOWN) {
+        $metadata = parse_markdown_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_TEXT) {
+        $metadata = parse_text_metadata($content, $file);
+    }
+    
+    # Add to registry
+    if ($metadata && keys %$metadata) {
+        add_metadata_to_registry($metadata, $file_type, $file);
+    }
+}
+
+# Determine file type based on extension
+sub determine_file_type($file) {
+    if ($file =~ /\.norg$/i) {
+        return FILE_TYPE_NEORG;
+    } elsif ($file =~ /\.md$/i) {
+        return FILE_TYPE_MARKDOWN;
+    } elsif ($file =~ /\.txt$/i) {
+        return FILE_TYPE_TEXT;
+    }
+    return undef;
+}
+
+# Read file content
+sub read_file_content($file) {
+    my $content;
+    
+    eval {
+        open my $fh, '<:encoding(UTF-8)', $file or die "Cannot open file $file: $!";
+        local $/;
+        $content = <$fh>;
+        close $fh;
+    };
+    
+    if ($@) {
+        warn "Error reading file $file: $@";
+        return undef;
+    }
+    
+    return $content;
+}
+
+# Parse metadata from Neorg file
+sub parse_neorg_metadata($content, $file) {
+    my $metadata = {
+        tags => [],
+        categories => [],
+        attributes => {},
+        source_format => FORMAT_NEORG,
+        source_file => $file,
+        last_updated => time(),
+    };
+    
+    # Extract title from the first heading if available
+    if ($content =~ /^\s*\*\s+(.+?)$/m) {
+        $metadata->{attributes}{title} = $1;
+    }
+    
+    # Extract Neorg inline tags (e.g., #tag)
+    # Exclude code blocks for tag extraction
+    my $content_no_code = $content;
+    $content_no_code =~ s/\@code.*?\@end//gs;
+    
+    # Extract tags but avoid matches within URLs or code
+    my @tags;
+    while ($content_no_code =~ /#(\w+)(?!\w|:\/\/|\.)/g) {
+        push @tags, $1;
+    }
+    
+    # Handle special tag syntax with curly braces for tag grouping
+    while ($content_no_code =~ /#\{([^}]+)\}/g) {
+        my $tag_group = $1;
+        push @tags, split(/,\s*/, $tag_group);
+    }
+    
+    # Add unique tags
+    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @tags }}];
+    
+    # Extract Neorg document metadata
+    # Method 1: Document properties module (@document.meta)
+    if ($content =~ /\@document\.meta\s*(.+?)\@end/s) {
+        my $meta_block = $1;
+        
+        # Parse key-value pairs
+        while ($meta_block =~ /(\w+[\w\.-]*)\s*:\s*(.+?)(?=\n\w+[\w\.-]*\s*:|$)/sg) {
+            my ($key, $value) = ($1, $2);
+            $key =~ s/^\s+|\s+$//g;
+            $value =~ s/^\s+|\s+$//g;
+            
+            if ($key =~ /^(?:categor(?:y|ies))$/i) {
+                $metadata->{categories} = [split(/\s*[,;]\s*/, $value)];
+            } elsif ($key =~ /^(?:tags?|keywords?)$/i) {
+                push @{$metadata->{tags}}, split(/\s*[,;]\s*/, $value);
+                # Remove duplicates
+                $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+            } else {
+                $metadata->{attributes}{$key} = $value;
+            }
+        }
+    }
+    
+    # Method 2: Attached modifiers
+    # Example: * Title {date: 2023-05-20} {tags: programming, perl}
+    if ($content =~ /\{([^}]+)\}/g) {
+        while ($content =~ /\{([^}]+)\}/g) {
+            my $modifier = $1;
+            
+            # Parse key-value modifiers
+            if ($modifier =~ /(\w+):\s*(.+)/) {
+                my ($key, $value) = ($1, $2);
+                $key =~ s/^\s+|\s+$//g;
+                $value =~ s/^\s+|\s+$//g;
+                
+                if ($key =~ /^(?:categor(?:y|ies))$/i) {
+                    $metadata->{categories} = [split(/\s*[,;]\s*/, $value)];
+                } elsif ($key =~ /^(?:tags?|keywords?)$/i) {
+                    push @{$metadata->{tags}}, split(/\s*[,;]\s*/, $value);
+                    # Remove duplicates
+                    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+                } else {
+                    $metadata->{attributes}{$key} = $value;
+                }
+            }
+        }
+    }
+    
+    # Extract creation/modification dates if available
+    if ($content =~ /created:?\s*([\d-]+)/i) {
+        $metadata->{attributes}{created} = $1;
+    }
+    if ($content =~ /modified:?\s*([\d-]+)/i) {
+        $metadata->{attributes}{modified} = $1;
+    }
+    
+    # Add file path info to attributes
+    $metadata->{attributes}{file_path} = $file;
+    $metadata->{attributes}{file_type} = FILE_TYPE_NEORG;
+    
+    return $metadata;
+}
+
+# Parse metadata from Markdown file
+sub parse_markdown_metadata($content, $file) {
+    my $metadata = {
+        tags => [],
+        categories => [],
+        attributes => {},
+        source_format => FORMAT_MARKDOWN,
+        source_file => $file,
+        last_updated => time(),
+    };
+    
+    # Extract title from the first H1 heading if available
+    if ($content =~ /^\s*#\s+(.+?)$/m) {
+        $metadata->{attributes}{title} = $1;
+    }
+    
+    # Extract Markdown inline tags (e.g., #tag)
+    # Exclude code blocks for tag extraction
+    my $content_no_code = $content;
+    $content_no_code =~ s/```.*?```//gs;    # Remove fenced code blocks
+    $content_no_code =~ s/`[^`]+`//g;       # Remove inline code
+    
+    # Extract tags but avoid matches within URLs or code
+    my @tags;
+    while ($content_no_code =~ /#(\w+)(?!\w|:\/\/|\.)/g) {
+        push @tags, $1;
+    }
+    
+    # Add unique tags
+    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @tags }}];
+    
+    # Extract YAML frontmatter
+    if ($content =~ /^---\s*\n(.*?)\n---\s*\n/s) {
+        my $frontmatter = $1;
+        parse_yaml_metadata($frontmatter, $metadata);
+    }
+    
+    # Extract creation/modification dates if available in text
+    if ($content =~ /created:?\s*([\d-]+)/i || $content =~ /date:?\s*([\d-]+)/i) {
+        $metadata->{attributes}{created} ||= $1;
+    }
+    if ($content =~ /modified:?\s*([\d-]+)/i || $content =~ /updated:?\s*([\d-]+)/i) {
+        $metadata->{attributes}{modified} ||= $1;
+    }
+    
+    # Add file path info to attributes
+    $metadata->{attributes}{file_path} = $file;
+    $metadata->{attributes}{file_type} = FILE_TYPE_MARKDOWN;
+    
+    return $metadata;
+}
+
+# Parse metadata from plain text file
+sub parse_text_metadata($content, $file) {
+    my $metadata = {
+        tags => [],
+        categories => [],
+        attributes => {},
+        source_format => 'text',
+        source_file => $file,
+        last_updated => time(),
+    };
+    
+    # Try to extract a title from the first line
+    if ($content =~ /^(.+?)$/m) {
+        $metadata->{attributes}{title} = $1;
+    }
+    
+    # Extract hashtags (e.g., #tag)
+    my @tags = $content =~ /#(\w+)(?!\w|:\/\/|\.)/g;
+    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @tags }}];
+    
+    # Look for metadata headers in different formats
+    
+    # Format 1: // KEY: VALUE
+    while ($content =~ m{^//\s*(\w+)\s*:\s*(.+?)$}mg) {
+        my ($key, $value) = ($1, $2);
+        $key =~ s/^\s+|\s+$//g;
+        $value =~ s/^\s+|\s+$//g;
+        
+        if ($key =~ /^(?:tags?|keywords?)$/i) {
+            push @{$metadata->{tags}}, split(/\s*[,;]\s*/, $value);
+            # Remove duplicates
+            $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+        } elsif ($key =~ /^(?:categor(?:y|ies))$/i) {
+            $metadata->{categories} = [split(/\s*[,;]\s*/, $value)];
+        } else {
+            $metadata->{attributes}{$key} = $value;
+        }
+    }
+    
+    # Format 2: % KEY: VALUE (LaTeX-style)
+    while ($content =~ m{^%\s*(\w+)\s*:\s*(.+?)$}mg) {
+        my ($key, $value) = ($1, $2);
+        $key =~ s/^\s+|\s+$//g;
+        $value =~ s/^\s+|\s+$//g;
+        
+        if ($key =~ /^(?:tags?|keywords?)$/i) {
+            push @{$metadata->{tags}}, split(/\s*[,;]\s*/, $value);
+            # Remove duplicates
+            $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+        } elsif ($key =~ /^(?:categor(?:y|ies))$/i) {
+            $metadata->{categories} = [split(/\s*[,;]\s*/, $value)];
+        } else {
+            $metadata->{attributes}{$key} = $value;
+        }
+    }
+    
+    # Look for a simple metadata block at the beginning
+    if ($content =~ /^---\s*\n(.*?)\n---\s*\n/s) {
+        my $frontmatter = $1;
+        parse_yaml_metadata($frontmatter, $metadata);
+    }
+    
+    # Extract creation/modification dates if available
+    if ($content =~ /created:?\s*([\d-]+)/i || $content =~ /date:?\s*([\d-]+)/i) {
+        $metadata->{attributes}{created} ||= $1;
+    }
+    if ($content =~ /modified:?\s*([\d-]+)/i || $content =~ /updated:?\s*([\d-]+)/i) {
+        $metadata->{attributes}{modified} ||= $1;
+    }
+    
+    # Add file path info to attributes
+    $metadata->{attributes}{file_path} = $file;
+    $metadata->{attributes}{file_type} = FILE_TYPE_TEXT;
+    
+    return $metadata;
+}
+
+# Parse YAML metadata (helper function for frontmatter)
+sub parse_yaml_metadata($yaml_content, $metadata) {
+    # Basic YAML parsing for frontmatter
+    # This could be replaced with YAML::XS or similar for more robust parsing
+    
+    # Check if we have array values in square brackets
+    my $in_array = 0;
+    my $current_key = '';
+    my @current_array = ();
+    
+    foreach my $line (split /\n/, $yaml_content) {
+        # Skip comments and empty lines
+        next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
+        
+        # Handle array continuation
+        if ($in_array) {
+            if ($line =~ /^\s*-\s*(.+?)\s*$/) {
+                # Array item
+                push @current_array, $1;
+            } else {
+                # End of array, save it
+                if ($current_key =~ /^(?:tags?|keywords?)$/i) {
+                    push @{$metadata->{tags}}, @current_array;
+                    # Remove duplicates
+                    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+                } elsif ($current_key =~ /^(?:categor(?:y|ies))$/i) {
+                    $metadata->{categories} = [@current_array];
+                } else {
+                    $metadata->{attributes}{$current_key} = join(', ', @current_array);
+                }
+                
+                $in_array = 0;
+                @current_array = ();
+                $current_key = '';
+                
+                # Process this line normally
+                redo;
+            }
+        } 
+        # Handle key-value pairs
+        elsif ($line =~ /^\s*(\w+[\w\.-]*)\s*:\s*(.+?)\s*$/) {
+            my ($key, $value) = ($1, $2);
+            
+            if ($key =~ /^(?:tags?|keywords?)$/i) {
+                # Handle array in brackets [item1, item2]
+                if ($value =~ /^\[(.+)\]$/) {
+                    my $array_content = $1;
+                    my @values = split(/\s*,\s*/, $array_content);
+                    push @{$metadata->{tags}}, @values;
+                    # Remove duplicates
+                    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+                } 
+                # Handle space-separated values
+                elsif ($value =~ /\s/) {
+                    my @values = split(/\s+/, $value);
+                    push @{$metadata->{tags}}, @values;
+                    # Remove duplicates
+                    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+                }
+                # Handle single value
+                else {
+                    push @{$metadata->{tags}}, $value;
+                }
+            } elsif ($key =~ /^(?:categor(?:y|ies))$/i) {
+                # Handle array in brackets [item1, item2]
+                if ($value =~ /^\[(.+)\]$/) {
+                    my $array_content = $1;
+                    my @values = split(/\s*,\s*/, $array_content);
+                    $metadata->{categories} = \@values;
+                }
+                # Handle space-separated values
+                elsif ($value =~ /\s/) {
+                    my @values = split(/\s+/, $value);
+                    $metadata->{categories} = \@values;
+                }
+                # Handle single value
+                else {
+                    $metadata->{categories} = [$value];
+                }
+            } else {
+                $metadata->{attributes}{$key} = $value;
+            }
+        }
+        # Handle array start
+        elsif ($line =~ /^\s*(\w+[\w\.-]*)\s*:\s*$/) {
+            $current_key = $1;
+            $in_array = 1;
+            @current_array = ();
+        }
+    }
+    
+    # Handle any remaining array
+    if ($in_array && @current_array) {
+        if ($current_key =~ /^(?:tags?|keywords?)$/i) {
+            push @{$metadata->{tags}}, @current_array;
+            # Remove duplicates
+            $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @{$metadata->{tags}} }}];
+        } elsif ($current_key =~ /^(?:categor(?:y|ies))$/i) {
+            $metadata->{categories} = [@current_array];
+        } else {
+            $metadata->{attributes}{$current_key} = join(', ', @current_array);
+        }
+    }
+}
+
+# Try to detect metadata format from content
+sub detect_metadata_format($content) {
+    # Check for Neorg-specific patterns
+    if ($content =~ /\@document\.meta/ || $content =~ /^\s*\*\s+/) {
+        return FORMAT_NEORG;
+    }
+    
+    # Check for Markdown-specific patterns
+    if ($content =~ /^---\s*\n.*?\n---\s*\n/s || $content =~ /^\s*#\s+/) {
+        return FORMAT_MARKDOWN;
+    }
+    
+    # Check for YAML blocks
+    if ($content =~ /^---\s*\n.*?\n---\s*\n/s) {
+        return FORMAT_YAML;
+    }
+    
+    # Check for JSON blocks
+    if ($content =~ /^\s*\{.*\}\s*$/s) {
+        return FORMAT_JSON;
+    }
+    
+    # Default to plain text
+    return 'text';
+}
+
+# Add extracted metadata to the registry
+sub add_metadata_to_registry($metadata, $file_type, $file) {
+    # Add tags to registry
+    foreach my $tag (@{$metadata->{tags}}) {
+        $REGISTRY->{taxonomy}{tags}{$tag} ||= {
+            count => 0,
+            first_seen => time(),
+            last_seen => time(),
+            files => [],
+        };
+        
+        $REGISTRY->{taxonomy}{tags}{$tag}{count}++;
+        $REGISTRY->{taxonomy}{tags}{$tag}{last_seen} = time();
+        
+        # Track files with this tag
+        push @{$REGISTRY->{taxonomy}{tags}{$tag}{files}}, $file
+            unless grep { $_ eq $file } @{$REGISTRY->{taxonomy}{tags}{$tag}{files}};
+    }
+    
+    # Add categories to registry
+    foreach my $category (@{$metadata->{categories}}) {
+        $REGISTRY->{taxonomy}{categories}{$category} ||= {
+            count => 0,
+            first_seen => time(),
+            last_seen => time(),
+            files => [],
+        };
+        
+        $REGISTRY->{taxonomy}{categories}{$category}{count}++;
+        $REGISTRY->{taxonomy}{categories}{$category}{last_seen} = time();
+        
+        # Track files with this category
+        push @{$REGISTRY->{taxonomy}{categories}{$category}{files}}, $file
+            unless grep { $_ eq $file } @{$REGISTRY->{taxonomy}{categories}{$category}{files}};
+    }
+    
+    # Add attributes to registry
+    foreach my $key (keys %{$metadata->{attributes}}) {
+        $REGISTRY->{taxonomy}{attributes}{$key} ||= {
+            count => 0,
+            first_seen => time(),
+            last_seen => time(),
+            values => {},
+            files => [],
+        };
+        
+        my $value = $metadata->{attributes}{$key};
+        
+        $REGISTRY->{taxonomy}{attributes}{$key}{count}++;
+        $REGISTRY->{taxonomy}{attributes}{$key}{last_seen} = time();
+        
+        # Track values for this attribute
+        $REGISTRY->{taxonomy}{attributes}{$key}{values}{$value} ||= 0;
+        $REGISTRY->{taxonomy}{attributes}{$key}{values}{$value}++;
+        
+        # Track files with this attribute
+        push @{$REGISTRY->{taxonomy}{attributes}{$key}{files}}, $file
+            unless grep { $_ eq $file } @{$REGISTRY->{taxonomy}{attributes}{$key}{files}};
+    }
+    
+    # Update mapping for file type
+    my $format = file_type_to_format($file_type);
+    if ($format) {
+        # Map tags
+        foreach my $tag (@{$metadata->{tags}}) {
+            $REGISTRY->{mappings}{$format}{tags}{$tag} ||= [];
+            push @{$REGISTRY->{mappings}{$format}{tags}{$tag}}, $file
+                unless grep { $_ eq $file } @{$REGISTRY->{mappings}{$format}{tags}{$tag}};
+        }
+        
+        # Map categories
+        foreach my $category (@{$metadata->{categories}}) {
+            $REGISTRY->{mappings}{$format}{categories}{$category} ||= [];
+            push @{$REGISTRY->{mappings}{$format}{categories}{$category}}, $file
+                unless grep { $_ eq $file } @{$REGISTRY->{mappings}{$format}{categories}{$category}};
+        }
+        
+        # Map attributes
+        foreach my $key (keys %{$metadata->{attributes}}) {
+            $REGISTRY->{mappings}{$format}{attributes}{$key} ||= {};
+            my $value = $metadata->{attributes}{$key};
+            $REGISTRY->{mappings}{$format}{attributes}{$key}{$value} ||= [];
+            push @{$REGISTRY->{mappings}{$format}{attributes}{$key}{$value}}, $file
+                unless grep { $_ eq $file } @{$REGISTRY->{mappings}{$format}{attributes}{$key}{$value}};
+        }
+    }
+    
+    # Update stats
+    $REGISTRY->{stats}{total_tags} = scalar keys %{$REGISTRY->{taxonomy}{tags}};
+    $REGISTRY->{stats}{total_categories} = scalar keys %{$REGISTRY->{taxonomy}{categories}};
+    $REGISTRY->{stats}{total_attributes} = scalar keys %{$REGISTRY->{taxonomy}{attributes}};
+}
+
+# Convert file type to format name
+sub file_type_to_format($file_type) {
+    if ($file_type eq FILE_TYPE_NEORG) {
+        return FORMAT_NEORG;
+    } elsif ($file_type eq FILE_TYPE_MARKDOWN) {
+        return FORMAT_MARKDOWN;
+    } elsif ($file_type eq FILE_TYPE_TEXT) {
+        return FORMAT_TEXT;
+    }
+    return undef;
+}
+
+# Normalize metadata in a single file
+sub normalize_file_metadata($file) {
+    print "Normalizing metadata in $file...\n" if $CONFIG->{verbose};
+    
+    # Determine file type
+    my $file_type = determine_file_type($file);
+    
+    # Skip unsupported file types
+    return unless $file_type;
+    
+    # Get the current metadata
+    my $content = read_file_content($file);
+    return unless defined $content;
+    
+    # Parse current metadata
+    my $current_metadata;
+    if ($file_type eq FILE_TYPE_NEORG) {
+        $current_metadata = parse_neorg_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_MARKDOWN) {
+        $current_metadata = parse_markdown_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_TEXT) {
+        $current_metadata = parse_text_metadata($content, $file);
+    }
+    
+    # Skip if no metadata found
+    return unless $current_metadata;
+    
+    # Apply normalization rules
+    my $normalized_metadata = normalize_metadata($current_metadata);
+    
+    # Skip if no changes
+    return if metadata_equals($current_metadata, $normalized_metadata);
+    
+    # Apply changes to the file
+    if (!$CONFIG->{dry_run}) {
+        update_file_with_metadata($file, $content, $normalized_metadata);
+    } else {
+        print "Dry run: Would update metadata in $file\n";
+        if ($CONFIG->{verbose}) {
+            print "Current metadata: " . metadata_to_string($current_metadata) . "\n";
+            print "Normalized metadata: " . metadata_to_string($normalized_metadata) . "\n";
+        }
+    }
+    
+    return 1;
+}
+
+# Normalize metadata based on rules
+sub normalize_metadata($metadata) {
+    my $normalized = {
+        # Create a deep copy of the metadata
+        tags => [@{$metadata->{tags}}],
+        categories => [@{$metadata->{categories}}],
+        attributes => {%{$metadata->{attributes}}},
+        source_format => $metadata->{source_format},
+        source_file => $metadata->{source_file},
+        last_updated => time(),
+    };
+    
+    # Apply tag normalization rules
+    normalize_tags($normalized);
+    
+    # Apply category normalization rules
+    normalize_categories($normalized);
+    
+    # Apply attribute normalization rules
+    normalize_attributes($normalized);
+    
+    # Handle tag synonyms
+    apply_tag_synonyms($normalized);
+    
+    # Handle category synonyms
+    apply_category_synonyms($normalized);
+    
+    return $normalized;
+}
+
+# Normalize tags based on rules
+sub normalize_tags($metadata) {
+    my @normalized_tags;
+    
+    # Apply each normalization rule to each tag
+    foreach my $tag (@{$metadata->{tags}}) {
+        my $normalized_tag = $tag;
+        
+        # Apply text transformations from rules
+        foreach my $rule (@{$REGISTRY->{rules}{normalization}}) {
+            # Skip rules that don't apply to tags
+            next unless $rule->{applies_to} eq 'tags' || !exists $rule->{applies_to};
+            
+            # Apply pattern replacement if it matches
+            if ($normalized_tag =~ $rule->{pattern}) {
+                my $old_tag = $normalized_tag;
+                $normalized_tag =~ s/$rule->{pattern}/$rule->{replacement}/;
+                
+                print "Normalized tag '$old_tag' to '$normalized_tag' using rule: $rule->{description}\n" 
+                    if $CONFIG->{verbose};
+            }
+        }
+        
+        # Apply casing rules (camelCase, lowercase, etc.)
+        $normalized_tag = apply_casing_rules($normalized_tag, 'tag');
+        
+        # Apply character substitutions (e.g., spaces to underscores)
+        $normalized_tag = apply_character_substitutions($normalized_tag, 'tag');
+        
+        # Add to the normalized list
+        push @normalized_tags, $normalized_tag if $normalized_tag;
+    }
+    
+    # Remove duplicates and sort
+    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @normalized_tags }}];
+}
+
+# Normalize categories based on rules
+sub normalize_categories($metadata) {
+    my @normalized_categories;
+    
+    # Apply each normalization rule to each category
+    foreach my $category (@{$metadata->{categories}}) {
+        my $normalized_category = $category;
+        
+        # Apply text transformations from rules
+        foreach my $rule (@{$REGISTRY->{rules}{normalization}}) {
+            # Skip rules that don't apply to categories
+            next unless $rule->{applies_to} eq 'categories' || !exists $rule->{applies_to};
+            
+            # Apply pattern replacement if it matches
+            if ($normalized_category =~ $rule->{pattern}) {
+                my $old_category = $normalized_category;
+                $normalized_category =~ s/$rule->{pattern}/$rule->{replacement}/;
+                
+                print "Normalized category '$old_category' to '$normalized_category' using rule: $rule->{description}\n" 
+                    if $CONFIG->{verbose};
+            }
+        }
+        
+        # Apply casing rules (Title Case, lowercase, etc.)
+        $normalized_category = apply_casing_rules($normalized_category, 'category');
+        
+        # Apply character substitutions (e.g., spaces to underscores)
+        $normalized_category = apply_character_substitutions($normalized_category, 'category');
+        
+        # Add to the normalized list
+        push @normalized_categories, $normalized_category if $normalized_category;
+    }
+    
+    # Remove duplicates and sort
+    $metadata->{categories} = [sort keys %{{ map { $_ => 1 } @normalized_categories }}];
+}
+
+# Normalize attributes based on rules
+sub normalize_attributes($metadata) {
+    my %normalized_attributes;
+    
+    # Apply each normalization rule to each attribute
+    foreach my $key (keys %{$metadata->{attributes}}) {
+        my $normalized_key = $key;
+        my $value = $metadata->{attributes}{$key};
+        
+        # Apply key normalization rules
+        foreach my $rule (@{$REGISTRY->{rules}{normalization}}) {
+            # Skip rules that don't apply to attribute keys
+            next unless $rule->{applies_to} eq 'attribute_keys' || !exists $rule->{applies_to};
+            
+            # Apply pattern replacement if it matches
+            if ($normalized_key =~ $rule->{pattern}) {
+                my $old_key = $normalized_key;
+                $normalized_key =~ s/$rule->{pattern}/$rule->{replacement}/;
+                
+                print "Normalized attribute key '$old_key' to '$normalized_key' using rule: $rule->{description}\n" 
+                    if $CONFIG->{verbose};
+            }
+        }
+        
+        # Apply value normalization rules for specific keys
+        if ($normalized_key =~ /^(?:created|modified|date|updated)$/i) {
+            # Normalize date format to ISO 8601 (YYYY-MM-DD)
+            if ($value =~ /(\d{4})[-\/]?(\d{1,2})[-\/]?(\d{1,2})/) {
+                $value = sprintf('%04d-%02d-%02d', $1, $2, $3);
+            }
+        }
+        
+        # Store normalized attribute
+        $normalized_attributes{$normalized_key} = $value;
+    }
+    
+    # Update attributes
+    $metadata->{attributes} = \%normalized_attributes;
+}
+
+# Apply tag synonyms
+sub apply_tag_synonyms($metadata) {
+    my @normalized_tags;
+    
+    # Replace tags with their preferred synonyms
+    foreach my $tag (@{$metadata->{tags}}) {
+        my $normalized_tag = $tag;
+        
+        # Check if this tag has a synonym
+        if (exists $REGISTRY->{rules}{synonyms}{tags}{$tag}) {
+            my $preferred = $REGISTRY->{rules}{synonyms}{tags}{$tag};
+            print "Replacing tag '$tag' with preferred synonym '$preferred'\n" if $CONFIG->{verbose};
+            $normalized_tag = $preferred;
+        }
+        
+        push @normalized_tags, $normalized_tag;
+    }
+    
+    # Remove duplicates and sort
+    $metadata->{tags} = [sort keys %{{ map { $_ => 1 } @normalized_tags }}];
+}
+
+# Apply category synonyms
+sub apply_category_synonyms($metadata) {
+    my @normalized_categories;
+    
+    # Replace categories with their preferred synonyms
+    foreach my $category (@{$metadata->{categories}}) {
+        my $normalized_category = $category;
+        
+        # Check if this category has a synonym
+        if (exists $REGISTRY->{rules}{synonyms}{categories}{$category}) {
+            my $preferred = $REGISTRY->{rules}{synonyms}{categories}{$category};
+            print "Replacing category '$category' with preferred synonym '$preferred'\n" if $CONFIG->{verbose};
+            $normalized_category = $preferred;
+        }
+        
+        push @normalized_categories, $normalized_category;
+    }
+    
+    # Remove duplicates and sort
+    $metadata->{categories} = [sort keys %{{ map { $_ => 1 } @normalized_categories }}];
+}
+
+# Apply casing rules to a string
+sub apply_casing_rules($string, $type) {
+    # Default behavior varies by type
+    if ($type eq 'tag') {
+        # Default for tags: lowercase
+        return lc($string);
+    } elsif ($type eq 'category') {
+        # Default for categories: Title Case
+        return title_case($string);
+    } else {
+        # Default for others: preserve as is
+        return $string;
+    }
+}
+
+# Apply character substitution rules
+sub apply_character_substitutions($string, $type) {
+    # Default behavior varies by type
+    if ($type eq 'tag') {
+        # Default for tags: spaces to underscores, remove special chars
+        $string =~ s/\s+/_/g;         # Spaces to underscores
+        $string =~ s/[^\w_-]//g;      # Remove special characters
+    } elsif ($type eq 'category') {
+        # Default for categories: preserve spaces, remove special chars
+        $string =~ s/[^\w\s_-]//g;    # Remove special characters
+    }
+    
+    return $string;
+}
+
+# Convert a string to Title Case
+sub title_case($string) {
+    my @words = split(/\s+/, $string);
+    @words = map { ucfirst(lc($_)) } @words;
+    return join(' ', @words);
+}
+
+# Update a file with new metadata
+sub update_file_with_metadata($file, $content, $metadata) {
+    my $file_type = determine_file_type($file);
+    my $new_content;
+    
+    if ($file_type eq FILE_TYPE_NEORG) {
+        $new_content = update_neorg_with_metadata($content, $metadata);
+    } elsif ($file_type eq FILE_TYPE_MARKDOWN) {
+        $new_content = update_markdown_with_metadata($content, $metadata);
+    } elsif ($file_type eq FILE_TYPE_TEXT) {
+        $new_content = update_text_with_metadata($content, $metadata);
+    } else {
+        # Unsupported file type
+        return 0;
+    }
+    
+    # Write the updated content back to the file
+    return write_file_content($file, $new_content);
+}
+
+# Update Neorg content with new metadata
+sub update_neorg_with_metadata($content, $metadata) {
+    my $new_content = $content;
+    
+    # Extract tags and categories
+    my $tags = join(', ', @{$metadata->{tags}});
+    my $categories = join(', ', @{$metadata->{categories}});
+    
+    # Check if there's an existing document.meta block
+    if ($new_content =~ /\@document\.meta\s*(.+?)\@end/s) {
+        my $meta_block = $1;
+        my $new_meta_block = $meta_block;
+        
+        # Update existing tags
+        if ($meta_block =~ /^(\s*tags\s*:\s*).+?$/m) {
+            my $prefix = $1;
+            $new_meta_block =~ s/^(\s*tags\s*:\s*).+?$/$prefix$tags/m;
+        } else {
+            # Add tags if not present
+            $new_meta_block .= "\ntags: $tags";
+        }
+        
+        # Update existing categories
+        if ($meta_block =~ /^(\s*categories\s*:\s*).+?$/m) {
+            my $prefix = $1;
+            $new_meta_block =~ s/^(\s*categories\s*:\s*).+?$/$prefix$categories/m;
+        } else {
+            # Add categories if not present
+            $new_meta_block .= "\ncategories: $categories";
+        }
+        
+        # Update other attributes
+        foreach my $key (keys %{$metadata->{attributes}}) {
+            next if $key =~ /^(?:file_path|file_type|title)$/;  # Skip internal attributes
+            
+            my $value = $metadata->{attributes}{$key};
+            
+            if ($meta_block =~ /^(\s*$key\s*:\s*).+?$/m) {
+                my $prefix = $1;
+                $new_meta_block =~ s/^(\s*$key\s*:\s*).+?$/$prefix$value/m;
+            } else {
+                # Add attribute if not present
+                $new_meta_block .= "\n$key: $value";
+            }
+        }
+        
+        # Replace the meta block
+        $new_content =~ s/\@document\.meta\s*(.+?)\@end/\@document.meta\n$new_meta_block\n\@end/s;
+    } else {
+        # No existing meta block, create one
+        my $meta_block = "\@document.meta\ntags: $tags\ncategories: $categories\n";
+        
+        # Add other attributes
+        foreach my $key (keys %{$metadata->{attributes}}) {
+            next if $key =~ /^(?:file_path|file_type|title)$/;  # Skip internal attributes
+            
+            my $value = $metadata->{attributes}{$key};
+            $meta_block .= "$key: $value\n";
+        }
+        
+        $meta_block .= "\@end\n\n";
+        
+        # Add meta block at the beginning of the file, or after the title
+        if ($new_content =~ /^\s*\*\s+.+?\n/m) {
+            # Add after the title
+            $new_content =~ s/(^\s*\*\s+.+?\n)/$1\n$meta_block/m;
+        } else {
+            # Add at the beginning
+            $new_content = $meta_block . $new_content;
+        }
+    }
+    
+    return $new_content;
+}
+
+# Update Markdown content with new metadata
+sub update_markdown_with_metadata($content, $metadata) {
+    my $new_content = $content;
+    
+    # Extract tags and categories
+    my $tags = join(', ', @{$metadata->{tags}});
+    my $categories = join(', ', @{$metadata->{categories}});
+    
+    # Prepare frontmatter
+    my $frontmatter = "---\n";
+    $frontmatter .= "tags: [$tags]\n" if $tags;
+    $frontmatter .= "categories: [$categories]\n" if $categories;
+    
+    # Add other attributes
+    foreach my $key (keys %{$metadata->{attributes}}) {
+        next if $key =~ /^(?:file_path|file_type|title)$/;  # Skip internal attributes
+        
+        my $value = $metadata->{attributes}{$key};
+        $frontmatter .= "$key: $value\n";
+    }
+    
+    $frontmatter .= "---\n\n";
+    
+    # Check if there's an existing frontmatter block
+    if ($new_content =~ /^---\s*\n.*?\n---\s*\n/s) {
+        # Replace the existing frontmatter
+        $new_content =~ s/^---\s*\n.*?\n---\s*\n/$frontmatter/s;
+    } else {
+        # Add frontmatter at the beginning
+        $new_content = $frontmatter . $new_content;
+    }
+    
+    return $new_content;
+}
+
+# Update text file with new metadata
+sub update_text_with_metadata($content, $metadata) {
+    my $new_content = $content;
+    
+    # Extract tags and categories
+    my $tags = join(', ', @{$metadata->{tags}});
+    my $categories = join(', ', @{$metadata->{categories}});
+    
+    # Prepare header comments
+    my $header = "// METADATA\n";
+    $header .= "// tags: $tags\n" if $tags;
+    $header .= "// categories: $categories\n" if $categories;
+    
+    # Add other attributes
+    foreach my $key (keys %{$metadata->{attributes}}) {
+        next if $key =~ /^(?:file_path|file_type|title)$/;  # Skip internal attributes
+        
+        my $value = $metadata->{attributes}{$key};
+        $header .= "// $key: $value\n";
+    }
+    
+    $header .= "// END METADATA\n\n";
+    
+    # Check if there's an existing header block
+    if ($new_content =~ m{^// METADATA\n.*?// END METADATA\n}s) {
+        # Replace the existing header
+        $new_content =~ s{^// METADATA\n.*?// END METADATA\n}{$header}s;
+    } else {
+        # Add header at the beginning
+        $new_content = $header . $new_content;
+    }
+    
+    return $new_content;
+}
+
+# Write content to a file
+sub write_file_content($file, $content) {
+    eval {
+        open my $fh, '>:encoding(UTF-8)', $file or die "Cannot write to file $file: $!";
+        print $fh $content;
+        close $fh;
+    };
+    
+    if ($@) {
+        warn "Error writing to file $file: $@";
+        return 0;
+    }
+    
+    return 1;
+}
+
+# Check if two metadata structures are equal
+sub metadata_equals($metadata1, $metadata2) {
+    # Compare tags (order-independent)
+    my $tags1 = join(',', sort @{$metadata1->{tags}});
+    my $tags2 = join(',', sort @{$metadata2->{tags}});
+    return 0 if $tags1 ne $tags2;
+    
+    # Compare categories (order-independent)
+    my $cats1 = join(',', sort @{$metadata1->{categories}});
+    my $cats2 = join(',', sort @{$metadata2->{categories}});
+    return 0 if $cats1 ne $cats2;
+    
+    # Compare attributes
+    foreach my $key (keys %{$metadata1->{attributes}}) {
+        next if $key =~ /^(?:file_path|file_type|last_updated)$/;  # Skip internal attributes
+        
+        return 0 if !exists $metadata2->{attributes}{$key};
+        return 0 if $metadata1->{attributes}{$key} ne $metadata2->{attributes}{$key};
+    }
+    
+    foreach my $key (keys %{$metadata2->{attributes}}) {
+        next if $key =~ /^(?:file_path|file_type|last_updated)$/;  # Skip internal attributes
+        
+        return 0 if !exists $metadata1->{attributes}{$key};
+    }
+    
+    return 1;
+}
+
+# Convert metadata to a readable string for display
+sub metadata_to_string($metadata) {
+    my $result = "Tags: " . join(', ', @{$metadata->{tags}}) . "\n";
+    $result .= "Categories: " . join(', ', @{$metadata->{categories}}) . "\n";
+    $result .= "Attributes:\n";
+    
+    foreach my $key (sort keys %{$metadata->{attributes}}) {
+        next if $key =~ /^(?:file_path|file_type)$/;  # Skip internal attributes
+        
+        $result .= "  $key: " . $metadata->{attributes}{$key} . "\n";
+    }
+    
+    return $result;
+}
+
+# Validate metadata in a single file
+sub validate_file_metadata($file) {
+    my @errors;
+    
+    # Determine file type
+    my $file_type = determine_file_type($file);
+    
+    # Skip unsupported file types
+    return \@errors unless $file_type;
+    
+    # Read the file content
+    my $content = read_file_content($file);
+    return \@errors unless defined $content;
+    
+    # Parse metadata
+    my $metadata;
+    
+    if ($file_type eq FILE_TYPE_NEORG) {
+        $metadata = parse_neorg_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_MARKDOWN) {
+        $metadata = parse_markdown_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_TEXT) {
+        $metadata = parse_text_metadata($content, $file);
+    }
+    
+    # Skip if no metadata found
+    return \@errors unless $metadata;
+    
+    # Check for validation errors
+    
+    # 1. Missing title
+    if (!$metadata->{attributes}{title}) {
+        push @errors, "Missing title in $file";
+    }
+    
+    # 2. Invalid or missing categories
+    if (!@{$metadata->{categories}}) {
+        push @errors, "No categories defined in $file";
+    } else {
+        # Check if categories exist in the registry
+        foreach my $category (@{$metadata->{categories}}) {
+            if (!exists $REGISTRY->{taxonomy}{categories}{$category}) {
+                push @errors, "Unknown category '$category' in $file";
+            }
+        }
+    }
+    
+    # 3. Check for disallowed tag characters
+    foreach my $tag (@{$metadata->{tags}}) {
+        if ($tag =~ /[^\w_-]/) {
+            push @errors, "Tag '$tag' contains invalid characters in $file";
+        }
+    }
+    
+    # 4. Check for tag conflicts
+    foreach my $rule (@{$REGISTRY->{rules}{conflicts}}) {
+        next unless $rule->{tags};
+        
+        # Convert tags to a hash for easier lookup
+        my %tags = map { $_ => 1 } @{$metadata->{tags}};
+        
+        # Check if all conflicting tags are present
+        my $conflict_found = 1;
+        foreach my $tag (@{$rule->{tags}}) {
+            if (!exists $tags{$tag}) {
+                $conflict_found = 0;
+                last;
+            }
+        }
+        
+        # Report conflict if found
+        if ($conflict_found) {
+            push @errors, "Conflicting tags '" . join("', '", @{$rule->{tags}}) . 
+                          "' found in $file (preferred: " . ($rule->{preferred} || "none") . ")";
+        }
+    }
+    
+    # 5. Check for required attributes based on categories
+    foreach my $category (@{$metadata->{categories}}) {
+        if ($category eq 'article' || $category eq 'book') {
+            # Articles and books should have an author
+            if (!exists $metadata->{attributes}{author}) {
+                push @errors, "Missing required attribute 'author' for category '$category' in $file";
+            }
+        }
+        
+        if ($category eq 'project') {
+            # Projects should have a status
+            if (!exists $metadata->{attributes}{status}) {
+                push @errors, "Missing required attribute 'status' for category '$category' in $file";
+            }
+        }
+    }
+    
+    # 6. Validate date formats
+    foreach my $key (qw(created modified date updated)) {
+        if (exists $metadata->{attributes}{$key}) {
+            my $value = $metadata->{attributes}{$key};
+            
+            if ($value !~ /^\d{4}-\d{2}-\d{2}$/) {
+                push @errors, "Invalid date format for '$key': '$value' in $file (expected YYYY-MM-DD)";
+            }
+        }
+    }
+    
+    return \@errors;
+}
+
+# Lint metadata in a single file
+sub lint_file_metadata($file) {
+    my @warnings;
+    
+    # Determine file type
+    my $file_type = determine_file_type($file);
+    
+    # Skip unsupported file types
+    return \@warnings unless $file_type;
+    
+    # Read the file content
+    my $content = read_file_content($file);
+    return \@warnings unless defined $content;
+    
+    # Parse metadata
+    my $metadata;
+    
+    if ($file_type eq FILE_TYPE_NEORG) {
+        $metadata = parse_neorg_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_MARKDOWN) {
+        $metadata = parse_markdown_metadata($content, $file);
+    } elsif ($file_type eq FILE_TYPE_TEXT) {
+        $metadata = parse_text_metadata($content, $file);
+    }
+    
+    # Skip if no metadata found
+    return \@warnings unless $metadata;
+    
+    # Check for linting warnings
+    
+    # 1. Inconsistent tag casing
+    my %tag_case_issues;
+    foreach my $tag (@{$metadata->{tags}}) {
+        my $lower = lc($tag);
+        
+        # Skip if tag is already lowercase
+        next if $tag eq $lower;
+        
+        $tag_case_issues{$lower} = $tag;
+    }
+    
+    if (%tag_case_issues) {
+        foreach my $lower (keys %tag_case_issues) {
+            push @warnings, "Inconsistent tag casing: '$tag_case_issues{$lower}' (suggested: '$lower') in $file";
+        }
+    }
+    
+    # 2. Inconsistent category casing
+    my %category_case_issues;
+    foreach my $category (@{$metadata->{categories}}) {
+        my $title_case = title_case($category);
+        
+        # Skip if category is already in title case
+        next if $category eq $title_case;
+        
+        $category_case_issues{$title_case} = $category;
+    }
+    
+    if (%category_case_issues) {
+        foreach my $title_case (keys %category_case_issues) {
+            push @warnings, "Inconsistent category casing: '$category_case_issues{$title_case}' (suggested: '$title_case') in $file";
+        }
+    }
+    
+    # 3. Check for overly specific tags (tags used only in this file)
+    foreach my $tag (@{$metadata->{tags}}) {
+        if (exists $REGISTRY->{taxonomy}{tags}{$tag} && 
+            $REGISTRY->{taxonomy}{tags}{$tag}{count} == 1) {
+            push @warnings, "Potentially over-specific tag: '$tag' (used only in this file) in $file";
+        }
+    }
+    
+    # 4. Check for redundant tags
+    my %tag_groups = (
+        programming => [qw(python javascript typescript java ruby php golang rust)],
+        database => [qw(mysql postgresql mongodb redis cassandra sqlite)],
+        frontend => [qw(react vue angular svelte)],
+        backend => [qw(nodejs django flask springboot rails express)],
+    );
+    
+    foreach my $group (keys %tag_groups) {
+        my @specific_tags = @{$tag_groups{$group}};
+        
+        # Convert tags to a hash for easier lookup
+        my %tags = map { $_ => 1 } @{$metadata->{tags}};
+        
+        # Skip if the general tag isn't present
+        next unless exists $tags{$group};
+        
+        # Check if any specific tags are also present
+        my @redundant;
+        foreach my $specific (@specific_tags) {
+            push @redundant, $specific if exists $tags{$specific};
+        }
+        
+        if (@redundant) {
+            push @warnings, "Redundant general tag '$group' with specific tags '" . 
+                           join("', '", @redundant) . "' in $file";
+        }
+    }
+    
+    # 5. Check for missing recommended attributes based on categories
+    foreach my $category (@{$metadata->{categories}}) {
+        if ($category eq 'note' || $category eq 'article') {
+            # Notes and articles should ideally have a summary
+            if (!exists $metadata->{attributes}{summary}) {
+                push @warnings, "Missing recommended attribute 'summary' for category '$category' in $file";
+            }
+        }
+    }
+    
+    # 6. Suggest normalization of similar tags
+    my %normalized_tags;
+    foreach my $tag (@{$metadata->{tags}}) {
+        # Generate normalized form (lowercase, replace special chars)
+        my $normalized = lc($tag);
+        $normalized =~ s/[^a-z0-9]//g;
+        
+        # Skip if nothing to normalize
+        next if $normalized eq $tag;
+        
+        # Check if we have other forms of this tag
+        if (exists $normalized_tags{$normalized}) {
+            push @warnings, "Similar tags: '$tag' and '" . $normalized_tags{$normalized} . 
+                           "' (consider normalizing) in $file";
+        } else {
+            $normalized_tags{$normalized} = $tag;
+        }
+    }
+    
+    # 7. Check title formatting
+    if (exists $metadata->{attributes}{title}) {
+        my $title = $metadata->{attributes}{title};
+        
+        # Check if title uses sentence case when it should use title case
+        if ($title =~ /^[A-Z][a-z]/ && $title =~ /[a-z]\s+[a-z]/) {
+            my $title_case_version = title_case($title);
+            if ($title ne $title_case_version) {
+                push @warnings, "Consider using Title Case for title: '$title' in $file";
+            }
+        }
+    }
+    
+    return \@warnings;
+}
+
+# Analyze metadata usage in a single file
+sub analyze_file_metadata_usage($file, $used_metadata_ref) {
+    # TODO: Implement usage analysis
+    return;
+}
+
+# Check if a file matches a metadata query
+sub file_matches_query($file, $query) {
+    # TODO: Implement query matching logic
+    return 0;
+}
+
+# --------------------------------------------------
+# Documentation
+# --------------------------------------------------
+
+=head1 NAME
+
+metadata_normalizer - Ensure consistent metadata across knowledge systems
+
+=head1 SYNOPSIS
+
+    metadata_normalizer -m scan [options]
+    metadata_normalizer -m normalize [options]
+    metadata_normalizer -m sync [options]
+    metadata_normalizer -m validate [options]
+    metadata_normalizer -m lint [options]
+    metadata_normalizer -m visualize [options]
+    metadata_normalizer -m cleanup [options]
+    metadata_normalizer -m migrate [options]
+    metadata_normalizer -m batch --batch file.txt [options]
+    metadata_normalizer -m search -q "query" [options]
+
+    Options:
+      -m, --mode MODE           Operation mode (required)
+      -d, --dir DIR             Notes directory (default: ~/Documents/notes)
+      -r, --registry FILE       Registry file (default: ~/.config/metadata_normalizer/registry.json)
+      -c, --config FILE         Configuration file (JSON format)
+      -o, --output FILE         Output file for results
+      -i, --input FILE          Input file for operations like migrate
+      -f, --format FORMAT       Output format (json, yaml, text)
+      -q, --query QUERY         Search query for search mode
+      
+      --include PATTERN         Include files matching this pattern
+      --exclude PATTERN         Exclude files matching this pattern
+      --include-dirs DIRS       Include these directories (comma-separated)
+      --exclude-dirs DIRS       Exclude these directories (comma-separated)
+      --file-types TYPES        File types to process (comma-separated, default: .norg,.md,.txt)
+      
+      -b, --batch FILE          Batch operation file
+      -n, --dry-run             Don't make any changes, just show what would be done
+      -v, --verbose             Display detailed information
+      --debug                   Display debugging information
+      --list                    List matched files without processing
+      
+      -h, --help                Display this help message
+
+=head1 DESCRIPTION
+
+This script provides tools for managing and synchronizing metadata across different knowledge
+management systems and file formats. It can scan, normalize, validate, and transform metadata
+to ensure consistency across your knowledge base.
+
+=head1 MODES
+
+=over 4
+
+=item B<scan>
+
+Scan files for metadata and build a central registry of tags, categories, and attributes.
+
+=item B<normalize>
+
+Apply normalization rules to standardize metadata across files.
+
+=item B<sync>
+
+Synchronize metadata between different systems or formats.
+
+=item B<validate>
+
+Check metadata for consistency and errors.
+
+=item B<lint>
+
+Check metadata style and suggest improvements.
+
+=item B<visualize>
+
+Create a visualization of metadata relationships and structure.
+
+=item B<cleanup>
+
+Remove unused or redundant metadata.
+
+=item B<migrate>
+
+Transform metadata from one format to another.
+
+=item B<batch>
+
+Process a batch file containing multiple operations.
+
+=item B<search>
+
+Search for files based on metadata.
+
+=back
+
+=head1 EXAMPLES
+
+Scan all notes for metadata:
+
+    metadata_normalizer -m scan -v
+
+Normalize tags in Markdown files:
+
+    metadata_normalizer -m normalize --include-dirs 02_areas,03_resources --include "\.md$"
+
+Validate metadata in a specific directory:
+
+    metadata_normalizer -m validate --include-dirs 01_projects
+
+Search for files with a specific tag:
+
+    metadata_normalizer -m search -q "tag:programming"
+
+Batch processing with a file:
+
+    metadata_normalizer -m batch --batch operations.txt
+
+=head1 AUTHOR
+
+Zach Podbielniak
+
+=cut
