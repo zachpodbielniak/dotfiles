@@ -9,13 +9,14 @@
 # License: N/A
 #
 # Usage:
-#   concept_expander [options] CONCEPT|FILE_PATH
+#   concept_expander [options] [CONCEPT|FILE_PATH]
+#   echo "CONCEPT" | concept_expander [options]
 #
 # Options:
 #   --extract               Extract concepts from a note file instead of using direct concept input
 #   --providers PROVIDERS   Comma-separated list of AI providers to use (default: claudpy,perpy,grokpy)
 #   --output FORMAT         Output format (neorg or markdown, default: neorg)
-#   --integrate             Integrate with existing notes instead of creating a new one
+#   --integrate, --sbi      Integrate with existing notes instead of creating a new one
 #   --para PARA             PARA category to use when --integrate is specified (default: resource)
 #   --category CATEGORY     Subcategory path within the PARA category (e.g., 'technology/ai')
 #   --name-seed NAME        Custom filename seed to use instead of the concept name
@@ -26,6 +27,7 @@
 #   --type TYPE             Summary type (e.g., 'book', 'meeting', 'research', etc.)
 #   --debug                 Toggle debug logging
 #   --default PROVIDER      Default provider to use when only one is needed (default: grokpy)
+#   --stdout                Write output to stdout instead of files
 #
 # Examples:
 #   concept_expander "Generative AI"
@@ -92,8 +94,10 @@ def ensure_distrobox() -> None:
             "--",
             *sys.argv
         ]
-        subprocess.run(cmd)
-        sys.exit(0)
+        # Pass stdin through to the re-executed script
+        process = subprocess.Popen(cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+        process.wait()
+        sys.exit(process.returncode)
 
 # Extract concepts from a file
 def extract_concepts_from_file(file_path: str, debug: bool) -> List[str]:
@@ -398,9 +402,11 @@ def main():
   
   # Integrate with existing notes with PARA category and subcategory
   concept_expander --integrate --para resource --category technology/ai "Neural Networks"
+  concept_expander --sbi --para resource --category technology/ai "Neural Networks"
   
   # Use custom filename with the name-seed parameter
   concept_expander --integrate --name-seed "deep_learning_foundations" "Neural Networks"
+  concept_expander --sbi --name-seed "deep_learning_foundations" "Neural Networks"
   
   # Control parallel processing with max-concurrent
   concept_expander --max-concurrent 10 "Artificial Intelligence"
@@ -416,18 +422,27 @@ def main():
   
   # Enable debug logging
   concept_expander --debug "Reinforcement Learning"
+  
+  # Output to stdout instead of files
+  concept_expander --stdout "Machine Learning"
+  
+  # Read concept from stdin
+  echo "Deep Learning" | concept_expander
+  
+  # Read concept from stdin and output to stdout
+  echo "Neural Networks" | concept_expander --stdout
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     
     # Define available command-line arguments
-    parser.add_argument("input", help="Concept name or path to note file")
+    parser.add_argument("input", nargs="?", help="Concept name or path to note file (optional if reading from stdin)")
     parser.add_argument("--extract", action="store_true", required=False, default=False,
                       help="Extract concepts from a note file instead of using direct concept input")
     parser.add_argument("--providers", required=False, default=",".join(DEFAULT_PROVIDERS),
                       help=f"Comma-separated list of AI providers to use (default: {','.join(DEFAULT_PROVIDERS)})")
     parser.add_argument("--output", choices=[NEORG_OUTPUT_TYPE, MARKDOWN_OUTPUT_TYPE], default=NEORG_OUTPUT_TYPE,
                       help=f"Output format (default: {NEORG_OUTPUT_TYPE})")
-    parser.add_argument("--integrate", action="store_true", required=False, default=False,
+    parser.add_argument("--integrate", "--sbi", action="store_true", required=False, default=False,
                       help="Integrate with existing notes instead of creating a new one")
     parser.add_argument("--para", choices=["project", "area", "resource", "archive", "detect"], 
                       default="resource", help="PARA category to use when --integrate is specified (default: resource)")
@@ -447,15 +462,41 @@ def main():
                       help="Print debug logging")
     parser.add_argument("--default", choices=ALL_PROVIDERS, default=DEFAULT_PROVIDER,
                       help=f"Default provider to use when only one is needed (default: {DEFAULT_PROVIDER})")
+    parser.add_argument("--stdout", action="store_true", required=False, default=False,
+                      help="Write output to stdout instead of files")
     
     # Parse the arguments provided by the user
     args = parser.parse_args()
     
-    # Set up logging if debug mode is enabled
+    # Set up logging if debug mode is enabled (need this before reading stdin)
     setup_logging(args.debug)
     
-    # Ensure we're in the dev distrobox container
+    # Ensure we're in the dev distrobox container BEFORE reading stdin
     ensure_distrobox()
+    
+    # Read from stdin
+    stdin_data = sys.stdin.read().strip()
+    if args.debug and stdin_data:
+        logging.debug(f"Read from stdin: {stdin_data[:100]}...")
+    
+    # Get argument concept
+    argument_concept = args.input or ""
+    
+    # Validate input - must have either command line argument or stdin
+    if not argument_concept and not stdin_data:
+        sys.stderr.write("Error: Must provide concept as argument or via stdin\n")
+        sys.exit(1)
+    
+    # Combine inputs
+    if argument_concept and stdin_data:
+        combined_input = f"{argument_concept}\n{stdin_data}"
+    elif argument_concept:
+        combined_input = argument_concept
+    else:
+        combined_input = stdin_data
+    
+    # Update args.input with the combined input
+    args.input = combined_input
     
     # Parse the providers list
     providers = [p.strip() for p in args.providers.split(',') if p.strip() in ALL_PROVIDERS]
@@ -526,9 +567,12 @@ def main():
         else:  # MARKDOWN_OUTPUT_TYPE
             output_content = format_as_markdown(concept, results)
         
-        # Generate output filename from concept name
-        safe_concept = re.sub(r'[^a-zA-Z0-9_]', '_', concept.lower())
-        file_name = f"{safe_concept}_expanded"
+        # Generate output filename from concept name or name-seed
+        if args.name_seed:
+            file_name = args.name_seed
+        else:
+            safe_concept = re.sub(r'[^a-zA-Z0-9_]', '_', concept.lower())
+            file_name = f"{safe_concept}_expanded"
         
         if args.output == NEORG_OUTPUT_TYPE:
             file_name += ".norg"
@@ -543,7 +587,12 @@ def main():
                 logging.debug(f"Generating summary of expanded concept using {args.summary_provider}")
                 
             # Create summary filename
-            summary_file_name = f"{safe_concept}_expanded_summary"
+            if args.name_seed:
+                summary_file_name = f"{args.name_seed}_summary"
+            else:
+                safe_concept = re.sub(r'[^a-zA-Z0-9_]', '_', concept.lower())
+                summary_file_name = f"{safe_concept}_expanded_summary"
+                
             if args.output == NEORG_OUTPUT_TYPE:
                 summary_file_name += ".norg"
                 summary_script = "ai_summary_as_neorg"
@@ -587,8 +636,15 @@ def main():
                 sys.stderr.write(f"Warning: Could not generate summary: {error_msg}\n")
                 summary_content = None
         
-        # Handle the output based on integration option
-        if args.integrate:
+        # Handle the output based on integration option and stdout flag
+        if args.stdout:
+            # When both --stdout and --summary are used, only output the summary
+            if args.summary and summary_content:
+                print(summary_content)
+            else:
+                # Write regular content to stdout when no summary or summary failed
+                print(output_content)
+        elif args.integrate:
             # Generate the content as usual - already done above
             if args.output == NEORG_OUTPUT_TYPE:
                 format_arg = "norg"
