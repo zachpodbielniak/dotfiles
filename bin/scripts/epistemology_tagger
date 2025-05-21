@@ -1,0 +1,1941 @@
+#!/usr/bin/python3
+
+###############################################################################
+# epistemology_tagger - Tool for evaluating confidence levels of information in notes
+###############################################################################
+#
+# This script analyzes notes in a Second Brain knowledge base and tags them with
+# epistemological metadata, including confidence ratings, evidence types, and source 
+# reliability. It helps prioritize what to trust when information conflicts and
+# tracks how knowledge evolves from speculation to certainty.
+#
+# The script provides multiple commands:
+# - analyze: Process a single note file
+# - batch: Process all notes in a category
+# - report: Generate confidence reports
+# - conflicts: Identify conflicting claims
+# - update: Update tags for modified notes
+# - taxonomy: Display the classification system
+# - stats: Generate confidence statistics
+#
+# The script uses AI to identify claims and evaluate their epistemological characteristics.
+# It adds structured metadata to note files, making it possible to track confidence levels,
+# evidence types, source reliability, and consistency with existing knowledge.
+#
+# Author: Zach Podbielniak
+# Version: 1.0.0
+# Created: May 2025
+#
+# Usage:
+#   epistemology_tagger [options] <command> [arguments...]
+#
+# Commands:
+#   analyze <path>              Analyze a single note and add epistemological tags
+#   batch <category>            Process all notes in a PARA category
+#   report [path]               Generate a confidence report for a note or directory
+#   conflicts                   Identify conflicting claims across notes
+#   update <path>               Update tags for notes that have been modified
+#   taxonomy                    Show the epistemological classification taxonomy
+#   stats [category]            Show confidence statistics across your notes
+#
+# Options:
+#   --notes-dir <path>          Path to notes directory (default: ~/Documents/notes)
+#   --taxonomy <path>           Path to custom taxonomy file
+#   --threshold <float>         Confidence threshold (0.0-1.0) for flagging low-confidence info
+#   --model <name>              AI model to use for analysis (default: depends on available models)
+#   --batch-size <int>          Number of files to process in each batch
+#   --visual                    Generate visual confidence maps
+#   --format <format>           Output format: text, json, neorg, markdown (default: text)
+#   --verbose                   Show detailed output during processing
+#   --dry-run                   Show what would be tagged without making changes
+#   --help                      Show this help message and exit
+
+import os
+import sys
+import argparse
+import json
+import yaml
+import tempfile
+import re
+import datetime
+import time
+import subprocess
+from pathlib import Path
+from collections import defaultdict, Counter
+
+# ----- Constants -----
+# Default directory for notes (user's Second Brain)
+DEFAULT_NOTES_DIR = os.path.expanduser("~/Documents/notes")
+
+# Default AI provider for analysis (compatible with other scripts in the system)
+DEFAULT_PROVIDER = "grokpy"
+
+# Path to optional custom taxonomy configuration
+TAXONOMY_FILE = os.path.expanduser("~/.config/epistemology_tagger/taxonomy.yaml")
+
+# ----- Epistemological Classification System -----
+# The following taxonomies define the classification system used to evaluate information.
+# Each type, level, or rating has a name, weight (or range), and description.
+# Weights are used to calculate confidence scores and determine what information to trust.
+
+# Evidence types with confidence weights - categorize the nature of evidence supporting a claim
+EVIDENCE_TYPES = {
+    "empirical_direct": {
+        "name": "Direct Empirical Observation",
+        "weight": 0.95,
+        "description": "Directly observed through personal experience or experiments"
+    },
+    "empirical_replicated": {
+        "name": "Replicated Empirical Finding",
+        "weight": 0.90,
+        "description": "Empirical finding that has been independently replicated"
+    },
+    "empirical_single": {
+        "name": "Single Empirical Study",
+        "weight": 0.75,
+        "description": "Empirical finding from a single study"
+    },
+    "theoretical_proven": {
+        "name": "Proven Theory",
+        "weight": 0.95,
+        "description": "Mathematically or logically proven theories"
+    },
+    "theoretical_model": {
+        "name": "Theoretical Model",
+        "weight": 0.70,
+        "description": "Theoretical models with substantive evidence"
+    },
+    "theoretical_hypothesis": {
+        "name": "Hypothesis",
+        "weight": 0.50,
+        "description": "Hypothesis with limited testing"
+    },
+    "expert_consensus": {
+        "name": "Expert Consensus",
+        "weight": 0.85,
+        "description": "Strong consensus among domain experts"
+    },
+    "expert_opinion": {
+        "name": "Expert Opinion",
+        "weight": 0.70,
+        "description": "Opinion from recognized experts in the field"
+    },
+    "anecdotal_multiple": {
+        "name": "Multiple Anecdotes",
+        "weight": 0.60,
+        "description": "Consistent anecdotal evidence from multiple sources"
+    },
+    "anecdotal_single": {
+        "name": "Single Anecdote",
+        "weight": 0.40,
+        "description": "Single anecdotal report"
+    },
+    "logical_argument": {
+        "name": "Logical Argument",
+        "weight": 0.65,
+        "description": "Well-structured logical argument"
+    },
+    "inference": {
+        "name": "Inference",
+        "weight": 0.55,
+        "description": "Inferred from related evidence"
+    },
+    "historical_verified": {
+        "name": "Verified Historical Account",
+        "weight": 0.80,
+        "description": "Historical account verified by multiple sources"
+    },
+    "historical_single": {
+        "name": "Single Historical Source",
+        "weight": 0.60,
+        "description": "Single historical source"
+    },
+    "speculation": {
+        "name": "Speculation",
+        "weight": 0.30,
+        "description": "Reasoned speculation without direct evidence"
+    },
+    "intuition": {
+        "name": "Intuition",
+        "weight": 0.25,
+        "description": "Personal intuition or gut feeling"
+    },
+    "unknown": {
+        "name": "Unknown",
+        "weight": 0.10,
+        "description": "Source or evidence type unknown or unclear"
+    }
+}
+
+# Confidence levels - categorize how certain a claim is based on available evidence
+CONFIDENCE_LEVELS = {
+    "proven": {
+        "name": "Proven",
+        "range": (0.90, 1.0),
+        "description": "Established beyond reasonable doubt"
+    },
+    "probable": {
+        "name": "Probable",
+        "range": (0.70, 0.89),
+        "description": "Strong evidence suggests this is true"
+    },
+    "possible": {
+        "name": "Possible",
+        "range": (0.40, 0.69),
+        "description": "Some evidence suggests this may be true"
+    },
+    "speculative": {
+        "name": "Speculative",
+        "range": (0.10, 0.39),
+        "description": "Limited evidence, primarily theoretical or speculative"
+    },
+    "uncertain": {
+        "name": "Uncertain",
+        "range": (0.0, 0.09),
+        "description": "Very little evidence, high uncertainty"
+    }
+}
+
+# Source reliability ratings - evaluate the trustworthiness of information sources
+SOURCE_RELIABILITY = {
+    "authoritative": {
+        "name": "Authoritative",
+        "weight": 0.95,
+        "description": "Expert or established authoritative source"
+    },
+    "credible": {
+        "name": "Credible",
+        "weight": 0.80,
+        "description": "Generally reliable source with good track record"
+    },
+    "mixed": {
+        "name": "Mixed",
+        "weight": 0.60,
+        "description": "Source with mixed reliability"
+    },
+    "questionable": {
+        "name": "Questionable",
+        "weight": 0.30,
+        "description": "Source with questionable reliability"
+    },
+    "unreliable": {
+        "name": "Unreliable",
+        "weight": 0.10,
+        "description": "Known unreliable source"
+    },
+    "unknown": {
+        "name": "Unknown",
+        "weight": 0.40,
+        "description": "Unknown source reliability"
+    }
+}
+
+# Consistency ratings - assess how well a claim aligns with existing knowledge
+CONSISTENCY_LEVELS = {
+    "consistent": {
+        "name": "Consistent",
+        "weight": 1.0,
+        "description": "Fully consistent with existing knowledge"
+    },
+    "compatible": {
+        "name": "Compatible",
+        "weight": 0.9,
+        "description": "Compatible with existing knowledge, with minor differences"
+    },
+    "partial": {
+        "name": "Partial",
+        "weight": 0.7,
+        "description": "Partially consistent with existing knowledge"
+    },
+    "conflicting": {
+        "name": "Conflicting",
+        "weight": 0.3,
+        "description": "Conflicts with some existing knowledge"
+    },
+    "contradictory": {
+        "name": "Contradictory",
+        "weight": 0.1,
+        "description": "Directly contradicts established knowledge"
+    },
+    "novel": {
+        "name": "Novel",
+        "weight": 0.5,
+        "description": "New information with no existing knowledge to compare"
+    }
+}
+
+# ----- Regular Expressions -----
+# These patterns are used to detect and extract existing epistemology metadata from files.
+# They match the legacy tag format that was previously used for storing epistemological metadata.
+
+# Metadata tag patterns for the legacy format (now replaced with structured sections)
+METADATA_TAG_PATTERN = re.compile(r'@epistemology\s+\{([^}]+)\}', re.DOTALL)  # Matches overall epistemology metadata
+CLAIM_TAG_PATTERN = re.compile(r'@claim\s+\{([^}]+)\}', re.DOTALL)            # Matches individual claim metadata
+SOURCE_TAG_PATTERN = re.compile(r'@source\s+\{([^}]+)\}', re.DOTALL)          # Matches source information
+
+# ----- Argument Parsing -----
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate and tag information with epistemological metadata",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Analyze a single note and add epistemological tags
+  epistemology_tagger analyze ~/Documents/notes/03_resources/ai/llm_overview.norg
+  
+  # Process all notes in a PARA category
+  epistemology_tagger batch 03_resources
+  
+  # Only process files in a category that don't have epistemology sections yet
+  epistemology_tagger --update-missing batch 03_resources
+  
+  # Remove existing epistemology sections and reanalyze
+  epistemology_tagger --redo batch 03_resources
+  
+  # Generate a confidence report for a note or directory
+  epistemology_tagger report ~/Documents/notes/02_areas/health
+  
+  # Identify conflicting claims across notes
+  epistemology_tagger conflicts
+  
+  # Update tags for notes that have been modified
+  epistemology_tagger update 01_projects
+  
+  # Show the epistemological classification taxonomy
+  epistemology_tagger taxonomy
+  
+  # Show confidence statistics across notes
+  epistemology_tagger stats 03_resources
+  
+  # Use a specific AI provider and model
+  epistemology_tagger --provider claudpy --model claude-3-opus-20240229 analyze note.norg
+"""
+    )
+    
+    # Commands
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    
+    # analyze command
+    analyze_parser = subparsers.add_parser(
+        "analyze", 
+        help="Analyze a single note and add epistemological tags",
+        description="Analyze a single note file, identify claims, and add epistemological metadata.",
+        epilog="Example: epistemology_tagger analyze ~/Documents/notes/03_resources/ai/llm_overview.norg"
+    )
+    analyze_parser.add_argument("path", help="Path to the note file to analyze")
+    
+    # batch command
+    batch_parser = subparsers.add_parser(
+        "batch", 
+        help="Process all notes in a PARA category",
+        description="Batch process all notes in a specified PARA category, adding epistemological metadata.",
+        epilog="Example: epistemology_tagger batch 03_resources"
+    )
+    batch_parser.add_argument("category", help="PARA category to process (e.g., '02_areas')")
+    
+    # report command
+    report_parser = subparsers.add_parser(
+        "report", 
+        help="Generate a confidence report for a note or directory",
+        description="Generate a confidence report showing high and low confidence information.",
+        epilog="Example: epistemology_tagger report ~/Documents/notes/02_areas/health"
+    )
+    report_parser.add_argument("path", nargs="?", help="Path to the note or directory to report on")
+    
+    # conflicts command
+    conflicts_parser = subparsers.add_parser(
+        "conflicts", 
+        help="Identify conflicting claims across notes",
+        description="Find and list claims that conflict with each other across your knowledge base.",
+        epilog="Example: epistemology_tagger conflicts"
+    )
+    
+    # update command
+    update_parser = subparsers.add_parser(
+        "update", 
+        help="Update tags for notes that have been modified",
+        description="Update epistemological metadata for notes that have been modified since last analysis.",
+        epilog="Example: epistemology_tagger update 01_projects"
+    )
+    update_parser.add_argument("path", help="Path to the note or directory to update")
+    
+    # taxonomy command
+    taxonomy_parser = subparsers.add_parser(
+        "taxonomy", 
+        help="Show the epistemological classification taxonomy",
+        description="Display the full taxonomy of evidence types, confidence levels, source reliability, and consistency ratings.",
+        epilog="Example: epistemology_tagger taxonomy"
+    )
+    
+    # stats command
+    stats_parser = subparsers.add_parser(
+        "stats", 
+        help="Show confidence statistics across your notes",
+        description="Generate statistics on confidence levels, evidence types, and other epistemological metrics.",
+        epilog="Example: epistemology_tagger stats 03_resources"
+    )
+    stats_parser.add_argument("category", nargs="?", help="PARA category for stats (e.g., '03_resources')")
+    
+    # Global options
+    parser.add_argument("--notes-dir", default=DEFAULT_NOTES_DIR, 
+                        help=f"Path to notes directory (default: {DEFAULT_NOTES_DIR})")
+    parser.add_argument("--taxonomy", help="Path to custom taxonomy file")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Confidence threshold (0.0-1.0) for flagging low-confidence info")
+    parser.add_argument("--provider", default=DEFAULT_PROVIDER,
+                        help=f"AI provider to use for analysis (default: {DEFAULT_PROVIDER})")
+    parser.add_argument("--model", 
+                        help="Specific model to use with the AI provider")
+    parser.add_argument("--batch-size", type=int, default=10,
+                        help="Number of files to process in each batch")
+    parser.add_argument("--update-missing", action="store_true",
+                        help="Only process files that don't already have an epistemology section")
+    parser.add_argument("--redo", action="store_true",
+                        help="Remove existing epistemology sections and reanalyze")
+    parser.add_argument("--visual", action="store_true",
+                        help="Generate visual confidence maps")
+    parser.add_argument("--format", choices=["text", "json", "neorg", "markdown"], default="text",
+                        help="Output format (default: text)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Show detailed output during processing")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be tagged without making changes")
+    
+    return parser.parse_args()
+
+# ----- Helper Functions -----
+def get_confidence_level(confidence_value):
+    """Map a confidence value (0.0-1.0) to a confidence level."""
+    for level, data in CONFIDENCE_LEVELS.items():
+        if data["range"][0] <= confidence_value <= data["range"][1]:
+            return level
+    return "uncertain"  # fallback
+
+def calculate_confidence(evidence_type, source_reliability, consistency):
+    """Calculate a confidence score from the evidence type, source reliability, and consistency."""
+    evidence_weight = EVIDENCE_TYPES.get(evidence_type, EVIDENCE_TYPES["unknown"])["weight"]
+    reliability_weight = SOURCE_RELIABILITY.get(source_reliability, SOURCE_RELIABILITY["unknown"])["weight"]
+    consistency_weight = CONSISTENCY_LEVELS.get(consistency, CONSISTENCY_LEVELS["novel"])["weight"]
+    
+    # Weighted average with emphasis on evidence type
+    confidence = (evidence_weight * 0.5) + (reliability_weight * 0.3) + (consistency_weight * 0.2)
+    return round(confidence, 2)
+
+def load_custom_taxonomy(file_path):
+    """Load a custom taxonomy from a YAML file."""
+    try:
+        with open(file_path, 'r') as file:
+            taxonomy = yaml.safe_load(file)
+        # Validate the taxonomy structure here
+        return taxonomy
+    except Exception as e:
+        print(f"Error loading custom taxonomy: {e}")
+        print("Using default taxonomy instead.")
+        return None
+
+def prompt_ai_for_analysis(content, provider, args=None):
+    """Send content to AI provider for epistemological analysis.
+    
+    This function communicates with an AI provider (e.g., ollampy, claudpy) to analyze the 
+    content and extract epistemological metadata. It constructs a detailed prompt that instructs
+    the AI to identify claims, evaluate their evidence types, determine source reliability,
+    assess consistency with existing knowledge, and calculate confidence scores.
+    
+    The function handles different AI provider interfaces and provides robust error handling
+    with a fallback mechanism if the AI analysis fails.
+    
+    Args:
+        content: The text content to analyze (the note contents)
+        provider: The AI provider to use (e.g., ollampy, claudpy)
+        args: Optional dictionary of additional arguments (e.g., model)
+            - model: Specific model to use with the provider
+    
+    Returns:
+        dict: A structured analysis containing claims, sources, and a summary
+              with all relevant epistemological metadata
+    """
+    if args is None:
+        args = {}
+    
+    # Prepare a temporary file with the content
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp:
+        temp.write(content)
+        temp_path = temp.name
+    
+    try:
+        # Prepare the prompt for the AI model
+        prompt = f"""
+        Analyze the following text and extract epistemological metadata:
+        
+        1. Identify key claims and statements
+        2. For each claim, determine:
+           - Evidence type (empirical, theoretical, anecdotal, etc.)
+           - Source reliability
+           - Consistency with established knowledge
+           - Confidence level
+        
+        Format your response as a JSON structure:
+        {{
+            "claims": [
+                {{
+                    "text": "The exact claim text",
+                    "evidence_type": "one of: {', '.join(EVIDENCE_TYPES.keys())}",
+                    "source_reliability": "one of: {', '.join(SOURCE_RELIABILITY.keys())}",
+                    "consistency": "one of: {', '.join(CONSISTENCY_LEVELS.keys())}",
+                    "confidence": 0.0 to 1.0,
+                    "confidence_level": "automatically determined",
+                    "context": "surrounding context of the claim"
+                }}
+            ],
+            "sources": [
+                {{
+                    "name": "Source name or description",
+                    "type": "Source type (academic, news, etc.)",
+                    "reliability": "one of: {', '.join(SOURCE_RELIABILITY.keys())}"
+                }}
+            ],
+            "summary": "Brief epistemological summary of the overall content"
+        }}
+        
+        Only respond with the JSON structure and nothing else.
+        """
+        
+        # Set up a fallback dummy analysis for testing
+        fallback_analysis = {
+            "claims": [
+                {
+                    "text": "This is a placeholder claim until AI analysis is properly configured",
+                    "evidence_type": "unknown",
+                    "source_reliability": "unknown",
+                    "consistency": "unknown",
+                    "confidence": 0.5,
+                    "confidence_level": "possible",
+                    "context": "Placeholder context"
+                }
+            ],
+            "sources": [
+                {
+                    "name": "Placeholder source",
+                    "type": "Placeholder",
+                    "reliability": "unknown"
+                }
+            ],
+            "summary": "This is a placeholder analysis. Please ensure the AI model is properly configured."
+        }
+        
+        # Call the appropriate AI provider script
+        try:
+            # Check if a specific model was specified
+            model_arg = args.get('model')
+            
+            print(f"Analyzing content with {provider}" + (f" (model: {model_arg})" if model_arg else "") + "...")
+            
+            # Different arguments depending on the provider
+            if provider == "ollampy":
+                cmd = [
+                    provider,
+                    "--prompt", prompt,
+                    "--json"
+                ]
+                
+                # Add model if specified
+                if model_arg:
+                    cmd.extend(["--model", model_arg])
+                
+                # Pass the content as stdin
+                with open(temp_path, 'r') as input_file:
+                    content_data = input_file.read()
+                    
+                proc = subprocess.run(
+                    cmd, 
+                    input=content_data, 
+                    text=True, 
+                    capture_output=True
+                )
+            elif provider in ["claudpy", "grokpy", "geminpy", "perpy", "openpy"]:
+                cmd = [
+                    provider,
+                    "--prompt", prompt
+                ]
+                
+                # Add model if specified
+                if model_arg:
+                    cmd.extend(["--model", model_arg])
+                
+                # Pass the content as stdin
+                with open(temp_path, 'r') as input_file:
+                    content_data = input_file.read()
+                    
+                proc = subprocess.run(
+                    cmd, 
+                    input=content_data, 
+                    text=True, 
+                    capture_output=True
+                )
+            else:
+                # Generic approach with file path
+                cmd = [
+                    provider,
+                    "--prompt", prompt,
+                ]
+                
+                # Add model if specified
+                if model_arg:
+                    cmd.extend(["--model", model_arg])
+                    
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if proc.returncode != 0:
+                print(f"Warning: AI analysis returned error code {proc.returncode}")
+                print(f"Error: {proc.stderr}")
+                print("Using fallback analysis instead.")
+                return fallback_analysis
+            
+            # Try to extract JSON from the response
+            response = proc.stdout
+            
+            # Look for JSON content in the response
+            json_start = response.find('{')
+            json_end = response.rfind('}')
+            
+            if json_start >= 0 and json_end > json_start:
+                # Extract the JSON part
+                json_content = response[json_start:json_end + 1]
+                
+                try:
+                    analysis = json.loads(json_content)
+                    return analysis
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Failed to parse AI response JSON: {e}")
+                    print(f"Response excerpt: {json_content[:100]}...")
+                    print("Using fallback analysis instead.")
+                    return fallback_analysis
+            else:
+                print("Warning: No JSON found in AI response")
+                print(f"Response excerpt: {response[:100]}...")
+                print("Using fallback analysis instead.")
+                return fallback_analysis
+            
+        except Exception as e:
+            print(f"Error during AI analysis: {e}")
+            print("Using fallback analysis instead.")
+            return fallback_analysis
+    finally:
+        # Clean up temporary file
+        os.unlink(temp_path)
+
+def format_neorg_tags(analysis):
+    """Format the analysis results as a structured Neorg section.
+    
+    This function takes the AI analysis results and formats them into a properly
+    structured Neorg document section that will be appended to the end of the file.
+    The formatting follows Neorg conventions with proper heading levels, lists,
+    and emphasis.
+    
+    The structure follows:
+    * Epistemology
+    ** Summary
+    ** Analysis Date
+    ** Claims
+    *** Claim 1
+    - *Text*: ...
+    - *Evidence Type*: ...
+    etc.
+    
+    Args:
+        analysis: The analyzed claims and sources from the AI provider
+        
+    Returns:
+        str: Formatted Neorg content ready to be appended to a file
+    """
+    # Start with header for epistemology section
+    formatted_content = "* Epistemology\n\n"
+    
+    # Add summary
+    formatted_content += "** Summary\n"
+    formatted_content += f"{analysis.get('summary', 'No summary provided')}\n\n"
+    
+    # Add analysis date
+    formatted_content += f"** Analysis Date\n"
+    formatted_content += f"{datetime.datetime.now().strftime('%Y-%m-%d')}\n\n"
+    
+    # Add claims section
+    formatted_content += "** Claims\n\n"
+    for i, claim in enumerate(analysis.get('claims', []), 1):
+        formatted_content += f"*** Claim {i}\n"
+        formatted_content += f"- *Text*: {claim['text']}\n"
+        formatted_content += f"- *Evidence Type*: {claim['evidence_type']}\n"
+        formatted_content += f"- *Confidence*: {claim['confidence']}\n"
+        formatted_content += f"- *Confidence Level*: {claim['confidence_level']}\n"
+        formatted_content += f"- *Source Reliability*: {claim['source_reliability']}\n"
+        formatted_content += f"- *Consistency*: {claim['consistency']}\n\n"
+    
+    # Add sources section
+    formatted_content += "** Sources\n\n"
+    for i, source in enumerate(analysis.get('sources', []), 1):
+        formatted_content += f"*** Source {i}\n"
+        formatted_content += f"- *Name*: {source['name']}\n"
+        formatted_content += f"- *Type*: {source['type']}\n"
+        formatted_content += f"- *Reliability*: {source['reliability']}\n\n"
+    
+    return formatted_content
+
+def format_markdown_tags(analysis):
+    """Format the analysis results as a structured Markdown section.
+    
+    This function takes the AI analysis results and formats them into a properly
+    structured Markdown document section that will be appended to the end of the file.
+    The formatting follows Markdown conventions with proper heading levels, lists,
+    and emphasis.
+    
+    The structure follows:
+    # Epistemology
+    ## Summary
+    ## Analysis Date
+    ## Claims
+    ### Claim 1
+    - **Text**: ...
+    - **Evidence Type**: ...
+    etc.
+    
+    Args:
+        analysis: The analyzed claims and sources from the AI provider
+        
+    Returns:
+        str: Formatted Markdown content ready to be appended to a file
+    """
+    # Start with header for epistemology section
+    formatted_content = "# Epistemology\n\n"
+    
+    # Add summary
+    formatted_content += "## Summary\n"
+    formatted_content += f"{analysis.get('summary', 'No summary provided')}\n\n"
+    
+    # Add analysis date
+    formatted_content += f"## Analysis Date\n"
+    formatted_content += f"{datetime.datetime.now().strftime('%Y-%m-%d')}\n\n"
+    
+    # Add claims section
+    formatted_content += "## Claims\n\n"
+    for i, claim in enumerate(analysis.get('claims', []), 1):
+        formatted_content += f"### Claim {i}\n"
+        formatted_content += f"- **Text**: {claim['text']}\n"
+        formatted_content += f"- **Evidence Type**: {claim['evidence_type']}\n"
+        formatted_content += f"- **Confidence**: {claim['confidence']}\n"
+        formatted_content += f"- **Confidence Level**: {claim['confidence_level']}\n"
+        formatted_content += f"- **Source Reliability**: {claim['source_reliability']}\n"
+        formatted_content += f"- **Consistency**: {claim['consistency']}\n\n"
+    
+    # Add sources section
+    formatted_content += "## Sources\n\n"
+    for i, source in enumerate(analysis.get('sources', []), 1):
+        formatted_content += f"### Source {i}\n"
+        formatted_content += f"- **Name**: {source['name']}\n"
+        formatted_content += f"- **Type**: {source['type']}\n"
+        formatted_content += f"- **Reliability**: {source['reliability']}\n\n"
+    
+    return formatted_content
+
+def insert_tags(file_path, formatted_content, file_format, dry_run=False):
+    """Append epistemological content to a file.
+    
+    This function appends the formatted epistemological metadata to the end of a file.
+    It reads the original content, adds the formatted content at the end, and
+    writes the result back to the file.
+    
+    Args:
+        file_path: Path to the file to modify
+        formatted_content: The formatted epistemological content to append
+        file_format: The format of the file (.norg, .md, etc.)
+        dry_run: If True, don't actually modify the file, just show what would be done
+        
+    Returns:
+        bool: True if the operation was successful, False otherwise
+    """
+    
+    with open(file_path, 'r') as file:
+        content = file.read()
+    
+    # Append the formatted content to the end of the file
+    modified_content = content + "\n\n" + formatted_content
+    
+    # Write back to file if not dry run
+    if not dry_run:
+        with open(file_path, 'w') as file:
+            file.write(modified_content)
+        return True
+    else:
+        print(f"[Dry run] Would append epistemology section to {file_path}:")
+        print("\n--- Appended content would be ---\n")
+        print(formatted_content)
+        return False
+
+def find_notes(directory, extensions=None, exclude_dirs=None):
+    """Find all notes in a directory with specified extensions."""
+    if extensions is None:
+        extensions = ['.norg', '.md', '.txt']
+    if exclude_dirs is None:
+        exclude_dirs = []
+    
+    notes = []
+    
+    for root, dirs, files in os.walk(directory):
+        # Skip excluded directories
+        dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith('.')]
+        
+        for file in files:
+            if any(file.endswith(ext) for ext in extensions):
+                notes.append(os.path.join(root, file))
+    
+    return notes
+
+def has_epistemology_section(file_path):
+    """Check if a file already has an epistemology section.
+    
+    This function examines a file to determine if it already has epistemological
+    metadata, either in the old tag format or the new structured section format.
+    It looks for both patterns and returns True if any are found.
+    
+    This is used by the --update-missing and --redo options to determine which
+    files to process or skip.
+    
+    Args:
+        file_path: Path to the file to check
+        
+    Returns:
+        bool: True if the file has epistemology metadata, False otherwise
+    """
+    with open(file_path, 'r') as file:
+        content = file.read()
+    
+    # Check for old style metadata tags
+    if METADATA_TAG_PATTERN.search(content) or CLAIM_TAG_PATTERN.search(content) or SOURCE_TAG_PATTERN.search(content):
+        return True
+    
+    # Check for new style headers
+    if file_path.endswith('.norg'):
+        # For Neorg files, check for "* Epistemology" section
+        if re.search(r'\*\s+Epistemology', content):
+            return True
+    elif file_path.endswith('.md'):
+        # For Markdown files, check for "# Epistemology" section
+        if re.search(r'#\s+Epistemology', content):
+            return True
+    
+    # No epistemology section found
+    return False
+
+def remove_epistemology_section(file_path):
+    """Remove existing epistemology section from a file.
+    
+    This function removes any existing epistemological metadata from a file,
+    whether in the old tag format or the new structured section format.
+    It uses regular expressions to identify and remove these sections,
+    then cleans up any resulting extra whitespace.
+    
+    This is used by the --redo option to remove existing metadata before
+    performing a fresh analysis.
+    
+    Args:
+        file_path: Path to the file to modify
+        
+    Returns:
+        bool: True if the file was modified, False otherwise
+    """
+    with open(file_path, 'r') as file:
+        content = file.read()
+    
+    modified_content = content
+    
+    # Remove old style metadata tags
+    if METADATA_TAG_PATTERN.search(content) or CLAIM_TAG_PATTERN.search(content) or SOURCE_TAG_PATTERN.search(content):
+        # Remove @epistemology tags
+        modified_content = re.sub(r'\n?@epistemology\s+\{[^}]+\}\n?', '\n', modified_content)
+        # Remove @claim tags
+        modified_content = re.sub(r'\n?@claim\s+\{[^}]+\}\n?', '\n', modified_content)
+        # Remove @source tags
+        modified_content = re.sub(r'\n?@source\s+\{[^}]+\}\n?', '\n', modified_content)
+    
+    # Remove new style sections
+    if file_path.endswith('.norg'):
+        # For Neorg files, remove "* Epistemology" section and everything under it until next top-level header
+        match = re.search(r'(\n\*\s+Epistemology\b.*?)(\n\*\s+\w+|\Z)', modified_content, re.DOTALL)
+        if match:
+            modified_content = modified_content.replace(match.group(1), '')
+    
+    elif file_path.endswith('.md'):
+        # For Markdown files, remove "# Epistemology" section and everything under it until next top-level header
+        match = re.search(r'(\n#\s+Epistemology\b.*?)(\n#\s+\w+|\Z)', modified_content, re.DOTALL)
+        if match:
+            modified_content = modified_content.replace(match.group(1), '')
+    
+    # Clean up multiple newlines
+    modified_content = re.sub(r'\n{3,}', '\n\n', modified_content)
+    
+    # Only write the file if changes were made
+    if modified_content != content:
+        with open(file_path, 'w') as file:
+            file.write(modified_content)
+        return True
+    
+    return False
+
+def extract_existing_metadata(file_path):
+    """Extract existing epistemological metadata from a file."""
+    with open(file_path, 'r') as file:
+        content = file.read()
+    
+    # Extract metadata tags
+    epistemology_matches = METADATA_TAG_PATTERN.findall(content)
+    claim_matches = CLAIM_TAG_PATTERN.findall(content)
+    source_matches = SOURCE_TAG_PATTERN.findall(content)
+    
+    # Parse the metadata
+    metadata = {}
+    
+    if epistemology_matches:
+        # Parse epistemology metadata
+        epistemology_str = epistemology_matches[0]
+        # Simple line parsing for key: value pairs
+        for line in epistemology_str.split('\n'):
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                metadata[key.strip()] = value.strip()
+    
+    # Parse claims
+    claims = []
+    for claim_str in claim_matches:
+        claim = {}
+        for line in claim_str.split('\n'):
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                claim[key.strip()] = value.strip()
+        if claim:
+            claims.append(claim)
+    
+    # Parse sources
+    sources = []
+    for source_str in source_matches:
+        source = {}
+        for line in source_str.split('\n'):
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                source[key.strip()] = value.strip()
+        if source:
+            sources.append(source)
+    
+    return {
+        'metadata': metadata,
+        'claims': claims,
+        'sources': sources
+    }
+
+# ----- Command Functions -----
+
+def cmd_analyze(args):
+    """Analyze a single note and add epistemological tags."""
+    file_path = args.path
+    
+    # Check if file exists
+    if not os.path.isfile(file_path):
+        # Try relative to notes directory
+        alternate_path = os.path.join(args.notes_dir, file_path)
+        if os.path.isfile(alternate_path):
+            file_path = alternate_path
+        else:
+            print(f"Error: File not found: {file_path}")
+            return False
+    
+    # Read file content
+    with open(file_path, 'r') as file:
+        content = file.read()
+    
+    print(f"Analyzing {file_path}...")
+    
+    # Handle existing epistemology sections based on command options
+    has_section = has_epistemology_section(file_path)
+    
+    if has_section:
+        if args.redo:
+            # If --redo is specified, remove existing section
+            if args.verbose or not args.batch_size:  # Don't show this in batch mode unless verbose
+                print(f"Removing existing epistemology section from {file_path}...")
+                
+            if not args.dry_run:
+                remove_epistemology_section(file_path)
+        elif args.update_missing:
+            # If --update-missing is specified, skip files with sections
+            if args.verbose:
+                print(f"Skipping {file_path} - already has epistemology section")
+            return False
+        else:
+            # Otherwise prompt the user whether to overwrite
+            existing = extract_existing_metadata(file_path)
+            if existing['claims'] and not args.dry_run:
+                print(f"Note already has {len(existing['claims'])} claims with epistemological metadata.")
+                choice = input("Overwrite existing metadata? (y/n): ")
+                if choice.lower() != 'y':
+                    print("Keeping existing metadata.")
+                    return False
+    
+    # Analyze content
+    try:
+        # Create a dict of additional args
+        analysis_args = {'model': args.model} if args.model else {}
+        
+        # Call the AI provider to analyze the content
+        analysis = prompt_ai_for_analysis(content, args.provider, analysis_args)
+        
+        # Post-process the analysis
+        for claim in analysis.get('claims', []):
+            # Calculate confidence if not provided
+            if 'confidence' not in claim:
+                claim['confidence'] = calculate_confidence(
+                    claim.get('evidence_type', 'unknown'),
+                    claim.get('source_reliability', 'unknown'),
+                    claim.get('consistency', 'unknown')
+                )
+            
+            # Determine confidence level if not provided
+            if 'confidence_level' not in claim:
+                claim['confidence_level'] = get_confidence_level(claim['confidence'])
+        
+        # Format the content based on file type
+        if file_path.endswith('.norg'):
+            formatted_content = format_neorg_tags(analysis)
+        elif file_path.endswith('.md'):
+            formatted_content = format_markdown_tags(analysis)
+        else:
+            # Default to markdown style for other file types
+            formatted_content = format_markdown_tags(analysis)
+        
+        # Append formatted content to the file
+        if insert_tags(file_path, formatted_content, os.path.splitext(file_path)[1], args.dry_run):
+            print(f"Successfully tagged {file_path} with epistemological metadata.")
+            
+            # Report on low-confidence claims
+            low_confidence_claims = [c for c in analysis.get('claims', []) 
+                                    if c.get('confidence', 0) < args.threshold]
+            if low_confidence_claims:
+                print(f"\nWarning: Found {len(low_confidence_claims)} low-confidence claims:")
+                for claim in low_confidence_claims:
+                    print(f"  - \"{claim['text'][:50]}...\" (Confidence: {claim['confidence']})")
+            
+            return True
+        else:
+            return False
+    
+    except Exception as e:
+        print(f"Error analyzing {file_path}: {e}")
+        return False
+
+def cmd_batch(args):
+    """Process all notes in a PARA category."""
+    category_path = os.path.join(args.notes_dir, args.category)
+    
+    if not os.path.isdir(category_path):
+        print(f"Error: Category directory not found: {category_path}")
+        return False
+    
+    print(f"Finding notes in {category_path}...")
+    notes = find_notes(category_path)
+    
+    if not notes:
+        print(f"No notes found in {category_path}")
+        return False
+    
+    # Filter notes based on command options
+    if args.update_missing and not args.redo:
+        print("Checking which notes need epistemology sections...")
+        missing_sections = []
+        for note in notes:
+            if not has_epistemology_section(note):
+                missing_sections.append(note)
+        
+        if not missing_sections:
+            print("All notes already have epistemology sections.")
+            return True
+        
+        print(f"Found {len(missing_sections)} notes that need epistemology sections (out of {len(notes)} total).")
+        notes = missing_sections
+    elif args.redo and not args.update_missing:
+        print("Checking which notes have epistemology sections to redo...")
+        has_sections = []
+        for note in notes:
+            if has_epistemology_section(note):
+                has_sections.append(note)
+        
+        if not has_sections:
+            print("No notes have epistemology sections to redo.")
+            return True
+        
+        print(f"Found {len(has_sections)} notes with epistemology sections to redo (out of {len(notes)} total).")
+        notes = has_sections
+    else:
+        print(f"Found {len(notes)} notes to process.")
+    
+    # Process notes in batches
+    batch_size = args.batch_size
+    total_notes = len(notes)
+    successful = 0
+    
+    for i in range(0, total_notes, batch_size):
+        batch_notes = notes[i:i+batch_size]
+        print(f"\nProcessing batch {i//batch_size + 1}/{(total_notes + batch_size - 1)//batch_size}...")
+        
+        for note in batch_notes:
+            # Use a modified args object for analyze command
+            batch_args = argparse.Namespace(**vars(args))
+            batch_args.path = note
+            
+            if cmd_analyze(batch_args):
+                successful += 1
+            
+            # Small delay to avoid overwhelming the system
+            time.sleep(0.5)
+    
+    print(f"\nBatch processing complete. Successfully tagged {successful}/{total_notes} notes.")
+    return True
+
+def cmd_report(args):
+    """Generate a confidence report for a note or directory."""
+    if args.path:
+        target_path = args.path
+        
+        # Check if path exists
+        if not os.path.exists(target_path):
+            # Try relative to notes directory
+            alternate_path = os.path.join(args.notes_dir, target_path)
+            if os.path.exists(alternate_path):
+                target_path = alternate_path
+            else:
+                print(f"Error: Path not found: {target_path}")
+                return False
+    else:
+        # Use the entire notes directory
+        target_path = args.notes_dir
+    
+    print(f"Generating confidence report for {target_path}...")
+    
+    # Find all notes to analyze
+    if os.path.isdir(target_path):
+        notes = find_notes(target_path)
+    else:
+        notes = [target_path]
+    
+    if not notes:
+        print(f"No notes found in {target_path}")
+        return False
+    
+    # Collect metadata from all notes
+    all_claims = []
+    all_sources = {}
+    
+    for note in notes:
+        try:
+            metadata = extract_existing_metadata(note)
+            
+            # Add file reference to each claim
+            for claim in metadata['claims']:
+                claim['file'] = os.path.relpath(note, args.notes_dir)
+                all_claims.append(claim)
+            
+            # Collect unique sources
+            for source in metadata['sources']:
+                source_name = source.get('name', 'Unknown')
+                if source_name not in all_sources:
+                    all_sources[source_name] = source
+                    all_sources[source_name]['files'] = [os.path.relpath(note, args.notes_dir)]
+                else:
+                    all_sources[source_name]['files'].append(os.path.relpath(note, args.notes_dir))
+        
+        except Exception as e:
+            print(f"Error processing {note}: {e}")
+    
+    # Generate the report
+    report = {
+        'report_date': datetime.datetime.now().strftime('%Y-%m-%d'),
+        'path': os.path.relpath(target_path, args.notes_dir) if target_path != args.notes_dir else 'all notes',
+        'total_notes': len(notes),
+        'total_claims': len(all_claims),
+        'total_sources': len(all_sources),
+        'confidence_summary': {},
+        'evidence_types': {},
+        'low_confidence_claims': [],
+        'high_confidence_claims': [],
+        'sources': all_sources
+    }
+    
+    # Group claims by confidence level
+    confidence_levels = defaultdict(list)
+    evidence_types = defaultdict(list)
+    
+    for claim in all_claims:
+        confidence = float(claim.get('confidence', 0))
+        confidence_level = claim.get('confidence_level', get_confidence_level(confidence))
+        confidence_levels[confidence_level].append(claim)
+        
+        evidence_type = claim.get('evidence_type', 'unknown')
+        evidence_types[evidence_type].append(claim)
+        
+        # Track low and high confidence claims
+        if confidence < args.threshold:
+            report['low_confidence_claims'].append(claim)
+        elif confidence >= 0.9:
+            report['high_confidence_claims'].append(claim)
+    
+    # Sort claims by confidence
+    report['low_confidence_claims'].sort(key=lambda x: float(x.get('confidence', 0)))
+    report['high_confidence_claims'].sort(key=lambda x: float(x.get('confidence', 0)), reverse=True)
+    
+    # Generate confidence summary
+    for level, claims in confidence_levels.items():
+        report['confidence_summary'][level] = {
+            'count': len(claims),
+            'percentage': round(100 * len(claims) / max(1, len(all_claims)), 1)
+        }
+    
+    # Generate evidence type summary
+    for evidence_type, claims in evidence_types.items():
+        report['evidence_types'][evidence_type] = {
+            'count': len(claims),
+            'percentage': round(100 * len(claims) / max(1, len(all_claims)), 1)
+        }
+    
+    # Output the report
+    if args.format == 'json':
+        print(json.dumps(report, indent=2))
+    elif args.format == 'neorg':
+        print("* Epistemological Confidence Report")
+        print(f"** Report Date: {report['report_date']}")
+        print(f"** Scope: {report['path']}")
+        print(f"** Summary")
+        print(f"- Total Notes: {report['total_notes']}")
+        print(f"- Total Claims: {report['total_claims']}")
+        print(f"- Total Sources: {report['total_sources']}")
+        
+        print("\n** Confidence Levels")
+        for level, data in report['confidence_summary'].items():
+            print(f"- {CONFIDENCE_LEVELS.get(level, {'name': level})['name']}: {data['count']} claims ({data['percentage']}%)")
+        
+        print("\n** Evidence Types")
+        for evidence_type, data in report['evidence_types'].items():
+            print(f"- {EVIDENCE_TYPES.get(evidence_type, {'name': evidence_type})['name']}: {data['count']} claims ({data['percentage']}%)")
+        
+        if report['low_confidence_claims']:
+            print("\n** Low Confidence Claims")
+            for claim in report['low_confidence_claims'][:10]:  # Show top 10
+                print(f"- \"{claim['text'][:50]}...\" (Confidence: {claim['confidence']})")
+                print(f"  File: {claim['file']}")
+        
+        if report['high_confidence_claims']:
+            print("\n** High Confidence Claims")
+            for claim in report['high_confidence_claims'][:10]:  # Show top 10
+                print(f"- \"{claim['text'][:50]}...\" (Confidence: {claim['confidence']})")
+                print(f"  File: {claim['file']}")
+    
+    elif args.format == 'markdown':
+        print("# Epistemological Confidence Report")
+        print(f"**Report Date:** {report['report_date']}")
+        print(f"**Scope:** {report['path']}")
+        print(f"## Summary")
+        print(f"- Total Notes: {report['total_notes']}")
+        print(f"- Total Claims: {report['total_claims']}")
+        print(f"- Total Sources: {report['total_sources']}")
+        
+        print("\n## Confidence Levels")
+        for level, data in report['confidence_summary'].items():
+            print(f"- **{CONFIDENCE_LEVELS.get(level, {'name': level})['name']}:** {data['count']} claims ({data['percentage']}%)")
+        
+        print("\n## Evidence Types")
+        for evidence_type, data in report['evidence_types'].items():
+            print(f"- **{EVIDENCE_TYPES.get(evidence_type, {'name': evidence_type})['name']}:** {data['count']} claims ({data['percentage']}%)")
+        
+        if report['low_confidence_claims']:
+            print("\n## Low Confidence Claims")
+            for claim in report['low_confidence_claims'][:10]:  # Show top 10
+                print(f"- \"{claim['text'][:50]}...\" (Confidence: {claim['confidence']})")
+                print(f"  *File:* {claim['file']}")
+        
+        if report['high_confidence_claims']:
+            print("\n## High Confidence Claims")
+            for claim in report['high_confidence_claims'][:10]:  # Show top 10
+                print(f"- \"{claim['text'][:50]}...\" (Confidence: {claim['confidence']})")
+                print(f"  *File:* {claim['file']}")
+    
+    else:  # text format
+        print("=== Epistemological Confidence Report ===")
+        print(f"Report Date: {report['report_date']}")
+        print(f"Scope: {report['path']}")
+        print(f"\nSummary:")
+        print(f"  Total Notes: {report['total_notes']}")
+        print(f"  Total Claims: {report['total_claims']}")
+        print(f"  Total Sources: {report['total_sources']}")
+        
+        print("\nConfidence Levels:")
+        for level, data in report['confidence_summary'].items():
+            print(f"  {CONFIDENCE_LEVELS.get(level, {'name': level})['name']}: {data['count']} claims ({data['percentage']}%)")
+        
+        print("\nEvidence Types:")
+        for evidence_type, data in report['evidence_types'].items():
+            print(f"  {EVIDENCE_TYPES.get(evidence_type, {'name': evidence_type})['name']}: {data['count']} claims ({data['percentage']}%)")
+        
+        if report['low_confidence_claims']:
+            print("\nLow Confidence Claims:")
+            for claim in report['low_confidence_claims'][:10]:  # Show top 10
+                print(f"  - \"{claim['text'][:50]}...\" (Confidence: {claim['confidence']})")
+                print(f"    File: {claim['file']}")
+        
+        if report['high_confidence_claims']:
+            print("\nHigh Confidence Claims:")
+            for claim in report['high_confidence_claims'][:10]:  # Show top 10
+                print(f"  - \"{claim['text'][:50]}...\" (Confidence: {claim['confidence']})")
+                print(f"    File: {claim['file']}")
+    
+    return True
+
+def cmd_conflicts(args):
+    """Identify conflicting claims across notes."""
+    print("Identifying conflicting claims...")
+    
+    # Find all notes
+    notes = find_notes(args.notes_dir)
+    
+    if not notes:
+        print(f"No notes found in {args.notes_dir}")
+        return False
+    
+    # Collect all claims
+    all_claims = []
+    
+    for note in notes:
+        try:
+            metadata = extract_existing_metadata(note)
+            
+            # Add file reference to each claim
+            for claim in metadata['claims']:
+                claim['file'] = os.path.relpath(note, args.notes_dir)
+                all_claims.append(claim)
+        
+        except Exception as e:
+            if args.verbose:
+                print(f"Error processing {note}: {e}")
+    
+    if not all_claims:
+        print("No claims found in any notes.")
+        return False
+    
+    print(f"Found {len(all_claims)} claims in {len(notes)} notes.")
+    
+    # Group claims by related topics/subjects
+    # This is a simplified approach using related terms
+    # A more sophisticated approach would use vector similarity
+    
+    # Extract keywords from claims
+    def extract_keywords(text):
+        # Simple tokenization and filtering
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+        # Filter out common stop words
+        stop_words = {
+            'the', 'and', 'that', 'for', 'with', 'this', 'have', 'from', 'not',
+            'are', 'was', 'were', 'has', 'been', 'their', 'these', 'those'
+        }
+        return [w for w in words if w not in stop_words]
+    
+    # Build an index of keywords to claims
+    keyword_index = defaultdict(list)
+    
+    for claim in all_claims:
+        keywords = extract_keywords(claim['text'])
+        for keyword in keywords:
+            keyword_index[keyword].append(claim)
+    
+    # Find potentially conflicting claims
+    conflicts = []
+    
+    for keyword, related_claims in keyword_index.items():
+        if len(related_claims) > 1:
+            # Group by consistency type
+            consistency_groups = defaultdict(list)
+            for claim in related_claims:
+                consistency = claim.get('consistency', 'unknown')
+                confidence = float(claim.get('confidence', 0))
+                consistency_groups[consistency].append((claim, confidence))
+            
+            # Check for contradictory or conflicting claims
+            if 'contradictory' in consistency_groups or 'conflicting' in consistency_groups:
+                # Find claims that might contradict each other
+                potential_conflicts = []
+                
+                # Add all contradictory claims
+                for claim, confidence in consistency_groups.get('contradictory', []):
+                    potential_conflicts.append((claim, confidence))
+                
+                # Add all conflicting claims
+                for claim, confidence in consistency_groups.get('conflicting', []):
+                    potential_conflicts.append((claim, confidence))
+                
+                # Add some high-confidence claims for comparison
+                high_confidence_claims = []
+                for consistency, claims in consistency_groups.items():
+                    if consistency not in ('contradictory', 'conflicting'):
+                        for claim, confidence in claims:
+                            if confidence >= 0.7:  # Only high confidence claims
+                                high_confidence_claims.append((claim, confidence))
+                
+                # Take up to 3 high confidence claims
+                high_confidence_claims.sort(key=lambda x: x[1], reverse=True)
+                for claim, confidence in high_confidence_claims[:3]:
+                    potential_conflicts.append((claim, confidence))
+                
+                if len(potential_conflicts) > 1:
+                    conflicts.append({
+                        'keyword': keyword,
+                        'claims': [claim for claim, _ in potential_conflicts]
+                    })
+    
+    # Remove duplicate conflicts (those with the same set of claims)
+    unique_conflicts = []
+    seen_claim_sets = set()
+    
+    for conflict in conflicts:
+        # Create a unique identifier for this set of claims
+        claim_ids = tuple(sorted(claim['file'] + claim['text'][:50] for claim in conflict['claims']))
+        if claim_ids not in seen_claim_sets:
+            seen_claim_sets.add(claim_ids)
+            unique_conflicts.append(conflict)
+    
+    # Output the conflicts
+    if not unique_conflicts:
+        print("No conflicts found.")
+        return True
+    
+    print(f"Found {len(unique_conflicts)} potential conflicts.")
+    
+    if args.format == 'json':
+        print(json.dumps(unique_conflicts, indent=2))
+    
+    elif args.format == 'neorg':
+        print("* Conflicting Claims Report")
+        print(f"** Report Date: {datetime.datetime.now().strftime('%Y-%m-%d')}")
+        
+        for i, conflict in enumerate(unique_conflicts, 1):
+            print(f"\n** Conflict {i}: Keyword '{conflict['keyword']}'")
+            for j, claim in enumerate(conflict['claims'], 1):
+                print(f"*** Claim {j}")
+                print(f"- Text: \"{claim['text'][:100]}...\"")
+                print(f"- Confidence: {claim.get('confidence', 'Unknown')}")
+                print(f"- Evidence Type: {claim.get('evidence_type', 'Unknown')}")
+                print(f"- Consistency: {claim.get('consistency', 'Unknown')}")
+                print(f"- File: {claim['file']}")
+    
+    elif args.format == 'markdown':
+        print("# Conflicting Claims Report")
+        print(f"**Report Date:** {datetime.datetime.now().strftime('%Y-%m-%d')}")
+        
+        for i, conflict in enumerate(unique_conflicts, 1):
+            print(f"\n## Conflict {i}: Keyword '{conflict['keyword']}'")
+            for j, claim in enumerate(conflict['claims'], 1):
+                print(f"### Claim {j}")
+                print(f"- **Text:** \"{claim['text'][:100]}...\"")
+                print(f"- **Confidence:** {claim.get('confidence', 'Unknown')}")
+                print(f"- **Evidence Type:** {claim.get('evidence_type', 'Unknown')}")
+                print(f"- **Consistency:** {claim.get('consistency', 'Unknown')}")
+                print(f"- **File:** {claim['file']}")
+    
+    else:  # text format
+        print("=== Conflicting Claims Report ===")
+        print(f"Report Date: {datetime.datetime.now().strftime('%Y-%m-%d')}")
+        
+        for i, conflict in enumerate(unique_conflicts, 1):
+            print(f"\nConflict {i}: Keyword '{conflict['keyword']}'")
+            for j, claim in enumerate(conflict['claims'], 1):
+                print(f"  Claim {j}:")
+                print(f"    Text: \"{claim['text'][:100]}...\"")
+                print(f"    Confidence: {claim.get('confidence', 'Unknown')}")
+                print(f"    Evidence Type: {claim.get('evidence_type', 'Unknown')}")
+                print(f"    Consistency: {claim.get('consistency', 'Unknown')}")
+                print(f"    File: {claim['file']}")
+    
+    return True
+
+def cmd_update(args):
+    """Update tags for notes that have been modified."""
+    target_path = args.path
+    
+    # Check if path exists
+    if not os.path.exists(target_path):
+        # Try relative to notes directory
+        alternate_path = os.path.join(args.notes_dir, target_path)
+        if os.path.exists(alternate_path):
+            target_path = alternate_path
+        else:
+            print(f"Error: Path not found: {target_path}")
+            return False
+    
+    print(f"Checking for modified notes in {target_path}...")
+    
+    # Find all notes
+    if os.path.isdir(target_path):
+        notes = find_notes(target_path)
+    else:
+        notes = [target_path]
+    
+    if not notes:
+        print(f"No notes found in {target_path}")
+        return False
+    
+    # Check for modified notes
+    modified_notes = []
+    
+    for note in notes:
+        try:
+            metadata = extract_existing_metadata(note)
+            
+            # Check if the file has been modified since the last analysis
+            if metadata['metadata']:
+                last_analysis = metadata['metadata'].get('analysis_date', '')
+                
+                if last_analysis:
+                    # Convert to datetime
+                    try:
+                        last_analysis_date = datetime.datetime.strptime(last_analysis, '%Y-%m-%d')
+                        file_mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(note))
+                        
+                        # Check if file was modified after the last analysis
+                        if file_mod_time > last_analysis_date:
+                            modified_notes.append(note)
+                        
+                    except ValueError:
+                        # Date parsing error, consider it modified
+                        modified_notes.append(note)
+                else:
+                    # No analysis date, treat as modified
+                    modified_notes.append(note)
+            else:
+                # No metadata, treat as new
+                modified_notes.append(note)
+        
+        except Exception as e:
+            if args.verbose:
+                print(f"Error checking {note}: {e}")
+            # If there was an error, include it for update
+            modified_notes.append(note)
+    
+    if not modified_notes:
+        print("No modified notes found that need updating.")
+        return True
+    
+    print(f"Found {len(modified_notes)} notes to update.")
+    
+    # Update each modified note
+    successful = 0
+    
+    for note in modified_notes:
+        print(f"\nUpdating {os.path.relpath(note, args.notes_dir)}...")
+        
+        # Use a modified args object for analyze command
+        update_args = argparse.Namespace(**vars(args))
+        update_args.path = note
+        
+        if cmd_analyze(update_args):
+            successful += 1
+    
+    print(f"\nUpdate complete. Successfully updated {successful}/{len(modified_notes)} notes.")
+    return True
+
+def cmd_taxonomy(args):
+    """Show the epistemological classification taxonomy."""
+    # Check for custom taxonomy file
+    taxonomy = None
+    if args.taxonomy:
+        taxonomy = load_custom_taxonomy(args.taxonomy)
+    
+    if taxonomy is None:
+        # Use the default taxonomy
+        taxonomy = {
+            'evidence_types': EVIDENCE_TYPES,
+            'confidence_levels': CONFIDENCE_LEVELS,
+            'source_reliability': SOURCE_RELIABILITY,
+            'consistency_levels': CONSISTENCY_LEVELS
+        }
+    
+    # Output the taxonomy
+    if args.format == 'json':
+        print(json.dumps(taxonomy, indent=2))
+    
+    elif args.format == 'neorg':
+        print("* Epistemological Taxonomy")
+        
+        print("\n** Evidence Types")
+        for id, data in taxonomy['evidence_types'].items():
+            print(f"*** {data['name']} (`{id}`)")
+            print(f"- Weight: {data['weight']}")
+            print(f"- {data['description']}")
+        
+        print("\n** Confidence Levels")
+        for id, data in taxonomy['confidence_levels'].items():
+            print(f"*** {data['name']} (`{id}`)")
+            print(f"- Range: {data['range'][0]} - {data['range'][1]}")
+            print(f"- {data['description']}")
+        
+        print("\n** Source Reliability")
+        for id, data in taxonomy['source_reliability'].items():
+            print(f"*** {data['name']} (`{id}`)")
+            print(f"- Weight: {data['weight']}")
+            print(f"- {data['description']}")
+        
+        print("\n** Consistency Levels")
+        for id, data in taxonomy['consistency_levels'].items():
+            print(f"*** {data['name']} (`{id}`)")
+            print(f"- Weight: {data['weight']}")
+            print(f"- {data['description']}")
+    
+    elif args.format == 'markdown':
+        print("# Epistemological Taxonomy")
+        
+        print("\n## Evidence Types")
+        for id, data in taxonomy['evidence_types'].items():
+            print(f"### {data['name']} (`{id}`)")
+            print(f"- **Weight:** {data['weight']}")
+            print(f"- {data['description']}")
+        
+        print("\n## Confidence Levels")
+        for id, data in taxonomy['confidence_levels'].items():
+            print(f"### {data['name']} (`{id}`)")
+            print(f"- **Range:** {data['range'][0]} - {data['range'][1]}")
+            print(f"- {data['description']}")
+        
+        print("\n## Source Reliability")
+        for id, data in taxonomy['source_reliability'].items():
+            print(f"### {data['name']} (`{id}`)")
+            print(f"- **Weight:** {data['weight']}")
+            print(f"- {data['description']}")
+        
+        print("\n## Consistency Levels")
+        for id, data in taxonomy['consistency_levels'].items():
+            print(f"### {data['name']} (`{id}`)")
+            print(f"- **Weight:** {data['weight']}")
+            print(f"- {data['description']}")
+    
+    else:  # text format
+        print("=== Epistemological Taxonomy ===")
+        
+        print("\nEvidence Types:")
+        for id, data in taxonomy['evidence_types'].items():
+            print(f"  {data['name']} ({id}):")
+            print(f"    Weight: {data['weight']}")
+            print(f"    {data['description']}")
+        
+        print("\nConfidence Levels:")
+        for id, data in taxonomy['confidence_levels'].items():
+            print(f"  {data['name']} ({id}):")
+            print(f"    Range: {data['range'][0]} - {data['range'][1]}")
+            print(f"    {data['description']}")
+        
+        print("\nSource Reliability:")
+        for id, data in taxonomy['source_reliability'].items():
+            print(f"  {data['name']} ({id}):")
+            print(f"    Weight: {data['weight']}")
+            print(f"    {data['description']}")
+        
+        print("\nConsistency Levels:")
+        for id, data in taxonomy['consistency_levels'].items():
+            print(f"  {data['name']} ({id}):")
+            print(f"    Weight: {data['weight']}")
+            print(f"    {data['description']}")
+    
+    return True
+
+def cmd_stats(args):
+    """Show confidence statistics across your notes."""
+    # Determine which directory to analyze
+    if args.category:
+        category_path = os.path.join(args.notes_dir, args.category)
+        if not os.path.isdir(category_path):
+            print(f"Error: Category directory not found: {category_path}")
+            return False
+        target_path = category_path
+    else:
+        target_path = args.notes_dir
+    
+    print(f"Generating statistics for {target_path}...")
+    
+    # Find all notes
+    notes = find_notes(target_path)
+    
+    if not notes:
+        print(f"No notes found in {target_path}")
+        return False
+    
+    # Collect statistics
+    stats = {
+        'total_notes': len(notes),
+        'notes_with_metadata': 0,
+        'total_claims': 0,
+        'total_sources': 0,
+        'evidence_types': Counter(),
+        'confidence_levels': Counter(),
+        'source_reliability': Counter(),
+        'consistency_levels': Counter(),
+        'confidence_over_time': defaultdict(list),
+        'high_confidence_topics': Counter(),
+        'low_confidence_topics': Counter()
+    }
+    
+    for note in notes:
+        try:
+            metadata = extract_existing_metadata(note)
+            
+            if metadata['claims'] or metadata['sources']:
+                stats['notes_with_metadata'] += 1
+            
+            stats['total_claims'] += len(metadata['claims'])
+            stats['total_sources'] += len(metadata['sources'])
+            
+            # Count evidence types, confidence levels, etc.
+            for claim in metadata['claims']:
+                # Evidence types
+                evidence_type = claim.get('evidence_type', 'unknown')
+                stats['evidence_types'][evidence_type] += 1
+                
+                # Confidence levels
+                confidence = float(claim.get('confidence', 0))
+                confidence_level = claim.get('confidence_level', get_confidence_level(confidence))
+                stats['confidence_levels'][confidence_level] += 1
+                
+                # Source reliability
+                source_reliability = claim.get('source_reliability', 'unknown')
+                stats['source_reliability'][source_reliability] += 1
+                
+                # Consistency levels
+                consistency = claim.get('consistency', 'unknown')
+                stats['consistency_levels'][consistency] += 1
+                
+                # Confidence over time
+                if 'analysis_date' in metadata['metadata']:
+                    try:
+                        date = datetime.datetime.strptime(metadata['metadata']['analysis_date'], '%Y-%m-%d')
+                        stats['confidence_over_time'][date.strftime('%Y-%m')].append(confidence)
+                    except ValueError:
+                        pass
+                
+                # Extract topics from claim text
+                topics = extract_keywords(claim['text'])
+                
+                # Track high and low confidence topics
+                if confidence >= 0.8:
+                    for topic in topics:
+                        stats['high_confidence_topics'][topic] += 1
+                elif confidence <= 0.4:
+                    for topic in topics:
+                        stats['low_confidence_topics'][topic] += 1
+            
+        except Exception as e:
+            if args.verbose:
+                print(f"Error processing {note}: {e}")
+    
+    # Calculate average confidence over time
+    avg_confidence_over_time = {
+        month: sum(confidences) / len(confidences) 
+        for month, confidences in stats['confidence_over_time'].items()
+    }
+    
+    # Output statistics
+    if args.format == 'json':
+        # Convert Counter objects to dictionaries for JSON serialization
+        stats_json = {
+            'total_notes': stats['total_notes'],
+            'notes_with_metadata': stats['notes_with_metadata'],
+            'total_claims': stats['total_claims'],
+            'total_sources': stats['total_sources'],
+            'evidence_types': dict(stats['evidence_types']),
+            'confidence_levels': dict(stats['confidence_levels']),
+            'source_reliability': dict(stats['source_reliability']),
+            'consistency_levels': dict(stats['consistency_levels']),
+            'confidence_over_time': avg_confidence_over_time,
+            'high_confidence_topics': dict(stats['high_confidence_topics'].most_common(10)),
+            'low_confidence_topics': dict(stats['low_confidence_topics'].most_common(10))
+        }
+        print(json.dumps(stats_json, indent=2))
+    
+    elif args.format == 'neorg':
+        print("* Epistemological Statistics")
+        print(f"** Generated: {datetime.datetime.now().strftime('%Y-%m-%d')}")
+        print(f"** Scope: {os.path.relpath(target_path, args.notes_dir) if target_path != args.notes_dir else 'all notes'}")
+        
+        print("\n** Overview")
+        print(f"- Total Notes: {stats['total_notes']}")
+        print(f"- Notes with Metadata: {stats['notes_with_metadata']} ({round(100 * stats['notes_with_metadata'] / max(1, stats['total_notes']), 1)}%)")
+        print(f"- Total Claims: {stats['total_claims']}")
+        print(f"- Total Sources: {stats['total_sources']}")
+        
+        print("\n** Evidence Types")
+        for evidence_type, count in stats['evidence_types'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- {EVIDENCE_TYPES.get(evidence_type, {'name': evidence_type})['name']}: {count} ({percentage}%)")
+        
+        print("\n** Confidence Levels")
+        for level, count in stats['confidence_levels'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- {CONFIDENCE_LEVELS.get(level, {'name': level})['name']}: {count} ({percentage}%)")
+        
+        print("\n** Source Reliability")
+        for reliability, count in stats['source_reliability'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- {SOURCE_RELIABILITY.get(reliability, {'name': reliability})['name']}: {count} ({percentage}%)")
+        
+        print("\n** Consistency Levels")
+        for consistency, count in stats['consistency_levels'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- {CONSISTENCY_LEVELS.get(consistency, {'name': consistency})['name']}: {count} ({percentage}%)")
+        
+        if avg_confidence_over_time:
+            print("\n** Confidence Over Time")
+            for month, avg_conf in sorted(avg_confidence_over_time.items()):
+                print(f"- {month}: {round(avg_conf, 2)}")
+        
+        print("\n** High Confidence Topics")
+        for topic, count in stats['high_confidence_topics'].most_common(10):
+            print(f"- {topic}: {count}")
+        
+        print("\n** Low Confidence Topics")
+        for topic, count in stats['low_confidence_topics'].most_common(10):
+            print(f"- {topic}: {count}")
+    
+    elif args.format == 'markdown':
+        print("# Epistemological Statistics")
+        print(f"**Generated:** {datetime.datetime.now().strftime('%Y-%m-%d')}")
+        print(f"**Scope:** {os.path.relpath(target_path, args.notes_dir) if target_path != args.notes_dir else 'all notes'}")
+        
+        print("\n## Overview")
+        print(f"- **Total Notes:** {stats['total_notes']}")
+        print(f"- **Notes with Metadata:** {stats['notes_with_metadata']} ({round(100 * stats['notes_with_metadata'] / max(1, stats['total_notes']), 1)}%)")
+        print(f"- **Total Claims:** {stats['total_claims']}")
+        print(f"- **Total Sources:** {stats['total_sources']}")
+        
+        print("\n## Evidence Types")
+        for evidence_type, count in stats['evidence_types'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- **{EVIDENCE_TYPES.get(evidence_type, {'name': evidence_type})['name']}:** {count} ({percentage}%)")
+        
+        print("\n## Confidence Levels")
+        for level, count in stats['confidence_levels'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- **{CONFIDENCE_LEVELS.get(level, {'name': level})['name']}:** {count} ({percentage}%)")
+        
+        print("\n## Source Reliability")
+        for reliability, count in stats['source_reliability'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- **{SOURCE_RELIABILITY.get(reliability, {'name': reliability})['name']}:** {count} ({percentage}%)")
+        
+        print("\n## Consistency Levels")
+        for consistency, count in stats['consistency_levels'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"- **{CONSISTENCY_LEVELS.get(consistency, {'name': consistency})['name']}:** {count} ({percentage}%)")
+        
+        if avg_confidence_over_time:
+            print("\n## Confidence Over Time")
+            for month, avg_conf in sorted(avg_confidence_over_time.items()):
+                print(f"- **{month}:** {round(avg_conf, 2)}")
+        
+        print("\n## High Confidence Topics")
+        for topic, count in stats['high_confidence_topics'].most_common(10):
+            print(f"- **{topic}:** {count}")
+        
+        print("\n## Low Confidence Topics")
+        for topic, count in stats['low_confidence_topics'].most_common(10):
+            print(f"- **{topic}:** {count}")
+    
+    else:  # text format
+        print("=== Epistemological Statistics ===")
+        print(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d')}")
+        print(f"Scope: {os.path.relpath(target_path, args.notes_dir) if target_path != args.notes_dir else 'all notes'}")
+        
+        print("\nOverview:")
+        print(f"  Total Notes: {stats['total_notes']}")
+        print(f"  Notes with Metadata: {stats['notes_with_metadata']} ({round(100 * stats['notes_with_metadata'] / max(1, stats['total_notes']), 1)}%)")
+        print(f"  Total Claims: {stats['total_claims']}")
+        print(f"  Total Sources: {stats['total_sources']}")
+        
+        print("\nEvidence Types:")
+        for evidence_type, count in stats['evidence_types'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"  {EVIDENCE_TYPES.get(evidence_type, {'name': evidence_type})['name']}: {count} ({percentage}%)")
+        
+        print("\nConfidence Levels:")
+        for level, count in stats['confidence_levels'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"  {CONFIDENCE_LEVELS.get(level, {'name': level})['name']}: {count} ({percentage}%)")
+        
+        print("\nSource Reliability:")
+        for reliability, count in stats['source_reliability'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"  {SOURCE_RELIABILITY.get(reliability, {'name': reliability})['name']}: {count} ({percentage}%)")
+        
+        print("\nConsistency Levels:")
+        for consistency, count in stats['consistency_levels'].most_common():
+            percentage = round(100 * count / max(1, stats['total_claims']), 1)
+            print(f"  {CONSISTENCY_LEVELS.get(consistency, {'name': consistency})['name']}: {count} ({percentage}%)")
+        
+        if avg_confidence_over_time:
+            print("\nConfidence Over Time:")
+            for month, avg_conf in sorted(avg_confidence_over_time.items()):
+                print(f"  {month}: {round(avg_conf, 2)}")
+        
+        print("\nHigh Confidence Topics:")
+        for topic, count in stats['high_confidence_topics'].most_common(10):
+            print(f"  {topic}: {count}")
+        
+        print("\nLow Confidence Topics:")
+        for topic, count in stats['low_confidence_topics'].most_common(10):
+            print(f"  {topic}: {count}")
+    
+    return True
+
+# ----- Main Function -----
+def main():
+    """Main entry point for the epistemology_tagger script.
+    
+    This function:
+    1. Parses command-line arguments
+    2. Dispatches to the appropriate command handler
+    3. Returns an exit code (0 for success, 1 for error)
+    
+    The script supports multiple commands (analyze, batch, report, etc.),
+    each with its own set of options and behaviors. The main function acts
+    as a dispatcher to route control to the appropriate command handler.
+    
+    Returns:
+        int: Exit code (0 for success, 1 for error)
+    """
+    args = parse_args()
+    
+    # Execute the requested command
+    if args.command == 'analyze':
+        cmd_analyze(args)
+    elif args.command == 'batch':
+        cmd_batch(args)
+    elif args.command == 'report':
+        cmd_report(args)
+    elif args.command == 'conflicts':
+        cmd_conflicts(args)
+    elif args.command == 'update':
+        cmd_update(args)
+    elif args.command == 'taxonomy':
+        cmd_taxonomy(args)
+    elif args.command == 'stats':
+        cmd_stats(args)
+    else:
+        print("Error: No command specified.")
+        print("Try 'epistemology_tagger --help' for usage information.")
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
