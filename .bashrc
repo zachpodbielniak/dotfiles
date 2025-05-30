@@ -132,6 +132,7 @@ alias gpia="curl https://icanhazip.com"
 alias k="kubectl"
 alias fcd='cd $(find * -type d | fzf)'
 alias y="yazi"
+alias sv="source venv/bin/activate"
 
 alias cdd="cd ${HOME}/.dotfiles"
 alias cdp="cd ${HOME}/Source/Projects"
