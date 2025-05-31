@@ -2,14 +2,14 @@ stow: dep_dirs
     #!/bin/bash 
     set -euxo pipefail
 
-    stow --ignore=Justfile --ignore=CLAUDE.md --ignore=tests .
+    stow --ignore=Justfile --ignore=CLAUDE.md --ignore=tests --ignore=Containerfile .
 
 
 stow_alt: dep_dirs
     #!/bin/bash 
     set -euxo pipefail
 
-    stow --ignore=Justfile --ignore=CLAUDE.md --ignore=tests --ignore=.gitconfig .
+    stow --ignore=Justfile --ignore=CLAUDE.md --ignore=tests --ignore=Containerfile --ignore=.gitconfig .
 
 
 unstow:
