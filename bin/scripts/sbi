@@ -34,7 +34,8 @@ set -euo pipefail
 # - perpy: For AI-based PARA category detection
 # - mton: For Markdown to Neorg conversion
 # - yt-dlp: For YouTube content downloading
-# - pandoc: For document format conversion
+# - markitdown: For document/HTML conversion (preferred)
+# - pandoc: For document format conversion (fallback)
 # - curl: For web content downloading
 # - vipe: For editing content within pipes
 # - Various fallback utilities: lynx/w3m, pdftotext, etc.
@@ -3348,51 +3349,146 @@ is_youtube_url() {
     fi
 }
 
+# Function to extract a clean filename from a URL
+extract_filename_from_url() {
+    local url="$1"
+    local filename=""
+    
+    # Remove protocol (http://, https://)
+    url="${url#http://}"
+    url="${url#https://}"
+    
+    # Remove query string and fragment
+    url="${url%%\?*}"
+    url="${url%%#*}"
+    
+    # Remove trailing slash
+    url="${url%/}"
+    
+    # Get the last path component
+    filename="${url##*/}"
+    
+    # If empty or the filename is the same as the cleaned URL (no path), use "index"
+    if [[ -z "$filename" || "$filename" == "$url" ]]; then
+        # This means we have just a domain with no path
+        filename="index"
+    fi
+    
+    # Clean up the filename - remove any remaining dots at the beginning
+    filename="${filename#.}"
+    
+    # If filename ends with .html or .htm, remove the extension
+    filename="${filename%.html}"
+    filename="${filename%.htm}"
+    
+    # If after removing extensions the filename is empty, use "index"
+    if [[ -z "$filename" ]]; then
+        filename="index"
+    fi
+    
+    # Convert to safe filename - replace non-alphanumeric chars (except dots, underscores, hyphens) with underscores
+    filename=$(echo "$filename" | sed 's/[^a-zA-Z0-9._-]/_/g' | tr -s '_')
+    
+    # Remove trailing underscores
+    filename="${filename%_}"
+    
+    echo "$filename"
+}
+
 # Function to download a generic URL and convert to markdown
 download_url_as_markdown() {
     local url="$1"
     local output_file="$2"
     
-    show_progress "Downloading web page from URL: $url"
+    show_progress "Processing web page from URL: $url"
     
     # Create temp directory for processing
     local temp_dir=$(mktemp -d "${HOME}/.tmp/sbi-url-XXXXXX")
     local html_file="${temp_dir}/page.html"
     local md_file="${temp_dir}/page.md"
     
-    # Check if curl is installed
-    if ! command -v curl &> /dev/null; then
-        handle_error "$ERROR_TYPE_DEPENDENCY" "curl not found. Please install it to download web pages" "" "ERROR"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    
-    # Download the webpage with curl
-    show_progress "Fetching web page content..."
-    if ! curl -s -L --max-redirs 5 --connect-timeout 10 --max-time 30 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" "$url" > "$html_file"; then
-        handle_error "$ERROR_TYPE_NETWORK" "Failed to download web page from URL: $url" "" "ERROR"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    
-    # Check if pandoc is installed for HTML to Markdown conversion
-    if command -v pandoc &> /dev/null; then
-        show_progress "Converting HTML to Markdown using pandoc..."
-        if ! pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
-            handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to Markdown with pandoc" "" "ERROR"
+    # Check if markitdown is available - it can handle URLs directly
+    if command -v markitdown &> /dev/null; then
+        show_progress "Fetching and converting web page using markitdown..."
+        if ! markitdown "$url" -o "$md_file"; then
+            handle_error "$ERROR_TYPE_CONVERSION" "Failed to fetch/convert web page with markitdown" "" "WARNING"
+            # Fall back to curl + pandoc method
+            show_progress "Falling back to curl + pandoc method..."
+            
+            # Check if curl is installed
+            if ! command -v curl &> /dev/null; then
+                handle_error "$ERROR_TYPE_DEPENDENCY" "curl not found. Please install it to download web pages" "" "ERROR"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Download the webpage with curl
+            show_progress "Fetching web page content with curl..."
+            if ! curl -s -L --max-redirs 5 --connect-timeout 10 --max-time 30 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" "$url" > "$html_file"; then
+                handle_error "$ERROR_TYPE_NETWORK" "Failed to download web page from URL: $url" "" "ERROR"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Try to convert with pandoc or alternatives
+            if command -v pandoc &> /dev/null; then
+                show_progress "Converting HTML to Markdown using pandoc..."
+                if ! pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
+                    handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to Markdown with pandoc" "" "ERROR"
+                    rm -rf "$temp_dir"
+                    return 1
+                fi
+            elif command -v distrobox &> /dev/null; then
+                show_progress "Attempting to use pandoc via distrobox..."
+                if ! distrobox enter dev -- pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
+                    handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to Markdown with pandoc via distrobox" "" "ERROR"
+                    rm -rf "$temp_dir"
+                    return 1
+                fi
+            else
+                handle_error "$ERROR_TYPE_CONVERSION" "No HTML to Markdown converters available" "" "ERROR"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        fi
+    else
+        # markitdown not available, use curl + pandoc method
+        show_progress "markitdown not found, using curl to fetch web page..."
+        
+        # Check if curl is installed
+        if ! command -v curl &> /dev/null; then
+            handle_error "$ERROR_TYPE_DEPENDENCY" "curl not found. Please install it to download web pages" "" "ERROR"
             rm -rf "$temp_dir"
             return 1
         fi
-    # Fallback to using distrobox with pandoc if system pandoc isn't available
-    elif command -v distrobox &> /dev/null; then
-        show_progress "Attempting to use pandoc via distrobox..."
-        if ! distrobox enter dev -- pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
-            handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to Markdown with pandoc via distrobox" "" "ERROR"
+        
+        # Download the webpage with curl
+        show_progress "Fetching web page content..."
+        if ! curl -s -L --max-redirs 5 --connect-timeout 10 --max-time 30 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" "$url" > "$html_file"; then
+            handle_error "$ERROR_TYPE_NETWORK" "Failed to download web page from URL: $url" "" "ERROR"
             rm -rf "$temp_dir"
             return 1
         fi
-    # Last resort: Use a very simple HTML to text conversion with lynx or w3m
-    elif command -v lynx &> /dev/null; then
+        
+        # Convert HTML to Markdown using available tools
+        
+        # Convert HTML to Markdown using available tools
+        if command -v pandoc &> /dev/null; then
+            show_progress "Converting HTML to Markdown using pandoc..."
+            if ! pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
+                handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to Markdown with pandoc" "" "ERROR"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        elif command -v distrobox &> /dev/null; then
+            show_progress "Attempting to use pandoc via distrobox..."
+            if ! distrobox enter dev -- pandoc -f html -t markdown_strict "$html_file" -o "$md_file"; then
+                handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to Markdown with pandoc via distrobox" "" "ERROR"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        # Last resort: Use a very simple HTML to text conversion with lynx or w3m
+        elif command -v lynx &> /dev/null; then
         show_progress "Using lynx for basic HTML to text conversion..."
         if ! lynx -dump -nolist "$html_file" > "$md_file"; then
             handle_error "$ERROR_TYPE_CONVERSION" "Failed to convert HTML to text with lynx" "" "ERROR"
@@ -3406,14 +3502,15 @@ download_url_as_markdown() {
             rm -rf "$temp_dir"
             return 1
         fi
-    else
-        handle_error "$ERROR_TYPE_DEPENDENCY" "No HTML to Markdown conversion tools found (pandoc, lynx, or w3m)" "" "ERROR"
-        # Store the URL in the metadata
-        echo "$url" > "${output_file}.url"
-        # Copy the raw HTML as a fallback
-        cp "$html_file" "$output_file"
-        rm -rf "$temp_dir"
-        return 1
+        else
+            handle_error "$ERROR_TYPE_DEPENDENCY" "No HTML to Markdown conversion tools found (pandoc, lynx, or w3m)" "" "ERROR"
+            # Store the URL in the metadata
+            echo "$url" > "${output_file}.url"
+            # Copy the raw HTML as a fallback
+            cp "$html_file" "$output_file"
+            rm -rf "$temp_dir"
+            return 1
+        fi
     fi
     
     # Extract title from HTML for potential use as filename
@@ -3656,7 +3753,12 @@ convert_document_to_markdown() {
     # Map file extensions to pandoc input formats
     case "$file_ext_lower" in
         epub)
-            pandoc_input_format="epub"
+            # Check if markitdown is available for EPUB files
+            if command -v markitdown &> /dev/null; then
+                use_markitdown=true
+            else
+                pandoc_input_format="epub"
+            fi
             ;;
         pdf)
             # Don't use pandoc for PDF files - will use markitdown or pdftotext instead
@@ -6105,10 +6207,14 @@ if [[ ${#WEB_URLS[@]} -gt 0 ]]; then
     for url in "${WEB_URLS[@]}"; do
         debug_log "INFO" "Processing web URL: $url"
         
-        # Generate a unique filename for this URL
-        url_hash=$(echo "$url" | md5sum | cut -d' ' -f1)
-        md_file="${WEB_TEMP_DIR}/${url_hash}.md"
-        debug_log "DEBUG" "Generated hash for URL: $url_hash"
+        # Generate a filename from the URL
+        url_filename=$(extract_filename_from_url "$url")
+        # If NAME_SEED is provided, use it instead
+        if [[ -n "$NAME_SEED" ]]; then
+            url_filename="$NAME_SEED"
+        fi
+        md_file="${WEB_TEMP_DIR}/${url_filename}.md"
+        debug_log "DEBUG" "Generated filename from URL: $url_filename"
         debug_log "DEBUG" "Target markdown file path: $md_file"
         
         # Download and convert web page to markdown
@@ -6231,6 +6337,25 @@ for file in "${FILES[@]}"; do
         filename_no_ext="$filename"
         echo "Using saved YouTube title for filename: $filename"
         debug_log "INFO" "Using saved YouTube title for filename: $filename"
+    # Check if this is a web content file (has a URL metadata file)
+    elif [[ -f "${file}.url" ]]; then
+        # Extract filename from the URL
+        url=$(cat "${file}.url")
+        url_filename=$(extract_filename_from_url "$url")
+        # Check if we also have a page title
+        if [[ -f "${file}.title" ]]; then
+            # Prefer page title over URL-based filename
+            filename=$(cat "${file}.title")
+            filename_no_ext="$filename"
+            echo "Using saved web page title for filename: $filename"
+            debug_log "INFO" "Using saved web page title for filename: $filename"
+        else
+            # Use URL-based filename
+            filename="$url_filename"
+            filename_no_ext="$filename"
+            echo "Using URL-based filename: $filename"
+            debug_log "INFO" "Using URL-based filename: $filename (from URL: $url)"
+        fi
     else
         # Default case - use original filename
         filename=$(basename "$file")
