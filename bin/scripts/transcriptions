@@ -1,0 +1,725 @@
+#!/bin/bash
+set -euo pipefail
+
+# transcriptions - Unified script for managing transcriptions in PostgreSQL
+# Combines search, view, list, and delete functionality
+
+# Configuration
+DB_HOST="${TRANSCRIPTION_DB_HOST:-127.0.0.1}"
+DB_PORT="${TRANSCRIPTION_DB_PORT:-5432}"
+DB_NAME="${TRANSCRIPTION_DB_NAME:-transcriptions}"
+DB_USER="${TRANSCRIPTION_DB_USER:-postgres}"
+DB_PASSWORD="${TRANSCRIPTION_DB_PASSWORD:-}"
+
+# Script variables
+SCRIPT_NAME="$(basename "$0")"
+ACTION=""
+QUERY=""
+IDENTIFIER=""
+LIMIT=10
+SHOW_METADATA=false
+TYPE_FILTER=""
+TAGS_FILTER=""
+CONFIRM_DELETE=false
+OUTPUT_FORMAT="text"  # text, simple, json, yaml
+VERBOSE=false
+
+# Database connection string
+get_connection_string() {
+    local conn="postgresql://${DB_USER}"
+    [[ -n "$DB_PASSWORD" ]] && conn="${conn}:${DB_PASSWORD}"
+    conn="${conn}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+    echo "$conn"
+}
+
+# Execute SQL with clean output
+execute_sql() {
+    local sql="$1"
+    psql -d "$(get_connection_string)" -tAq -c "$sql" 2>/dev/null
+}
+
+# Execute SQL with formatted output
+execute_sql_formatted() {
+    local sql="$1"
+    psql -d "$(get_connection_string)" -c "$sql"
+}
+
+# Usage help
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [ACTION] [OPTIONS] [QUERY|ID|FILENAME]
+
+Unified management tool for transcriptions stored in PostgreSQL.
+
+ACTIONS:
+    search QUERY        Search transcriptions using full-text search
+    view ID|FILENAME    View full transcription content
+    list               List recent transcriptions
+    delete ID|FILENAME  Delete a transcription and its chunks
+    stats              Show database statistics
+
+OPTIONS:
+    -h, --help         Show this help message
+    -l, --limit N      Number of results to show (default: 10)
+    -m, --metadata     Include metadata in output
+    -t, --type TYPE    Filter by transcription type
+    -T, --tags TAGS    Filter by tags (comma-separated)
+    -y, --yes          Skip confirmation prompts
+    -f, --format FMT   Output format: text, simple, json, yaml (default: text)
+    -v, --verbose      Enable verbose output for debugging
+
+EXAMPLES:
+    # Search for content
+    $SCRIPT_NAME search "action items"
+    $SCRIPT_NAME search --type meeting --limit 5 "budget"
+    
+    # View transcription
+    $SCRIPT_NAME view 75647fb6-5a16-44a5-9155-2bc0aab58b0f
+    $SCRIPT_NAME view recording.mp3
+    $SCRIPT_NAME view -m recording.mp3  # With metadata
+    
+    # List recent transcriptions
+    $SCRIPT_NAME list
+    $SCRIPT_NAME list --limit 20 --type meeting
+    
+    # Delete transcription
+    $SCRIPT_NAME delete recording.mp3
+    $SCRIPT_NAME delete -y 75647fb6-5a16-44a5-9155-2bc0aab58b0f
+    
+    # Show statistics
+    $SCRIPT_NAME stats
+
+ENVIRONMENT VARIABLES:
+    TRANSCRIPTION_DB_HOST     Database host (default: 127.0.0.1)
+    TRANSCRIPTION_DB_PORT     Database port (default: 5432)
+    TRANSCRIPTION_DB_NAME     Database name (default: transcriptions)
+    TRANSCRIPTION_DB_USER     Database user (default: postgres)
+    TRANSCRIPTION_DB_PASSWORD Database password (default: none)
+EOF
+}
+
+# Search transcriptions
+search_transcriptions() {
+    local query="$1"
+    
+    # Escape single quotes in query for SQL
+    local escaped_query=$(echo "$query" | sed "s/'/''/g")
+    
+    # Build WHERE clause
+    local where_clauses=("tc.content_vector @@ plainto_tsquery('english', '$escaped_query')")
+    
+    [[ -n "$TYPE_FILTER" ]] && where_clauses+=("t.metadata->>'type' = '$TYPE_FILTER'")
+    
+    if [[ -n "$TAGS_FILTER" ]]; then
+        IFS=',' read -ra tags <<< "$TAGS_FILTER"
+        local tag_conditions=()
+        for tag in "${tags[@]}"; do
+            tag=$(echo "$tag" | xargs)  # Trim whitespace
+            tag_conditions+=("t.metadata->'tags' ? '$tag'")
+        done
+        [[ ${#tag_conditions[@]} -gt 0 ]] && where_clauses+=("(${tag_conditions[*]})")
+    fi
+    
+    local where_clause=$(IFS=' AND '; echo "${where_clauses[*]}")
+    
+    # Build query with pipe separator for easier parsing
+    local sql="
+    SELECT DISTINCT ON (t.id)
+        t.id || '|' ||
+        t.filename || '|' ||
+        COALESCE(t.file_path, '') || '|' ||
+        t.metadata::text || '|' ||
+        t.transcribed_at || '|' ||
+        ts_rank(tc.content_vector, plainto_tsquery('english', '$escaped_query')) || '|' ||
+        ts_headline('english', tc.content, plainto_tsquery('english', '$escaped_query'),
+            'StartSel=**, StopSel=**, MaxWords=50, MinWords=20')
+    FROM transcriptions t
+    JOIN transcription_chunks tc ON t.id = tc.transcription_id
+    WHERE $where_clause
+    ORDER BY t.id, ts_rank(tc.content_vector, plainto_tsquery('english', '$escaped_query')) DESC
+    LIMIT $LIMIT;"
+    
+    case "$OUTPUT_FORMAT" in
+        simple)
+            execute_sql "
+            SELECT DISTINCT t.filename
+            FROM transcriptions t
+            JOIN transcription_chunks tc ON t.id = tc.transcription_id
+            WHERE $where_clause
+            ORDER BY t.filename
+            LIMIT $LIMIT;"
+            ;;
+        json)
+            execute_sql "
+            SELECT json_agg(sub)::text FROM (
+                SELECT DISTINCT ON (t.id)
+                    t.id,
+                    t.filename,
+                    t.file_path,
+                    t.metadata,
+                    t.transcribed_at,
+                    ts_rank(tc.content_vector, plainto_tsquery('english', '$escaped_query')) AS rank,
+                    ts_headline('english', tc.content, plainto_tsquery('english', '$escaped_query'),
+                        'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') AS snippet
+                FROM transcriptions t
+                JOIN transcription_chunks tc ON t.id = tc.transcription_id
+                WHERE $where_clause
+                ORDER BY t.id, rank DESC
+                LIMIT $LIMIT
+            ) sub;"
+            ;;
+        yaml)
+            # Get results and convert to YAML
+            local yaml_results=$(execute_sql "$sql")
+            if [[ -z "$yaml_results" ]]; then
+                echo "results: []"
+                return
+            fi
+            
+            echo "results:"
+            while IFS='|' read -r id filename file_path metadata transcribed_at rank snippet; do
+                [[ -z "$id" ]] && continue
+                
+                # Clean up values
+                local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
+                if [[ -n "$snippet" ]]; then
+                    snippet=$(echo "$snippet" | sed "s/''''/'/g")
+                fi
+                
+                # Extract metadata
+                local type=""
+                local tags_array="[]"
+                if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
+                    type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
+                    tags_array=$(echo "$metadata" | jq -c '.tags // []' 2>/dev/null)
+                fi
+                
+                # Output YAML format
+                echo "  - id: \"$id\""
+                echo "    filename: \"$filename\""
+                [[ -n "$file_path" ]] && echo "    file_path: \"$file_path\""
+                echo "    transcribed_at: \"$formatted_date\""
+                echo "    rank: $rank"
+                [[ -n "$type" ]] && echo "    type: \"$type\""
+                
+                # Handle tags array
+                if [[ "$tags_array" != "[]" ]] && [[ "$tags_array" != "null" ]]; then
+                    echo "    tags:"
+                    echo "$tags_array" | jq -r '.[]' | while read -r tag; do
+                        echo "      - \"$tag\""
+                    done
+                fi
+                
+                # Escape quotes in snippet for YAML
+                local escaped_snippet=$(echo "$snippet" | sed 's/"/\\"/g')
+                echo "    snippet: \"$escaped_snippet\""
+            done <<< "$yaml_results"
+            ;;
+        *)
+            echo "Search results for: \"$query\""
+            echo "=================="
+            
+            # Debug SQL if verbose
+            if [[ "$VERBOSE" == true ]]; then
+                echo "DEBUG: SQL Query:"
+                echo "$sql"
+                echo "DEBUG: Where clause: $where_clause"
+            fi
+            
+            local results=$(execute_sql "$sql")
+            
+            # Debug: Show raw results if verbose
+            [[ "$VERBOSE" == true ]] && echo "DEBUG: Raw results: '$results'"
+            
+            if [[ -z "$results" || "$results" == "NULL" || "$results" == "" ]]; then
+                echo "No results found."
+                return
+            fi
+            
+            # Parse and display results
+            local count=0
+            while IFS='|' read -r id filename file_path metadata transcribed_at rank snippet; do
+                # Skip empty lines
+                [[ -z "$id" ]] && continue
+                
+                count=$((count + 1))
+                echo -e "\n$count. $filename"
+                echo "   ID: $id"
+                [[ -n "$file_path" ]] && echo "   Path: $file_path"
+                
+                # Format timestamp nicely
+                local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
+                echo "   Transcribed: $formatted_date"
+                
+                if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
+                    local type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
+                    local tags=$(echo "$metadata" | jq -r '.tags // [] | join(", ")' 2>/dev/null)
+                    [[ -n "$type" ]] && echo "   Type: $type"
+                    [[ -n "$tags" ]] && echo "   Tags: $tags"
+                fi
+                
+                # Clean up snippet
+                if [[ -n "$snippet" ]]; then
+                    snippet=$(echo "$snippet" | sed "s/''''/'/g")
+                    echo "   Snippet: $snippet"
+                fi
+            done <<< "$results"
+            
+            echo -e "\nFound $count results."
+            ;;
+    esac
+}
+
+# View transcription
+view_transcription() {
+    local identifier="$1"
+    local uuid=""
+    
+    # Determine if identifier is UUID or filename
+    if [[ "$identifier" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        uuid="$identifier"
+    else
+        # Look up UUID by filename
+        uuid=$(execute_sql "SELECT id FROM transcriptions WHERE filename = '$identifier' ORDER BY transcribed_at DESC LIMIT 1")
+        if [[ -z "$uuid" ]]; then
+            echo "Error: No transcription found for filename: $identifier" >&2
+            return 1
+        fi
+    fi
+    
+    case "$OUTPUT_FORMAT" in
+        json)
+            execute_sql "
+            SELECT json_build_object(
+                'id', t.id,
+                'filename', t.filename,
+                'file_path', t.file_path,
+                'metadata', t.metadata,
+                'transcribed_at', t.transcribed_at,
+                'model_used', t.model_used,
+                'duration_seconds', t.duration_seconds,
+                'content', string_agg(tc.content, E'\n' ORDER BY tc.chunk_number)
+            )::text
+            FROM transcriptions t
+            LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+            WHERE t.id = '$uuid'::uuid
+            GROUP BY t.id;"
+            ;;
+        yaml)
+            # Get transcription data
+            local data=$(execute_sql "
+            SELECT 
+                t.id || '|' ||
+                t.filename || '|' ||
+                COALESCE(t.file_path, '') || '|' ||
+                t.metadata::text || '|' ||
+                t.transcribed_at || '|' ||
+                COALESCE(t.model_used, '') || '|' ||
+                COALESCE(t.duration_seconds::text, '') || '|' ||
+                COALESCE(string_agg(tc.content, E'\n' ORDER BY tc.chunk_number), '')
+            FROM transcriptions t
+            LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+            WHERE t.id = '$uuid'::uuid
+            GROUP BY t.id;")
+            
+            if [[ -z "$data" ]]; then
+                echo "error: \"Transcription not found\""
+                return 1
+            fi
+            
+            IFS='|' read -r id filename file_path metadata transcribed_at model_used duration content <<< "$data"
+            
+            # Clean up timestamp
+            local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
+            
+            # Start YAML output
+            echo "transcription:"
+            echo "  id: \"$id\""
+            echo "  filename: \"$filename\""
+            [[ -n "$file_path" ]] && echo "  file_path: \"$file_path\""
+            echo "  transcribed_at: \"$formatted_date\""
+            [[ -n "$model_used" ]] && echo "  model_used: \"$model_used\""
+            [[ -n "$duration" ]] && echo "  duration_seconds: $duration"
+            
+            # Handle metadata
+            if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
+                local type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
+                local tags_array=$(echo "$metadata" | jq -c '.tags // []' 2>/dev/null)
+                
+                [[ -n "$type" ]] && echo "  type: \"$type\""
+                
+                if [[ "$tags_array" != "[]" ]] && [[ "$tags_array" != "null" ]]; then
+                    echo "  tags:"
+                    echo "$tags_array" | jq -r '.[]' | while read -r tag; do
+                        echo "    - \"$tag\""
+                    done
+                fi
+            fi
+            
+            # Handle content - properly escape for YAML
+            echo "  content: |"
+            echo "$content" | sed 's/^/    /'
+            ;;
+        simple)
+            execute_sql "
+            SELECT string_agg(content, E'\n' ORDER BY chunk_number)
+            FROM transcription_chunks
+            WHERE transcription_id = '$uuid'::uuid;"
+            ;;
+        *)
+            if [[ "$SHOW_METADATA" == true ]]; then
+                echo "=== METADATA ==="
+                execute_sql "
+                SELECT 
+                    'ID: ' || id || E'\n' ||
+                    'Filename: ' || filename || E'\n' ||
+                    'Path: ' || COALESCE(file_path, 'N/A') || E'\n' ||
+                    'Transcribed: ' || transcribed_at || E'\n' ||
+                    'Model: ' || COALESCE(model_used, 'unknown') || E'\n' ||
+                    'Duration: ' || COALESCE(duration_seconds::text || ' seconds', 'unknown') || E'\n' ||
+                    'Type: ' || COALESCE(metadata->>'type', 'none') || E'\n' ||
+                    'Tags: ' || CASE 
+                        WHEN metadata->'tags' IS NOT NULL 
+                        THEN array_to_string(ARRAY(SELECT jsonb_array_elements_text(metadata->'tags')), ', ')
+                        ELSE 'none'
+                    END
+                FROM transcriptions 
+                WHERE id = '$uuid'::uuid;"
+                echo -e "\n=== TRANSCRIPTION ==="
+            fi
+            
+            execute_sql "
+            SELECT string_agg(content, E'\n' ORDER BY chunk_number)
+            FROM transcription_chunks
+            WHERE transcription_id = '$uuid'::uuid;"
+            ;;
+    esac
+}
+
+# List transcriptions
+list_transcriptions() {
+    # Build WHERE clause
+    local where_clauses=()
+    [[ -n "$TYPE_FILTER" ]] && where_clauses+=("metadata->>'type' = '$TYPE_FILTER'")
+    
+    if [[ -n "$TAGS_FILTER" ]]; then
+        IFS=',' read -ra tags <<< "$TAGS_FILTER"
+        local tag_conditions=()
+        for tag in "${tags[@]}"; do
+            tag=$(echo "$tag" | xargs)  # Trim whitespace
+            tag_conditions+=("metadata->'tags' ? '$tag'")
+        done
+        [[ ${#tag_conditions[@]} -gt 0 ]] && where_clauses+=("(${tag_conditions[*]})")
+    fi
+    
+    local where_clause=""
+    if [[ ${#where_clauses[@]} -gt 0 ]]; then
+        where_clause="WHERE $(IFS=' AND '; echo "${where_clauses[*]}")"
+    fi
+    
+    case "$OUTPUT_FORMAT" in
+        simple)
+            execute_sql "
+            SELECT filename
+            FROM transcriptions
+            $where_clause
+            ORDER BY transcribed_at DESC
+            LIMIT $LIMIT;"
+            ;;
+        json)
+            execute_sql "
+            SELECT json_agg(row_to_json(t))::text FROM (
+                SELECT 
+                    id,
+                    filename,
+                    file_path,
+                    transcribed_at,
+                    metadata
+                FROM transcriptions
+                $where_clause
+                ORDER BY transcribed_at DESC
+                LIMIT $LIMIT
+            ) t;"
+            ;;
+        yaml)
+            local yaml_data=$(execute_sql "
+            SELECT 
+                id || '|' ||
+                filename || '|' ||
+                COALESCE(file_path, '') || '|' ||
+                transcribed_at || '|' ||
+                metadata::text
+            FROM transcriptions
+            $where_clause
+            ORDER BY transcribed_at DESC
+            LIMIT $LIMIT;")
+            
+            if [[ -z "$yaml_data" ]]; then
+                echo "transcriptions: []"
+                return
+            fi
+            
+            echo "transcriptions:"
+            while IFS='|' read -r id filename file_path transcribed_at metadata; do
+                [[ -z "$id" ]] && continue
+                
+                # Clean up timestamp
+                local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
+                
+                echo "  - id: \"$id\""
+                echo "    filename: \"$filename\""
+                [[ -n "$file_path" ]] && echo "    file_path: \"$file_path\""
+                echo "    transcribed_at: \"$formatted_date\""
+                
+                # Handle metadata
+                if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
+                    local type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
+                    local tags_array=$(echo "$metadata" | jq -c '.tags // []' 2>/dev/null)
+                    
+                    [[ -n "$type" ]] && echo "    type: \"$type\""
+                    
+                    if [[ "$tags_array" != "[]" ]] && [[ "$tags_array" != "null" ]]; then
+                        echo "    tags:"
+                        echo "$tags_array" | jq -r '.[]' | while read -r tag; do
+                            echo "      - \"$tag\""
+                        done
+                    fi
+                fi
+            done <<< "$yaml_data"
+            ;;
+        *)
+            echo "Recent transcriptions:"
+            echo "===================="
+            execute_sql_formatted "
+            SELECT 
+                id,
+                filename,
+                transcribed_at,
+                COALESCE(metadata->>'type', 'none') as type,
+                CASE 
+                    WHEN metadata->'tags' IS NOT NULL 
+                    THEN array_to_string(ARRAY(SELECT jsonb_array_elements_text(metadata->'tags')), ', ')
+                    ELSE 'none'
+                END as tags
+            FROM transcriptions
+            $where_clause
+            ORDER BY transcribed_at DESC
+            LIMIT $LIMIT;"
+            ;;
+    esac
+}
+
+# Delete transcription
+delete_transcription() {
+    local identifier="$1"
+    local uuid=""
+    local filename=""
+    
+    # Determine if identifier is UUID or filename
+    if [[ "$identifier" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        uuid="$identifier"
+        filename=$(execute_sql "SELECT filename FROM transcriptions WHERE id = '$uuid'::uuid")
+    else
+        filename="$identifier"
+        uuid=$(execute_sql "SELECT id FROM transcriptions WHERE filename = '$filename' ORDER BY transcribed_at DESC LIMIT 1")
+    fi
+    
+    if [[ -z "$uuid" ]]; then
+        echo "Error: No transcription found for: $identifier" >&2
+        return 1
+    fi
+    
+    # Confirm deletion
+    if [[ "$CONFIRM_DELETE" != true ]]; then
+        echo "About to delete transcription:"
+        echo "  ID: $uuid"
+        echo "  Filename: $filename"
+        echo -n "Are you sure? (y/N): "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "Deletion cancelled."
+            return 0
+        fi
+    fi
+    
+    # Delete transcription (chunks are cascade deleted)
+    if execute_sql "DELETE FROM transcriptions WHERE id = '$uuid'::uuid"; then
+        echo "Transcription deleted successfully."
+    else
+        echo "Error: Failed to delete transcription." >&2
+        return 1
+    fi
+}
+
+# Show statistics
+show_stats() {
+    echo "Transcription Database Statistics"
+    echo "================================="
+    
+    execute_sql_formatted "
+    SELECT 
+        COUNT(DISTINCT t.id) as total_transcriptions,
+        COUNT(tc.id) as total_chunks,
+        COALESCE(SUM(tc.character_count), 0) as total_characters,
+        COALESCE(AVG(tc.character_count), 0)::integer as avg_chunk_size
+    FROM transcriptions t
+    LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id;"
+    
+    echo -e "\nTop 5 types:"
+    execute_sql_formatted "
+    SELECT 
+        COALESCE(metadata->>'type', 'none') as type,
+        COUNT(*) as count
+    FROM transcriptions
+    GROUP BY metadata->>'type'
+    ORDER BY count DESC
+    LIMIT 5;"
+    
+    echo -e "\nTop 10 tags:"
+    execute_sql_formatted "
+    SELECT 
+        tag,
+        COUNT(*) as count
+    FROM (
+        SELECT jsonb_array_elements_text(metadata->'tags') as tag
+        FROM transcriptions
+        WHERE metadata->'tags' IS NOT NULL
+    ) t
+    GROUP BY tag
+    ORDER BY count DESC
+    LIMIT 10;"
+}
+
+# Parse command line arguments
+parse_args() {
+    # First, check for action
+    case "${1:-}" in
+        search|view|list|delete|stats)
+            ACTION="$1"
+            shift
+            ;;
+        -h|--help|"")
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown action: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+    
+    # Parse remaining options
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -l|--limit)
+                LIMIT="$2"
+                shift 2
+                ;;
+            -m|--metadata)
+                SHOW_METADATA=true
+                shift
+                ;;
+            -t|--type)
+                TYPE_FILTER="$2"
+                shift 2
+                ;;
+            -T|--tags)
+                TAGS_FILTER="$2"
+                shift 2
+                ;;
+            -y|--yes)
+                CONFIRM_DELETE=true
+                shift
+                ;;
+            -f|--format)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                # Remaining arguments depend on action
+                case "$ACTION" in
+                    search)
+                        QUERY="$*"
+                        break
+                        ;;
+                    view|delete)
+                        IDENTIFIER="$1"
+                        shift
+                        ;;
+                    *)
+                        echo "Unexpected argument: $1" >&2
+                        usage
+                        exit 1
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+# Main execution
+main() {
+    parse_args "$@"
+    
+    # Check psql availability
+    if ! command -v psql &> /dev/null; then
+        echo "Error: psql command not found. Please install PostgreSQL client." >&2
+        exit 1
+    fi
+    
+    # Execute action
+    case "$ACTION" in
+        search)
+            if [[ -z "$QUERY" ]]; then
+                echo "Error: Search requires a query" >&2
+                usage
+                exit 1
+            fi
+            search_transcriptions "$QUERY"
+            ;;
+        view)
+            if [[ -z "$IDENTIFIER" ]]; then
+                echo "Error: View requires a UUID or filename" >&2
+                usage
+                exit 1
+            fi
+            view_transcription "$IDENTIFIER"
+            ;;
+        list)
+            list_transcriptions
+            ;;
+        delete)
+            if [[ -z "$IDENTIFIER" ]]; then
+                echo "Error: Delete requires a UUID or filename" >&2
+                usage
+                exit 1
+            fi
+            delete_transcription "$IDENTIFIER"
+            ;;
+        stats)
+            show_stats
+            ;;
+        *)
+            echo "Error: Unknown action: $ACTION" >&2
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

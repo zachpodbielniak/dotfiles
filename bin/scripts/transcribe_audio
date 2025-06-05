@@ -1,18 +1,526 @@
 #!/bin/bash
+set -euo pipefail
 
-filename=""
+# transcribe_audio - Transcribe audio files using Whisper with optional PostgreSQL storage
+# Supports storing transcriptions in database with metadata and tags
 
-if [[ $# -ge 1 ]]
-then
-    filename="${1}"
-else 
-    echo -e "use this tool correctly"
-    echo -e "\t${0} <path_to_file>"
-    exit 1
+# Script variables
+SCRIPT_NAME="$(basename "$0")"
+FILENAME=""
+NO_STORE_DB=false
+DB_ONLY=false
+UPDATE_DB=false
+TYPE=""
+TAGS=""
+MODEL="ggml-base.en.bin"
+LANGUAGE="en"
+OUTPUT_DIR=""
+VERBOSE=false
+SHOW_ONLY_UUID=false
+
+# Configuration file path
+CONFIG_FILE="${HOME}/.config/transcription_db/config.yaml"
+
+# Load configuration from YAML if available
+if [[ -f "$CONFIG_FILE" ]] && command -v yq &> /dev/null; then
+    CONFIG_DB_HOST=$(yq eval '.database.host // "127.0.0.1"' "$CONFIG_FILE")
+    CONFIG_DB_PORT=$(yq eval '.database.port // 5432' "$CONFIG_FILE")
+    CONFIG_DB_NAME=$(yq eval '.database.name // "transcriptions"' "$CONFIG_FILE")
+    CONFIG_DB_USER=$(yq eval '.database.user // postgres' "$CONFIG_FILE")
+    CONFIG_DB_PASSWORD=$(yq eval '.database.password // ""' "$CONFIG_FILE")
+    CONFIG_CHUNK_SIZE=$(yq eval '.transcription.chunk_size // 1048576' "$CONFIG_FILE")
+    CONFIG_WHISPER_MODEL_PATH=$(yq eval '.transcription.whisper_model_path // "${HOME}/Source/Public/whisper.cpp/models"' "$CONFIG_FILE" | envsubst)
+    CONFIG_WHISPER_BIN=$(yq eval '.transcription.whisper_bin_path // "${HOME}/Source/Public/whisper.cpp/build/bin/whisper-cli"' "$CONFIG_FILE" | envsubst)
+else
+    CONFIG_DB_HOST="127.0.0.1"
+    CONFIG_DB_PORT="5432"
+    CONFIG_DB_NAME="transcriptions"
+    CONFIG_DB_USER="postgres"
+    CONFIG_DB_PASSWORD=""
+    CONFIG_CHUNK_SIZE=1048576
+    CONFIG_WHISPER_MODEL_PATH="${HOME}/Source/Public/whisper.cpp/models"
+    CONFIG_WHISPER_BIN="${HOME}/Source/Public/whisper.cpp/build/bin/whisper-cli"
 fi
 
-distrobox enter whisper -- \
-    ${HOME}/Source/Public/whisper.cpp/build/bin/whisper-cli \
-    -m ${HOME}/Source/Public/whisper.cpp/models/ggml-base.en.bin \
-    -f "${filename}" \
-    -otxt
+# Database configuration (environment variables override config file)
+DB_HOST="${TRANSCRIPTION_DB_HOST:-$CONFIG_DB_HOST}"
+DB_PORT="${TRANSCRIPTION_DB_PORT:-$CONFIG_DB_PORT}"
+DB_NAME="${TRANSCRIPTION_DB_NAME:-$CONFIG_DB_NAME}"
+DB_USER="${TRANSCRIPTION_DB_USER:-$CONFIG_DB_USER}"
+DB_PASSWORD="${TRANSCRIPTION_DB_PASSWORD:-$CONFIG_DB_PASSWORD}"
+
+# Constants
+CHUNK_SIZE="${TRANSCRIPTION_CHUNK_SIZE:-$CONFIG_CHUNK_SIZE}"
+WHISPER_MODEL_PATH="$CONFIG_WHISPER_MODEL_PATH"
+WHISPER_BIN="$CONFIG_WHISPER_BIN"
+
+# Database connection string
+get_connection_string() {
+    local conn="postgresql://${DB_USER}"
+    [[ -n "$DB_PASSWORD" ]] && conn="${conn}:${DB_PASSWORD}"
+    conn="${conn}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+    echo "$conn"
+}
+
+# Execute SQL query
+execute_sql() {
+    local sql="$1"
+    local result
+    local error_output
+    
+    # Capture both stdout and stderr, use -q to suppress "INSERT 0 1" type messages
+    if result=$(psql -d "$(get_connection_string)" -tAq -c "$sql" 2>&1); then
+        echo "$result"
+    else
+        # On error, show the actual PostgreSQL error message
+        echo "SQL Error: $result" >&2
+        return 1
+    fi
+}
+
+# Calculate SHA256 hash of file
+calculate_file_hash() {
+    local file="$1"
+    sha256sum "$file" | cut -d' ' -f1
+}
+
+# Get file duration in seconds (for audio files)
+get_audio_duration() {
+    local file="$1"
+    # Try to get duration using ffprobe if available
+    if command -v ffprobe &> /dev/null; then
+        ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | cut -d. -f1
+    else
+        echo "0"  # Return 0 if we can't determine duration
+    fi
+}
+
+# Check if transcription already exists in database
+transcription_exists() {
+    local file_hash="$1"
+    local count=$(execute_sql "SELECT COUNT(*) FROM transcriptions WHERE file_hash='$file_hash'")
+    [[ "$count" -gt 0 ]]
+}
+
+# Split text into chunks
+split_into_chunks() {
+    local text="$1"
+    local chunk_size="$2"
+    local chunks=()
+    local current_chunk=""
+    local current_size=0
+    
+    # Split by sentences to avoid breaking in the middle of words
+    while IFS= read -r line; do
+        local line_size=${#line}
+        
+        if [[ $((current_size + line_size)) -gt $chunk_size && -n "$current_chunk" ]]; then
+            chunks+=("$current_chunk")
+            current_chunk="$line"
+            current_size=$line_size
+        else
+            if [[ -n "$current_chunk" ]]; then
+                current_chunk="${current_chunk}
+${line}"  # Use actual newline instead of \n
+            else
+                current_chunk="$line"
+            fi
+            current_size=$((current_size + line_size + 1))  # +1 for newline
+        fi
+    done < <(echo -e "$text" | sed 's/\. /.\n/g')
+    
+    # Add remaining chunk
+    [[ -n "$current_chunk" ]] && chunks+=("$current_chunk")
+    
+    printf '%s\n' "${chunks[@]}"
+}
+
+# Insert transcription into database
+insert_transcription() {
+    local filename="$1"
+    local file_path="$2"
+    local file_hash="$3"
+    local content="$4"
+    local duration="$5"
+    local model="$6"
+    local language="$7"
+    local type="$8"
+    local tags="$9"
+    
+    # Build metadata JSON
+    local metadata="{}"
+    [[ -n "$type" ]] && metadata=$(echo "$metadata" | jq --arg t "$type" '. + {type: $t}')
+    if [[ -n "$tags" ]]; then
+        # Convert comma-separated tags to JSON array
+        local tags_json=$(echo "$tags" | jq -R 'split(",")')
+        metadata=$(echo "$metadata" | jq --argjson t "$tags_json" '. + {tags: $t}')
+    fi
+    
+    # Add source script if called from another script
+    local parent_cmd=$(ps -o comm= $PPID 2>/dev/null || echo "")
+    [[ -n "$parent_cmd" && "$parent_cmd" != "bash" ]] && \
+        metadata=$(echo "$metadata" | jq --arg s "$parent_cmd" '. + {source_script: $s}')
+    
+    # Escape content for SQL
+    content=$(echo "$content" | sed "s/'/''/g")
+    
+    # Insert main transcription record - use -tAq to get only the value
+    local transcription_id=$(psql -d "$(get_connection_string)" -tAq -c "
+        INSERT INTO transcriptions 
+        (filename, file_path, file_hash, duration_seconds, model_used, language, metadata)
+        VALUES 
+        ('$filename', '$file_path', '$file_hash', $duration, '$model', '$language', '$metadata'::jsonb)
+        RETURNING id;")
+    
+    if [[ -z "$transcription_id" ]]; then
+        echo "Error: Failed to insert transcription record" >&2
+        return 1
+    fi
+    
+    # Split content into chunks and insert
+    local chunk_number=0
+    while IFS= read -r chunk; do
+        chunk_number=$((chunk_number + 1))
+        
+        # Remove NULL bytes and clean the chunk
+        chunk=$(echo "$chunk" | tr -d '\000')
+        local char_count=${#chunk}
+        
+        # Escape single quotes for SQL
+        chunk=$(echo "$chunk" | sed "s/'/''/g")
+        
+        # Use parameterized query format with psql \set
+        local temp_file=$(mktemp)
+        echo "$chunk" > "$temp_file"
+        
+        if ! psql -d "$(get_connection_string)" -q -v tid="'$transcription_id'" -v cnum="$chunk_number" -v ccount="$char_count" <<EOF 2>&1
+\set content \`cat $temp_file\`
+INSERT INTO transcription_chunks 
+(transcription_id, chunk_number, content, character_count)
+VALUES 
+(:tid::uuid, :cnum, :'content', :ccount);
+EOF
+        then
+            echo "Error: Failed to insert chunk $chunk_number" >&2
+            # Debug output to help diagnose the issue
+            echo "Debug: Chunk length: $char_count characters" >&2
+            echo "Debug: First 100 chars: ${chunk:0:100}" >&2
+            rm -f "$temp_file"
+            return 1
+        fi
+        
+        rm -f "$temp_file"
+    done < <(split_into_chunks "$content" "$CHUNK_SIZE")
+    
+    echo "$transcription_id"
+}
+
+# Update existing transcription
+update_transcription() {
+    local file_hash="$1"
+    local type="$2"
+    local tags="$3"
+    
+    # Get existing transcription ID
+    local transcription_id=$(execute_sql "SELECT id FROM transcriptions WHERE file_hash='$file_hash'")
+    
+    if [[ -z "$transcription_id" ]]; then
+        echo "Error: No transcription found with file hash $file_hash" >&2
+        return 1
+    fi
+    
+    # Update metadata
+    local update_sql="UPDATE transcriptions SET updated_at = CURRENT_TIMESTAMP"
+    
+    if [[ -n "$type" ]]; then
+        update_sql+=", metadata = jsonb_set(metadata, '{type}', '\"$type\"')"
+    fi
+    
+    if [[ -n "$tags" ]]; then
+        local tags_json=$(echo "$tags" | jq -R 'split(",")')
+        update_sql+=", metadata = jsonb_set(metadata, '{tags}', '$tags_json'::jsonb)"
+    fi
+    
+    update_sql+=" WHERE id = '$transcription_id'"
+    
+    execute_sql "$update_sql" || {
+        echo "Error: Failed to update transcription" >&2
+        return 1
+    }
+    
+    echo "$transcription_id"
+}
+
+# Transcribe audio file
+transcribe_file() {
+    local input_file="$1"
+    local output_file="${input_file}.txt"
+    
+    if [[ -n "$OUTPUT_DIR" ]]; then
+        output_file="${OUTPUT_DIR}/$(basename "${input_file}").txt"
+    fi
+    
+    # Run whisper transcription
+    if ! distrobox enter whisper -- \
+        "$WHISPER_BIN" \
+        -m "${WHISPER_MODEL_PATH}/${MODEL}" \
+        -f "$input_file" \
+        -otxt; then
+        echo "Error: Transcription failed" >&2
+        return 1
+    fi
+    
+    # Read the transcription result
+    if [[ -f "$output_file" ]]; then
+        cat "$output_file"
+    else
+        echo "Error: Transcription output file not found: $output_file" >&2
+        return 1
+    fi
+}
+
+# Usage help
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [OPTIONS] <audio_file>
+
+Transcribe audio files using Whisper with optional PostgreSQL storage.
+
+OPTIONS:
+    -h, --help          Show this help message
+    -v, --verbose       Enable verbose output
+    --no-store-db       Do not store transcription in database (default: store)
+    --db-only           Only store in database, skip file output
+    --update-db         Update existing transcription metadata
+    --type TYPE         Categorize transcription (e.g., meeting, interview, lecture)
+    --tags TAGS         Comma-separated tags (e.g., "important,client-x,2024-q1")
+    --model MODEL       Whisper model to use (default: ggml-base.en.bin)
+    --output-dir DIR    Output directory for transcription files
+    --show-only-uuid    Output only the transcription UUID (implies --db-only)
+
+ENVIRONMENT VARIABLES:
+    TRANSCRIPTION_DB_HOST     Database host (default: 127.0.0.1)
+    TRANSCRIPTION_DB_PORT     Database port (default: 5432)
+    TRANSCRIPTION_DB_NAME     Database name (default: transcriptions)
+    TRANSCRIPTION_DB_USER     Database user (default: current user)
+    TRANSCRIPTION_DB_PASSWORD Database password (default: none)
+
+EXAMPLES:
+    # Basic transcription with database storage
+    $SCRIPT_NAME audio.mp3
+    
+    # Transcribe with metadata
+    $SCRIPT_NAME --type meeting --tags "team,standup,2024-q1" audio.mp3
+    
+    # Skip database storage (legacy mode)
+    $SCRIPT_NAME --no-store-db audio.mp3
+    
+    # Update existing transcription metadata
+    $SCRIPT_NAME --update-db --tags "reviewed,important" audio.mp3
+    
+    # Database only (no file output)
+    $SCRIPT_NAME --db-only --type interview candidate.mp3
+
+NOTES:
+    - Transcriptions are stored in PostgreSQL by default
+    - Use 'local_postgres setup' to initialize the database
+    - Large transcriptions are automatically split into chunks
+    - Duplicate files (by hash) are detected and skipped
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --no-store-db)
+                NO_STORE_DB=true
+                shift
+                ;;
+            --db-only)
+                DB_ONLY=true
+                shift
+                ;;
+            --update-db)
+                UPDATE_DB=true
+                shift
+                ;;
+            --type)
+                TYPE="$2"
+                shift 2
+                ;;
+            --tags)
+                TAGS="$2"
+                shift 2
+                ;;
+            --model)
+                MODEL="$2"
+                shift 2
+                ;;
+            --output-dir)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --show-only-uuid)
+                SHOW_ONLY_UUID=true
+                DB_ONLY=true  # Implies --db-only
+                shift
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                FILENAME="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# Main execution
+main() {
+    parse_args "$@"
+    
+    # Validate input
+    if [[ -z "$FILENAME" ]]; then
+        echo "Error: No audio file specified" >&2
+        usage
+        exit 1
+    fi
+    
+    if [[ ! -f "$FILENAME" ]]; then
+        echo "Error: File not found: $FILENAME" >&2
+        exit 1
+    fi
+    
+    # Get absolute path
+    local abs_path=$(realpath "$FILENAME")
+    local basename=$(basename "$FILENAME")
+    
+    # Calculate file hash
+    local file_hash=$(calculate_file_hash "$abs_path")
+    [[ "$VERBOSE" == true ]] && [[ "$SHOW_ONLY_UUID" != true ]] && echo "File hash: $file_hash"
+    
+    # Check if we need to check database
+    if [[ "$NO_STORE_DB" != true ]] && command -v psql &> /dev/null; then
+        # For update mode, just update metadata
+        if [[ "$UPDATE_DB" == true ]]; then
+            [[ "$SHOW_ONLY_UUID" != true ]] && echo "Updating transcription metadata..."
+            local transcription_id=$(update_transcription "$file_hash" "$TYPE" "$TAGS")
+            if [[ -n "$transcription_id" ]]; then
+                if [[ "$SHOW_ONLY_UUID" == true ]]; then
+                    echo "$transcription_id"
+                else
+                    echo "Transcription updated: $transcription_id"
+                fi
+            fi
+            exit 0
+        fi
+        
+        # Check if transcription already exists
+        if transcription_exists "$file_hash"; then
+            local existing_id=$(execute_sql "SELECT id FROM transcriptions WHERE file_hash='$file_hash'")
+            
+            if [[ "$SHOW_ONLY_UUID" == true ]]; then
+                echo "$existing_id"
+                exit 0
+            else
+                echo "Transcription already exists in database for this file"
+                echo "Transcription ID: $existing_id"
+                
+                # If db-only mode, we're done
+                [[ "$DB_ONLY" == true ]] && exit 0
+                
+                # Otherwise, still generate the file output
+                echo "Generating file output..."
+            fi
+        fi
+    fi
+    
+    # Perform transcription
+    [[ "$SHOW_ONLY_UUID" != true ]] && echo "Transcribing: $basename"
+    
+    # Redirect whisper output to stderr if show-only-uuid is set
+    local transcription
+    if [[ "$SHOW_ONLY_UUID" == true ]]; then
+        transcription=$(transcribe_file "$abs_path" 2>&1 | tail -n +2)  # Skip first line of whisper output
+    else
+        transcription=$(transcribe_file "$abs_path")
+    fi
+    
+    if [[ -z "$transcription" ]]; then
+        [[ "$SHOW_ONLY_UUID" != true ]] && echo "Error: Transcription produced no output" >&2
+        exit 1
+    fi
+    
+    # Output to file unless in db-only mode
+    if [[ "$DB_ONLY" != true ]]; then
+        local output_file="${abs_path}.txt"
+        [[ -n "$OUTPUT_DIR" ]] && output_file="${OUTPUT_DIR}/${basename}.txt"
+        
+        # The transcription is already written by whisper, but ensure it exists
+        if [[ ! -f "$output_file" ]]; then
+            echo "$transcription" > "$output_file"
+        fi
+        [[ "$SHOW_ONLY_UUID" != true ]] && echo "Transcription saved to: $output_file"
+    fi
+    
+    # Store in database if enabled
+    if [[ "$NO_STORE_DB" != true ]] && command -v psql &> /dev/null; then
+        # Check if transcription already exists again (in case it was just added)
+        if transcription_exists "$file_hash"; then
+            local existing_id=$(execute_sql "SELECT id FROM transcriptions WHERE file_hash='$file_hash'")
+            
+            if [[ "$SHOW_ONLY_UUID" == true ]]; then
+                echo "$existing_id"
+            else
+                echo "Transcription already exists in database"
+                echo "Transcription ID: $existing_id"
+            fi
+        else
+            [[ "$SHOW_ONLY_UUID" != true ]] && echo "Storing transcription in database..."
+            
+            # Get audio duration
+            local duration=$(get_audio_duration "$abs_path")
+            
+            # Insert into database
+            local transcription_id=$(insert_transcription \
+                "$basename" \
+                "$abs_path" \
+                "$file_hash" \
+                "$transcription" \
+                "$duration" \
+                "$MODEL" \
+                "$LANGUAGE" \
+                "$TYPE" \
+                "$TAGS")
+            
+            if [[ -n "$transcription_id" ]]; then
+                if [[ "$SHOW_ONLY_UUID" == true ]]; then
+                    echo "$transcription_id"
+                else
+                    echo "Transcription stored in database"
+                    echo "Transcription ID: $transcription_id"
+                fi
+            else
+                [[ "$SHOW_ONLY_UUID" != true ]] && echo "Warning: Failed to store transcription in database" >&2
+                [[ "$SHOW_ONLY_UUID" == true ]] && exit 1  # Exit with error if UUID was expected
+            fi
+        fi
+    fi
+    
+    [[ "$SHOW_ONLY_UUID" != true ]] && echo "Transcription completed"
+}
+
+# Run main function
+main "$@"

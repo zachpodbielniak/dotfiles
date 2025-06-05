@@ -1,0 +1,398 @@
+#!/bin/bash
+set -euo pipefail
+
+# local_postgres - Universal PostgreSQL management script for local dotfiles
+# First implementation: Transcription storage
+# Designed to be extended with additional schemas and functionality
+
+# Configuration file path
+CONFIG_FILE="${HOME}/.config/transcription_db/config.yaml"
+
+# Load configuration from YAML if available
+if [[ -f "$CONFIG_FILE" ]] && command -v yq &> /dev/null; then
+    CONFIG_DB_HOST=$(yq eval '.database.host // "127.0.0.1"' "$CONFIG_FILE")
+    CONFIG_DB_PORT=$(yq eval '.database.port // 5432' "$CONFIG_FILE")
+    CONFIG_DB_NAME=$(yq eval '.database.name // "transcriptions"' "$CONFIG_FILE")
+    CONFIG_DB_USER=$(yq eval '.database.user // postgres' "$CONFIG_FILE")
+    CONFIG_DB_PASSWORD=$(yq eval '.database.password // ""' "$CONFIG_FILE")
+else
+    CONFIG_DB_HOST="127.0.0.1"
+    CONFIG_DB_PORT="5432"
+    CONFIG_DB_NAME="transcriptions"
+    CONFIG_DB_USER="postgres"
+    CONFIG_DB_PASSWORD=""
+fi
+
+# Default configuration (environment variables override config file)
+DEFAULT_DB_HOST="${TRANSCRIPTION_DB_HOST:-$CONFIG_DB_HOST}"
+DEFAULT_DB_PORT="${TRANSCRIPTION_DB_PORT:-$CONFIG_DB_PORT}"
+DEFAULT_DB_NAME="${TRANSCRIPTION_DB_NAME:-$CONFIG_DB_NAME}"
+DEFAULT_DB_USER="${TRANSCRIPTION_DB_USER:-$CONFIG_DB_USER}"
+DEFAULT_DB_PASSWORD="${TRANSCRIPTION_DB_PASSWORD:-$CONFIG_DB_PASSWORD}"
+
+# Script variables
+SCRIPT_NAME="$(basename "$0")"
+ACTION=""
+VERBOSE=false
+
+# Database connection string
+get_connection_string() {
+    local host="${1:-$DEFAULT_DB_HOST}"
+    local port="${2:-$DEFAULT_DB_PORT}"
+    local dbname="${3:-$DEFAULT_DB_NAME}"
+    local user="${4:-$DEFAULT_DB_USER}"
+    local password="${5:-$DEFAULT_DB_PASSWORD}"
+    
+    local conn="postgresql://${user}"
+    [[ -n "$password" ]] && conn="${conn}:${password}"
+    conn="${conn}@${host}:${port}/${dbname}"
+    echo "$conn"
+}
+
+# Execute SQL with error handling
+execute_sql() {
+    local sql="$1"
+    local db="${2:-$DEFAULT_DB_NAME}"
+    
+    if [[ "$VERBOSE" == true ]]; then
+        echo "Executing SQL on database '$db':"
+        echo "$sql"
+    fi
+    
+    psql -d "$(get_connection_string "" "" "$db")" -c "$sql" 2>&1 || {
+        echo "Error executing SQL: $?" >&2
+        return 1
+    }
+}
+
+# Check if database exists
+database_exists() {
+    local dbname="${1:-$DEFAULT_DB_NAME}"
+    psql -d "$(get_connection_string "" "" "postgres")" -tAc "SELECT 1 FROM pg_database WHERE datname='$dbname'" 2>/dev/null | grep -q 1
+}
+
+# Create database if it doesn't exist
+create_database() {
+    local dbname="${DEFAULT_DB_NAME}"
+    
+    if database_exists "$dbname"; then
+        echo "Database '$dbname' already exists"
+        return 0
+    fi
+    
+    echo "Creating database '$dbname'..."
+    execute_sql "CREATE DATABASE $dbname" "postgres" || return 1
+    echo "Database created successfully"
+}
+
+# Initialize transcriptions schema
+init_transcriptions_schema() {
+    echo "Initializing transcriptions schema..."
+    
+    # Create main transcriptions table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS transcriptions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        filename VARCHAR(512) NOT NULL,
+        file_path TEXT,
+        file_hash VARCHAR(64) NOT NULL,
+        transcribed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        duration_seconds INTEGER,
+        model_used VARCHAR(100),
+        language VARCHAR(10),
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(file_hash)
+    );" || return 1
+    
+    # Create chunks table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS transcription_chunks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        transcription_id UUID NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+        chunk_number INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        content_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+        character_count INTEGER NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(transcription_id, chunk_number)
+    );" || return 1
+    
+    # Create indexes
+    echo "Creating indexes..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_transcription_chunks_content_vector ON transcription_chunks USING GIN(content_vector);" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_transcription_chunks_transcription_id ON transcription_chunks(transcription_id);" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_transcriptions_file_hash ON transcriptions(file_hash);" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_transcriptions_metadata ON transcriptions USING GIN(metadata);" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_transcriptions_type ON transcriptions((metadata->>'type'));" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_transcriptions_tags ON transcriptions USING GIN((metadata->'tags'));" || return 1
+    
+    # Create update trigger function
+    execute_sql "
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS \$\$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    \$\$ language 'plpgsql';" || return 1
+    
+    # Create trigger
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_transcriptions_updated_at') THEN
+            CREATE TRIGGER update_transcriptions_updated_at 
+            BEFORE UPDATE ON transcriptions
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" || return 1
+    
+    echo "Transcriptions schema initialized successfully"
+}
+
+# Setup all schemas
+setup_all() {
+    create_database || return 1
+    init_transcriptions_schema || return 1
+    echo "All schemas setup completed"
+}
+
+# Maintenance operations
+perform_maintenance() {
+    echo "Performing database maintenance..."
+    
+    # Vacuum and analyze all tables
+    execute_sql "VACUUM ANALYZE transcriptions;" || echo "Warning: Failed to vacuum transcriptions table"
+    execute_sql "VACUUM ANALYZE transcription_chunks;" || echo "Warning: Failed to vacuum transcription_chunks table"
+    
+    # Reindex
+    execute_sql "REINDEX TABLE transcriptions;" || echo "Warning: Failed to reindex transcriptions table"
+    execute_sql "REINDEX TABLE transcription_chunks;" || echo "Warning: Failed to reindex transcription_chunks table"
+    
+    # Clean up orphaned chunks
+    execute_sql "
+    DELETE FROM transcription_chunks 
+    WHERE transcription_id NOT IN (SELECT id FROM transcriptions);" || echo "Warning: Failed to clean orphaned chunks"
+    
+    echo "Maintenance completed"
+}
+
+# Database statistics
+show_stats() {
+    echo "Database Statistics:"
+    echo "==================="
+    
+    # Overall database size
+    execute_sql "
+    SELECT pg_database.datname as database_name,
+           pg_size_pretty(pg_database_size(pg_database.datname)) as size
+    FROM pg_database
+    WHERE datname = '$DEFAULT_DB_NAME';" || return 1
+    
+    echo -e "\nTable Sizes:"
+    execute_sql "
+    SELECT schemaname || '.' || tablename AS table,
+           pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS size
+    FROM pg_tables
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+    ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;" || return 1
+    
+    echo -e "\nTranscription Statistics:"
+    execute_sql "
+    SELECT 
+        COUNT(DISTINCT t.id) as total_transcriptions,
+        COUNT(tc.id) as total_chunks,
+        COALESCE(SUM(tc.character_count), 0) as total_characters
+    FROM transcriptions t
+    LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id;" || return 1
+}
+
+# Export transcriptions
+export_transcriptions() {
+    local output_file="${1:-transcriptions_export_$(date +%Y%m%d_%H%M%S).json}"
+    
+    echo "Exporting transcriptions to $output_file..."
+    
+    psql -d "$(get_connection_string)" -t -A -c "
+    SELECT json_agg(row_to_json(t))
+    FROM (
+        SELECT t.*, 
+               array_agg(
+                   json_build_object(
+                       'chunk_number', tc.chunk_number,
+                       'content', tc.content,
+                       'character_count', tc.character_count
+                   ) ORDER BY tc.chunk_number
+               ) as chunks
+        FROM transcriptions t
+        LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+        GROUP BY t.id
+    ) t;" > "$output_file" || {
+        echo "Error exporting transcriptions" >&2
+        return 1
+    }
+    
+    echo "Export completed: $output_file"
+}
+
+# Archive old transcriptions
+archive_old_transcriptions() {
+    local days="${1:-365}"
+    local archive_file="transcriptions_archive_$(date +%Y%m%d_%H%M%S).json"
+    
+    echo "Archiving transcriptions older than $days days..."
+    
+    # First export old transcriptions
+    psql -d "$(get_connection_string)" -t -A -c "
+    SELECT json_agg(row_to_json(t))
+    FROM (
+        SELECT t.*, 
+               array_agg(
+                   json_build_object(
+                       'chunk_number', tc.chunk_number,
+                       'content', tc.content,
+                       'character_count', tc.character_count
+                   ) ORDER BY tc.chunk_number
+               ) as chunks
+        FROM transcriptions t
+        LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+        WHERE t.created_at < CURRENT_DATE - INTERVAL '$days days'
+        GROUP BY t.id
+    ) t;" > "$archive_file" || {
+        echo "Error archiving transcriptions" >&2
+        return 1
+    }
+    
+    # Delete archived transcriptions
+    execute_sql "
+    DELETE FROM transcriptions 
+    WHERE created_at < CURRENT_DATE - INTERVAL '$days days';" || {
+        echo "Error deleting old transcriptions" >&2
+        return 1
+    }
+    
+    echo "Archived to: $archive_file"
+}
+
+# Usage help
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [OPTIONS] COMMAND
+
+Universal PostgreSQL management script for local dotfiles.
+Currently implements transcription storage functionality.
+
+COMMANDS:
+    setup           Setup database and all schemas
+    init            Initialize transcriptions schema only
+    maintain        Perform maintenance operations (vacuum, reindex, cleanup)
+    stats           Show database statistics
+    export [FILE]   Export all transcriptions to JSON file
+    archive [DAYS]  Archive transcriptions older than DAYS (default: 365)
+    
+OPTIONS:
+    -h, --help      Show this help message
+    -v, --verbose   Enable verbose output
+    
+ENVIRONMENT VARIABLES:
+    TRANSCRIPTION_DB_HOST     Database host (default: 127.0.0.1)
+    TRANSCRIPTION_DB_PORT     Database port (default: 5432)
+    TRANSCRIPTION_DB_NAME     Database name (default: transcriptions)
+    TRANSCRIPTION_DB_USER     Database user (default: current user)
+    TRANSCRIPTION_DB_PASSWORD Database password (default: none)
+
+EXAMPLES:
+    # Initial setup
+    $SCRIPT_NAME setup
+    
+    # Perform maintenance
+    $SCRIPT_NAME maintain
+    
+    # Show statistics
+    $SCRIPT_NAME stats
+    
+    # Export transcriptions
+    $SCRIPT_NAME export my_transcriptions.json
+    
+    # Archive old transcriptions
+    $SCRIPT_NAME archive 180
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            setup|init|maintain|stats|export|archive)
+                ACTION="$1"
+                shift
+                break
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Store remaining arguments
+    ARGS=("$@")
+}
+
+# Main execution
+main() {
+    parse_args "$@"
+    
+    if [[ -z "$ACTION" ]]; then
+        echo "Error: No command specified" >&2
+        usage
+        exit 1
+    fi
+    
+    # Check psql availability
+    if ! command -v psql &> /dev/null; then
+        echo "Error: psql command not found. Please install PostgreSQL client." >&2
+        exit 1
+    fi
+    
+    case "$ACTION" in
+        setup)
+            setup_all
+            ;;
+        init)
+            init_transcriptions_schema
+            ;;
+        maintain)
+            perform_maintenance
+            ;;
+        stats)
+            show_stats
+            ;;
+        export)
+            export_transcriptions "${ARGS[0]}"
+            ;;
+        archive)
+            archive_old_transcriptions "${ARGS[0]}"
+            ;;
+        *)
+            echo "Unknown command: $ACTION" >&2
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"
