@@ -5,6 +5,20 @@ set -euo pipefail
 # First implementation: Transcription storage
 # Designed to be extended with additional schemas and functionality
 
+# Sync configuration - add databases and hosts to sync here
+SYNC_DATABASES=(
+    "transcriptions"
+    "postgres"  # For pgvector/second_brain_vectors table
+)
+
+# Tailscale hostnames/IPs to sync with
+SYNC_HOSTS=(
+    # Add your other devices here, e.g.:
+    # "laptop.tailnet-name.ts.net"
+    # "desktop.tailnet-name.ts.net"
+    # "100.64.0.2"
+)
+
 # Configuration file path
 CONFIG_FILE="${HOME}/.config/transcription_db/config.yaml"
 
@@ -277,6 +291,319 @@ archive_old_transcriptions() {
     echo "Archived to: $archive_file"
 }
 
+# Get current host information
+get_host_info() {
+    local hostname=$(hostname)
+    local tailscale_ip=""
+    
+    # Try to get Tailscale IP
+    if command -v tailscale &> /dev/null; then
+        tailscale_ip=$(tailscale ip -4 2>/dev/null || echo "")
+    fi
+    
+    echo "${hostname}:${tailscale_ip}"
+}
+
+# Check if a host is the current host
+is_current_host() {
+    local host="$1"
+    local current_hostname=$(hostname)
+    local current_tailscale_ip=""
+    
+    # Get current Tailscale IP if available
+    if command -v tailscale &> /dev/null; then
+        current_tailscale_ip=$(tailscale ip -4 2>/dev/null || echo "")
+    fi
+    
+    # Check if the host matches current hostname
+    if [[ "$host" == "$current_hostname" ]] || [[ "$host" == "${current_hostname}."* ]]; then
+        return 0
+    fi
+    
+    # Check if the host matches current Tailscale IP
+    if [[ -n "$current_tailscale_ip" ]] && [[ "$host" == "$current_tailscale_ip" ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Check if a remote host is reachable
+check_host_reachable() {
+    local host="$1"
+    local port="${2:-5432}"
+    
+    # Use timeout command to prevent hanging
+    if timeout 3 bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Get table schema information
+get_table_info() {
+    local db="$1"
+    local table="$2"
+    
+    psql -d "$(get_connection_string "" "" "$db")" -tAc "
+    SELECT column_name, data_type, is_nullable 
+    FROM information_schema.columns 
+    WHERE table_name = '$table' 
+    ORDER BY ordinal_position;" 2>/dev/null
+}
+
+# Check if table has timestamp columns
+table_has_timestamps() {
+    local db="$1"
+    local table="$2"
+    
+    local schema_info=$(get_table_info "$db" "$table")
+    if echo "$schema_info" | grep -q "timestamp"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Add timestamps to pgvector table if missing
+ensure_vector_table_timestamps() {
+    local has_timestamps=$(psql -d "$(get_connection_string "" "" "postgres")" -tAc "
+    SELECT COUNT(*) FROM information_schema.columns 
+    WHERE table_name = 'second_brain_vectors' 
+    AND column_name IN ('created_at', 'updated_at');" 2>/dev/null || echo "0")
+    
+    if [[ "$has_timestamps" -lt 2 ]]; then
+        echo "Adding timestamp columns to second_brain_vectors table..."
+        execute_sql "
+        ALTER TABLE second_brain_vectors 
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;" "postgres" || {
+            echo "Warning: Could not add timestamps to vector table"
+        }
+    fi
+}
+
+# Perform merge-based sync for a single table
+merge_sync_table() {
+    local source_host="$1"
+    local db="$2"
+    local table="$3"
+    
+    echo "      → Syncing table: $table"
+    
+    # Create temporary table for remote data
+    local temp_table="${table}_remote_sync_$$"
+    
+    # Copy table structure
+    execute_sql "CREATE TEMP TABLE $temp_table (LIKE $table INCLUDING ALL);" "$db" >/dev/null 2>&1 || {
+        echo "        ✗ Failed to create temporary table"
+        return 1
+    }
+    
+    # Copy data from remote host
+    if PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+        -h "$source_host" \
+        -p "$DEFAULT_DB_PORT" \
+        -U "$DEFAULT_DB_USER" \
+        -d "$db" \
+        -c "\\COPY $table TO STDOUT" 2>/dev/null | \
+        PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+        -h "$DEFAULT_DB_HOST" \
+        -p "$DEFAULT_DB_PORT" \
+        -U "$DEFAULT_DB_USER" \
+        -d "$db" \
+        -c "\\COPY $temp_table FROM STDIN" 2>/dev/null; then
+        
+        # Perform the merge based on table type
+        case "$table" in
+            "transcriptions")
+                # Merge using UUID and updated_at timestamp
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (id) DO UPDATE SET
+                    filename = EXCLUDED.filename,
+                    file_path = EXCLUDED.file_path,
+                    file_hash = EXCLUDED.file_hash,
+                    transcribed_at = EXCLUDED.transcribed_at,
+                    duration_seconds = EXCLUDED.duration_seconds,
+                    model_used = EXCLUDED.model_used,
+                    language = EXCLUDED.language,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                ;;
+            
+            "transcription_chunks")
+                # Merge chunks - only insert if not exists (they shouldn't change)
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" "$db" >/dev/null 2>&1
+                ;;
+            
+            "second_brain_vectors")
+                # For vectors, use file path as key and update if remote is newer
+                if table_has_timestamps "$db" "$table"; then
+                    execute_sql "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        embedding = EXCLUDED.embedding,
+                        path = EXCLUDED.path,
+                        content_snippet = EXCLUDED.content_snippet,
+                        provider = EXCLUDED.provider,
+                        model = EXCLUDED.model,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                else
+                    # No timestamps, just insert new records
+                    execute_sql "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO NOTHING;" "$db" >/dev/null 2>&1
+                fi
+                ;;
+            
+            *)
+                # Generic merge - insert only if not exists
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT DO NOTHING;" "$db" >/dev/null 2>&1
+                ;;
+        esac
+        
+        # Drop temporary table
+        execute_sql "DROP TABLE IF EXISTS $temp_table;" "$db" >/dev/null 2>&1
+        
+        echo "        ✓ Merged successfully"
+        return 0
+    else
+        echo "        ✗ Failed to copy data from remote"
+        return 1
+    fi
+}
+
+# Sync databases with remote hosts
+sync_databases() {
+    echo "Starting database synchronization (merge mode)..."
+    echo "Current host: $(get_host_info)"
+    echo ""
+    
+    # Check if any hosts are configured
+    if [[ ${#SYNC_HOSTS[@]} -eq 0 ]]; then
+        echo "No sync hosts configured. Add hosts to SYNC_HOSTS array in the script."
+        return 0
+    fi
+    
+    # Check if any databases are configured
+    if [[ ${#SYNC_DATABASES[@]} -eq 0 ]]; then
+        echo "No databases configured for sync. Add databases to SYNC_DATABASES array in the script."
+        return 0
+    fi
+    
+    # Ensure vector table has timestamps if it exists
+    if database_exists "postgres"; then
+        ensure_vector_table_timestamps
+    fi
+    
+    local sync_success=0
+    local sync_failed=0
+    local sync_skipped=0
+    
+    # Iterate through each configured host
+    for host in "${SYNC_HOSTS[@]}"; do
+        echo "Processing host: $host"
+        
+        # Skip if this is the current host
+        if is_current_host "$host"; then
+            echo "  → Skipping (current host)"
+            ((sync_skipped++))
+            continue
+        fi
+        
+        # Check if host is reachable
+        if ! check_host_reachable "$host"; then
+            echo "  → Host unreachable (soft fail)"
+            ((sync_skipped++))
+            continue
+        fi
+        
+        echo "  → Host is reachable, syncing databases..."
+        
+        # Sync each configured database
+        for db in "${SYNC_DATABASES[@]}"; do
+            echo "    Syncing database: $db"
+            
+            # Ensure database exists locally
+            if ! database_exists "$db"; then
+                echo "      → Creating local database..."
+                if [[ "$db" == "transcriptions" ]]; then
+                    create_database
+                else
+                    execute_sql "CREATE DATABASE $db" "postgres" >/dev/null 2>&1
+                fi
+            fi
+            
+            # Get list of tables to sync based on database
+            local tables_to_sync=()
+            case "$db" in
+                "transcriptions")
+                    tables_to_sync=("transcriptions" "transcription_chunks")
+                    ;;
+                "postgres")
+                    # For postgres db, sync the vector table if it exists
+                    if psql -d "$(get_connection_string "" "" "$db")" -tAc "SELECT 1 FROM information_schema.tables WHERE table_name='second_brain_vectors'" 2>/dev/null | grep -q 1; then
+                        tables_to_sync=("second_brain_vectors")
+                    else
+                        echo "      → No second_brain_vectors table found, skipping"
+                        continue
+                    fi
+                    ;;
+                *)
+                    echo "      → Unknown database type, skipping"
+                    continue
+                    ;;
+            esac
+            
+            # Sync each table
+            local db_sync_success=true
+            for table in "${tables_to_sync[@]}"; do
+                if merge_sync_table "$host" "$db" "$table"; then
+                    ((sync_success++))
+                else
+                    ((sync_failed++))
+                    db_sync_success=false
+                fi
+            done
+            
+            if [[ "$db_sync_success" == true ]]; then
+                echo "      ✓ Database sync completed"
+            else
+                echo "      ✗ Database sync had errors"
+            fi
+        done
+        
+        echo ""
+    done
+    
+    # Print summary
+    echo "Synchronization complete:"
+    echo "  - Successful syncs: $sync_success"
+    echo "  - Failed syncs: $sync_failed"
+    echo "  - Skipped operations: $sync_skipped"
+    
+    # Return non-zero if all operations failed
+    if [[ $sync_success -eq 0 ]] && [[ $sync_failed -gt 0 ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
 # Usage help
 usage() {
     cat << EOF
@@ -292,6 +619,7 @@ COMMANDS:
     stats           Show database statistics
     export [FILE]   Export all transcriptions to JSON file
     archive [DAYS]  Archive transcriptions older than DAYS (default: 365)
+    sync            Sync databases from configured remote hosts
     
 OPTIONS:
     -h, --help      Show this help message
@@ -319,6 +647,13 @@ EXAMPLES:
     
     # Archive old transcriptions
     $SCRIPT_NAME archive 180
+    
+    # Sync databases from remote hosts
+    $SCRIPT_NAME sync
+    
+SYNC CONFIGURATION:
+    Edit SYNC_DATABASES and SYNC_HOSTS arrays at the top of this script
+    to configure which databases and hosts to sync with.
 EOF
 }
 
@@ -334,7 +669,7 @@ parse_args() {
                 VERBOSE=true
                 shift
                 ;;
-            setup|init|maintain|stats|export|archive)
+            setup|init|maintain|stats|export|archive|sync)
                 ACTION="$1"
                 shift
                 break
@@ -385,6 +720,9 @@ main() {
             ;;
         archive)
             archive_old_transcriptions "${ARGS[0]}"
+            ;;
+        sync)
+            sync_databases
             ;;
         *)
             echo "Unknown command: $ACTION" >&2
