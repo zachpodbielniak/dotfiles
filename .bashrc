@@ -148,7 +148,7 @@ alias cdnastv="cd /var/mnt/NAS/Media/TV\ Series/"
 
 alias nn="new_note"
 alias na="note_append"
-alias on="open_note"
+alias on="fopen_note"
 alias nj="new_journal"
 alias goals="bash -c 'cd ${HOME}/Documents/notes && nvim 02_areas/goals.norg'"
 alias notes="bash -c 'cd ${HOME}/Documents/notes && nvim 00_index.norg'"
@@ -197,9 +197,9 @@ export FZF_DEFAULT_OPTS=" \
 --color=marker:#b4befe,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8 \
 --color=selected-bg:#45475a \
 --multi \
--i --height=50% \
+-i --height=65% \
 --preview=\"if [ -f "{}" ]; then bat {}; else echo "{}"; fi\" \
---tmux center --preview-window=wrap"
+--tmux center,65%,border-native --preview-window=wrap"
 
 
 # Bash completion stuff
@@ -213,7 +213,8 @@ _have glab && eval "$(glab completion -s bash)"
 
 
 # Keybinds
-bind -x '"\C-o":vim $(fzf)'
+bind -x '"\C-o":fopen_file'
+bind -x '"\C-n":fopen_note'
 
 
 # Starship
