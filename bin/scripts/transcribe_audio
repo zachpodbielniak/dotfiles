@@ -1,526 +1,580 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/python3
 
-# transcribe_audio - Transcribe audio files using Whisper with optional PostgreSQL storage
-# Supports storing transcriptions in database with metadata and tags
+import os
+import sys
+import subprocess
+from pathlib import Path
 
-# Script variables
-SCRIPT_NAME="$(basename "$0")"
-FILENAME=""
-NO_STORE_DB=false
-DB_ONLY=false
-UPDATE_DB=false
-TYPE=""
-TAGS=""
-MODEL="ggml-base.en.bin"
-LANGUAGE="en"
-OUTPUT_DIR=""
-VERBOSE=false
-SHOW_ONLY_UUID=false
+# Container check for distrobox - do this BEFORE any other imports
+# Check if we need psycopg2 (not using --no-store-db)
+if '--no-store-db' not in sys.argv:
+    ctr_id = os.environ.get("CONTAINER_ID", "")
+    if ctr_id != "dev":
+        cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+        subprocess.run(cmd)
+        sys.exit(0)
+
+# Now import everything else
+try:
+    import argparse
+    import hashlib
+    import json
+    import tempfile
+    from datetime import datetime
+    import yaml
+    from typing import Optional, List, Tuple
+    import uuid
+    
+    # Only import psycopg2 if we're going to use the database
+    if '--no-store-db' not in sys.argv:
+        import psycopg2
+        from psycopg2.extras import Json, execute_values
+except ImportError as e:
+    # We're inside dev container but missing dependencies
+    print(f"Error: Missing required Python module: {e}", file=sys.stderr)
+    print("Please install the required dependencies:", file=sys.stderr)
+    print("  pip install psycopg2-binary pyyaml", file=sys.stderr)
+    sys.exit(1)
 
 # Configuration file path
-CONFIG_FILE="${HOME}/.config/transcription_db/config.yaml"
+CONFIG_FILE = Path.home() / ".config/transcription_db/config.yaml"
 
-# Load configuration from YAML if available
-if [[ -f "$CONFIG_FILE" ]] && command -v yq &> /dev/null; then
-    CONFIG_DB_HOST=$(yq eval '.database.host // "127.0.0.1"' "$CONFIG_FILE")
-    CONFIG_DB_PORT=$(yq eval '.database.port // 5432' "$CONFIG_FILE")
-    CONFIG_DB_NAME=$(yq eval '.database.name // "transcriptions"' "$CONFIG_FILE")
-    CONFIG_DB_USER=$(yq eval '.database.user // "postgres"' "$CONFIG_FILE")
-    CONFIG_DB_PASSWORD=$(yq eval '.database.password // ""' "$CONFIG_FILE")
-    CONFIG_CHUNK_SIZE=$(yq eval '.transcription.chunk_size // 1048576' "$CONFIG_FILE")
-    CONFIG_WHISPER_MODEL_PATH=$(yq eval '.transcription.whisper_model_path // "${HOME}/Source/Public/whisper.cpp/models"' "$CONFIG_FILE" | envsubst)
-    CONFIG_WHISPER_BIN=$(yq eval '.transcription.whisper_bin_path // "${HOME}/Source/Public/whisper.cpp/build/bin/whisper-cli"' "$CONFIG_FILE" | envsubst)
-else
-    CONFIG_DB_HOST="127.0.0.1"
-    CONFIG_DB_PORT="5432"
-    CONFIG_DB_NAME="transcriptions"
-    CONFIG_DB_USER="postgres"
-    CONFIG_DB_PASSWORD=""
-    CONFIG_CHUNK_SIZE=1048576
-    CONFIG_WHISPER_MODEL_PATH="${HOME}/Source/Public/whisper.cpp/models"
-    CONFIG_WHISPER_BIN="${HOME}/Source/Public/whisper.cpp/build/bin/whisper-cli"
-fi
-
-# Database configuration (environment variables override config file)
-DB_HOST="${TRANSCRIPTION_DB_HOST:-$CONFIG_DB_HOST}"
-DB_PORT="${TRANSCRIPTION_DB_PORT:-$CONFIG_DB_PORT}"
-DB_NAME="${TRANSCRIPTION_DB_NAME:-$CONFIG_DB_NAME}"
-DB_USER="${TRANSCRIPTION_DB_USER:-$CONFIG_DB_USER}"
-DB_PASSWORD="${TRANSCRIPTION_DB_PASSWORD:-$CONFIG_DB_PASSWORD}"
-
-# Constants
-CHUNK_SIZE="${TRANSCRIPTION_CHUNK_SIZE:-$CONFIG_CHUNK_SIZE}"
-WHISPER_MODEL_PATH="$CONFIG_WHISPER_MODEL_PATH"
-WHISPER_BIN="$CONFIG_WHISPER_BIN"
-
-# Database connection string
-get_connection_string() {
-    local conn="postgresql://${DB_USER}"
-    [[ -n "$DB_PASSWORD" ]] && conn="${conn}:${DB_PASSWORD}"
-    conn="${conn}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-    echo "$conn"
-}
-
-# Execute SQL query
-execute_sql() {
-    local sql="$1"
-    local result
-    local error_output
-    
-    # Capture both stdout and stderr, use -q to suppress "INSERT 0 1" type messages
-    if result=$(psql -d "$(get_connection_string)" -tAq -c "$sql" 2>&1); then
-        echo "$result"
-    else
-        # On error, show the actual PostgreSQL error message
-        echo "SQL Error: $result" >&2
-        return 1
-    fi
-}
-
-# Calculate SHA256 hash of file
-calculate_file_hash() {
-    local file="$1"
-    sha256sum "$file" | cut -d' ' -f1
-}
-
-# Get file duration in seconds (for audio files)
-get_audio_duration() {
-    local file="$1"
-    # Try to get duration using ffprobe if available
-    if command -v ffprobe &> /dev/null; then
-        ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | cut -d. -f1
-    else
-        echo "0"  # Return 0 if we can't determine duration
-    fi
-}
-
-# Check if transcription already exists in database
-transcription_exists() {
-    local file_hash="$1"
-    local count=$(execute_sql "SELECT COUNT(*) FROM transcriptions WHERE file_hash='$file_hash'")
-    [[ "$count" -gt 0 ]]
-}
-
-# Split text into chunks
-split_into_chunks() {
-    local text="$1"
-    local chunk_size="$2"
-    local chunks=()
-    local current_chunk=""
-    local current_size=0
-    
-    # Split by sentences to avoid breaking in the middle of words
-    while IFS= read -r line; do
-        local line_size=${#line}
-        
-        if [[ $((current_size + line_size)) -gt $chunk_size && -n "$current_chunk" ]]; then
-            chunks+=("$current_chunk")
-            current_chunk="$line"
-            current_size=$line_size
-        else
-            if [[ -n "$current_chunk" ]]; then
-                current_chunk="${current_chunk}
-${line}"  # Use actual newline instead of \n
-            else
-                current_chunk="$line"
-            fi
-            current_size=$((current_size + line_size + 1))  # +1 for newline
-        fi
-    done < <(echo -e "$text" | sed 's/\. /.\n/g')
-    
-    # Add remaining chunk
-    [[ -n "$current_chunk" ]] && chunks+=("$current_chunk")
-    
-    printf '%s\n' "${chunks[@]}"
-}
-
-# Insert transcription into database
-insert_transcription() {
-    local filename="$1"
-    local file_path="$2"
-    local file_hash="$3"
-    local content="$4"
-    local duration="$5"
-    local model="$6"
-    local language="$7"
-    local type="$8"
-    local tags="$9"
-    
-    # Build metadata JSON
-    local metadata="{}"
-    [[ -n "$type" ]] && metadata=$(echo "$metadata" | jq --arg t "$type" '. + {type: $t}')
-    if [[ -n "$tags" ]]; then
-        # Convert comma-separated tags to JSON array
-        local tags_json=$(echo "$tags" | jq -R 'split(",")')
-        metadata=$(echo "$metadata" | jq --argjson t "$tags_json" '. + {tags: $t}')
-    fi
-    
-    # Add source script if called from another script
-    local parent_cmd=$(ps -o comm= $PPID 2>/dev/null || echo "")
-    [[ -n "$parent_cmd" && "$parent_cmd" != "bash" ]] && \
-        metadata=$(echo "$metadata" | jq --arg s "$parent_cmd" '. + {source_script: $s}')
-    
-    # Escape content for SQL
-    content=$(echo "$content" | sed "s/'/''/g")
-    
-    # Insert main transcription record - use -tAq to get only the value
-    local transcription_id=$(psql -d "$(get_connection_string)" -tAq -c "
-        INSERT INTO transcriptions 
-        (filename, file_path, file_hash, duration_seconds, model_used, language, metadata)
-        VALUES 
-        ('$filename', '$file_path', '$file_hash', $duration, '$model', '$language', '$metadata'::jsonb)
-        RETURNING id;")
-    
-    if [[ -z "$transcription_id" ]]; then
-        echo "Error: Failed to insert transcription record" >&2
-        return 1
-    fi
-    
-    # Split content into chunks and insert
-    local chunk_number=0
-    while IFS= read -r chunk; do
-        chunk_number=$((chunk_number + 1))
-        
-        # Remove NULL bytes and clean the chunk
-        chunk=$(echo "$chunk" | tr -d '\000')
-        local char_count=${#chunk}
-        
-        # Escape single quotes for SQL
-        chunk=$(echo "$chunk" | sed "s/'/''/g")
-        
-        # Use parameterized query format with psql \set
-        local temp_file=$(mktemp)
-        echo "$chunk" > "$temp_file"
-        
-        if ! psql -d "$(get_connection_string)" -q -v tid="'$transcription_id'" -v cnum="$chunk_number" -v ccount="$char_count" <<EOF 2>&1
-\set content \`cat $temp_file\`
-INSERT INTO transcription_chunks 
-(transcription_id, chunk_number, content, character_count)
-VALUES 
-(:tid::uuid, :cnum, :'content', :ccount);
-EOF
-        then
-            echo "Error: Failed to insert chunk $chunk_number" >&2
-            # Debug output to help diagnose the issue
-            echo "Debug: Chunk length: $char_count characters" >&2
-            echo "Debug: First 100 chars: ${chunk:0:100}" >&2
-            rm -f "$temp_file"
-            return 1
-        fi
-        
-        rm -f "$temp_file"
-    done < <(split_into_chunks "$content" "$CHUNK_SIZE")
-    
-    echo "$transcription_id"
-}
-
-# Update existing transcription
-update_transcription() {
-    local file_hash="$1"
-    local type="$2"
-    local tags="$3"
-    
-    # Get existing transcription ID
-    local transcription_id=$(execute_sql "SELECT id FROM transcriptions WHERE file_hash='$file_hash'")
-    
-    if [[ -z "$transcription_id" ]]; then
-        echo "Error: No transcription found with file hash $file_hash" >&2
-        return 1
-    fi
-    
-    # Update metadata
-    local update_sql="UPDATE transcriptions SET updated_at = CURRENT_TIMESTAMP"
-    
-    if [[ -n "$type" ]]; then
-        update_sql+=", metadata = jsonb_set(metadata, '{type}', '\"$type\"')"
-    fi
-    
-    if [[ -n "$tags" ]]; then
-        local tags_json=$(echo "$tags" | jq -R 'split(",")')
-        update_sql+=", metadata = jsonb_set(metadata, '{tags}', '$tags_json'::jsonb)"
-    fi
-    
-    update_sql+=" WHERE id = '$transcription_id'"
-    
-    execute_sql "$update_sql" || {
-        echo "Error: Failed to update transcription" >&2
-        return 1
+# Default configuration
+DEFAULT_CONFIG = {
+    'database': {
+        'host': '127.0.0.1',
+        'port': 5432,
+        'name': 'transcriptions',
+        'user': 'postgres',
+        'password': ''
+    },
+    'transcription': {
+        'chunk_size': 1048576,
+        'whisper_model_path': str(Path.home() / "Source/Public/whisper.cpp/models"),
+        'whisper_bin_path': str(Path.home() / "Source/Public/whisper.cpp/build/bin/whisper-cli")
     }
-    
-    echo "$transcription_id"
 }
 
-# Transcribe audio file
-transcribe_file() {
-    local input_file="$1"
-    local output_file="${input_file}.txt"
-    
-    if [[ -n "$OUTPUT_DIR" ]]; then
-        output_file="${OUTPUT_DIR}/$(basename "${input_file}").txt"
-    fi
-    
-    # Run whisper transcription
-    if ! distrobox enter whisper -- \
-        "$WHISPER_BIN" \
-        -m "${WHISPER_MODEL_PATH}/${MODEL}" \
-        -f "$input_file" \
-        -otxt; then
-        echo "Error: Transcription failed" >&2
-        return 1
-    fi
-    
-    # Read the transcription result
-    if [[ -f "$output_file" ]]; then
-        cat "$output_file"
-    else
-        echo "Error: Transcription output file not found: $output_file" >&2
-        return 1
-    fi
+# Deep merge function to handle nested configs
+def deep_merge(default, override):
+    """Recursively merge override dict into default dict"""
+    result = default.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+# Load configuration
+config = DEFAULT_CONFIG.copy()
+
+# Load from YAML config if available
+if CONFIG_FILE.exists():
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            loaded_config = yaml.safe_load(f)
+            if loaded_config:
+                config = deep_merge(config, loaded_config)
+    except Exception:
+        pass  # Use defaults if config can't be loaded
+
+# Environment variables override config
+DB_CONFIG = {
+    'host': os.environ.get('TRANSCRIPTION_DB_HOST', config.get('database', {}).get('host', '127.0.0.1')),
+    'port': int(os.environ.get('TRANSCRIPTION_DB_PORT', config.get('database', {}).get('port', 5432))),
+    'database': os.environ.get('TRANSCRIPTION_DB_NAME', config.get('database', {}).get('name', 'transcriptions')),
+    'user': os.environ.get('TRANSCRIPTION_DB_USER', config.get('database', {}).get('user', 'postgres')),
+    'password': os.environ.get('TRANSCRIPTION_DB_PASSWORD', config.get('database', {}).get('password', ''))
 }
 
-# Usage help
-usage() {
-    cat << EOF
-Usage: $SCRIPT_NAME [OPTIONS] <audio_file>
+CHUNK_SIZE = int(os.environ.get('TRANSCRIPTION_CHUNK_SIZE', config.get('transcription', {}).get('chunk_size', 1048576)))
+WHISPER_MODEL_PATH = os.path.expandvars(config.get('transcription', {}).get('whisper_model_path', str(Path.home() / "Source/Public/whisper.cpp/models")))
+WHISPER_BIN = os.path.expandvars(config.get('transcription', {}).get('whisper_bin_path', str(Path.home() / "Source/Public/whisper.cpp/build/bin/whisper-cli")))
 
-Transcribe audio files using Whisper with optional PostgreSQL storage.
 
-OPTIONS:
-    -h, --help          Show this help message
-    -v, --verbose       Enable verbose output
-    --no-store-db       Do not store transcription in database (default: store)
-    --db-only           Only store in database, skip file output
-    --update-db         Update existing transcription metadata
-    --type TYPE         Categorize transcription (e.g., meeting, interview, lecture)
-    --tags TAGS         Comma-separated tags (e.g., "important,client-x,2024-q1")
-    --model MODEL       Whisper model to use (default: ggml-base.en.bin)
-    --output-dir DIR    Output directory for transcription files
-    --show-only-uuid    Output only the transcription UUID (implies --db-only)
+class TranscriptionProcessor:
+    def __init__(self):
+        self.conn = None
+        self.cursor = None
+        
+    def connect_db(self):
+        """Establish database connection"""
+        try:
+            self.conn = psycopg2.connect(**DB_CONFIG)
+            self.cursor = self.conn.cursor()
+            return True
+        except psycopg2.Error as e:
+            print(f"Database connection failed: {e}", file=sys.stderr)
+            return False
+    
+    def disconnect_db(self):
+        """Close database connection"""
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+    
+    def calculate_file_hash(self, filepath: str) -> str:
+        """Calculate SHA256 hash of file"""
+        sha256_hash = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    
+    def get_audio_duration(self, filepath: str) -> int:
+        """Get audio duration in seconds using ffprobe"""
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', filepath],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                return int(float(result.stdout.strip()))
+        except Exception:
+            pass
+        return 0
+    
+    def transcription_exists(self, file_hash: str) -> Optional[str]:
+        """Check if transcription already exists, return UUID if it does"""
+        try:
+            self.cursor.execute(
+                "SELECT id FROM transcriptions WHERE file_hash = %s",
+                (file_hash,)
+            )
+            result = self.cursor.fetchone()
+            return str(result[0]) if result else None
+        except psycopg2.Error:
+            return None
+    
+    def split_into_chunks(self, text: str) -> List[str]:
+        """Split text into chunks efficiently, preserving timestamped lines"""
+        chunks = []
+        lines = text.split('\n')
+        
+        current_chunk = ""
+        current_size = 0
+        
+        for line in lines:
+            line_size = len(line) + 1  # +1 for newline
+            
+            # Check if this line starts with a timestamp pattern [HH:MM:SS
+            is_timestamp_line = line.strip().startswith('[') and '-->' in line
+            
+            # If adding this line would exceed chunk size and we have content
+            if current_size + line_size > CHUNK_SIZE and current_chunk:
+                # Only split at timestamp boundaries to preserve structure
+                if is_timestamp_line:
+                    chunks.append(current_chunk.rstrip())
+                    current_chunk = line
+                    current_size = line_size
+                else:
+                    # If not a timestamp line, keep adding to preserve context
+                    if current_chunk:
+                        current_chunk += "\n" + line
+                    else:
+                        current_chunk = line
+                    current_size += line_size
+            else:
+                if current_chunk:
+                    current_chunk += "\n" + line
+                else:
+                    current_chunk = line
+                current_size += line_size
+        
+        if current_chunk:
+            chunks.append(current_chunk.rstrip())
+        
+        return chunks
+    
+    def insert_transcription(self, filename: str, file_path: str, file_hash: str,
+                           content: str, duration: int, model: str, language: str,
+                           type_: Optional[str], tags: Optional[str]) -> Optional[str]:
+        """Insert transcription with optimized chunk insertion"""
+        try:
+            if args.verbose:
+                print(f"Inserting transcription: {filename}")
+                print(f"Content length: {len(content)} characters")
+                print(f"First 100 chars: {content[:100]}...")
+            
+            # Build metadata
+            metadata = {}
+            if type_:
+                metadata['type'] = type_
+            if tags:
+                metadata['tags'] = [tag.strip() for tag in tags.split(',')]
+            
+            # Add source script if called from another script
+            parent = psutil.Process(os.getppid()).name() if 'psutil' in sys.modules else None
+            if parent and parent != 'bash':
+                metadata['source_script'] = parent
+            
+            # Insert main transcription record
+            self.cursor.execute("""
+                INSERT INTO transcriptions 
+                (filename, file_path, file_hash, duration_seconds, model_used, language, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (filename, file_path, file_hash, duration, model, language, Json(metadata)))
+            
+            transcription_id = self.cursor.fetchone()[0]
+            
+            # Split content into chunks
+            chunks = self.split_into_chunks(content)
+            
+            if args.verbose:
+                print(f"Split into {len(chunks)} chunks")
+            
+            # Prepare chunk data for batch insert
+            chunk_data = []
+            for i, chunk in enumerate(chunks, 1):
+                # Clean chunk content
+                chunk_clean = chunk.replace('\x00', '')  # Remove NULL bytes
+                chunk_data.append((
+                    transcription_id,
+                    i,
+                    chunk_clean,
+                    len(chunk_clean)
+                ))
+                
+                if args.verbose and i == 1:
+                    print(f"First chunk length: {len(chunk_clean)}")
+                    print(f"First chunk preview: {chunk_clean[:100]}...")
+            
+            # Batch insert all chunks at once - MUCH faster than individual inserts
+            from psycopg2.extras import execute_values
+            execute_values(
+                self.cursor,
+                """
+                INSERT INTO transcription_chunks 
+                (transcription_id, chunk_number, content, character_count)
+                VALUES %s
+                """,
+                chunk_data
+            )
+            
+            if args.verbose:
+                print(f"Successfully inserted {len(chunk_data)} chunks")
+            
+            self.conn.commit()
+            return str(transcription_id)
+            
+        except psycopg2.Error as e:
+            self.conn.rollback()
+            print(f"Error inserting transcription: {e}", file=sys.stderr)
+            return None
+    
+    def update_transcription(self, file_hash: str, type_: Optional[str], 
+                           tags: Optional[str]) -> Optional[str]:
+        """Update existing transcription metadata"""
+        try:
+            # Get existing transcription
+            self.cursor.execute(
+                "SELECT id, metadata FROM transcriptions WHERE file_hash = %s",
+                (file_hash,)
+            )
+            result = self.cursor.fetchone()
+            if not result:
+                print(f"Error: No transcription found with file hash {file_hash}", file=sys.stderr)
+                return None
+            
+            transcription_id, existing_metadata = result
+            metadata = existing_metadata or {}
+            
+            # Update metadata
+            if type_:
+                metadata['type'] = type_
+            if tags:
+                metadata['tags'] = [tag.strip() for tag in tags.split(',')]
+            
+            self.cursor.execute("""
+                UPDATE transcriptions 
+                SET metadata = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (Json(metadata), transcription_id))
+            
+            self.conn.commit()
+            return str(transcription_id)
+            
+        except psycopg2.Error as e:
+            self.conn.rollback()
+            print(f"Error updating transcription: {e}", file=sys.stderr)
+            return None
+    
+    def transcribe_file(self, input_file: str, output_dir: Optional[str] = None) -> Optional[str]:
+        """Transcribe audio file using whisper, capturing both timestamped and plain text"""
+        # Whisper creates output file as input_file + .txt in the same directory
+        expected_output = f"{input_file}.txt"
+        
+        # Run whisper transcription
+        cmd = [
+            'distrobox', 'enter', 'whisper', '--',
+            WHISPER_BIN,
+            '-m', f"{WHISPER_MODEL_PATH}/{args.model}",
+            '-f', input_file,
+            '-otxt'
+        ]
+        
+        try:
+            if args.verbose:
+                print(f"Running command: {' '.join(cmd)}")
+            
+            # Capture stdout for timestamped content
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print("Error: Transcription failed", file=sys.stderr)
+                if args.verbose:
+                    print(f"Command stderr: {result.stderr}", file=sys.stderr)
+                    print(f"Command stdout: {result.stdout}", file=sys.stderr)
+                return None
+            
+            # Extract timestamped content from stdout
+            timestamped_content = ""
+            for line in result.stdout.split('\n'):
+                # Look for lines that start with timestamps like [00:00:00.000 --> 00:00:03.360]
+                if line.strip().startswith('[') and '-->' in line and line.strip().endswith(']'):
+                    timestamped_content += line + '\n'
+            
+            # Wait a moment for file to be written
+            import time
+            time.sleep(0.5)
+            
+            # Read the plain text transcription result from where whisper puts it
+            plain_content = ""
+            if os.path.exists(expected_output):
+                with open(expected_output, 'r', encoding='utf-8') as f:
+                    plain_content = f.read()
+                    
+                if args.verbose:
+                    print(f"Read {len(plain_content)} characters from {expected_output}")
+                    print(f"Captured {len(timestamped_content)} characters of timestamped content")
+                
+                # If output_dir specified, copy to that location
+                if output_dir and plain_content:
+                    final_output = os.path.join(output_dir, f"{os.path.basename(input_file)}.txt")
+                    with open(final_output, 'w', encoding='utf-8') as f:
+                        f.write(plain_content)
+                
+                # Combine both formats: timestamped followed by plain text
+                combined_content = ""
+                if timestamped_content:
+                    combined_content = timestamped_content
+                    if plain_content:
+                        combined_content += "\n\n--- PLAIN TEXT ---\n\n" + plain_content
+                else:
+                    # No timestamps captured, just use plain content
+                    combined_content = plain_content
+                
+                return combined_content
+            else:
+                print(f"Error: Transcription output file not found: {expected_output}", file=sys.stderr)
+                # List files in directory for debugging
+                if args.verbose:
+                    dir_path = os.path.dirname(input_file)
+                    print(f"Files in {dir_path}:", file=sys.stderr)
+                    for f in os.listdir(dir_path):
+                        print(f"  {f}", file=sys.stderr)
+                return None
+                
+        except Exception as e:
+            print(f"Error running transcription: {e}", file=sys.stderr)
+            return None
 
+
+def main():
+    global args
+    
+    parser = argparse.ArgumentParser(
+        description='Transcribe audio files using Whisper with optional PostgreSQL storage',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 ENVIRONMENT VARIABLES:
     TRANSCRIPTION_DB_HOST     Database host (default: 127.0.0.1)
     TRANSCRIPTION_DB_PORT     Database port (default: 5432)
     TRANSCRIPTION_DB_NAME     Database name (default: transcriptions)
-    TRANSCRIPTION_DB_USER     Database user (default: current user)
+    TRANSCRIPTION_DB_USER     Database user (default: postgres)
     TRANSCRIPTION_DB_PASSWORD Database password (default: none)
 
 EXAMPLES:
     # Basic transcription with database storage
-    $SCRIPT_NAME audio.mp3
+    transcribe_audio-ng audio.mp3
     
     # Transcribe with metadata
-    $SCRIPT_NAME --type meeting --tags "team,standup,2024-q1" audio.mp3
+    transcribe_audio-ng --type meeting --tags "team,standup,2024-q1" audio.mp3
     
     # Skip database storage (legacy mode)
-    $SCRIPT_NAME --no-store-db audio.mp3
+    transcribe_audio-ng --no-store-db audio.mp3
     
     # Update existing transcription metadata
-    $SCRIPT_NAME --update-db --tags "reviewed,important" audio.mp3
+    transcribe_audio-ng --update-db --tags "reviewed,important" audio.mp3
     
     # Database only (no file output)
-    $SCRIPT_NAME --db-only --type interview candidate.mp3
+    transcribe_audio-ng --db-only --type interview candidate.mp3
 
 NOTES:
     - Transcriptions are stored in PostgreSQL by default
     - Use 'local_postgres setup' to initialize the database
     - Large transcriptions are automatically split into chunks
     - Duplicate files (by hash) are detected and skipped
-EOF
-}
-
-# Parse command line arguments
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            -v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            --no-store-db)
-                NO_STORE_DB=true
-                shift
-                ;;
-            --db-only)
-                DB_ONLY=true
-                shift
-                ;;
-            --update-db)
-                UPDATE_DB=true
-                shift
-                ;;
-            --type)
-                TYPE="$2"
-                shift 2
-                ;;
-            --tags)
-                TAGS="$2"
-                shift 2
-                ;;
-            --model)
-                MODEL="$2"
-                shift 2
-                ;;
-            --output-dir)
-                OUTPUT_DIR="$2"
-                shift 2
-                ;;
-            --show-only-uuid)
-                SHOW_ONLY_UUID=true
-                DB_ONLY=true  # Implies --db-only
-                shift
-                ;;
-            -*)
-                echo "Unknown option: $1" >&2
-                usage
-                exit 1
-                ;;
-            *)
-                FILENAME="$1"
-                shift
-                ;;
-        esac
-    done
-}
-
-# Main execution
-main() {
-    parse_args "$@"
+"""
+    )
     
-    # Validate input
-    if [[ -z "$FILENAME" ]]; then
-        echo "Error: No audio file specified" >&2
-        usage
-        exit 1
-    fi
+    parser.add_argument('audio_file', help='Audio file to transcribe')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--no-store-db', action='store_true', 
+                       help='Do not store transcription in database (default: store)')
+    parser.add_argument('--db-only', action='store_true',
+                       help='Only store in database, skip file output')
+    parser.add_argument('--update-db', action='store_true',
+                       help='Update existing transcription metadata')
+    parser.add_argument('--type', help='Categorize transcription (e.g., meeting, interview, lecture)')
+    parser.add_argument('--tags', help='Comma-separated tags (e.g., "important,client-x,2024-q1")')
+    parser.add_argument('--model', default='ggml-base.en.bin',
+                       help='Whisper model to use (default: ggml-base.en.bin)')
+    parser.add_argument('--output-dir', help='Output directory for transcription files')
+    parser.add_argument('--show-only-uuid', action='store_true',
+                       help='Output only the transcription UUID (implies --db-only)')
     
-    if [[ ! -f "$FILENAME" ]]; then
-        echo "Error: File not found: $FILENAME" >&2
-        exit 1
-    fi
+    args = parser.parse_args()
+    
+    # --show-only-uuid implies --db-only
+    if args.show_only_uuid:
+        args.db_only = True
+    
+    # Validate input file
+    if not os.path.exists(args.audio_file):
+        print(f"Error: File not found: {args.audio_file}", file=sys.stderr)
+        sys.exit(1)
     
     # Get absolute path
-    local abs_path=$(realpath "$FILENAME")
-    local basename=$(basename "$FILENAME")
+    abs_path = os.path.abspath(args.audio_file)
+    basename = os.path.basename(args.audio_file)
+    
+    # Initialize processor
+    processor = TranscriptionProcessor()
     
     # Calculate file hash
-    local file_hash=$(calculate_file_hash "$abs_path")
-    [[ "$VERBOSE" == true ]] && [[ "$SHOW_ONLY_UUID" != true ]] && echo "File hash: $file_hash"
+    file_hash = processor.calculate_file_hash(abs_path)
+    if args.verbose and not args.show_only_uuid:
+        print(f"File hash: {file_hash}")
     
-    # Check if we need to check database
-    if [[ "$NO_STORE_DB" != true ]] && command -v psql &> /dev/null; then
+    # Check database operations
+    db_available = False
+    if not args.no_store_db:
+        db_available = processor.connect_db()
+    
+    if db_available:
         # For update mode, just update metadata
-        if [[ "$UPDATE_DB" == true ]]; then
-            [[ "$SHOW_ONLY_UUID" != true ]] && echo "Updating transcription metadata..."
-            local transcription_id=$(update_transcription "$file_hash" "$TYPE" "$TAGS")
-            if [[ -n "$transcription_id" ]]; then
-                if [[ "$SHOW_ONLY_UUID" == true ]]; then
-                    echo "$transcription_id"
-                else
-                    echo "Transcription updated: $transcription_id"
-                fi
-            fi
-            exit 0
-        fi
+        if args.update_db:
+            if not args.show_only_uuid:
+                print("Updating transcription metadata...")
+            transcription_id = processor.update_transcription(file_hash, args.type, args.tags)
+            if transcription_id:
+                if args.show_only_uuid:
+                    print(transcription_id)
+                else:
+                    print(f"Transcription updated: {transcription_id}")
+            processor.disconnect_db()
+            sys.exit(0 if transcription_id else 1)
         
         # Check if transcription already exists
-        if transcription_exists "$file_hash"; then
-            local existing_id=$(execute_sql "SELECT id FROM transcriptions WHERE file_hash='$file_hash'")
-            
-            if [[ "$SHOW_ONLY_UUID" == true ]]; then
-                echo "$existing_id"
-                exit 0
-            else
-                echo "Transcription already exists in database for this file"
-                echo "Transcription ID: $existing_id"
+        existing_id = processor.transcription_exists(file_hash)
+        if existing_id:
+            if args.show_only_uuid:
+                print(existing_id)
+                processor.disconnect_db()
+                sys.exit(0)
+            else:
+                print("Transcription already exists in database for this file")
+                print(f"Transcription ID: {existing_id}")
                 
                 # If db-only mode, we're done
-                [[ "$DB_ONLY" == true ]] && exit 0
+                if args.db_only:
+                    processor.disconnect_db()
+                    sys.exit(0)
                 
                 # Otherwise, still generate the file output
-                echo "Generating file output..."
-            fi
-        fi
-    fi
+                print("Generating file output...")
     
     # Perform transcription
-    [[ "$SHOW_ONLY_UUID" != true ]] && echo "Transcribing: $basename"
+    if not args.show_only_uuid:
+        print(f"Transcribing: {basename}")
     
-    # Redirect whisper output to stderr if show-only-uuid is set
-    local transcription
-    if [[ "$SHOW_ONLY_UUID" == true ]]; then
-        transcription=$(transcribe_file "$abs_path" 2>&1 | tail -n +2)  # Skip first line of whisper output
-    else
-        transcription=$(transcribe_file "$abs_path")
-    fi
-    
-    if [[ -z "$transcription" ]]; then
-        [[ "$SHOW_ONLY_UUID" != true ]] && echo "Error: Transcription produced no output" >&2
-        exit 1
-    fi
+    transcription = processor.transcribe_file(abs_path, args.output_dir)
+    if not transcription:
+        if not args.show_only_uuid:
+            print("Error: Transcription produced no output", file=sys.stderr)
+        sys.exit(1)
     
     # Output to file unless in db-only mode
-    if [[ "$DB_ONLY" != true ]]; then
-        local output_file="${abs_path}.txt"
-        [[ -n "$OUTPUT_DIR" ]] && output_file="${OUTPUT_DIR}/${basename}.txt"
+    if not args.db_only:
+        output_file = f"{abs_path}.txt"
+        if args.output_dir:
+            output_file = os.path.join(args.output_dir, f"{basename}.txt")
         
-        # The transcription is already written by whisper, but ensure it exists
-        if [[ ! -f "$output_file" ]]; then
-            echo "$transcription" > "$output_file"
-        fi
-        [[ "$SHOW_ONLY_UUID" != true ]] && echo "Transcription saved to: $output_file"
-    fi
+        # Ensure the transcription is saved
+        if not os.path.exists(output_file):
+            with open(output_file, 'w') as f:
+                f.write(transcription)
+        
+        if not args.show_only_uuid:
+            print(f"Transcription saved to: {output_file}")
     
     # Store in database if enabled
-    if [[ "$NO_STORE_DB" != true ]] && command -v psql &> /dev/null; then
-        # Check if transcription already exists again (in case it was just added)
-        if transcription_exists "$file_hash"; then
-            local existing_id=$(execute_sql "SELECT id FROM transcriptions WHERE file_hash='$file_hash'")
-            
-            if [[ "$SHOW_ONLY_UUID" == true ]]; then
-                echo "$existing_id"
-            else
-                echo "Transcription already exists in database"
-                echo "Transcription ID: $existing_id"
-            fi
-        else
-            [[ "$SHOW_ONLY_UUID" != true ]] && echo "Storing transcription in database..."
+    if db_available:
+        # Check again if transcription was added while we were transcribing
+        existing_id = processor.transcription_exists(file_hash)
+        if existing_id:
+            if args.show_only_uuid:
+                print(existing_id)
+            else:
+                print("Transcription already exists in database")
+                print(f"Transcription ID: {existing_id}")
+        else:
+            if not args.show_only_uuid:
+                print("Storing transcription in database...")
             
             # Get audio duration
-            local duration=$(get_audio_duration "$abs_path")
+            duration = processor.get_audio_duration(abs_path)
             
             # Insert into database
-            local transcription_id=$(insert_transcription \
-                "$basename" \
-                "$abs_path" \
-                "$file_hash" \
-                "$transcription" \
-                "$duration" \
-                "$MODEL" \
-                "$LANGUAGE" \
-                "$TYPE" \
-                "$TAGS")
+            transcription_id = processor.insert_transcription(
+                basename,
+                abs_path,
+                file_hash,
+                transcription,
+                duration,
+                args.model,
+                'en',  # Language hardcoded as 'en' like original
+                args.type,
+                args.tags
+            )
             
-            if [[ -n "$transcription_id" ]]; then
-                if [[ "$SHOW_ONLY_UUID" == true ]]; then
-                    echo "$transcription_id"
-                else
-                    echo "Transcription stored in database"
-                    echo "Transcription ID: $transcription_id"
-                fi
-            else
-                [[ "$SHOW_ONLY_UUID" != true ]] && echo "Warning: Failed to store transcription in database" >&2
-                [[ "$SHOW_ONLY_UUID" == true ]] && exit 1  # Exit with error if UUID was expected
-            fi
-        fi
-    fi
+            if transcription_id:
+                if args.show_only_uuid:
+                    print(transcription_id)
+                else:
+                    print("Transcription stored in database")
+                    print(f"Transcription ID: {transcription_id}")
+            else:
+                if not args.show_only_uuid:
+                    print("Warning: Failed to store transcription in database", file=sys.stderr)
+                if args.show_only_uuid:
+                    sys.exit(1)  # Exit with error if UUID was expected
+        
+        processor.disconnect_db()
     
-    [[ "$SHOW_ONLY_UUID" != true ]] && echo "Transcription completed"
-}
+    if not args.show_only_uuid:
+        print("Transcription completed")
 
-# Run main function
-main "$@"
+
+if __name__ == '__main__':
+    # Try to import psutil for parent process detection (optional)
+    try:
+        import psutil
+    except ImportError:
+        pass
+    
+    main()

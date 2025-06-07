@@ -1,93 +1,584 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/python3
 
-# transcriptions - Unified script for managing transcriptions in PostgreSQL
-# Combines search, view, list, and delete functionality
+import os
+import sys
+import subprocess
 
-# Configuration
-DB_HOST="${TRANSCRIPTION_DB_HOST:-127.0.0.1}"
-DB_PORT="${TRANSCRIPTION_DB_PORT:-5432}"
-DB_NAME="${TRANSCRIPTION_DB_NAME:-transcriptions}"
-DB_USER="${TRANSCRIPTION_DB_USER:-postgres}"
-DB_PASSWORD="${TRANSCRIPTION_DB_PASSWORD:-}"
+# Container check for distrobox - do this BEFORE any other imports
+ctr_id = os.environ.get("CONTAINER_ID", "")
+if ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
 
-# Script variables
-SCRIPT_NAME="$(basename "$0")"
-ACTION=""
-QUERY=""
-IDENTIFIER=""
-LIMIT=10
-SHOW_METADATA=false
-TYPE_FILTER=""
-TAGS_FILTER=""
-CONFIRM_DELETE=false
-OUTPUT_FORMAT="text"  # text, simple, json, yaml
-VERBOSE=false
+# Now import everything else inside the dev container
+try:
+    import argparse
+    import json
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    from datetime import datetime
+    from typing import Optional, List, Dict, Any
+    from tabulate import tabulate
+    from colorama import init, Fore, Style, Back
+    import yaml
+except ImportError as e:
+    # We're inside dev container but missing dependencies
+    print(f"Error: Missing required Python module: {e}", file=sys.stderr)
+    print("Please install the required dependencies:", file=sys.stderr)
+    print("  pip install psycopg2-binary tabulate colorama pyyaml", file=sys.stderr)
+    sys.exit(1)
 
-# Database connection string
-get_connection_string() {
-    local conn="postgresql://${DB_USER}"
-    [[ -n "$DB_PASSWORD" ]] && conn="${conn}:${DB_PASSWORD}"
-    conn="${conn}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-    echo "$conn"
+# Initialize colorama for cross-platform color support
+init(autoreset=True)
+
+# Configuration with environment variables
+DB_CONFIG = {
+    'host': os.environ.get('TRANSCRIPTION_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('TRANSCRIPTION_DB_PORT', '5432')),
+    'database': os.environ.get('TRANSCRIPTION_DB_NAME', 'transcriptions'),
+    'user': os.environ.get('TRANSCRIPTION_DB_USER', 'postgres'),
+    'password': os.environ.get('TRANSCRIPTION_DB_PASSWORD', '')
 }
 
-# Execute SQL with clean output
-execute_sql() {
-    local sql="$1"
-    psql -d "$(get_connection_string)" -tAq -c "$sql" 2>/dev/null
-}
+class TranscriptionManager:
+    def __init__(self, no_color: bool = False):
+        self.no_color = no_color
+        self.conn = None
+        self.cursor = None
+        self._connect()
+    
+    def _connect(self):
+        """Establish persistent database connection"""
+        try:
+            self.conn = psycopg2.connect(**DB_CONFIG)
+            self.cursor = self.conn.cursor(cursor_factory=RealDictCursor)
+        except psycopg2.Error as e:
+            self._error(f"Database connection failed: {e}")
+            sys.exit(1)
+    
+    def __del__(self):
+        """Clean up database connection"""
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+    
+    def _color(self, text: str, color: str) -> str:
+        """Apply color to text unless no_color is set"""
+        if self.no_color:
+            return text
+        return f"{color}{text}{Style.RESET_ALL}"
+    
+    def _error(self, message: str):
+        """Print error message"""
+        print(self._color(f"Error: {message}", Fore.RED), file=sys.stderr)
+    
+    def _success(self, message: str):
+        """Print success message"""
+        print(self._color(message, Fore.GREEN))
+    
+    def _info(self, message: str):
+        """Print info message"""
+        print(self._color(message, Fore.CYAN))
+    
+    def _format_date(self, dt: datetime) -> str:
+        """Format datetime for display"""
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    
+    def search(self, query: str, limit: int = 10, type_filter: Optional[str] = None,
+               tags_filter: Optional[List[str]] = None, output_format: str = 'text',
+               verbose: bool = False) -> None:
+        """Search transcriptions using full-text search"""
+        
+        # Build WHERE clauses
+        where_clauses = ["tc.content_vector @@ plainto_tsquery('english', %s)"]
+        params = [query]
+        
+        if type_filter:
+            where_clauses.append("t.metadata->>'type' = %s")
+            params.append(type_filter)
+        
+        if tags_filter:
+            tag_conditions = []
+            for tag in tags_filter:
+                tag_conditions.append("t.metadata->'tags' ? %s")
+                params.append(tag.strip())
+            if tag_conditions:
+                where_clauses.append(f"({' OR '.join(tag_conditions)})")
+        
+        where_clause = " AND ".join(where_clauses)
+        
+        # Main search query
+        sql = f"""
+        SELECT DISTINCT ON (t.id)
+            t.id,
+            t.filename,
+            t.file_path,
+            t.metadata,
+            t.transcribed_at,
+            ts_rank(tc.content_vector, plainto_tsquery('english', %s)) as rank,
+            ts_headline('english', tc.content, plainto_tsquery('english', %s),
+                'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') as snippet
+        FROM transcriptions t
+        JOIN transcription_chunks tc ON t.id = tc.transcription_id
+        WHERE {where_clause}
+        ORDER BY t.id, rank DESC
+        LIMIT %s
+        """
+        
+        params.extend([query, query, limit])
+        
+        if verbose:
+            print(f"DEBUG: SQL Query: {sql}")
+            print(f"DEBUG: Params: {params}")
+        
+        try:
+            self.cursor.execute(sql, params)
+            results = self.cursor.fetchall()
+            
+            if output_format == 'json':
+                print(json.dumps([dict(r) for r in results], default=str, indent=2))
+            elif output_format == 'yaml':
+                yaml_data = {'results': []}
+                for r in results:
+                    item = {
+                        'id': str(r['id']),
+                        'filename': r['filename'],
+                        'transcribed_at': self._format_date(r['transcribed_at']),
+                        'rank': float(r['rank']),
+                        'snippet': r['snippet'].replace("''", "'")
+                    }
+                    if r['file_path']:
+                        item['file_path'] = r['file_path']
+                    if r['metadata']:
+                        if r['metadata'].get('type'):
+                            item['type'] = r['metadata']['type']
+                        if r['metadata'].get('tags'):
+                            item['tags'] = r['metadata']['tags']
+                    yaml_data['results'].append(item)
+                print(yaml.dump(yaml_data, default_flow_style=False))
+            elif output_format == 'simple':
+                for r in results:
+                    print(r['filename'])
+            else:  # text format with nice table
+                if not results:
+                    self._info("No results found.")
+                    return
+                
+                print(self._color(f"\nSearch results for: \"{query}\"", Fore.YELLOW))
+                print(self._color("=" * 50, Fore.YELLOW))
+                
+                table_data = []
+                for i, r in enumerate(results, 1):
+                    metadata_info = []
+                    if r['metadata']:
+                        if r['metadata'].get('type'):
+                            metadata_info.append(f"Type: {self._color(r['metadata']['type'], Fore.MAGENTA)}")
+                        if r['metadata'].get('tags'):
+                            tags_colored = [self._color(tag, Fore.BLUE) for tag in r['metadata']['tags']]
+                            metadata_info.append(f"Tags: {', '.join(tags_colored)}")
+                    
+                    snippet = r['snippet'].replace("''", "'")
+                    # Highlight matched terms in snippet
+                    if not self.no_color:
+                        snippet = snippet.replace("**", f"{Fore.YELLOW}{Style.BRIGHT}")
+                        snippet = snippet.replace("**", f"{Style.RESET_ALL}")
+                    
+                    table_data.append([
+                        self._color(str(i), Fore.WHITE + Style.BRIGHT),
+                        self._color(r['filename'], Fore.CYAN),  # Filename in cyan
+                        self._color(self._format_date(r['transcribed_at']), Fore.WHITE),
+                        '\n'.join(metadata_info) if metadata_info else self._color('None', Fore.LIGHTBLACK_EX),
+                        snippet[:100] + '...' if len(snippet) > 100 else snippet
+                    ])
+                
+                headers = [
+                    self._color('#', Fore.WHITE + Style.BRIGHT),
+                    self._color('Filename', Fore.CYAN + Style.BRIGHT),
+                    self._color('Transcribed', Fore.WHITE + Style.BRIGHT),
+                    self._color('Metadata', Fore.YELLOW + Style.BRIGHT),
+                    self._color('Snippet', Fore.YELLOW + Style.BRIGHT)
+                ]
+                print(tabulate(table_data, headers=headers, tablefmt='grid'))
+                print(f"\nFound {len(results)} results.")
+                
+        except psycopg2.Error as e:
+            self._error(f"Search failed: {e}")
+    
+    def view(self, identifier: str, show_metadata: bool = False, 
+             output_format: str = 'text', no_timestamps: bool = False) -> None:
+        """View full transcription content"""
+        
+        # Determine if identifier is UUID or filename
+        try:
+            # Try to parse as UUID
+            import uuid
+            uuid.UUID(identifier)
+            is_uuid = True
+        except ValueError:
+            is_uuid = False
+        
+        # Always aggregate chunks in order to get the full content
+        # Use newline separator to properly join chunks
+        if is_uuid:
+            sql = """
+            SELECT t.*, 
+                   string_agg(tc.content, E'\n' ORDER BY tc.chunk_number) as full_content
+            FROM transcriptions t
+            LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+            WHERE t.id = %s::uuid
+            GROUP BY t.id
+            """
+            params = [identifier]
+        else:
+            sql = """
+            SELECT t.*, 
+                   string_agg(tc.content, E'\n' ORDER BY tc.chunk_number) as full_content
+            FROM transcriptions t
+            LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+            WHERE t.filename = %s
+            GROUP BY t.id
+            ORDER BY t.transcribed_at DESC
+            LIMIT 1
+            """
+            params = [identifier]
+        
+        try:
+            self.cursor.execute(sql, params)
+            result = self.cursor.fetchone()
+            
+            if not result:
+                self._error(f"No transcription found for: {identifier}")
+                return
+            
+            if output_format == 'json':
+                output = dict(result)
+                print(json.dumps(output, default=str, indent=2))
+            elif output_format == 'yaml':
+                output = {
+                    'transcription': {
+                        'id': str(result['id']),
+                        'filename': result['filename'],
+                        'transcribed_at': self._format_date(result['transcribed_at']),
+                        'content': result['full_content']
+                    }
+                }
+                if result['file_path']:
+                    output['transcription']['file_path'] = result['file_path']
+                if result['model_used']:
+                    output['transcription']['model_used'] = result['model_used']
+                if result['duration_seconds']:
+                    output['transcription']['duration_seconds'] = result['duration_seconds']
+                if result['metadata']:
+                    if result['metadata'].get('type'):
+                        output['transcription']['type'] = result['metadata']['type']
+                    if result['metadata'].get('tags'):
+                        output['transcription']['tags'] = result['metadata']['tags']
+                print(yaml.dump(output, default_flow_style=False))
+            elif output_format == 'simple':
+                content = result['full_content']
+                if content:
+                    lines = content.split('\n')
+                    if no_timestamps:
+                        # Show only lines without timestamps
+                        filtered_lines = [line for line in lines 
+                                        if not (line.strip().startswith('[') and '-->' in line)]
+                    else:
+                        # Check if there are any timestamped lines
+                        timestamped_lines = [line for line in lines 
+                                           if line.strip().startswith('[') and '-->' in line]
+                        if timestamped_lines:
+                            # Show only timestamped lines if they exist
+                            filtered_lines = timestamped_lines
+                        else:
+                            # No timestamps found, show all content
+                            filtered_lines = lines
+                    
+                    print('\n'.join(filtered_lines))
+            else:  # text format
+                if show_metadata:
+                    print(self._color("=== METADATA ===", Fore.CYAN))
+                    metadata_table = [
+                        ['ID', str(result['id'])],
+                        ['Filename', result['filename']],
+                        ['Path', result['file_path'] or 'N/A'],
+                        ['Transcribed', self._format_date(result['transcribed_at'])],
+                        ['Model', result['model_used'] or 'unknown'],
+                        ['Duration', f"{result['duration_seconds']} seconds" if result['duration_seconds'] else 'unknown']
+                    ]
+                    
+                    if result['metadata']:
+                        if result['metadata'].get('type'):
+                            metadata_table.append(['Type', result['metadata']['type']])
+                        if result['metadata'].get('tags'):
+                            metadata_table.append(['Tags', ', '.join(result['metadata']['tags'])])
+                    
+                    print(tabulate(metadata_table, tablefmt='plain'))
+                    print(self._color("\n=== TRANSCRIPTION ===", Fore.CYAN))
+                
+                # Filter content based on timestamps preference
+                content = result['full_content']
+                if content:
+                    lines = content.split('\n')
+                    if no_timestamps:
+                        # Show only lines without timestamps
+                        filtered_lines = [line for line in lines 
+                                        if not (line.strip().startswith('[') and '-->' in line)]
+                    else:
+                        # Check if there are any timestamped lines
+                        timestamped_lines = [line for line in lines 
+                                           if line.strip().startswith('[') and '-->' in line]
+                        if timestamped_lines:
+                            # Show only timestamped lines if they exist
+                            filtered_lines = timestamped_lines
+                        else:
+                            # No timestamps found, show all content
+                            filtered_lines = lines
+                    
+                    print('\n'.join(filtered_lines))
+                
+        except psycopg2.Error as e:
+            self._error(f"View failed: {e}")
+    
+    def list(self, limit: int = 10, type_filter: Optional[str] = None,
+             tags_filter: Optional[List[str]] = None, output_format: str = 'text') -> None:
+        """List recent transcriptions"""
+        
+        # Build WHERE clause
+        where_clauses = []
+        params = []
+        
+        if type_filter:
+            where_clauses.append("metadata->>'type' = %s")
+            params.append(type_filter)
+        
+        if tags_filter:
+            tag_conditions = []
+            for tag in tags_filter:
+                tag_conditions.append("metadata->'tags' ? %s")
+                params.append(tag.strip())
+            if tag_conditions:
+                where_clauses.append(f"({' OR '.join(tag_conditions)})")
+        
+        where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        
+        sql = f"""
+        SELECT id, filename, file_path, transcribed_at, metadata
+        FROM transcriptions
+        {where_clause}
+        ORDER BY transcribed_at DESC
+        LIMIT %s
+        """
+        params.append(limit)
+        
+        try:
+            self.cursor.execute(sql, params)
+            results = self.cursor.fetchall()
+            
+            if output_format == 'json':
+                print(json.dumps([dict(r) for r in results], default=str, indent=2))
+            elif output_format == 'yaml':
+                yaml_data = {'transcriptions': []}
+                for r in results:
+                    item = {
+                        'id': str(r['id']),
+                        'filename': r['filename'],
+                        'transcribed_at': self._format_date(r['transcribed_at'])
+                    }
+                    if r['file_path']:
+                        item['file_path'] = r['file_path']
+                    if r['metadata']:
+                        if r['metadata'].get('type'):
+                            item['type'] = r['metadata']['type']
+                        if r['metadata'].get('tags'):
+                            item['tags'] = r['metadata']['tags']
+                    yaml_data['transcriptions'].append(item)
+                print(yaml.dump(yaml_data, default_flow_style=False))
+            elif output_format == 'simple':
+                for r in results:
+                    print(r['filename'])
+            else:  # text format with nice table
+                if not results:
+                    self._info("No transcriptions found.")
+                    return
+                
+                print(self._color("\nRecent transcriptions:", Fore.YELLOW))
+                print(self._color("=" * 80, Fore.YELLOW))
+                
+                table_data = []
+                for r in results:
+                    metadata_info = []
+                    if r['metadata']:
+                        if r['metadata'].get('type'):
+                            metadata_info.append(self._color(r['metadata']['type'], Fore.MAGENTA))
+                        if r['metadata'].get('tags'):
+                            tags_colored = [self._color(tag, Fore.BLUE) for tag in r['metadata']['tags']]
+                            metadata_info.append(', '.join(tags_colored))
+                    
+                    table_data.append([
+                        self._color(str(r['id']), Fore.GREEN),  # UUID in green
+                        self._color(r['filename'], Fore.CYAN),   # Filename in cyan
+                        self._color(self._format_date(r['transcribed_at']), Fore.WHITE),
+                        ' | '.join(metadata_info) if metadata_info else self._color('None', Fore.LIGHTBLACK_EX)
+                    ])
+                
+                headers = [
+                    self._color('ID', Fore.GREEN + Style.BRIGHT),
+                    self._color('Filename', Fore.CYAN + Style.BRIGHT),
+                    self._color('Transcribed', Fore.WHITE + Style.BRIGHT),
+                    self._color('Type/Tags', Fore.YELLOW + Style.BRIGHT)
+                ]
+                print(tabulate(table_data, headers=headers, tablefmt='grid'))
+                
+        except psycopg2.Error as e:
+            self._error(f"List failed: {e}")
+    
+    def delete(self, identifier: str, confirm: bool = False) -> None:
+        """Delete a transcription and its chunks"""
+        
+        # Determine if identifier is UUID or filename
+        try:
+            import uuid
+            uuid.UUID(identifier)
+            is_uuid = True
+        except ValueError:
+            is_uuid = False
+        
+        # First, get the transcription details
+        if is_uuid:
+            sql = "SELECT id, filename FROM transcriptions WHERE id = %s::uuid"
+            params = [identifier]
+        else:
+            sql = """
+            SELECT id, filename FROM transcriptions 
+            WHERE filename = %s 
+            ORDER BY transcribed_at DESC 
+            LIMIT 1
+            """
+            params = [identifier]
+        
+        try:
+            self.cursor.execute(sql, params)
+            result = self.cursor.fetchone()
+            
+            if not result:
+                self._error(f"No transcription found for: {identifier}")
+                return
+            
+            # Confirm deletion
+            if not confirm:
+                print(self._color("About to delete transcription:", Fore.YELLOW))
+                print(f"  ID: {result['id']}")
+                print(f"  Filename: {result['filename']}")
+                response = input(self._color("Are you sure? (y/N): ", Fore.YELLOW))
+                if response.lower() != 'y':
+                    print("Deletion cancelled.")
+                    return
+            
+            # Delete transcription (chunks are cascade deleted)
+            self.cursor.execute("DELETE FROM transcriptions WHERE id = %s::uuid", [result['id']])
+            self.conn.commit()
+            self._success("Transcription deleted successfully.")
+            
+        except psycopg2.Error as e:
+            self.conn.rollback()
+            self._error(f"Delete failed: {e}")
+    
+    def stats(self) -> None:
+        """Show database statistics"""
+        
+        print(self._color("\nTranscription Database Statistics", Fore.YELLOW))
+        print(self._color("=" * 50, Fore.YELLOW))
+        
+        try:
+            # Overall statistics
+            self.cursor.execute("""
+                SELECT 
+                    COUNT(DISTINCT t.id) as total_transcriptions,
+                    COUNT(tc.id) as total_chunks,
+                    COALESCE(SUM(tc.character_count), 0) as total_characters,
+                    COALESCE(AVG(tc.character_count), 0)::integer as avg_chunk_size
+                FROM transcriptions t
+                LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+            """)
+            stats = self.cursor.fetchone()
+            
+            stats_table = [
+                [self._color('Total Transcriptions', Fore.CYAN), self._color(f"{stats['total_transcriptions']:,}", Fore.GREEN)],
+                [self._color('Total Chunks', Fore.CYAN), self._color(f"{stats['total_chunks']:,}", Fore.GREEN)],
+                [self._color('Total Characters', Fore.CYAN), self._color(f"{stats['total_characters']:,}", Fore.GREEN)],
+                [self._color('Average Chunk Size', Fore.CYAN), self._color(f"{stats['avg_chunk_size']:,}", Fore.GREEN)]
+            ]
+            print(tabulate(stats_table, tablefmt='plain'))
+            
+            # Top types
+            print(self._color("\nTop 5 Types:", Fore.CYAN))
+            self.cursor.execute("""
+                SELECT 
+                    COALESCE(metadata->>'type', 'none') as type,
+                    COUNT(*) as count
+                FROM transcriptions
+                GROUP BY metadata->>'type'
+                ORDER BY count DESC
+                LIMIT 5
+            """)
+            types = self.cursor.fetchall()
+            if types:
+                type_table = [[self._color(t['type'], Fore.MAGENTA), self._color(f"{t['count']:,}", Fore.GREEN)] for t in types]
+                headers = [self._color('Type', Fore.MAGENTA + Style.BRIGHT), self._color('Count', Fore.GREEN + Style.BRIGHT)]
+                print(tabulate(type_table, headers=headers, tablefmt='simple'))
+            
+            # Top tags
+            print(self._color("\nTop 10 Tags:", Fore.CYAN))
+            self.cursor.execute("""
+                SELECT 
+                    tag,
+                    COUNT(*) as count
+                FROM (
+                    SELECT jsonb_array_elements_text(metadata->'tags') as tag
+                    FROM transcriptions
+                    WHERE metadata->'tags' IS NOT NULL
+                ) t
+                GROUP BY tag
+                ORDER BY count DESC
+                LIMIT 10
+            """)
+            tags = self.cursor.fetchall()
+            if tags:
+                tag_table = [[self._color(t['tag'], Fore.BLUE), self._color(f"{t['count']:,}", Fore.GREEN)] for t in tags]
+                headers = [self._color('Tag', Fore.BLUE + Style.BRIGHT), self._color('Count', Fore.GREEN + Style.BRIGHT)]
+                print(tabulate(tag_table, headers=headers, tablefmt='simple'))
+                
+        except psycopg2.Error as e:
+            self._error(f"Stats failed: {e}")
 
-# Execute SQL with formatted output
-execute_sql_formatted() {
-    local sql="$1"
-    psql -d "$(get_connection_string)" -c "$sql"
-}
 
-# Usage help
-usage() {
-    cat << EOF
-Usage: $SCRIPT_NAME [ACTION] [OPTIONS] [QUERY|ID|FILENAME]
-
-Unified management tool for transcriptions stored in PostgreSQL.
-
-ACTIONS:
-    search QUERY        Search transcriptions using full-text search
-    view ID|FILENAME    View full transcription content
-    list               List recent transcriptions
-    delete ID|FILENAME  Delete a transcription and its chunks
-    stats              Show database statistics
-
-OPTIONS:
-    -h, --help         Show this help message
-    -l, --limit N      Number of results to show (default: 10)
-    -m, --metadata     Include metadata in output
-    -t, --type TYPE    Filter by transcription type
-    -T, --tags TAGS    Filter by tags (comma-separated)
-    -y, --yes          Skip confirmation prompts
-    -f, --format FMT   Output format: text, simple, json, yaml (default: text)
-    -v, --verbose      Enable verbose output for debugging
-
+def main():
+    parser = argparse.ArgumentParser(
+        description='Unified management tool for transcriptions stored in PostgreSQL',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 EXAMPLES:
     # Search for content
-    $SCRIPT_NAME search "action items"
-    $SCRIPT_NAME search --type meeting --limit 5 "budget"
+    transcriptions-ng search "action items"
+    transcriptions-ng search --type meeting --limit 5 "budget"
     
     # View transcription
-    $SCRIPT_NAME view 75647fb6-5a16-44a5-9155-2bc0aab58b0f
-    $SCRIPT_NAME view recording.mp3
-    $SCRIPT_NAME view -m recording.mp3  # With metadata
+    transcriptions-ng view 75647fb6-5a16-44a5-9155-2bc0aab58b0f
+    transcriptions-ng view recording.mp3
+    transcriptions-ng view -m recording.mp3  # With metadata
     
     # List recent transcriptions
-    $SCRIPT_NAME list
-    $SCRIPT_NAME list --limit 20 --type meeting
+    transcriptions-ng list
+    transcriptions-ng list --limit 20 --type meeting
     
     # Delete transcription
-    $SCRIPT_NAME delete recording.mp3
-    $SCRIPT_NAME delete -y 75647fb6-5a16-44a5-9155-2bc0aab58b0f
+    transcriptions-ng delete recording.mp3
+    transcriptions-ng delete -y 75647fb6-5a16-44a5-9155-2bc0aab58b0f
     
     # Show statistics
-    $SCRIPT_NAME stats
+    transcriptions-ng stats
 
 ENVIRONMENT VARIABLES:
     TRANSCRIPTION_DB_HOST     Database host (default: 127.0.0.1)
@@ -95,631 +586,84 @@ ENVIRONMENT VARIABLES:
     TRANSCRIPTION_DB_NAME     Database name (default: transcriptions)
     TRANSCRIPTION_DB_USER     Database user (default: postgres)
     TRANSCRIPTION_DB_PASSWORD Database password (default: none)
-EOF
-}
-
-# Search transcriptions
-search_transcriptions() {
-    local query="$1"
+"""
+    )
     
-    # Escape single quotes in query for SQL
-    local escaped_query=$(echo "$query" | sed "s/'/''/g")
+    # Subcommands
+    subparsers = parser.add_subparsers(dest='action', help='Action to perform')
     
-    # Build WHERE clause
-    local where_clauses=("tc.content_vector @@ plainto_tsquery('english', '$escaped_query')")
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search transcriptions using full-text search')
+    search_parser.add_argument('query', help='Search query')
+    search_parser.add_argument('-l', '--limit', type=int, default=10, help='Number of results to show (default: 10)')
+    search_parser.add_argument('-t', '--type', help='Filter by transcription type')
+    search_parser.add_argument('-T', '--tags', help='Filter by tags (comma-separated)')
+    search_parser.add_argument('-f', '--format', choices=['text', 'simple', 'json', 'yaml'], 
+                              default='text', help='Output format')
+    search_parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     
-    [[ -n "$TYPE_FILTER" ]] && where_clauses+=("t.metadata->>'type' = '$TYPE_FILTER'")
+    # View command
+    view_parser = subparsers.add_parser('view', help='View full transcription content')
+    view_parser.add_argument('identifier', help='UUID or filename')
+    view_parser.add_argument('-m', '--metadata', action='store_true', help='Include metadata in output')
+    view_parser.add_argument('-f', '--format', choices=['text', 'simple', 'json', 'yaml'], 
+                            default='text', help='Output format')
+    view_parser.add_argument('--no-timestamps', action='store_true', 
+                            help='Show content without timestamps (default: show only timestamped lines)')
     
-    if [[ -n "$TAGS_FILTER" ]]; then
-        IFS=',' read -ra tags <<< "$TAGS_FILTER"
-        local tag_conditions=()
-        for tag in "${tags[@]}"; do
-            tag=$(echo "$tag" | xargs)  # Trim whitespace
-            tag_conditions+=("t.metadata->'tags' ? '$tag'")
-        done
-        [[ ${#tag_conditions[@]} -gt 0 ]] && where_clauses+=("(${tag_conditions[*]})")
-    fi
+    # List command
+    list_parser = subparsers.add_parser('list', help='List recent transcriptions')
+    list_parser.add_argument('-l', '--limit', type=int, default=10, help='Number of results to show (default: 10)')
+    list_parser.add_argument('-t', '--type', help='Filter by transcription type')
+    list_parser.add_argument('-T', '--tags', help='Filter by tags (comma-separated)')
+    list_parser.add_argument('-f', '--format', choices=['text', 'simple', 'json', 'yaml'], 
+                            default='text', help='Output format')
     
-    local where_clause=$(IFS=' AND '; echo "${where_clauses[*]}")
+    # Delete command
+    delete_parser = subparsers.add_parser('delete', help='Delete a transcription and its chunks')
+    delete_parser.add_argument('identifier', help='UUID or filename')
+    delete_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt')
     
-    # Build query with pipe separator for easier parsing
-    local sql="
-    SELECT DISTINCT ON (t.id)
-        t.id || '|' ||
-        t.filename || '|' ||
-        COALESCE(t.file_path, '') || '|' ||
-        t.metadata::text || '|' ||
-        t.transcribed_at || '|' ||
-        ts_rank(tc.content_vector, plainto_tsquery('english', '$escaped_query')) || '|' ||
-        ts_headline('english', tc.content, plainto_tsquery('english', '$escaped_query'),
-            'StartSel=**, StopSel=**, MaxWords=50, MinWords=20')
-    FROM transcriptions t
-    JOIN transcription_chunks tc ON t.id = tc.transcription_id
-    WHERE $where_clause
-    ORDER BY t.id, ts_rank(tc.content_vector, plainto_tsquery('english', '$escaped_query')) DESC
-    LIMIT $LIMIT;"
+    # Stats command
+    stats_parser = subparsers.add_parser('stats', help='Show database statistics')
     
-    case "$OUTPUT_FORMAT" in
-        simple)
-            execute_sql "
-            SELECT DISTINCT t.filename
-            FROM transcriptions t
-            JOIN transcription_chunks tc ON t.id = tc.transcription_id
-            WHERE $where_clause
-            ORDER BY t.filename
-            LIMIT $LIMIT;"
-            ;;
-        json)
-            execute_sql "
-            SELECT json_agg(sub)::text FROM (
-                SELECT DISTINCT ON (t.id)
-                    t.id,
-                    t.filename,
-                    t.file_path,
-                    t.metadata,
-                    t.transcribed_at,
-                    ts_rank(tc.content_vector, plainto_tsquery('english', '$escaped_query')) AS rank,
-                    ts_headline('english', tc.content, plainto_tsquery('english', '$escaped_query'),
-                        'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') AS snippet
-                FROM transcriptions t
-                JOIN transcription_chunks tc ON t.id = tc.transcription_id
-                WHERE $where_clause
-                ORDER BY t.id, rank DESC
-                LIMIT $LIMIT
-            ) sub;"
-            ;;
-        yaml)
-            # Get results and convert to YAML
-            local yaml_results=$(execute_sql "$sql")
-            if [[ -z "$yaml_results" ]]; then
-                echo "results: []"
-                return
-            fi
-            
-            echo "results:"
-            while IFS='|' read -r id filename file_path metadata transcribed_at rank snippet; do
-                [[ -z "$id" ]] && continue
-                
-                # Clean up values
-                local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
-                if [[ -n "$snippet" ]]; then
-                    snippet=$(echo "$snippet" | sed "s/''''/'/g")
-                fi
-                
-                # Extract metadata
-                local type=""
-                local tags_array="[]"
-                if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
-                    type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
-                    tags_array=$(echo "$metadata" | jq -c '.tags // []' 2>/dev/null)
-                fi
-                
-                # Output YAML format
-                echo "  - id: \"$id\""
-                echo "    filename: \"$filename\""
-                [[ -n "$file_path" ]] && echo "    file_path: \"$file_path\""
-                echo "    transcribed_at: \"$formatted_date\""
-                echo "    rank: $rank"
-                [[ -n "$type" ]] && echo "    type: \"$type\""
-                
-                # Handle tags array
-                if [[ "$tags_array" != "[]" ]] && [[ "$tags_array" != "null" ]]; then
-                    echo "    tags:"
-                    echo "$tags_array" | jq -r '.[]' | while read -r tag; do
-                        echo "      - \"$tag\""
-                    done
-                fi
-                
-                # Escape quotes in snippet for YAML
-                local escaped_snippet=$(echo "$snippet" | sed 's/"/\\"/g')
-                echo "    snippet: \"$escaped_snippet\""
-            done <<< "$yaml_results"
-            ;;
-        *)
-            echo "Search results for: \"$query\""
-            echo "=================="
-            
-            # Debug SQL if verbose
-            if [[ "$VERBOSE" == true ]]; then
-                echo "DEBUG: SQL Query:"
-                echo "$sql"
-                echo "DEBUG: Where clause: $where_clause"
-            fi
-            
-            local results=$(execute_sql "$sql")
-            
-            # Debug: Show raw results if verbose
-            [[ "$VERBOSE" == true ]] && echo "DEBUG: Raw results: '$results'"
-            
-            if [[ -z "$results" || "$results" == "NULL" || "$results" == "" ]]; then
-                echo "No results found."
-                return
-            fi
-            
-            # Parse and display results
-            local count=0
-            while IFS='|' read -r id filename file_path metadata transcribed_at rank snippet; do
-                # Skip empty lines
-                [[ -z "$id" ]] && continue
-                
-                count=$((count + 1))
-                echo -e "\n$count. $filename"
-                echo "   ID: $id"
-                [[ -n "$file_path" ]] && echo "   Path: $file_path"
-                
-                # Format timestamp nicely
-                local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
-                echo "   Transcribed: $formatted_date"
-                
-                if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
-                    local type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
-                    local tags=$(echo "$metadata" | jq -r '.tags // [] | join(", ")' 2>/dev/null)
-                    [[ -n "$type" ]] && echo "   Type: $type"
-                    [[ -n "$tags" ]] && echo "   Tags: $tags"
-                fi
-                
-                # Clean up snippet
-                if [[ -n "$snippet" ]]; then
-                    snippet=$(echo "$snippet" | sed "s/''''/'/g")
-                    echo "   Snippet: $snippet"
-                fi
-            done <<< "$results"
-            
-            echo -e "\nFound $count results."
-            ;;
-    esac
-}
-
-# View transcription
-view_transcription() {
-    local identifier="$1"
-    local uuid=""
+    # Global options
+    parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     
-    # Determine if identifier is UUID or filename
-    if [[ "$identifier" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-        uuid="$identifier"
-    else
-        # Look up UUID by filename
-        uuid=$(execute_sql "SELECT id FROM transcriptions WHERE filename = '$identifier' ORDER BY transcribed_at DESC LIMIT 1")
-        if [[ -z "$uuid" ]]; then
-            echo "Error: No transcription found for filename: $identifier" >&2
-            return 1
-        fi
-    fi
+    args = parser.parse_args()
     
-    case "$OUTPUT_FORMAT" in
-        json)
-            execute_sql "
-            SELECT json_build_object(
-                'id', t.id,
-                'filename', t.filename,
-                'file_path', t.file_path,
-                'metadata', t.metadata,
-                'transcribed_at', t.transcribed_at,
-                'model_used', t.model_used,
-                'duration_seconds', t.duration_seconds,
-                'content', string_agg(tc.content, E'\n' ORDER BY tc.chunk_number)
-            )::text
-            FROM transcriptions t
-            LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
-            WHERE t.id = '$uuid'::uuid
-            GROUP BY t.id;"
-            ;;
-        yaml)
-            # Get transcription data
-            local data=$(execute_sql "
-            SELECT 
-                t.id || '|' ||
-                t.filename || '|' ||
-                COALESCE(t.file_path, '') || '|' ||
-                t.metadata::text || '|' ||
-                t.transcribed_at || '|' ||
-                COALESCE(t.model_used, '') || '|' ||
-                COALESCE(t.duration_seconds::text, '') || '|' ||
-                COALESCE(string_agg(tc.content, E'\n' ORDER BY tc.chunk_number), '')
-            FROM transcriptions t
-            LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
-            WHERE t.id = '$uuid'::uuid
-            GROUP BY t.id;")
-            
-            if [[ -z "$data" ]]; then
-                echo "error: \"Transcription not found\""
-                return 1
-            fi
-            
-            IFS='|' read -r id filename file_path metadata transcribed_at model_used duration content <<< "$data"
-            
-            # Clean up timestamp
-            local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
-            
-            # Start YAML output
-            echo "transcription:"
-            echo "  id: \"$id\""
-            echo "  filename: \"$filename\""
-            [[ -n "$file_path" ]] && echo "  file_path: \"$file_path\""
-            echo "  transcribed_at: \"$formatted_date\""
-            [[ -n "$model_used" ]] && echo "  model_used: \"$model_used\""
-            [[ -n "$duration" ]] && echo "  duration_seconds: $duration"
-            
-            # Handle metadata
-            if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
-                local type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
-                local tags_array=$(echo "$metadata" | jq -c '.tags // []' 2>/dev/null)
-                
-                [[ -n "$type" ]] && echo "  type: \"$type\""
-                
-                if [[ "$tags_array" != "[]" ]] && [[ "$tags_array" != "null" ]]; then
-                    echo "  tags:"
-                    echo "$tags_array" | jq -r '.[]' | while read -r tag; do
-                        echo "    - \"$tag\""
-                    done
-                fi
-            fi
-            
-            # Handle content - properly escape for YAML
-            echo "  content: |"
-            echo "$content" | sed 's/^/    /'
-            ;;
-        simple)
-            execute_sql "
-            SELECT string_agg(content, E'\n' ORDER BY chunk_number)
-            FROM transcription_chunks
-            WHERE transcription_id = '$uuid'::uuid;"
-            ;;
-        *)
-            if [[ "$SHOW_METADATA" == true ]]; then
-                echo "=== METADATA ==="
-                execute_sql "
-                SELECT 
-                    'ID: ' || id || E'\n' ||
-                    'Filename: ' || filename || E'\n' ||
-                    'Path: ' || COALESCE(file_path, 'N/A') || E'\n' ||
-                    'Transcribed: ' || transcribed_at || E'\n' ||
-                    'Model: ' || COALESCE(model_used, 'unknown') || E'\n' ||
-                    'Duration: ' || COALESCE(duration_seconds::text || ' seconds', 'unknown') || E'\n' ||
-                    'Type: ' || COALESCE(metadata->>'type', 'none') || E'\n' ||
-                    'Tags: ' || CASE 
-                        WHEN metadata->'tags' IS NOT NULL 
-                        THEN array_to_string(ARRAY(SELECT jsonb_array_elements_text(metadata->'tags')), ', ')
-                        ELSE 'none'
-                    END
-                FROM transcriptions 
-                WHERE id = '$uuid'::uuid;"
-                echo -e "\n=== TRANSCRIPTION ==="
-            fi
-            
-            execute_sql "
-            SELECT string_agg(content, E'\n' ORDER BY chunk_number)
-            FROM transcription_chunks
-            WHERE transcription_id = '$uuid'::uuid;"
-            ;;
-    esac
-}
-
-# List transcriptions
-list_transcriptions() {
-    # Build WHERE clause
-    local where_clauses=()
-    [[ -n "$TYPE_FILTER" ]] && where_clauses+=("metadata->>'type' = '$TYPE_FILTER'")
+    if not args.action:
+        parser.print_help()
+        sys.exit(0)
     
-    if [[ -n "$TAGS_FILTER" ]]; then
-        IFS=',' read -ra tags <<< "$TAGS_FILTER"
-        local tag_conditions=()
-        for tag in "${tags[@]}"; do
-            tag=$(echo "$tag" | xargs)  # Trim whitespace
-            tag_conditions+=("metadata->'tags' ? '$tag'")
-        done
-        [[ ${#tag_conditions[@]} -gt 0 ]] && where_clauses+=("(${tag_conditions[*]})")
-    fi
-    
-    local where_clause=""
-    if [[ ${#where_clauses[@]} -gt 0 ]]; then
-        where_clause="WHERE $(IFS=' AND '; echo "${where_clauses[*]}")"
-    fi
-    
-    case "$OUTPUT_FORMAT" in
-        simple)
-            execute_sql "
-            SELECT filename
-            FROM transcriptions
-            $where_clause
-            ORDER BY transcribed_at DESC
-            LIMIT $LIMIT;"
-            ;;
-        json)
-            execute_sql "
-            SELECT json_agg(row_to_json(t))::text FROM (
-                SELECT 
-                    id,
-                    filename,
-                    file_path,
-                    transcribed_at,
-                    metadata
-                FROM transcriptions
-                $where_clause
-                ORDER BY transcribed_at DESC
-                LIMIT $LIMIT
-            ) t;"
-            ;;
-        yaml)
-            local yaml_data=$(execute_sql "
-            SELECT 
-                id || '|' ||
-                filename || '|' ||
-                COALESCE(file_path, '') || '|' ||
-                transcribed_at || '|' ||
-                metadata::text
-            FROM transcriptions
-            $where_clause
-            ORDER BY transcribed_at DESC
-            LIMIT $LIMIT;")
-            
-            if [[ -z "$yaml_data" ]]; then
-                echo "transcriptions: []"
-                return
-            fi
-            
-            echo "transcriptions:"
-            while IFS='|' read -r id filename file_path transcribed_at metadata; do
-                [[ -z "$id" ]] && continue
-                
-                # Clean up timestamp
-                local formatted_date=$(echo "$transcribed_at" | cut -d'.' -f1 | sed 's/+00$//')
-                
-                echo "  - id: \"$id\""
-                echo "    filename: \"$filename\""
-                [[ -n "$file_path" ]] && echo "    file_path: \"$file_path\""
-                echo "    transcribed_at: \"$formatted_date\""
-                
-                # Handle metadata
-                if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
-                    local type=$(echo "$metadata" | jq -r '.type // ""' 2>/dev/null)
-                    local tags_array=$(echo "$metadata" | jq -c '.tags // []' 2>/dev/null)
-                    
-                    [[ -n "$type" ]] && echo "    type: \"$type\""
-                    
-                    if [[ "$tags_array" != "[]" ]] && [[ "$tags_array" != "null" ]]; then
-                        echo "    tags:"
-                        echo "$tags_array" | jq -r '.[]' | while read -r tag; do
-                            echo "      - \"$tag\""
-                        done
-                    fi
-                fi
-            done <<< "$yaml_data"
-            ;;
-        *)
-            echo "Recent transcriptions:"
-            echo "===================="
-            execute_sql_formatted "
-            SELECT 
-                id,
-                filename,
-                transcribed_at,
-                COALESCE(metadata->>'type', 'none') as type,
-                CASE 
-                    WHEN metadata->'tags' IS NOT NULL 
-                    THEN array_to_string(ARRAY(SELECT jsonb_array_elements_text(metadata->'tags')), ', ')
-                    ELSE 'none'
-                END as tags
-            FROM transcriptions
-            $where_clause
-            ORDER BY transcribed_at DESC
-            LIMIT $LIMIT;"
-            ;;
-    esac
-}
-
-# Delete transcription
-delete_transcription() {
-    local identifier="$1"
-    local uuid=""
-    local filename=""
-    
-    # Determine if identifier is UUID or filename
-    if [[ "$identifier" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-        uuid="$identifier"
-        filename=$(execute_sql "SELECT filename FROM transcriptions WHERE id = '$uuid'::uuid")
-    else
-        filename="$identifier"
-        uuid=$(execute_sql "SELECT id FROM transcriptions WHERE filename = '$filename' ORDER BY transcribed_at DESC LIMIT 1")
-    fi
-    
-    if [[ -z "$uuid" ]]; then
-        echo "Error: No transcription found for: $identifier" >&2
-        return 1
-    fi
-    
-    # Confirm deletion
-    if [[ "$CONFIRM_DELETE" != true ]]; then
-        echo "About to delete transcription:"
-        echo "  ID: $uuid"
-        echo "  Filename: $filename"
-        echo -n "Are you sure? (y/N): "
-        read -r response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            echo "Deletion cancelled."
-            return 0
-        fi
-    fi
-    
-    # Delete transcription (chunks are cascade deleted)
-    if execute_sql "DELETE FROM transcriptions WHERE id = '$uuid'::uuid"; then
-        echo "Transcription deleted successfully."
-    else
-        echo "Error: Failed to delete transcription." >&2
-        return 1
-    fi
-}
-
-# Show statistics
-show_stats() {
-    echo "Transcription Database Statistics"
-    echo "================================="
-    
-    execute_sql_formatted "
-    SELECT 
-        COUNT(DISTINCT t.id) as total_transcriptions,
-        COUNT(tc.id) as total_chunks,
-        COALESCE(SUM(tc.character_count), 0) as total_characters,
-        COALESCE(AVG(tc.character_count), 0)::integer as avg_chunk_size
-    FROM transcriptions t
-    LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id;"
-    
-    echo -e "\nTop 5 types:"
-    execute_sql_formatted "
-    SELECT 
-        COALESCE(metadata->>'type', 'none') as type,
-        COUNT(*) as count
-    FROM transcriptions
-    GROUP BY metadata->>'type'
-    ORDER BY count DESC
-    LIMIT 5;"
-    
-    echo -e "\nTop 10 tags:"
-    execute_sql_formatted "
-    SELECT 
-        tag,
-        COUNT(*) as count
-    FROM (
-        SELECT jsonb_array_elements_text(metadata->'tags') as tag
-        FROM transcriptions
-        WHERE metadata->'tags' IS NOT NULL
-    ) t
-    GROUP BY tag
-    ORDER BY count DESC
-    LIMIT 10;"
-}
-
-# Parse command line arguments
-parse_args() {
-    # First, check for action
-    case "${1:-}" in
-        search|view|list|delete|stats)
-            ACTION="$1"
-            shift
-            ;;
-        -h|--help|"")
-            usage
-            exit 0
-            ;;
-        *)
-            echo "Error: Unknown action: $1" >&2
-            usage
-            exit 1
-            ;;
-    esac
-    
-    # Parse remaining options
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            -l|--limit)
-                LIMIT="$2"
-                shift 2
-                ;;
-            -m|--metadata)
-                SHOW_METADATA=true
-                shift
-                ;;
-            -t|--type)
-                TYPE_FILTER="$2"
-                shift 2
-                ;;
-            -T|--tags)
-                TAGS_FILTER="$2"
-                shift 2
-                ;;
-            -y|--yes)
-                CONFIRM_DELETE=true
-                shift
-                ;;
-            -f|--format)
-                OUTPUT_FORMAT="$2"
-                shift 2
-                ;;
-            -v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            -*)
-                echo "Unknown option: $1" >&2
-                usage
-                exit 1
-                ;;
-            *)
-                # Remaining arguments depend on action
-                case "$ACTION" in
-                    search)
-                        QUERY="$*"
-                        break
-                        ;;
-                    view|delete)
-                        IDENTIFIER="$1"
-                        shift
-                        ;;
-                    *)
-                        echo "Unexpected argument: $1" >&2
-                        usage
-                        exit 1
-                        ;;
-                esac
-                ;;
-        esac
-    done
-}
-
-# Main execution
-main() {
-    parse_args "$@"
-    
-    # Check psql availability
-    if ! command -v psql &> /dev/null; then
-        echo "Error: psql command not found. Please install PostgreSQL client." >&2
-        exit 1
-    fi
+    # Create manager instance
+    manager = TranscriptionManager(no_color=args.no_color)
     
     # Execute action
-    case "$ACTION" in
-        search)
-            if [[ -z "$QUERY" ]]; then
-                echo "Error: Search requires a query" >&2
-                usage
-                exit 1
-            fi
-            search_transcriptions "$QUERY"
-            ;;
-        view)
-            if [[ -z "$IDENTIFIER" ]]; then
-                echo "Error: View requires a UUID or filename" >&2
-                usage
-                exit 1
-            fi
-            view_transcription "$IDENTIFIER"
-            ;;
-        list)
-            list_transcriptions
-            ;;
-        delete)
-            if [[ -z "$IDENTIFIER" ]]; then
-                echo "Error: Delete requires a UUID or filename" >&2
-                usage
-                exit 1
-            fi
-            delete_transcription "$IDENTIFIER"
-            ;;
-        stats)
-            show_stats
-            ;;
-        *)
-            echo "Error: Unknown action: $ACTION" >&2
-            usage
-            exit 1
-            ;;
-    esac
-}
+    try:
+        if args.action == 'search':
+            tags = args.tags.split(',') if args.tags else None
+            manager.search(args.query, limit=args.limit, type_filter=args.type,
+                          tags_filter=tags, output_format=args.format,
+                          verbose=args.verbose)
+        elif args.action == 'view':
+            manager.view(args.identifier, show_metadata=args.metadata,
+                        output_format=args.format, no_timestamps=args.no_timestamps)
+        elif args.action == 'list':
+            tags = args.tags.split(',') if args.tags else None
+            manager.list(limit=args.limit, type_filter=args.type,
+                        tags_filter=tags, output_format=args.format)
+        elif args.action == 'delete':
+            manager.delete(args.identifier, confirm=args.yes)
+        elif args.action == 'stats':
+            manager.stats()
+    except KeyboardInterrupt:
+        print("\nOperation cancelled.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-# Run main function
-main "$@"
+
+if __name__ == '__main__':
+    main()
