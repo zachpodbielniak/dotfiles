@@ -7,6 +7,9 @@ import argparse
 import json
 import requests
 import sys
+import os
+import base64
+import mimetypes
 
 ctr_id: str|None = ""
 api_key: str|None = ""
@@ -48,11 +51,215 @@ parser.add_argument("-S", "--no-streaming", action="store_true", help="Disable s
 parser.add_argument("--embedding", action="store_true", help="Generate an embedding vector instead of a text response")
 parser.add_argument("-f", "--file", action="append", dest="files",
                     help="Include file content in the context (can be specified multiple times)")
+parser.add_argument("-L", "--list-models", action="store_true",
+                    help="List available models from the OpenAI API")
+parser.add_argument("--no-color", action="store_true",
+                    help="Disable colored output")
+parser.add_argument("--image-gen", action="store_true",
+                    help="Generate an image instead of text response")
+parser.add_argument("--output", help="Output filename for image generation (default: auto-numbered output-NNNN.png)")
+parser.add_argument("--image", action="append", dest="images",
+                    help="Include image file(s) for vision analysis (can be specified multiple times)")
 args = parser.parse_args()
+
+def get_auto_numbered_filename(base_name="output", extension=".png"):
+    """Generate an auto-numbered filename that doesn't exist yet."""
+    counter = 0
+    while True:
+        filename = f"{base_name}-{counter:04d}{extension}"
+        if not os.path.exists(filename):
+            return filename
+        counter += 1
+
+def encode_image_to_base64(image_path):
+    """Encode an image file to base64 with proper MIME type detection."""
+    try:
+        with open(image_path, 'rb') as image_file:
+            image_data = image_file.read()
+            encoded_string = base64.b64encode(image_data).decode('utf-8')
+            
+            # Get MIME type
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if not mime_type or not mime_type.startswith('image/'):
+                # Default to common image types
+                if image_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                    ext = image_path.lower().split('.')[-1]
+                    if ext == 'jpg':
+                        ext = 'jpeg'
+                    mime_type = f'image/{ext}'
+                else:
+                    mime_type = 'image/jpeg'  # fallback
+            
+            return f"data:{mime_type};base64,{encoded_string}"
+    except Exception as e:
+        print(f"Error reading image {image_path}: {e}", file=sys.stderr)
+        exit(1)
 
 # Since outside of the distrobox we may not have these modules
 # quietly ignore the fact that they may not exist
 try:
+    # Handle list-models option first
+    if args.list_models:
+        # Check if colors should be disabled
+        use_colors = not args.no_color and environ.get("NO_COLOR", "").lower() not in ("1", "true")
+        
+        # ANSI color codes (conditionally set based on use_colors)
+        class Colors:
+            HEADER = '\033[95m' if use_colors else ''
+            BLUE = '\033[94m' if use_colors else ''
+            CYAN = '\033[96m' if use_colors else ''
+            GREEN = '\033[92m' if use_colors else ''
+            YELLOW = '\033[93m' if use_colors else ''
+            RED = '\033[91m' if use_colors else ''
+            BOLD = '\033[1m' if use_colors else ''
+            UNDERLINE = '\033[4m' if use_colors else ''
+            END = '\033[0m' if use_colors else ''
+        
+        # Query OpenAI API for available models
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.get("https://api.openai.com/v1/models", headers=headers)
+            
+            if response.status_code != 200:
+                print(f"Error querying models: {response.status_code}")
+                print(response.text)
+                exit(1)
+            
+            models_data = response.json()
+            
+            # Extract and sort models by ID
+            models = []
+            for model in models_data.get("data", []):
+                model_id = model.get("id", "")
+                # Skip fine-tuned models (they usually have a colon in the ID)
+                if ":" not in model_id:
+                    # Categorize models for better descriptions
+                    if "gpt-4" in model_id:
+                        if "turbo" in model_id:
+                            desc = "GPT-4 Turbo model"
+                        elif "gpt-4o" in model_id:
+                            if "mini" in model_id:
+                                desc = "Affordable and intelligent small model"
+                            else:
+                                desc = "Multimodal flagship model"
+                        else:
+                            desc = "GPT-4 model"
+                    elif "gpt-3.5" in model_id:
+                        if "16k" in model_id:
+                            desc = "Extended context version"
+                        else:
+                            desc = "Fast and efficient model"
+                    elif "embedding" in model_id:
+                        if "large" in model_id:
+                            desc = "Most capable embedding model"
+                        elif "small" in model_id:
+                            desc = "Efficient embedding model"
+                        else:
+                            desc = "Embedding model"
+                    elif "dall-e" in model_id:
+                        if "3" in model_id:
+                            desc = "Most advanced image generation"
+                        else:
+                            desc = "Image generation model"
+                    elif "whisper" in model_id:
+                        desc = "Speech recognition model"
+                    elif "tts" in model_id:
+                        if "hd" in model_id:
+                            desc = "High quality text-to-speech"
+                        else:
+                            desc = "Text-to-speech model"
+                    else:
+                        desc = "AI model"
+                    
+                    models.append((model_id, model_id, desc))
+            
+            # Sort models by ID
+            models.sort(key=lambda x: x[0])
+            
+            if not models:
+                print(f"{Colors.YELLOW}No models found. Check your API key permissions.{Colors.END}")
+                exit(0)
+            
+            # Calculate column widths
+            max_model = max(len(model[0]) for model in models)
+            max_name = max(len(model[1]) for model in models)
+            max_desc = max(len(model[2]) for model in models)
+            
+            # Ensure minimum widths
+            max_model = max(max_model, len("Model ID"))
+            max_name = max(max_name, len("Name"))
+            max_desc = max(max_desc, len("Description"))
+            
+            # Print header
+            print(f"\n{Colors.BOLD}{Colors.CYAN}Available OpenAI Models:{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            
+            # Print table header
+            print(f"{Colors.BOLD}{Colors.HEADER}{'Model ID':<{max_model}} {'Name':<{max_name}} {'Description':<{max_desc}}{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * max_model} {'─' * max_name} {'─' * max_desc}{Colors.END}")
+            
+            # Print table rows
+            for i, (model_id, name, description) in enumerate(models):
+                # Alternate row colors
+                color = Colors.CYAN if i % 2 == 0 else Colors.BLUE
+                name_color = Colors.GREEN
+                desc_color = Colors.YELLOW
+                
+                print(f"{color}{model_id:<{max_model}}{Colors.END} "
+                      f"{name_color}{name:<{max_name}}{Colors.END} "
+                      f"{desc_color}{description:<{max_desc}}{Colors.END}")
+            
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            print(f"{Colors.BOLD}Total models: {Colors.GREEN}{len(models)}{Colors.END}\n")
+            
+        except Exception as e:
+            print(f"{Colors.RED}Error querying models: {e}{Colors.END}")
+            print(f"{Colors.YELLOW}Falling back to known models list...{Colors.END}")
+            
+            # Fallback to static list if API fails
+            models = [
+                ("gpt-4-turbo", "GPT-4 Turbo", "Most capable GPT-4 model"),
+                ("gpt-4o", "GPT-4o", "Multimodal flagship model"),
+                ("gpt-4o-mini", "GPT-4o Mini", "Affordable and intelligent small model"),
+                ("gpt-4", "GPT-4", "Original GPT-4 model"),
+                ("gpt-3.5-turbo", "GPT-3.5 Turbo", "Fast and efficient model"),
+                ("dall-e-3", "DALL-E 3", "Most advanced image generation"),
+                ("whisper-1", "Whisper v1", "Speech recognition model"),
+            ]
+            
+            # Calculate and display as before
+            max_model = max(len(model[0]) for model in models)
+            max_name = max(len(model[1]) for model in models)
+            max_desc = max(len(model[2]) for model in models)
+            
+            max_model = max(max_model, len("Model ID"))
+            max_name = max(max_name, len("Name"))
+            max_desc = max(max_desc, len("Description"))
+            
+            print(f"\n{Colors.BOLD}{Colors.CYAN}Known OpenAI Models:{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            
+            print(f"{Colors.BOLD}{Colors.HEADER}{'Model ID':<{max_model}} {'Name':<{max_name}} {'Description':<{max_desc}}{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * max_model} {'─' * max_name} {'─' * max_desc}{Colors.END}")
+            
+            for i, (model_id, name, description) in enumerate(models):
+                color = Colors.CYAN if i % 2 == 0 else Colors.BLUE
+                name_color = Colors.GREEN
+                desc_color = Colors.YELLOW
+                
+                print(f"{color}{model_id:<{max_model}}{Colors.END} "
+                      f"{name_color}{name:<{max_name}}{Colors.END} "
+                      f"{desc_color}{description:<{max_desc}}{Colors.END}")
+            
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            print(f"{Colors.BOLD}Total models: {Colors.GREEN}{len(models)}{Colors.END}\n")
+        
+        exit(0)
+    
     # Read file contents if any files were specified
     file_contents = []
     if args.files:
@@ -102,16 +309,60 @@ try:
             "model": args.model if "embedding" in args.model else "text-embedding-3-small",
             "input": query
         }
+    elif args.image_gen:
+        # Use the image generation API endpoint for OpenAI
+        url = "https://api.openai.com/v1/images/generations"
+        image_model = args.model if args.model in ["dall-e-2", "dall-e-3"] else "dall-e-3"
+        data = {
+            "model": image_model,
+            "prompt": query,
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "b64_json"
+        }
     else:
         # Use the chat completions API endpoint for regular requests
         url = "https://api.openai.com/v1/chat/completions"
+        
+        # Construct message content (text + images if provided)
+        message_content = []
+        
+        # Add text content
+        if query:
+            message_content.append({
+                "type": "text",
+                "text": query
+            })
+        
+        # Add image content if provided
+        if args.images:
+            for image_path in args.images:
+                if not os.path.exists(image_path):
+                    print(f"Error: Image file not found: {image_path}", file=sys.stderr)
+                    exit(1)
+                
+                image_url = encode_image_to_base64(image_path)
+                message_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url
+                    }
+                })
+        
+        # If no content was added, add empty text
+        if not message_content:
+            message_content.append({
+                "type": "text",
+                "text": ""
+            })
+        
         data = {
             "model": args.model,
             "max_tokens": 16384,
             "messages": [
                 {
                     "role": "user",
-                    "content": query
+                    "content": message_content
                 }
             ],
             # Don't stream if JSON output is requested or --no-streaming
@@ -123,6 +374,11 @@ try:
         print(f"Debug: API URL: {url}", file=sys.stderr)
         print(f"Debug: Headers (API key partially hidden): {{'Authorization': 'Bearer {api_key[:5]}...{api_key[-4:]}', 'Content-Type': 'application/json'}}", file=sys.stderr)
         print(f"Debug: Data: {json.dumps(data)}", file=sys.stderr)
+        if args.image_gen:
+            output_file = args.output if args.output else get_auto_numbered_filename()
+            print(f"Debug: Image will be saved to: {output_file}", file=sys.stderr)
+        if args.images:
+            print(f"Debug: Processing {len(args.images)} image(s): {', '.join(args.images)}", file=sys.stderr)
 
     # Send request to OpenAI API
     response = requests.post(url, headers=headers, json=data, stream=data.get("stream", False))
@@ -142,6 +398,31 @@ try:
             print(json.dumps({"embedding": embedding}))
         else:
             print(json.dumps(response_data))
+    elif args.image_gen:
+        # Process image generation response
+        response_data = response.json()
+        if "data" in response_data and len(response_data["data"]) > 0:
+            # Get the base64 image data
+            image_data = response_data["data"][0]["b64_json"]
+            
+            # Determine output filename
+            if args.output:
+                output_filename = args.output
+            else:
+                output_filename = get_auto_numbered_filename()
+            
+            # Decode and save the image
+            try:
+                image_bytes = base64.b64decode(image_data)
+                with open(output_filename, 'wb') as f:
+                    f.write(image_bytes)
+                print(f"Image saved to: {output_filename}")
+            except Exception as e:
+                print(f"Error saving image: {e}", file=sys.stderr)
+                exit(1)
+        else:
+            print(f"Error: No image data in response: {json.dumps(response_data)}", file=sys.stderr)
+            exit(1)
     elif args.json or args.no_streaming:
         # Process standard JSON response (not streamed)
         response_data = response.json()

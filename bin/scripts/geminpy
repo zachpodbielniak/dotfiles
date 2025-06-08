@@ -7,6 +7,9 @@ import argparse
 import json
 import requests
 import sys
+import os
+import base64
+import mimetypes
 
 
 ctr_id: str|None = ""
@@ -49,11 +52,204 @@ parser.add_argument("-S", "--no-streaming", action="store_true", help="Disable s
 parser.add_argument("--embedding", action="store_true", help="Generate an embedding vector instead of a text response")
 parser.add_argument("-f", "--file", action="append", dest="files",
                     help="Include file content in the context (can be specified multiple times)")
+parser.add_argument("-L", "--list-models", action="store_true",
+                    help="List available models from the Gemini API")
+parser.add_argument("--no-color", action="store_true",
+                    help="Disable colored output")
+parser.add_argument("--image-gen", action="store_true",
+                    help="Generate an image instead of text response")
+parser.add_argument("--output", help="Output filename for image generation (default: auto-numbered output-NNNN.png)")
+parser.add_argument("--image", action="append", dest="images",
+                    help="Include image file(s) for vision analysis (can be specified multiple times)")
 args = parser.parse_args()
+
+def get_auto_numbered_filename(base_name="output", extension=".png"):
+    """Generate an auto-numbered filename that doesn't exist yet."""
+    counter = 0
+    while True:
+        filename = f"{base_name}-{counter:04d}{extension}"
+        if not os.path.exists(filename):
+            return filename
+        counter += 1
+
+def encode_image_to_base64(image_path):
+    """Encode an image file to base64 for Gemini API."""
+    try:
+        with open(image_path, 'rb') as image_file:
+            image_data = image_file.read()
+            encoded_string = base64.b64encode(image_data).decode('utf-8')
+            
+            # Get MIME type
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if not mime_type or not mime_type.startswith('image/'):
+                # Default to common image types
+                if image_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                    ext = image_path.lower().split('.')[-1]
+                    if ext == 'jpg':
+                        ext = 'jpeg'
+                    mime_type = f'image/{ext}'
+                else:
+                    mime_type = 'image/jpeg'  # fallback
+            
+            return {
+                "mime_type": mime_type,
+                "data": encoded_string
+            }
+    except Exception as e:
+        print(f"Error reading image {image_path}: {e}", file=sys.stderr)
+        exit(1)
 
 # Since outside of the distrobox we may not have these modules
 # quietly ignore the fact that they may not exist
 try:
+    # Handle list-models option first
+    if args.list_models:
+        # Check if colors should be disabled
+        use_colors = not args.no_color and environ.get("NO_COLOR", "").lower() not in ("1", "true")
+        
+        # ANSI color codes (conditionally set based on use_colors)
+        class Colors:
+            HEADER = '\033[95m' if use_colors else ''
+            BLUE = '\033[94m' if use_colors else ''
+            CYAN = '\033[96m' if use_colors else ''
+            GREEN = '\033[92m' if use_colors else ''
+            YELLOW = '\033[93m' if use_colors else ''
+            RED = '\033[91m' if use_colors else ''
+            BOLD = '\033[1m' if use_colors else ''
+            UNDERLINE = '\033[4m' if use_colors else ''
+            END = '\033[0m' if use_colors else ''
+        
+        # Query Gemini API for available models
+        try:
+            # Use the models.list endpoint
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+            
+            response = requests.get(url)
+            
+            if response.status_code != 200:
+                print(f"Error querying models: {response.status_code}")
+                print(response.text)
+                exit(1)
+            
+            models_data = response.json()
+            
+            # Extract and format models
+            models = []
+            for model in models_data.get("models", []):
+                model_name = model.get("name", "").replace("models/", "")
+                display_name = model.get("displayName", model_name)
+                
+                # Generate description based on model capabilities
+                supported_methods = model.get("supportedGenerationMethods", [])
+                if "generateContent" in supported_methods and "embedContent" in supported_methods:
+                    desc = "Text generation & embeddings"
+                elif "generateContent" in supported_methods:
+                    desc = "Text generation"
+                elif "embedContent" in supported_methods:
+                    desc = "Embeddings"
+                elif "generateImage" in supported_methods:
+                    desc = "Image generation"
+                else:
+                    desc = "AI model"
+                
+                # Add more specific descriptions based on model name
+                if "flash" in model_name.lower():
+                    desc = f"Fast {desc.lower()}"
+                elif "pro" in model_name.lower():
+                    desc = f"Professional {desc.lower()}"
+                elif "imagen" in model_name.lower():
+                    desc = "Image generation"
+                elif "veo" in model_name.lower():
+                    desc = "Video generation"
+                elif "embedding" in model_name.lower():
+                    desc = "Text embeddings"
+                elif "aqa" in model_name.lower():
+                    desc = "Question answering"
+                
+                models.append((model_name, display_name, desc))
+            
+            # Sort models by name
+            models.sort(key=lambda x: x[0])
+            
+            if not models:
+                print(f"{Colors.YELLOW}No models found. Check your API key permissions.{Colors.END}")
+                exit(0)
+            
+            # Calculate column widths
+            max_model = max(len(model[0]) for model in models)
+            max_name = max(len(model[1]) for model in models)
+            max_desc = max(len(model[2]) for model in models)
+            
+            # Ensure minimum widths
+            max_model = max(max_model, len("Model ID"))
+            max_name = max(max_name, len("Name"))
+            max_desc = max(max_desc, len("Description"))
+            
+            # Print header
+            print(f"\n{Colors.BOLD}{Colors.CYAN}Available Gemini Models:{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            
+            # Print table header
+            print(f"{Colors.BOLD}{Colors.HEADER}{'Model ID':<{max_model}} {'Name':<{max_name}} {'Description':<{max_desc}}{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * max_model} {'─' * max_name} {'─' * max_desc}{Colors.END}")
+            
+            # Print table rows
+            for i, (model_id, name, description) in enumerate(models):
+                # Alternate row colors
+                color = Colors.CYAN if i % 2 == 0 else Colors.BLUE
+                name_color = Colors.GREEN
+                desc_color = Colors.YELLOW
+                
+                print(f"{color}{model_id:<{max_model}}{Colors.END} "
+                      f"{name_color}{name:<{max_name}}{Colors.END} "
+                      f"{desc_color}{description:<{max_desc}}{Colors.END}")
+            
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            print(f"{Colors.BOLD}Total models: {Colors.GREEN}{len(models)}{Colors.END}\n")
+            
+        except Exception as e:
+            print(f"{Colors.RED}Error querying models: {e}{Colors.END}")
+            print(f"{Colors.YELLOW}Falling back to known models list...{Colors.END}")
+            
+            # Fallback to static list if API fails
+            models = [
+                ("gemini-2.5-pro-preview-05-06", "Gemini 2.5 Pro Preview", "Latest flagship model"),
+                ("gemini-2.5-flash-preview-04-17", "Gemini 2.5 Flash Preview", "Fast responses"),
+                ("gemini-2.0-flash", "Gemini 2.0 Flash", "Balanced performance"),
+                ("gemini-1.5-flash", "Gemini 1.5 Flash", "Fast processing"),
+                ("gemini-1.5-pro", "Gemini 1.5 Pro", "Professional grade"),
+                ("text-embedding-004", "Text Embedding v4", "Text embeddings"),
+            ]
+            
+            # Calculate and display as before
+            max_model = max(len(model[0]) for model in models)
+            max_name = max(len(model[1]) for model in models)
+            max_desc = max(len(model[2]) for model in models)
+            
+            max_model = max(max_model, len("Model ID"))
+            max_name = max(max_name, len("Name"))
+            max_desc = max(max_desc, len("Description"))
+            
+            print(f"\n{Colors.BOLD}{Colors.CYAN}Known Gemini Models:{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            
+            print(f"{Colors.BOLD}{Colors.HEADER}{'Model ID':<{max_model}} {'Name':<{max_name}} {'Description':<{max_desc}}{Colors.END}")
+            print(f"{Colors.BOLD}{'─' * max_model} {'─' * max_name} {'─' * max_desc}{Colors.END}")
+            
+            for i, (model_id, name, description) in enumerate(models):
+                color = Colors.CYAN if i % 2 == 0 else Colors.BLUE
+                name_color = Colors.GREEN
+                desc_color = Colors.YELLOW
+                
+                print(f"{color}{model_id:<{max_model}}{Colors.END} "
+                      f"{name_color}{name:<{max_name}}{Colors.END} "
+                      f"{desc_color}{description:<{max_desc}}{Colors.END}")
+            
+            print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
+            print(f"{Colors.BOLD}Total models: {Colors.GREEN}{len(models)}{Colors.END}\n")
+        
+        exit(0)
+    
     # Read file contents if any files were specified
     file_contents = []
     if args.files:
@@ -108,6 +304,19 @@ try:
                 }]
             }
         }
+    elif args.image_gen:
+        # Use the image generation API for Gemini (Imagen)
+        image_model = args.model if "imagen" in args.model else "imagen-3.0-generate-002"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:generateImage"
+        data = {
+            "prompt": {
+                "text": query
+            },
+            "config": {
+                "aspectRatio": "1:1",
+                "sampleCount": 1
+            }
+        }
     else:
         # Use standard generation endpoint
         endpoint = "generateContent"
@@ -116,15 +325,38 @@ try:
             
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{args.model}:{endpoint}"
         
+        # Construct parts (text + images if provided)
+        parts = []
+        
+        # Add text content
+        if query:
+            parts.append({
+                "text": query
+            })
+        
+        # Add image content if provided
+        if args.images:
+            for image_path in args.images:
+                if not os.path.exists(image_path):
+                    print(f"Error: Image file not found: {image_path}", file=sys.stderr)
+                    exit(1)
+                
+                image_data = encode_image_to_base64(image_path)
+                parts.append({
+                    "inline_data": image_data
+                })
+        
+        # If no parts were added, add empty text
+        if not parts:
+            parts.append({
+                "text": ""
+            })
+        
         data = {
             "contents": [
                 {
                     "role": "user",
-                    "parts": [
-                        {
-                            "text": query
-                        }
-                    ]
+                    "parts": parts
                 }
             ],
             "generation_config": {
@@ -137,6 +369,11 @@ try:
         print(f"Debug: API URL: {url}", file=sys.stderr)
         print(f"Debug: Headers (API key partially hidden): {{'x-goog-api-key': '{api_key[:5]}...{api_key[-4:]}', 'Content-Type': 'application/json'}}", file=sys.stderr)
         print(f"Debug: Data: {json.dumps(data)}", file=sys.stderr)
+        if args.image_gen:
+            output_file = args.output if args.output else get_auto_numbered_filename()
+            print(f"Debug: Image will be saved to: {output_file}", file=sys.stderr)
+        if args.images:
+            print(f"Debug: Processing {len(args.images)} image(s): {', '.join(args.images)}", file=sys.stderr)
 
     try:
         # Send request to Gemini API
@@ -177,6 +414,32 @@ try:
                 print(json.dumps({"embedding": embedding}))
             else:
                 print(json.dumps(response_data))
+                
+        # Process image generation response
+        elif args.image_gen:
+            response_data = response.json()
+            if "generatedImages" in response_data and len(response_data["generatedImages"]) > 0:
+                # Get the base64 image data
+                image_data = response_data["generatedImages"][0]["bytesBase64Encoded"]
+                
+                # Determine output filename
+                if args.output:
+                    output_filename = args.output
+                else:
+                    output_filename = get_auto_numbered_filename()
+                
+                # Decode and save the image
+                try:
+                    image_bytes = base64.b64decode(image_data)
+                    with open(output_filename, 'wb') as f:
+                        f.write(image_bytes)
+                    print(f"Image saved to: {output_filename}")
+                except Exception as e:
+                    print(f"Error saving image: {e}", file=sys.stderr)
+                    exit(1)
+            else:
+                print(f"Error: No image data in response: {json.dumps(response_data)}", file=sys.stderr)
+                exit(1)
                 
         # Process non-streaming JSON response
         elif args.json or args.no_streaming:
