@@ -6,6 +6,7 @@ from sys import argv, exit, stdin, stderr
 import argparse
 import json
 import sys
+import time
 
 
 ctr_id: str|None = ""
@@ -48,7 +49,129 @@ parser.add_argument("-L", "--list-models", action="store_true",
                     help="List available models from the Perplexity API")
 parser.add_argument("--no-color", action="store_true",
                     help="Disable colored output")
+parser.add_argument("--summary", action="store_true",
+                    help="Show usage summary with token counts, timing, and costs in a formatted table")
 args = parser.parse_args()
+
+def calculate_cost(model, input_tokens, output_tokens):
+    """Calculate cost based on Perplexity pricing (as of 2024)."""
+    # Pricing per 1M tokens (in dollars)
+    pricing = {
+        # Perplexity models
+        "sonar-pro": {"input": 1.00, "output": 1.00},
+        "sonar": {"input": 0.50, "output": 0.50},
+        "reasoning-pro": {"input": 2.00, "output": 2.00},
+        "sonar-reasoning-pro": {"input": 3.00, "output": 3.00},
+        "r1-1776": {"input": 5.00, "output": 5.00},
+    }
+    
+    # Get pricing for the model, default to sonar-pro if not found
+    model_pricing = pricing.get(model, pricing.get("sonar-pro"))
+    
+    # Calculate costs (convert from per million to actual tokens)
+    input_cost = (input_tokens / 1_000_000) * model_pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * model_pricing["output"]
+    total_cost = input_cost + output_cost
+    
+    return {
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": total_cost
+    }
+
+def print_summary_table(model, input_tokens, output_tokens, total_time, first_token_time, cost_info, is_estimated=False, use_color=True):
+    """Print a formatted summary table with color support."""
+    # ANSI color codes (conditionally set based on use_color)
+    if use_color:
+        CYAN = '\033[96m'
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        BLUE = '\033[94m'
+        MAGENTA = '\033[95m'
+        BOLD = '\033[1m'
+        END = '\033[0m'
+    else:
+        CYAN = GREEN = YELLOW = BLUE = MAGENTA = BOLD = END = ''
+    
+    # Calculate total tokens
+    total_tokens = input_tokens + output_tokens
+    
+    # Table width (inner content width)
+    width = 50
+    
+    # Helper to strip ANSI codes
+    import re
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    
+    def strip_ansi(text):
+        return ansi_escape.sub('', text)
+    
+    # Helper to create a padded line
+    def make_line(left, right, left_width=22):
+        """Create a line with left and right parts, properly padded."""
+        left_plain = strip_ansi(left)
+        right_plain = strip_ansi(right)
+        
+        # Total inner content must be exactly 48 characters
+        # Left part: left_text + padding to reach left_width
+        left_part = left + ' ' * (left_width - len(left_plain))
+        
+        # Right part: right_text + padding to fill remaining space
+        remaining_width = 48 - left_width - 1  # -1 for space between left and right
+        right_part = right + ' ' * (remaining_width - len(right_plain))
+        
+        # Combine: left_part + space + right_part = exactly 48 chars
+        content = f"{left_part} {right_part}"
+        
+        return f"{CYAN}║{END} {content} {CYAN}║{END}"
+    
+    # Build the table
+    print(f"\n{BOLD}{CYAN}╔{'═' * width}╗{END}", file=sys.stderr)
+    
+    # Title
+    title = "API Usage Summary"
+    title_pad_left = (width - len(title)) // 2
+    title_pad_right = width - len(title) - title_pad_left
+    print(f"{BOLD}{CYAN}║{' ' * title_pad_left}{title}{' ' * title_pad_right}║{END}", file=sys.stderr)
+    
+    print(f"{BOLD}{CYAN}╠{'═' * width}╣{END}", file=sys.stderr)
+    
+    # Model info
+    model_display = model if len(model) <= 30 else model[:27] + "..."
+    print(make_line(f"{BOLD}Model:{END}", f"{GREEN}{model_display}{END}"), file=sys.stderr)
+    print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
+    
+    # Token usage
+    print(make_line(f"{BOLD}Token Usage:{END}", ""), file=sys.stderr)
+    
+    est_marker = " (est)" if is_estimated else ""
+    print(make_line("  Input:", f"{YELLOW}{input_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
+    print(make_line("  Output:", f"{YELLOW}{output_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
+    print(make_line("  Total:", f"{BOLD}{YELLOW}{total_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
+    print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
+    
+    # Performance
+    print(make_line(f"{BOLD}Performance:{END}", ""), file=sys.stderr)
+    
+    if first_token_time:
+        print(make_line("  Time to first token:", f"{BLUE}{first_token_time:.2f}s{END}"), file=sys.stderr)
+    
+    print(make_line("  Total time:", f"{BLUE}{total_time:.2f}s{END}"), file=sys.stderr)
+    
+    if output_tokens > 0 and total_time > 0:
+        tokens_per_sec = output_tokens / total_time
+        print(make_line("  Tokens/second:", f"{BLUE}{tokens_per_sec:.1f}{END}"), file=sys.stderr)
+    
+    print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
+    
+    # Cost
+    print(make_line(f"{BOLD}Cost Breakdown:{END}", ""), file=sys.stderr)
+    
+    print(make_line("  Input cost:", f"{MAGENTA}${cost_info['input_cost']:.6f}{END}"), file=sys.stderr)
+    print(make_line("  Output cost:", f"{MAGENTA}${cost_info['output_cost']:.6f}{END}"), file=sys.stderr)
+    print(make_line(f"  {BOLD}Total cost:{END}", f"{BOLD}{MAGENTA}${cost_info['total_cost']:.6f}{END}"), file=sys.stderr)
+    
+    print(f"{BOLD}{CYAN}╚{'═' * width}╝{END}", file=sys.stderr)
 
 # Since outside of the distrobox we may not have these modules
 # quietly ignore the fact that they may not exist
@@ -174,11 +297,44 @@ if args.embedding:
     if args.debug:
         print(f"Debug: Generating embedding with model {embedding_model}", file=sys.stderr)
     
+    # Track timing if summary mode
+    start_time = time.time() if args.summary else None
+    
     try:
         # Generate embedding
         embedding = client.get_embedding(query, model=embedding_model)
         # Output as JSON for semantic_search to parse
         print(json.dumps({"embedding": embedding}))
+        
+        # Summary output for embeddings
+        if args.summary:
+            end_time = time.time()
+            total_time = end_time - start_time
+            
+            # Add newline before summary
+            print(file=sys.stderr)
+            
+            # For embeddings, estimate token count
+            estimated_tokens = len(query) // 4
+            
+            # Calculate cost
+            cost_info = calculate_cost(
+                "sonar",  # Use sonar for embedding cost estimation
+                estimated_tokens,
+                0  # Embeddings have no output tokens
+            )
+            
+            # Print summary table
+            print_summary_table(
+                model="sonar-small-online",
+                input_tokens=estimated_tokens,
+                output_tokens=0,
+                total_time=total_time,
+                first_token_time=None,
+                cost_info=cost_info,
+                is_estimated=True,
+                use_color=not args.no_color
+            )
     except Exception as e:
         if args.debug:
             print(f"Debug: Error generating embedding: {e}", file=sys.stderr)
@@ -190,15 +346,95 @@ elif args.json or args.no_streaming:
     # Use non-streaming version for clean output
     if args.debug:
         print(f"Debug: Executing non-streaming query", file=sys.stderr)
+    
+    # Track timing if summary mode
+    start_time = time.time() if args.summary else None
+    
     result = client.query(query)
     print(result)
+    
+    # Summary output for non-streaming
+    if args.summary:
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        # Add newline before summary
+        print(file=sys.stderr)
+        
+        # Estimate tokens (Perplexipy doesn't provide token counts)
+        estimated_input_tokens = len(query) // 4
+        estimated_output_tokens = len(result) // 4
+        
+        # Calculate cost
+        cost_info = calculate_cost(
+            args.model,
+            estimated_input_tokens,
+            estimated_output_tokens
+        )
+        
+        # Print summary table
+        print_summary_table(
+            model=args.model,
+            input_tokens=estimated_input_tokens,
+            output_tokens=estimated_output_tokens,
+            total_time=total_time,
+            first_token_time=None,
+            cost_info=cost_info,
+            is_estimated=True,
+            use_color=not args.no_color
+        )
 else:
     # Use streaming version for interactive output
     if args.debug:
         print(f"Debug: Executing streaming query", file=sys.stderr)
+    
+    # Track timing if summary mode
+    start_time = time.time() if args.summary else None
+    first_token_time = None
+    accumulated_content = ""
+    
     results = client.queryStreamable(query)
     for result in results:
+        # Track first token time
+        if args.summary and first_token_time is None and result:
+            first_token_time = time.time()
+        
         # flush since it may not have a '\n' to give it
         # a streaming output appearance
         print(result, end="", flush=True)
+        accumulated_content += result
+    
+    # Summary output for streaming
+    if args.summary:
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        # Add newline before summary
+        print(file=sys.stderr)
+        
+        # Estimate tokens (Perplexipy doesn't provide token counts)
+        estimated_input_tokens = len(query) // 4
+        estimated_output_tokens = len(accumulated_content) // 4
+        
+        # Calculate cost
+        cost_info = calculate_cost(
+            args.model,
+            estimated_input_tokens,
+            estimated_output_tokens
+        )
+        
+        # Calculate time to first token
+        ttft = (first_token_time - start_time) if first_token_time else None
+        
+        # Print summary table
+        print_summary_table(
+            model=args.model,
+            input_tokens=estimated_input_tokens,
+            output_tokens=estimated_output_tokens,
+            total_time=total_time,
+            first_token_time=ttft,
+            cost_info=cost_info,
+            is_estimated=True,
+            use_color=not args.no_color
+        )
 
