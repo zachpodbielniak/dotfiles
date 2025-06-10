@@ -59,6 +59,8 @@ _path_prepend \
     "/var/home/linuxbrew/.linuxbrew/bin" \
     "${HOME}/perl5/bin" \
     "${HOME}/bin" \
+    "${HOME}/.ghcup/bin" \
+    "${HOME}/.nimble/bin" \
     "${HOME}/bin/nim/bin" \
     "${HOME}/bin/scripts" \
     "${HOME}/bin/export"
