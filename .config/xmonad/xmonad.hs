@@ -5,6 +5,7 @@ import Data.Maybe (maybe)
 
 import XMonad
 import XMonad.Util.EZConfig (additionalKeysP)
+import XMonad.Layout.Spacing
 import XMonad.Layout.ThreeColumns
 import XMonad.Layout.Magnifier
 import XMonad.Hooks.EwmhDesktops
@@ -14,6 +15,7 @@ import XMonad.Hooks.StatusBar
 import XMonad.Hooks.StatusBar.PP
 
 import XMonad.Util.Loggers
+import XMonad.Util.Run
 
 import XMonad.Config.Desktop
 import XMonad.Config.Gnome
@@ -31,13 +33,16 @@ import XMonad.Config.Xfce
 -- desktop _ = desktopConfig
 
 main :: IO ()
-main = xmonad 
-    $ ewmhFullscreen 
-    $ ewmh 
-    $ withEasySB (statusBarProp "xmobar" (pure myXmobarPP)) defToggleStrutsKey -- bound to M-b
-    $ myConfig
+main = do
+    -- _ <- spawn "xmonad"
+    xmonad 
+        $ ewmhFullscreen 
+        $ ewmh 
+        $ withEasySB (statusBarProp "xmobar" (pure myXmobarPP)) defToggleStrutsKey -- bound to M-b
+        $ myConfig
 
 
+focusedBorderColor = "#FFFFFF"
 
 -- configuration, specifically keybinds
 myConfig = def 
@@ -56,7 +61,7 @@ myConfig = def
 
 
 -- layout settings
-myLayout = tiled ||| Mirror tiled ||| Full ||| threeCol
+myLayout = smartSpacing 24 $ tiled ||| Mirror tiled ||| Full ||| threeCol
     where 
         threeCol = magnifiercz' 1.3 $ ThreeColMid nmaster delta ratio
         tiled = Tall nmaster delta ratio 
