@@ -1,7 +1,7 @@
 -- default desktop configuration for Fedora
 
 import System.Posix.Env (getEnv)
-import Data.Maybe (maybe)
+import Data.Maybe (maybe, fromMaybe)
 
 import XMonad
 import XMonad.Util.EZConfig (additionalKeysP)
@@ -22,6 +22,8 @@ import XMonad.Config.Gnome
 import XMonad.Config.Kde
 import XMonad.Config.Xfce
 
+import System.Environment
+
 -- main = do
 --      session <- getEnv "DESKTOP_SESSION"
 --      xmonad  $ maybe desktopConfig desktop session
@@ -32,9 +34,35 @@ import XMonad.Config.Xfce
 -- desktop "xmonad-mate" = gnomeConfig
 -- desktop _ = desktopConfig
 
+backgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png"
+
+
+getEnvVar :: String -> String -> IO String
+getEnvVar varName defaultValue = do 
+    envValue <- lookupEnv varName 
+    return $ fromMaybe defaultValue envValue
+    -- return $ case result of 
+    --     Just value -> value 
+    --     Nothing -> defaultValue
+        
+
+
 main :: IO ()
 main = do
     -- _ <- spawn "xmonad"
+    homeDir <- getEnvVar "HOME" ""
+
+    -- set background
+    _ <- spawn $ "feh --bg-fill " 
+        <> homeDir 
+        <> backgroundPicture
+
+    -- spawn compistor
+    _ <- spawnPipe $ "picom --backend xrender --config " 
+        <> homeDir 
+        <> "/.config/picom/picom.conf"
+
+    -- start xmonad
     xmonad 
         $ ewmhFullscreen 
         $ ewmh 
@@ -42,7 +70,7 @@ main = do
         $ myConfig
 
 
-focusedBorderColor = "#FFFFFF"
+focusedBorderColor = "#ffffff"
 
 -- configuration, specifically keybinds
 myConfig = def 
