@@ -34,7 +34,8 @@ import System.Environment
 -- desktop "xmonad-mate" = gnomeConfig
 -- desktop _ = desktopConfig
 
-backgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png"
+terminalBin = "kitty" :: String
+backgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png" :: String
 
 
 getEnvVar :: String -> String -> IO String
@@ -62,6 +63,9 @@ main = do
         <> homeDir 
         <> "/.config/picom/picom.conf"
 
+    -- spawn xmobar 
+    _ <- spawn "xmobar"
+
     -- start xmonad
     xmonad 
         $ ewmhFullscreen 
@@ -77,14 +81,19 @@ myConfig = def
     { modMask = mod4Mask -- rebind mod to super
     , layoutHook = myLayout -- use custom layout
     }
+    -- https://xmonad.github.io/xmonad-docs/xmonad-contrib/XMonad-Util-EZConfig.html
     `additionalKeysP`
-    [ ("M-<Return>", spawn "kitty")
+    [ ("M-<Return>", spawn terminalBin)
     , ("M-i", spawn "flatpak --user run io.gitlab.librewolf-community")
-    , ("M-C-s", unGrab *> spawn "scrot -s")
+    , ("M-y", spawn $ terminalBin <> " yazi")
+    , ("M-S-s", unGrab *> spawn "flatpak --user run org.flameshot.Flameshot gui")
     , ("M-d", spawn "rofi -show drun")
     , ("M-S-d", spawn "rofi -show run")
     , ("M-w", spawn "rofi -show window")
     , ("M-S-t", spawn "i3lock -c000000")
+    , ("M-S-p", lockAndSuspend)
+    , ("M-<XF86MonBrightnessUp>", spawn "brightnessctl set 10%+")
+    , ("M-<XF86MonBrightnessDown>", spawn "brightnessctl set 10%-")
     ]
 
 
@@ -123,3 +132,16 @@ myXmobarPP = def
         red = xmobarColor "#ff5555" "" 
         white = xmobarColor "#f8f8f2" ""
         yellow = xmobarColor "#f1fa8c" ""
+
+
+
+
+-- lock and suspend
+lockAndSuspend :: X () 
+lockAndSuspend =  do 
+    spawn "i3lock -c000000"
+    spawn "systemctl suspend"
+    
+
+
+
