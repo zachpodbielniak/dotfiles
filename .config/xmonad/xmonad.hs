@@ -34,24 +34,21 @@ import System.Environment
 -- desktop "xmonad-mate" = gnomeConfig
 -- desktop _ = desktopConfig
 
-terminalBin = "kitty" :: String
-backgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png" :: String
+terminalBin :: String
+terminalBin = "kitty"
+
+backgroundPicture :: String
+backgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png"
 
 
-getEnvVar :: String -> String -> IO String
-getEnvVar varName defaultValue = do 
-    envValue <- lookupEnv varName 
-    return $ fromMaybe defaultValue envValue
-    -- return $ case result of 
-    --     Just value -> value 
-    --     Nothing -> defaultValue
         
 
 
 main :: IO ()
 main = do
-    -- _ <- spawn "xmonad"
+    -- key info
     homeDir <- getEnvVar "HOME" ""
+    hostName <- getEnvVar "HOSTNAME" "none"
 
     -- set background
     _ <- spawn $ "feh --bg-fill " 
@@ -59,9 +56,10 @@ main = do
         <> backgroundPicture
 
     -- spawn compistor
-    _ <- spawnPipe $ "picom --backend xrender --config " 
+    _ <- spawn $ "picom --config " 
         <> homeDir 
-        <> "/.config/picom/picom.conf"
+        <> "/.config/picom/"
+        <> getPicomConf hostName
 
     -- spawn xmobar 
     _ <- spawn "xmobar"
@@ -82,6 +80,9 @@ myConfig = def
     , layoutHook = myLayout -- use custom layout
     }
     -- https://xmonad.github.io/xmonad-docs/xmonad-contrib/XMonad-Util-EZConfig.html
+    -- to get keys:
+    -- sudo showkey -k
+    -- xmodmap -pke
     `additionalKeysP`
     [ ("M-<Return>", spawn terminalBin)
     , ("M-i", spawn "flatpak --user run io.gitlab.librewolf-community")
@@ -94,6 +95,10 @@ myConfig = def
     , ("M-S-p", lockAndSuspend)
     , ("M-<XF86MonBrightnessUp>", spawn "brightnessctl set 10%+")
     , ("M-<XF86MonBrightnessDown>", spawn "brightnessctl set 10%-")
+    , ("M-<XF86KbdBrightnessUp>", spawn "brightnessctl set 10%+")
+    , ("M-<XF86KbdBrightnessDown>", spawn "brightnessctl set 10%-")
+    , ("M-<XF86Messenger>", spawn "brightnessctl set 10%+")
+    , ("M-<XF86Search>", spawn "brightnessctl set 10%-")
     ]
 
 
@@ -144,4 +149,16 @@ lockAndSuspend =  do
     
 
 
+getEnvVar :: String -> String -> IO String
+getEnvVar varName defaultValue = do 
+    envValue <- lookupEnv varName 
+    return $ fromMaybe defaultValue envValue
+    -- return $ case result of 
+    --     Just value -> value 
+    --     Nothing -> defaultValue
 
+
+getPicomConf :: String -> String 
+getPicomConf hostName 
+    -- | hostName == "lt-zach" = "picom-gpu.conf"
+    | otherwise = "picom.conf"
