@@ -72,6 +72,9 @@ main = do
         <> homeDir 
         <> backgroundPicture
 
+    -- set Xorg settings
+    setXsettings
+
     -- start xmonad
     xmonad 
         $ ewmhFullscreen 
@@ -189,6 +192,29 @@ getEnvVar varName defaultValue = do
     -- return $ case result of 
     --     Just value -> value 
     --     Nothing -> defaultValue
+
+
+
+--                   __ _          __                  _   _                 
+--   ___ ___  _ __  / _(_) __ _   / _|_   _ _ __   ___| |_(_) ___  _ __  ___ 
+--  / __/ _ \| '_ \| |_| |/ _` | | |_| | | | '_ \ / __| __| |/ _ \| '_ \/ __|
+-- | (_| (_) | | | |  _| | (_| | |  _| |_| | | | | (__| |_| | (_) | | | \__ \
+--  \___\___/|_| |_|_| |_|\__, | |_|  \__,_|_| |_|\___|\__|_|\___/|_| |_|___/
+--                        |___/                                              
+
+
+setXsettings :: IO ()
+setXsettings = do 
+    spawn getXsettings
+
+
+
+getXsettings :: String 
+getXsettings = 
+    intercalate "; "
+    [ "xset s off -dpms"
+    , ""
+    ]
 
 
 --                   __ _          __ _ _                   _   _   _             
