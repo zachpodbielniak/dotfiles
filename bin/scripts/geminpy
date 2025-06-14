@@ -11,6 +11,7 @@ import os
 import base64
 import mimetypes
 import time
+import select
 
 
 ctr_id: str|None = ""
@@ -59,8 +60,8 @@ parser.add_argument("--no-color", action="store_true",
                     help="Disable colored output")
 parser.add_argument("--image-gen", action="store_true",
                     help="Generate an image instead of text response")
-parser.add_argument("--upscale", action="store_true",
-                    help="Upscale an image provided via --image (uses Imagen upscaling)")
+parser.add_argument("--regen", action="store_true",
+                    help="Regenerate/enhance an image provided via --image (uses Gemini 2.0 Flash image generation)")
 parser.add_argument("--output", help="Output filename for image generation (default: auto-numbered output-NNNN.png)")
 parser.add_argument("--size", default="1:1",
                     help="Aspect ratio for image generation (default: 1:1). Common options: 1:1, 16:9, 9:16, 4:3, 3:4")
@@ -84,7 +85,7 @@ def calculate_cost(model, input_tokens, output_tokens):
     # Check if this is an image generation model
     if "imagen" in model or "image-generation" in model:
         # Image generation pricing (per image, not per token)
-        # Note: Upscaling might have different pricing, using same as generation for now
+        # Note: Regeneration might have different pricing, using same as generation for now
         image_pricing = {
             "imagen-3.0-generate-002": 0.040,  # $0.040 per image
             "gemini-2.0-flash-preview-image-generation": 0.040,  # Estimated
@@ -410,8 +411,16 @@ try:
             except IOError as e:
                 print(f"Warning: Could not read file {file_path}: {e}", file=stderr)
     
-    # Read from standard input
-    query = stdin.read()
+    # Read from standard input only if there's data available
+    query = ""
+    if not args.regen:  # Regen doesn't need text input
+        # Check if stdin has data (not a terminal and has content)
+        if not stdin.isatty() or stdin in select.select([stdin], [], [], 0)[0]:
+            query = stdin.read()
+        # If no stdin and no prompt/files provided, and not doing image operations, show error
+        elif not args.prompt and not args.files and not args.image_gen and not args.images:
+            print("Error: No input provided. Use --prompt, -f/--file, or pipe input via stdin", file=stderr)
+            exit(1)
 
     # Combine file contents with query
     combined_parts = []
@@ -453,13 +462,13 @@ try:
                 }]
             }
         }
-    elif args.upscale:
-        # Use the image upscaling API for Gemini (Imagen)
+    elif args.regen:
+        # Use the image regeneration API for Gemini (Imagen)
         if not args.images or len(args.images) == 0:
-            print("Error: --upscale requires an image to be provided via --image", file=sys.stderr)
+            print("Error: --regen requires an image to be provided via --image", file=sys.stderr)
             exit(1)
         
-        # Use the first image for upscaling
+        # Use the first image for regeneration
         image_path = args.images[0]
         if not os.path.exists(image_path):
             print(f"Error: Image file not found: {image_path}", file=sys.stderr)
@@ -468,25 +477,35 @@ try:
         # Encode the image
         image_data = encode_image_to_base64(image_path)
         
-        # Use Imagen model for upscaling
-        image_model = args.model if "imagen" in args.model else "imagen-3.0-generate-002"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:editImage"
+        # Use Gemini 2.0 Flash with image generation for regeneration
+        # This uses the generateContent endpoint with image modification
+        image_model = "gemini-2.0-flash-preview-image-generation"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:generateContent"
+        
+        # Construct the request for image regeneration/enhancement
+        parts = []
+        
+        # Add regeneration instruction
+        regen_prompt = query if query else "Enhance and regenerate this image with improved quality, detail, and clarity."
+        parts.append({
+            "text": regen_prompt
+        })
+        
+        # Add the image to regenerate
+        parts.append({
+            "inline_data": image_data
+        })
         
         data = {
-            "image": {
-                "bytesBase64Encoded": image_data["data"]
-            },
-            "editMode": "UPSCALE",
-            "config": {
-                "sampleCount": 1
+            "contents": [{
+                "role": "user",
+                "parts": parts
+            }],
+            "generationConfig": {
+                "responseModalities": ["IMAGE"],
+                "maxOutputTokens": 8192
             }
         }
-        
-        # Add prompt if provided (for guided upscaling)
-        if query:
-            data["prompt"] = {
-                "text": query
-            }
     elif args.image_gen:
         # Use the image generation API for Gemini (Imagen)
         image_model = args.model if "imagen" in args.model else "imagen-3.0-generate-002"
@@ -558,13 +577,13 @@ try:
         print(f"Debug: API URL: {url}", file=sys.stderr)
         print(f"Debug: Headers (API key partially hidden): {{'x-goog-api-key': '{api_key[:5]}...{api_key[-4:]}', 'Content-Type': 'application/json'}}", file=sys.stderr)
         print(f"Debug: Data: {json.dumps(data)}", file=sys.stderr)
-        if args.image_gen or args.upscale:
+        if args.image_gen or args.regen:
             output_file = args.output if args.output else get_auto_numbered_filename()
             print(f"Debug: Image will be saved to: {output_file}", file=sys.stderr)
-            if args.upscale:
-                print(f"Debug: Upscaling image: {args.images[0]}", file=sys.stderr)
+            if args.regen:
+                print(f"Debug: Regenerating image: {args.images[0]}", file=sys.stderr)
                 if query:
-                    print(f"Debug: Using upscaling prompt guidance", file=sys.stderr)
+                    print(f"Debug: Using regeneration prompt guidance", file=sys.stderr)
             else:
                 print(f"Debug: Using aspect ratio: {args.size}", file=sys.stderr)
         if args.images:
@@ -644,12 +663,27 @@ try:
             else:
                 print(json.dumps(response_data))
                 
-        # Process image generation or upscaling response
-        elif args.image_gen or args.upscale:
+        # Process image generation or regeneration response
+        elif args.image_gen or args.regen:
             response_data = response.json()
+            image_data = None
+            
+            # Handle different response formats
             if "generatedImages" in response_data and len(response_data["generatedImages"]) > 0:
-                # Get the base64 image data
+                # Standard image generation format
                 image_data = response_data["generatedImages"][0]["bytesBase64Encoded"]
+            elif "candidates" in response_data and len(response_data["candidates"]) > 0:
+                # GenerateContent format (used for regeneration)
+                for candidate in response_data["candidates"]:
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        for part in candidate["content"]["parts"]:
+                            if "inlineData" in part and "data" in part["inlineData"]:
+                                image_data = part["inlineData"]["data"]
+                                break
+                    if image_data:
+                        break
+            
+            if image_data:
                 
                 # Determine output filename
                 if args.output:
