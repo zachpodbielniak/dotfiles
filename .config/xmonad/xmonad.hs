@@ -90,9 +90,10 @@ myConfig = def
     , ("M-S-s", unGrab *> spawn "flatpak --user run org.flameshot.Flameshot gui")
     , ("M-d", spawn "rofi -show drun")
     , ("M-S-d", spawn "rofi -show run")
-    , ("M-w", spawn "rofi -show window")
+    , ("M-S-w", spawn "rofi -show window")
     , ("M-S-t", spawn "i3lock -c000000")
     , ("M-S-p", lockAndSuspend)
+    , ("M-S-r", restartXmonad)
     , ("M-<XF86MonBrightnessUp>", spawn "brightnessctl set 10%+")
     , ("M-<XF86MonBrightnessDown>", spawn "brightnessctl set 10%-")
     , ("M-<XF86KbdBrightnessUp>", spawn "brightnessctl set 10%+")
@@ -146,6 +147,11 @@ lockAndSuspend :: X ()
 lockAndSuspend =  do 
     spawn "i3lock -c000000"
     spawn "systemctl suspend"
+
+-- restart xmonad with a recompile
+restartXmonad :: X ()
+restartXmonad = do 
+    spawn "bash -c 'xmonad --recompile; killall -9 picom; killall -9 xmobar; xmonad --restart'"
     
 
 
@@ -160,5 +166,5 @@ getEnvVar varName defaultValue = do
 
 getPicomConf :: String -> String 
 getPicomConf hostName 
-    -- | hostName == "lt-zach" = "picom-gpu.conf"
+    | hostName == "lt-zach" = "picom-gpu.conf"
     | otherwise = "picom.conf"
