@@ -1,4 +1,7 @@
--- default desktop configuration for Fedora
+-- if using cabal for other projects might need to run the following:
+-- cabal install --lib xmonad xmonad-contrib --package-env .
+-- cabal install --lib xmonad xmonad-contrib X11 unix process containers mtl --overwrite-policy=always 
+
 
 import System.Posix.Env (getEnv)
 import Data.Maybe (maybe, fromMaybe)
@@ -110,6 +113,16 @@ myConfig = def
     , ("M-<XF86KbdBrightnessDown>", spawn "brightnessctl set 10%-")
     , ("M-<XF86Messenger>", spawn "brightnessctl set 10%+")
     , ("M-<XF86Search>", spawn "brightnessctl set 10%-")
+    , ("M-C-1", spawn $ toggleHassCmd "lamp-01")
+    , ("M-C-2", spawn $ toggleHassCmd "lamp-02")
+    , ("M-C-3", spawn $ toggleHassCmd "lamp-03")
+    , ("M-C-4", spawn $ toggleHassCmd "lamp-04")
+    , ("M-C-5", spawn $ toggleHassCmd "can-left")
+    , ("M-C-6", spawn $ toggleHassCmd "can-right")
+    , ("M-C-7", spawn $ toggleHassCmd "storage-room")
+    , ("M-C-8", spawn $ toggleHassCmd "server-room")
+    , ("M-C-9", spawn $ toggleHassCmd "fan-01")
+    , ("M-C-0", spawn $ toggleHassCmd "fan-02")
     ]
 
 
@@ -301,5 +314,37 @@ xrandrLtZachDocked =
         , "--output DP-12 --mode 2560x2880 --pos 2560x0 --rotate normal"
         , "--output DP-13 --off"
         ]
+
+
+
+--            _                        _             _ _     
+--   _____  _| |_ ___ _ __ _ __   __ _| |   ___ __ _| | |___ 
+--  / _ \ \/ / __/ _ \ '__| '_ \ / _` | |  / __/ _` | | / __|
+-- |  __/>  <| ||  __/ |  | | | | (_| | | | (_| (_| | | \__ \
+--  \___/_/\_\\__\___|_|  |_| |_|\__,_|_|  \___\__,_|_|_|___/
+
+
+
+-- home assistant calls
+toggleHassSwitchCmd :: String -> String
+toggleHassSwitchCmd switchId =
+    "bash -c 'source $HOME/.bashrc && hass-cli service call switch.toggle --arguments entity_id=switch." <> switchId <> "'"
+
+toggleHassLightCmd :: String -> String
+toggleHassLightCmd lightId =
+    "bash -c 'source $HOME/.bashrc && hass-cli service call light.toggle --arguments entity_id=light." <> lightId <> "'"
+
+toggleHassCmd :: String -> String
+toggleHassCmd "lamp-01" = toggleHassSwitchCmd "b4_b0_24_0e_09_83"
+toggleHassCmd "lamp-02" = toggleHassSwitchCmd "b4_b0_24_0e_0d_c5"
+toggleHassCmd "lamp-03" = toggleHassSwitchCmd "54_af_97_f4_25_28"
+toggleHassCmd "lamp-04" = toggleHassSwitchCmd "28_87_ba_6a_2a_ef"
+toggleHassCmd "can-left" = toggleHassLightCmd "1c_61_b4_64_ea_42"
+toggleHassCmd "can-right" = toggleHassLightCmd "30_de_4b_77_19_54"
+toggleHassCmd "storage-room" = toggleHassSwitchCmd "6c_5a_b0_9b_38_ae"
+toggleHassCmd "server-room" = toggleHassSwitchCmd "d8_47_32_9e_e9_15"
+toggleHassCmd "fan-01" = toggleHassSwitchCmd "b4_b0_24_29_80_df"
+toggleHassCmd "fan-02" = toggleHassSwitchCmd "b4_b0_24_29_c2_2c"
+-- end home assistant calls
 
 
