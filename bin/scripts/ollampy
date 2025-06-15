@@ -14,6 +14,8 @@ import time
 import select
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import difflib
 
 
 # Default configurations for Ollama
@@ -84,7 +86,76 @@ parser.add_argument("--use-context", action="store_true",
                     help="Include today's chat history as context for the conversation")
 parser.add_argument("--use-context-from", 
                     help="Include chat history from a specific date (YYYY-MM-DD format) as context")
+parser.add_argument("--profile-performance", action="store_true",
+                    help="Profile performance of various Ollama models and compare accuracy with other AI providers")
+parser.add_argument("--profile-prompt", default="Explain quantum computing in one paragraph.",
+                    help="Custom prompt for performance profiling (default: 'Explain quantum computing in one paragraph.')")
+parser.add_argument("--profile-models",
+                    help="Comma-separated list of specific models to profile (e.g., 'llama2,mistral,codellama')")
+parser.add_argument("--profile-show-output", action="store_true",
+                    help="Show the output from each model in the performance profile table")
+parser.add_argument("--personality", 
+                    help="Set a personality/role for the AI. Available: cfp, swe, teacher, doctor, lawyer, chef, therapist, scientist, historian, artist, coach, journalist, philosopher, librarian, tutor, consultant, translator, critic, comedian, mentor, investor, cybersecurity. You can also use custom descriptions.")
 args = parser.parse_args()
+
+# Personality definitions
+PERSONALITIES = {
+    "cfp": "You are a Certified Financial Planner (CFP) with extensive knowledge of personal finance, investment strategies, tax planning, retirement planning, and estate planning. Provide professional, ethical financial advice while always reminding users to consult with their own financial advisor for personalized guidance.",
+    
+    "swe": "You are a Senior Software Engineer with deep expertise in software architecture, design patterns, code quality, and best practices. Focus on writing clean, maintainable, and efficient code. Consider scalability, security, and performance in your recommendations.",
+    
+    "teacher": "You are a patient and encouraging teacher who excels at breaking down complex topics into understandable concepts. Use analogies, examples, and step-by-step explanations. Adapt your teaching style to the learner's level and encourage questions.",
+    
+    "doctor": "You are a knowledgeable medical professional who provides general health information and guidance. Always emphasize that your advice is educational only and users should consult with healthcare providers for medical diagnosis and treatment.",
+    
+    "lawyer": "You are a legal expert who provides general legal information and explains legal concepts clearly. Always clarify that this is not legal advice and users should consult with an attorney for specific legal matters.",
+    
+    "chef": "You are a professional chef with expertise in various cuisines, cooking techniques, and food science. Share recipes, cooking tips, and culinary knowledge with enthusiasm. Consider dietary restrictions and preferences when making suggestions.",
+    
+    "therapist": "You are a supportive mental health professional who provides emotional support and coping strategies. Always encourage users to seek professional help for serious mental health concerns while offering compassionate guidance.",
+    
+    "scientist": "You are a research scientist with broad knowledge across multiple scientific disciplines. Explain scientific concepts clearly, cite evidence-based information, and maintain scientific accuracy while making complex topics accessible.",
+    
+    "historian": "You are a historian with deep knowledge of world history, cultures, and historical analysis. Provide context, multiple perspectives, and help users understand how past events connect to the present.",
+    
+    "artist": "You are a creative artist with expertise in various art forms, techniques, and art history. Encourage creativity, provide constructive feedback, and help users explore their artistic expression.",
+    
+    "coach": "You are a life coach focused on helping people achieve their goals, overcome obstacles, and maximize their potential. Use motivational techniques, ask powerful questions, and help users create actionable plans.",
+    
+    "journalist": "You are an investigative journalist skilled in research, fact-checking, and clear communication. Help users understand complex issues, identify reliable sources, and think critically about information.",
+    
+    "philosopher": "You are a philosopher who explores deep questions about existence, ethics, knowledge, and reality. Engage in thoughtful dialogue, present multiple philosophical perspectives, and encourage critical thinking.",
+    
+    "librarian": "You are a research librarian with expertise in finding, evaluating, and organizing information. Help users with research strategies, source evaluation, and information literacy.",
+    
+    "tutor": "You are a subject-specific tutor who helps students understand difficult concepts, complete assignments, and prepare for exams. Focus on building understanding rather than just providing answers.",
+    
+    "consultant": "You are a business consultant with expertise in strategy, operations, and organizational development. Provide practical business advice, analyze problems systematically, and offer actionable recommendations.",
+    
+    "translator": "You are a professional translator and linguist with expertise in multiple languages and cultures. Help with translations, explain linguistic nuances, and provide cultural context.",
+    
+    "critic": "You are a thoughtful critic who analyzes literature, films, art, and media with depth and insight. Provide balanced critiques that consider both strengths and weaknesses while respecting different perspectives.",
+    
+    "comedian": "You are a witty comedian who uses humor appropriately to lighten conversations while remaining helpful. Balance entertainment with usefulness, and be sensitive to context and audience.",
+    
+    "mentor": "You are a wise mentor who guides others based on experience and wisdom. Offer perspective, share relevant experiences, and help mentees navigate challenges while encouraging their growth.",
+    
+    "investor": "You are an experienced investment professional with deep knowledge of financial markets, portfolio management, risk assessment, and investment strategies. Provide insights on stocks, bonds, real estate, alternative investments, and market analysis while emphasizing the importance of diversification and risk management.",
+    
+    "cybersecurity": "You are a cybersecurity expert with extensive knowledge of information security, threat analysis, network security, and digital privacy. Help users understand security best practices, identify vulnerabilities, and implement protective measures while staying current with emerging threats and security technologies."
+}
+
+def get_personality_prompt(personality_key):
+    """Get the personality prompt for the given key, or return empty string if not found."""
+    if not personality_key:
+        return ""
+    
+    personality_key = personality_key.lower()
+    if personality_key in PERSONALITIES:
+        return PERSONALITIES[personality_key] + "\n\n"
+    else:
+        # If not a predefined personality, treat it as a custom personality description
+        return f"You are {personality_key}.\n\n"
 
 def get_auto_numbered_filename(base_name="output", extension=".png"):
     """Generate an auto-numbered filename that doesn't exist yet."""
@@ -291,10 +362,415 @@ def save_chat_transaction(provider, model, prompt, response, metadata=None):
     except Exception as e:
         print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
 
+def get_ollama_models():
+    """Get list of available Ollama models."""
+    try:
+        url = f"{args.endpoint}/api/tags"
+        response = requests.get(url)
+        if response.status_code == 200:
+            models_data = response.json()
+            if "models" in models_data:
+                return [model["name"] for model in models_data["models"]]
+    except:
+        pass
+    return []
+
+def test_model_performance(model, prompt):
+    """Test a single model's performance."""
+    try:
+        # Prepare request
+        url = f"{args.endpoint}/api/generate"
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False
+        }
+        
+        # Time the request
+        start_time = time.time()
+        response = requests.post(url, json=data, timeout=60)
+        end_time = time.time()
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            total_time = end_time - start_time
+            
+            # Extract metrics
+            result = {
+                "model": model,
+                "response": response_data.get("response", ""),
+                "total_time": total_time,
+                "eval_count": response_data.get("eval_count", 0),
+                "prompt_eval_count": response_data.get("prompt_eval_count", 0),
+                "eval_duration": response_data.get("eval_duration", 0) / 1e9,  # Convert to seconds
+                "prompt_eval_duration": response_data.get("prompt_eval_duration", 0) / 1e9,
+                "total_duration": response_data.get("total_duration", 0) / 1e9,
+                "tokens_per_second": 0
+            }
+            
+            # Calculate tokens per second
+            if result["eval_duration"] > 0:
+                result["tokens_per_second"] = result["eval_count"] / result["eval_duration"]
+            
+            return result
+        else:
+            return {"model": model, "error": f"HTTP {response.status_code}"}
+            
+    except Exception as e:
+        return {"model": model, "error": str(e)}
+
+def test_other_providers(prompt):
+    """Test other AI providers for comparison."""
+    providers = [
+        {"name": "Claude", "cmd": ["claudpy", "--no-preserve"], "model": "claude-sonnet-4-20250514"},
+        {"name": "Grok", "cmd": ["grokpy", "--no-preserve"], "model": "grok-3-beta"},
+        {"name": "Gemini", "cmd": ["geminpy", "--no-preserve"], "model": "gemini-2.5-pro-preview-06-05"},
+        {"name": "OpenAI", "cmd": ["openpy", "--no-preserve"], "model": "gpt-4-turbo"},
+        {"name": "Perplexity", "cmd": ["perpy", "--no-preserve"], "model": "sonar-pro"}
+    ]
+    
+    results = []
+    for provider in providers:
+        try:
+            # Run the provider command
+            start_time = time.time()
+            result = subprocess.run(
+                provider["cmd"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            end_time = time.time()
+            
+            if result.returncode == 0:
+                results.append({
+                    "provider": provider["name"],
+                    "model": provider["model"],
+                    "response": result.stdout.strip(),
+                    "total_time": end_time - start_time,
+                    "error": None
+                })
+            else:
+                results.append({
+                    "provider": provider["name"],
+                    "model": provider["model"],
+                    "response": "",
+                    "total_time": end_time - start_time,
+                    "error": result.stderr.strip()
+                })
+        except subprocess.TimeoutExpired:
+            results.append({
+                "provider": provider["name"],
+                "model": provider["model"],
+                "response": "",
+                "total_time": 30.0,
+                "error": "Timeout"
+            })
+        except Exception as e:
+            results.append({
+                "provider": provider["name"],
+                "model": provider["model"],
+                "response": "",
+                "total_time": 0,
+                "error": str(e)
+            })
+    
+    return results
+
+def calculate_similarity(text1, text2):
+    """Calculate similarity between two texts using difflib."""
+    return difflib.SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+
+def print_performance_table(ollama_results, other_results):
+    """Print a formatted performance comparison table."""
+    # ANSI colors
+    use_colors = not args.no_color
+    CYAN = '\033[96m' if use_colors else ''
+    GREEN = '\033[92m' if use_colors else ''
+    YELLOW = '\033[93m' if use_colors else ''
+    RED = '\033[91m' if use_colors else ''
+    BLUE = '\033[94m' if use_colors else ''
+    MAGENTA = '\033[95m' if use_colors else ''
+    GRAY = '\033[90m' if use_colors else ''
+    BOLD = '\033[1m' if use_colors else ''
+    END = '\033[0m' if use_colors else ''
+    
+    # Get reference response (first successful provider response)
+    reference_response = ""
+    for result in other_results:
+        if not result.get("error") and result["response"]:
+            reference_response = result["response"]
+            break
+    
+    # If no reference from other providers, use first successful Ollama response
+    if not reference_response:
+        for result in ollama_results:
+            if not result.get("error") and result.get("response"):
+                reference_response = result["response"]
+                break
+    
+    # Print header
+    print(f"\n{BOLD}{CYAN}╔{'═' * 120}╗{END}")
+    # Center the title: 120 - 2 (borders) = 118 inner width, title is 27 chars
+    # (118 - 27) / 2 = 45.5, so 45 before and 46 after
+    print(f"{BOLD}{CYAN}║{' ' * 45}Performance Profile Results{' ' * 46}║{END}")
+    print(f"{BOLD}{CYAN}╠{'═' * 120}╣{END}")
+    
+    # Print prompt - width calculation: 120 - 2 (borders) - 1 (start space) - 7 (Prompt:) - 1 (space after) - 1 (end space) = 108
+    print(f"{BOLD}{CYAN}║{END} {BOLD}Prompt:{END} {args.profile_prompt[:108]:<108} {BOLD}{CYAN}║{END}")
+    if len(args.profile_prompt) > 108:
+        remaining = args.profile_prompt[108:]
+        while remaining:
+            # For continuation lines: 120 - 2 (borders) - 1 (start space) - 8 (indent) - 1 (end space) = 108
+            print(f"{BOLD}{CYAN}║{END} {' ' * 8}{remaining[:108]:<108} {BOLD}{CYAN}║{END}")
+            remaining = remaining[108:]
+    
+    print(f"{BOLD}{CYAN}╠{'═' * 120}╣{END}")
+    
+    # Print Ollama models section
+    # Width calculation: 120 - 2 (borders) - 1 (start space) - 13 (text) - 1 (end space) = 103
+    print(f"{BOLD}{CYAN}║{END} {BOLD}{GREEN}Ollama Models{END}{' ' * 103} {BOLD}{CYAN}║{END}")
+    print(f"{BOLD}{CYAN}╠{'─' * 120}╣{END}")
+    
+    # Header row - total width must be 120
+    # Calculate Status width: 120 - 2 (borders) - 1 (start space) - 25 - 1 - 10 - 1 - 12 - 1 - 15 - 1 - 12 - 1 = 39
+    print(f"{BOLD}{CYAN}║{END} {BOLD}{'Model':<25} {'Time (s)':<10} {'Tokens/s':<12} {'Output Tokens':<15} {'Similarity':<12} {'Status':<39}{END} {BOLD}{CYAN}║{END}")
+    print(f"{BOLD}{CYAN}╠{'─' * 120}╣{END}")
+    
+    # Ollama results
+    for i, result in enumerate(ollama_results):
+        model = result["model"][:25]
+        
+        if result.get("error"):
+            status_text = f"Error: {result['error'][:20]}"
+            status_colored = f"{RED}{status_text}{END}"
+            time_str = "-"
+            tps_str = "-"
+            tokens_str = "-"
+            sim_str = "-"
+            sim_colored = "-"
+        else:
+            status_text = "Success"
+            status_colored = f"{GREEN}{status_text}{END}"
+            time_str = f"{result['total_time']:.2f}"
+            tps_str = f"{result['tokens_per_second']:.1f}" if result.get('tokens_per_second') else "-"
+            tokens_str = str(result.get('eval_count', '-'))
+            
+            # Calculate similarity
+            if reference_response and result.get("response"):
+                similarity = calculate_similarity(reference_response, result["response"])
+                sim_str = f"{similarity:.1%}"
+                if similarity >= 0.8:
+                    sim_colored = f"{GREEN}{sim_str}{END}"
+                elif similarity >= 0.6:
+                    sim_colored = f"{YELLOW}{sim_str}{END}"
+                else:
+                    sim_colored = f"{RED}{sim_str}{END}"
+            else:
+                sim_str = "-"
+                sim_colored = "-"
+        
+        # Build row with exact spacing to match header
+        # Header format: ║ Model(25) Time(10) Tokens/s(12) Output Tokens(15) Similarity(12) Status(30) ║
+        # Total content width should be: 25+10+12+15+12+30 + 5 spaces = 109 chars
+        row_parts = []
+        row_parts.append(f"{BOLD}{CYAN}║{END} ")
+        row_parts.append(f"{model:<25} ")
+        row_parts.append(f"{time_str:<10} ")
+        row_parts.append(f"{tps_str:<12} ")
+        row_parts.append(f"{tokens_str:<15} ")
+        
+        # Handle colored fields with padding
+        if sim_colored == "-":
+            row_parts.append(f"{sim_str:<12} ")
+        else:
+            # Add the colored text and pad with spaces
+            padding_needed = 12 - len(sim_str)
+            row_parts.append(sim_colored + (" " * padding_needed) + " ")
+            
+        if status_colored == status_text:  # No color
+            row_parts.append(f"{status_text:<39}")
+        else:
+            # Add the colored text and pad with spaces
+            padding_needed = 39 - len(status_text)
+            row_parts.append(status_colored + (" " * padding_needed))
+            
+        row_parts.append(f"{END} {BOLD}{CYAN}║{END}")
+        
+        print("".join(row_parts))
+        
+        # Show output if requested
+        if args.profile_show_output and result.get("response"):
+            output_lines = result["response"].strip().split('\n')
+            for line in output_lines:
+                # Wrap long lines (account for table structure: ║ + 3 spaces + text + space + ║)
+                # Total width is 120, so content width = 120 - 2 (║) - 3 (indent) - 1 (space) - 1 (║) = 113
+                while line:
+                    chunk = line[:113]
+                    line = line[113:]
+                    # Pad the chunk to exactly 113 characters
+                    padded_chunk = chunk.ljust(113)
+                    print(f"{BOLD}{CYAN}║{END}   {GRAY}{padded_chunk}{END} {BOLD}{CYAN}║{END}")
+            # Add separator after output (but not after the last item in section)
+            if i < len(ollama_results) - 1:
+                print(f"{BOLD}{CYAN}╟{'─' * 120}╢{END}")
+    
+    # Other providers section
+    print(f"{BOLD}{CYAN}╠{'─' * 120}╣{END}")
+    # Width calculation: 120 - 2 (borders) - 1 (start space) - 36 (text) - 1 (end space) = 80
+    print(f"{BOLD}{CYAN}║{END} {BOLD}{BLUE}Other AI Providers (for comparison){END}{' ' * 80} {BOLD}{CYAN}║{END}")
+    print(f"{BOLD}{CYAN}╠{'─' * 120}╣{END}")
+    
+    # Header row - total width must be 120
+    # Calculate Status width: 120 - 2 (borders) - 1 (start space) - 15 - 1 - 35 - 1 - 10 - 1 - 12 - 1 = 42
+    print(f"{BOLD}{CYAN}║{END} {BOLD}{'Provider':<15} {'Model':<35} {'Time (s)':<10} {'Similarity':<12} {'Status':<42}{END} {BOLD}{CYAN}║{END}")
+    print(f"{BOLD}{CYAN}╠{'─' * 120}╣{END}")
+    
+    # Other provider results
+    for i, result in enumerate(other_results):
+        provider = result["provider"][:15]
+        model = result["model"][:35]
+        
+        if result.get("error"):
+            status_text = f"Error: {result['error'][:25]}"
+            status_colored = f"{RED}{status_text}{END}"
+            time_str = "-"
+            sim_str = "-"
+            sim_colored = "-"
+        else:
+            status_text = "Success"
+            status_colored = f"{GREEN}{status_text}{END}"
+            time_str = f"{result['total_time']:.2f}"
+            
+            # Calculate similarity
+            if reference_response and result["response"]:
+                similarity = calculate_similarity(reference_response, result["response"])
+                sim_str = f"{similarity:.1%}"
+                if similarity >= 0.8:
+                    sim_colored = f"{GREEN}{sim_str}{END}"
+                elif similarity >= 0.6:
+                    sim_colored = f"{YELLOW}{sim_str}{END}"
+                else:
+                    sim_colored = f"{RED}{sim_str}{END}"
+            else:
+                sim_str = "-"
+                sim_colored = "-"
+        
+        # Build row with exact spacing to match header
+        # Header format: ║ Provider(15) Model(35) Time(10) Similarity(12) Status(36) ║
+        row_parts = []
+        row_parts.append(f"{BOLD}{CYAN}║{END} ")
+        row_parts.append(f"{provider:<15} ")
+        row_parts.append(f"{model:<35} ")
+        row_parts.append(f"{time_str:<10} ")
+        
+        # Handle colored similarity field
+        if sim_colored == "-":
+            row_parts.append(f"{sim_str:<12} ")
+        else:
+            # Add the colored text and pad with spaces
+            padding_needed = 12 - len(sim_str)
+            row_parts.append(sim_colored + (" " * padding_needed) + " ")
+            
+        # Handle colored status field
+        if status_colored == status_text:  # No color
+            row_parts.append(f"{status_text:<42}")
+        else:
+            # Add the colored text and pad with spaces
+            padding_needed = 42 - len(status_text)
+            row_parts.append(status_colored + (" " * padding_needed))
+            
+        row_parts.append(f"{END} {BOLD}{CYAN}║{END}")
+        
+        print("".join(row_parts))
+        
+        # Show output if requested
+        if args.profile_show_output and result.get("response"):
+            output_lines = result["response"].strip().split('\n')
+            for line in output_lines:
+                # Wrap long lines (account for table structure: ║ + 3 spaces + text + space + ║)
+                # Total width is 120, so content width = 120 - 2 (║) - 3 (indent) - 1 (space) - 1 (║) = 113
+                while line:
+                    chunk = line[:113]
+                    line = line[113:]
+                    # Pad the chunk to exactly 113 characters
+                    padded_chunk = chunk.ljust(113)
+                    print(f"{BOLD}{CYAN}║{END}   {GRAY}{padded_chunk}{END} {BOLD}{CYAN}║{END}")
+            # Add separator after output (but not after the last item)
+            if i < len(other_results) - 1:
+                print(f"{BOLD}{CYAN}╟{'─' * 120}╢{END}")
+    
+    print(f"{BOLD}{CYAN}╚{'═' * 120}╝{END}")
+    
+    # Print legend
+    print(f"\n{BOLD}Legend:{END}")
+    print(f"  Similarity: {GREEN}≥80% (High){END}, {YELLOW}60-79% (Medium){END}, {RED}<60% (Low){END}")
+    print(f"  Similarity is calculated against the first successful response as reference")
+    print(f"  Local Ollama models typically have no cost, while cloud providers charge per token\n")
+
 # Since outside of the distrobox we may not have these modules
 # quietly ignore the fact that they may not exist
 try:
-    # Handle list-models option first
+    # Handle profile-performance option first
+    if args.profile_performance:
+        print("Starting performance profiling...", file=sys.stderr)
+        
+        # Determine which models to test
+        if args.profile_models:
+            # Use specified models
+            specified_models = [m.strip() for m in args.profile_models.split(',') if m.strip()]
+            
+            # Get all available models to validate
+            available_models = get_ollama_models()
+            if not available_models:
+                print("Error: No Ollama models found. Make sure Ollama is running.", file=sys.stderr)
+                exit(1)
+            
+            # Filter to only available models
+            ollama_models = []
+            unavailable = []
+            for model in specified_models:
+                if model in available_models:
+                    ollama_models.append(model)
+                else:
+                    unavailable.append(model)
+            
+            if unavailable:
+                print(f"Warning: The following models are not available: {', '.join(unavailable)}", file=sys.stderr)
+            
+            if not ollama_models:
+                print("Error: None of the specified models are available.", file=sys.stderr)
+                print(f"Available models: {', '.join(available_models)}", file=sys.stderr)
+                exit(1)
+                
+            print(f"Testing {len(ollama_models)} specified models: {', '.join(ollama_models)}", file=sys.stderr)
+        else:
+            # Get all available Ollama models
+            ollama_models = get_ollama_models()
+            if not ollama_models:
+                print("Error: No Ollama models found. Make sure Ollama is running.", file=sys.stderr)
+                exit(1)
+            
+            print(f"Found {len(ollama_models)} Ollama models to test", file=sys.stderr)
+        
+        # Test Ollama models
+        ollama_results = []
+        for i, model in enumerate(ollama_models):
+            print(f"Testing Ollama model {i+1}/{len(ollama_models)}: {model}...", file=sys.stderr)
+            result = test_model_performance(model, args.profile_prompt)
+            ollama_results.append(result)
+        
+        # Test other providers
+        print("\nTesting other AI providers for comparison...", file=sys.stderr)
+        other_results = test_other_providers(args.profile_prompt)
+        
+        # Print results table
+        print_performance_table(ollama_results, other_results)
+        
+        exit(0)
+    
+    # Handle list-models option
     if args.list_models:
         # Check if colors should be disabled
         use_colors = not args.no_color and environ.get("NO_COLOR", "").lower() not in ("1", "true")
@@ -474,6 +950,15 @@ try:
             query = context_str + "\nCurrent Query:\n" + query
         else:
             query = context_str
+    
+    # Prepend personality prompt if specified
+    if args.personality:
+        personality_prompt = get_personality_prompt(args.personality)
+        if personality_prompt:
+            if query:
+                query = personality_prompt + query
+            else:
+                query = personality_prompt.rstrip()  # Remove trailing newlines if no other content
 
     # Set up API call
     headers = {

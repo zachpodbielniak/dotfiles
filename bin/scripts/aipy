@@ -1,0 +1,640 @@
+#!/usr/bin/python3
+
+import argparse
+import asyncio
+import concurrent.futures
+import json
+import subprocess
+import sys
+import os
+import select
+import time
+from pathlib import Path
+from datetime import datetime
+
+# Default decision model for --pick-best feature
+DEFAULT_DECISION_MODEL = "claude-opus-4-20250514"
+
+# Model to provider mapping
+MODEL_PROVIDERS = {
+    # Claude models
+    "claude-3-5-sonnet-20241022": "claudpy",
+    "claude-3-5-sonnet-latest": "claudpy", 
+    "claude-3-5-haiku-20241022": "claudpy",
+    "claude-3-5-haiku-latest": "claudpy",
+    "claude-3-opus-20240229": "claudpy",
+    "claude-3-opus-latest": "claudpy",
+    "claude-3-sonnet-20240229": "claudpy",
+    "claude-3-haiku-20240307": "claudpy",
+    "claude-sonnet-4-20250514": "claudpy",
+    "claude-opus-4-20250514": "claudpy",
+    "claude-3-7-sonnet-latest": "claudpy",
+    
+    # Grok models
+    "grok-3": "grokpy",
+    "grok-3-mini": "grokpy", 
+    "grok-3-fast": "grokpy",
+    "grok-3-mini-fast": "grokpy",
+    "grok-2-1212": "grokpy",
+    "grok-2-image-1212": "grokpy",
+    "grok-2-vision-1212": "grokpy",
+    
+    # Gemini models
+    "gemini-2.5-pro-preview-06-05": "geminpy",
+    "gemini-2.5-pro-preview-05-06": "geminpy",
+    "gemini-2.5-flash-preview-04-17": "geminpy",
+    "gemini-2.0-flash": "geminpy",
+    "gemini-2.0-flash-preview-image-generation": "geminpy",
+    "gemini-2.0-flash-lite": "geminpy",
+    "gemini-1.5-flash": "geminpy",
+    "gemini-1.5-flash-8b": "geminpy",
+    "gemini-1.5-pro": "geminpy",
+    "gemini-embedding-exp": "geminpy",
+    "imagen-3.0-generate-002": "geminpy",
+    "veo-2.0-generate-001": "geminpy",
+    "gemini-2.0-flash-live-001": "geminpy",
+    "text-embedding-004": "geminpy",
+    "embedding-001": "geminpy",
+    "models/aqa": "geminpy",
+    
+    # OpenAI models
+    "gpt-4o": "openpy",
+    "gpt-4-turbo": "openpy",
+    "gpt-4": "openpy",
+    "gpt-4-32k": "openpy",
+    "gpt-4o-mini": "openpy",
+    "gpt-3.5-turbo": "openpy",
+    "gpt-3.5-turbo-16k": "openpy",
+    "dall-e-3": "openpy",
+    "dall-e-2": "openpy",
+    "whisper-1": "openpy",
+    "text-embedding-3-small": "openpy",
+    "text-embedding-3-large": "openpy",
+    "text-embedding-ada-002": "openpy",
+    
+    # Perplexity models
+    "sonar-pro": "perpy",
+    "sonar": "perpy",
+    "reasoning-pro": "perpy",
+    "sonar-reasoning-pro": "perpy",
+    "r1-1776": "perpy",
+}
+
+def get_provider_for_model(model):
+    """Get the provider for a given model, or return 'ollampy' as default for unknown models."""
+    return MODEL_PROVIDERS.get(model, "ollampy")
+
+def pick_best_response(prompt, model_responses, decision_model):
+    """Use a reasoning model to pick the best response from multiple models."""
+    # Prepare the decision prompt
+    decision_prompt = f"""Original User Query:
+{prompt}
+
+I received multiple AI responses to this query. Please analyze them and select the BEST response based on:
+1. Accuracy and correctness
+2. Completeness and thoroughness
+3. Clarity and coherence
+4. Relevance to the query
+5. Practical usefulness
+
+Here are the responses from different models:
+
+"""
+    
+    for i, (model, response) in enumerate(model_responses):
+        if response.get("success") and response.get("output"):
+            decision_prompt += f"=== Response {i+1} from {model} ===\n{response['output']}\n\n"
+    
+    decision_prompt += """Please analyze all responses and tell me which response number is the BEST (1, 2, 3, etc).
+Start your response with "BEST: X" where X is the response number.
+Then provide a brief explanation of why that response is superior to the others.
+"""
+    
+    # Get the provider for the decision model
+    provider = get_provider_for_model(decision_model)
+    
+    # Build command for decision model
+    cmd = [provider, "--model", decision_model, "--no-preserve", decision_prompt]
+    
+    try:
+        # Run the decision model
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0 and result.stdout:
+            # Parse the response to find the best model
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                if line.strip().startswith("BEST:"):
+                    try:
+                        # Extract the number
+                        best_num = int(line.split(":")[1].strip().split()[0]) - 1
+                        if 0 <= best_num < len(model_responses):
+                            best_model = model_responses[best_num][0]
+                            reasoning = '\n'.join(lines[1:])  # Rest is explanation
+                            return best_model, reasoning.strip()
+                    except:
+                        pass
+            
+        # If parsing fails, return the first successful response
+        for model, response in model_responses:
+            if response.get("success"):
+                return model, "Could not determine best response, defaulting to first successful model"
+                
+    except Exception as e:
+        print(f"Error running decision model: {e}", file=sys.stderr)
+        # Return first successful response as fallback
+        for model, response in model_responses:
+            if response.get("success"):
+                return model, "Decision model failed, defaulting to first successful model"
+    
+    return None, "No successful responses to choose from"
+
+def save_multi_model_transaction(models, prompt, responses, metadata=None):
+    """Save multi-model chat transaction to markdown file organized by date."""
+    # Create directory structure if it doesn't exist
+    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    base_path.mkdir(parents=True, exist_ok=True)
+    
+    # Generate filename based on today's date
+    today = datetime.now()
+    filename = today.strftime("%Y-%m-%d.md")
+    file_path = base_path / filename
+    
+    # Generate timestamp for section header
+    timestamp = today.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Prepare content
+    content = f"\n# {timestamp} - Multi-Model Query (aipy)\n\n"
+    content += f"## Prompt\n\n```\n{prompt}\n```\n\n"
+    
+    # Add model responses
+    content += f"## Model Responses\n\n"
+    
+    for i, (model, response) in enumerate(zip(models, responses)):
+        content += f"### {i+1}. {model}\n\n"
+        if response.get("success"):
+            content += f"{response.get('output', 'No output captured')}\n\n"
+        else:
+            content += f"**Error**: {response.get('error', 'Unknown error')}\n\n"
+    
+    # Add metadata if provided
+    if metadata:
+        content += f"## Metadata\n\n"
+        content += f"- **Provider**: aipy (multi-model wrapper)\n"
+        content += f"- **Models**: {', '.join(models)}\n"
+        if 'total_time' in metadata:
+            content += f"- **Total Time**: {metadata['total_time']:.2f}s\n"
+        if 'parallel' in metadata:
+            content += f"- **Execution**: {'Parallel' if metadata['parallel'] else 'Sequential'}\n"
+        if 'iterations' in metadata:
+            content += f"- **Iterations**: {metadata['iterations']}\n"
+        if 'best_model' in metadata:
+            content += f"- **Best Response**: {metadata['best_model']}\n"
+        if 'decision_model' in metadata:
+            content += f"- **Decision Model**: {metadata['decision_model']}\n"
+        if 'decision_reasoning' in metadata:
+            content += f"\n### Decision Reasoning\n\n{metadata['decision_reasoning']}\n"
+    
+    content += "\n---\n"
+    
+    # Write to file (append if exists)
+    try:
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Universal AI provider wrapper - intelligently routes to the appropriate AI service",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  aipy "What is quantum computing?"                    # Uses default model
+  aipy --model gpt-4o "Explain AI"                   # Routes to OpenAI
+  aipy --model sonar-pro "Latest news"               # Routes to Perplexity
+  aipy --model claude-3-5-sonnet-latest "Help me"    # Routes to Claude
+  aipy --model gpt-4o,claude-3-5-sonnet "Compare"    # Multiple models in parallel
+  aipy --times 3 --image-gen "A sunset"              # Generate 3 images
+  aipy -L                                             # List all available models
+        """
+    )
+    
+    # Core options
+    parser.add_argument("prompt", nargs="?", help="The prompt to send to the AI")
+    parser.add_argument("--model", default="grok-3",
+                        help="Model(s) to use. Can specify multiple models comma-separated for parallel execution")
+    parser.add_argument("--times", type=int, default=1, 
+                        help="Number of times to repeat the request (useful for image generation)")
+    
+    # Provider selection
+    parser.add_argument("--provider", choices=["claudpy", "grokpy", "geminpy", "openpy", "ollampy", "perpy"],
+                        help="Force a specific provider (overrides model-based routing)")
+    
+    # Output options
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--json", action="store_true", help="Return JSON response")
+    parser.add_argument("-S", "--no-streaming", action="store_true", help="Disable streaming")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--summary", action="store_true", help="Show usage summary")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be sent without executing")
+    
+    # Content input
+    parser.add_argument("-f", "--file", action="append", dest="files",
+                        help="Include file content (can be used multiple times)")
+    parser.add_argument("--image", action="append", dest="images", 
+                        help="Include image files for vision analysis")
+    
+    # Generation modes
+    parser.add_argument("--image-gen", action="store_true", help="Generate images")
+    parser.add_argument("--embedding", action="store_true", help="Generate embeddings")
+    parser.add_argument("--regen", action="store_true", help="Regenerate/enhance images")
+    
+    # Image generation options
+    parser.add_argument("--output", help="Output filename for generated content")
+    parser.add_argument("--size", help="Image size (format depends on provider)")
+    parser.add_argument("--hd", action="store_true", help="Use HD quality for image generation")
+    
+    # Model/provider info
+    parser.add_argument("-L", "--list-models", action="store_true", help="List all available models")
+    
+    # Context and personality
+    parser.add_argument("--use-context", action="store_true", help="Include today's chat history")
+    parser.add_argument("--use-context-from", help="Include chat history from specific date (YYYY-MM-DD)")
+    parser.add_argument("--personality", help="Set AI personality/role")
+    parser.add_argument("--no-preserve", action="store_true", help="Don't save chat transaction")
+    
+    # Pick best feature
+    parser.add_argument("--pick-best", action="store_true", 
+                        help="When using multiple models, use a reasoning model to pick the best response")
+    parser.add_argument("--decision-model", default=DEFAULT_DECISION_MODEL,
+                        help=f"Model to use for picking the best response (default: {DEFAULT_DECISION_MODEL})")
+    
+    # Ollama-specific options
+    parser.add_argument("--endpoint", help="Ollama API endpoint")
+    parser.add_argument("--profile-performance", action="store_true", help="Profile Ollama model performance")
+    parser.add_argument("--profile-prompt", help="Custom prompt for performance profiling")
+    parser.add_argument("--profile-models", help="Specific models to profile")
+    parser.add_argument("--profile-show-output", action="store_true", help="Show model outputs in performance table")
+    
+    return parser.parse_args()
+
+def run_provider_command(provider, args, model=None, iteration=None, stdin_input=None):
+    """Run a command with the specified provider."""
+    cmd = [provider]
+    
+    # Add model if specified and different from default
+    if model and model != "grok-3":
+        cmd.extend(["--model", model])
+    
+    # Add all the flags and options
+    if args.debug:
+        cmd.append("--debug")
+    if args.json:
+        cmd.append("--json")
+    if args.no_streaming:
+        cmd.append("--no-streaming")
+    if args.no_color:
+        cmd.append("--no-color")
+    if args.summary:
+        cmd.append("--summary")
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.embedding:
+        cmd.append("--embedding")
+    if args.image_gen:
+        cmd.append("--image-gen")
+    if args.regen:
+        cmd.append("--regen")
+    if args.hd:
+        cmd.append("--hd")
+    if args.use_context:
+        cmd.append("--use-context")
+    # Always pass --no-preserve to providers since aipy handles preservation
+    cmd.append("--no-preserve")
+    if args.list_models:
+        cmd.append("--list-models")
+    if args.profile_performance:
+        cmd.append("--profile-performance")
+    if args.profile_show_output:
+        cmd.append("--profile-show-output")
+    
+    # Add options with values
+    if args.files:
+        for file in args.files:
+            cmd.extend(["-f", file])
+    if args.images:
+        for image in args.images:
+            cmd.extend(["--image", image])
+    if args.output:
+        # For multiple iterations, modify output filename
+        if iteration is not None and args.times > 1:
+            output_path = Path(args.output)
+            stem = output_path.stem
+            suffix = output_path.suffix
+            new_output = f"{stem}-{iteration:03d}{suffix}"
+            cmd.extend(["--output", new_output])
+        else:
+            cmd.extend(["--output", args.output])
+    if args.size:
+        cmd.extend(["--size", args.size])
+    if args.use_context_from:
+        cmd.extend(["--use-context-from", args.use_context_from])
+    if args.personality:
+        cmd.extend(["--personality", args.personality])
+    if args.endpoint:
+        cmd.extend(["--endpoint", args.endpoint])
+    if args.profile_prompt:
+        cmd.extend(["--profile-prompt", args.profile_prompt])
+    if args.profile_models:
+        cmd.extend(["--profile-models", args.profile_models])
+    
+    # Add --prompt if provided separately from stdin
+    if hasattr(args, 'original_prompt') and args.original_prompt and not args.list_models:
+        cmd.extend(["--prompt", args.original_prompt])
+    
+    return cmd, stdin_input
+
+def execute_command(cmd_and_stdin, model=None, iteration=None, capture_output=False):
+    """Execute a command and return the result."""
+    try:
+        if isinstance(cmd_and_stdin, tuple):
+            cmd, stdin_input = cmd_and_stdin
+        else:
+            cmd, stdin_input = cmd_and_stdin, None
+            
+        if iteration is not None:
+            print(f"[{model or 'default'} - Iteration {iteration + 1}]", file=sys.stderr)
+        elif model:
+            print(f"[{model}]", file=sys.stderr)
+        
+        # If we have stdin input, pass it to the command
+        if stdin_input:
+            result = subprocess.run(cmd, input=stdin_input, text=True, capture_output=capture_output)
+        else:
+            result = subprocess.run(cmd, capture_output=capture_output, text=True)
+            
+        response = {
+            "success": result.returncode == 0,
+            "returncode": result.returncode,
+            "model": model,
+            "iteration": iteration,
+            "cmd": " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        }
+        
+        if capture_output:
+            response["output"] = result.stdout
+            if result.stderr:
+                response["stderr"] = result.stderr
+                
+        return response
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "model": model,
+            "iteration": iteration,
+            "cmd": " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+        }
+
+def list_all_models():
+    """List models from all providers."""
+    providers = ["claudpy", "grokpy", "geminpy", "openpy", "ollampy", "perpy"]
+    
+    print("🤖 All Available AI Models\n")
+    print("=" * 80)
+    
+    for provider in providers:
+        print(f"\n📡 {provider.upper()}")
+        print("-" * 40)
+        
+        try:
+            # Run the list-models command for each provider
+            result = subprocess.run([provider, "--list-models"], 
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                # Clean up the output to remove extra formatting
+                output = result.stdout.strip()
+                if output:
+                    print(output)
+                else:
+                    print("  No models returned")
+            else:
+                print(f"  Error: {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            print("  Timeout - provider not responding")
+        except FileNotFoundError:
+            print(f"  Provider '{provider}' not found in PATH")
+        except Exception as e:
+            print(f"  Error: {e}")
+    
+    print("\n" + "=" * 80)
+    print("💡 Usage: aipy --model <model-name> \"your prompt\"")
+    print("💡 Multiple models: aipy --model model1,model2 \"your prompt\"")
+    print("💡 Model routing is automatic based on the model name")
+
+def main():
+    args = parse_arguments()
+    
+    # Handle list-models specially
+    if args.list_models:
+        list_all_models()
+        return
+    
+    # Check for stdin data
+    stdin_data = ""
+    if not sys.stdin.isatty() or sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+        try:
+            stdin_data = sys.stdin.read()
+        except:
+            pass  # If reading fails, continue without stdin data
+    
+    # Validate that we have a prompt or stdin data for non-listing operations
+    if not args.prompt and not stdin_data and not args.list_models:
+        print("Error: No prompt provided via argument or stdin. Use --help for usage information.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Store original prompt for --prompt flag
+    args.original_prompt = args.prompt
+    
+    # Store the full prompt for preservation
+    full_prompt = stdin_data + (("\n" + args.prompt) if args.prompt and stdin_data else args.prompt if args.prompt else "")
+    
+    # Parse models (can be comma-separated)
+    models = [m.strip() for m in args.model.split(",") if m.strip()]
+    
+    # Prepare all commands to execute
+    commands = []
+    
+    for model in models:
+        # Determine provider
+        if args.provider:
+            provider = args.provider
+        else:
+            provider = get_provider_for_model(model)
+        
+        # Generate commands for multiple iterations
+        for iteration in range(args.times):
+            cmd_and_stdin = run_provider_command(provider, args, model, 
+                                                 iteration if args.times > 1 else None, 
+                                                 stdin_data if stdin_data else None)
+            commands.append((cmd_and_stdin, model, iteration if args.times > 1 else None))
+    
+    # Track execution time
+    start_time = time.time()
+    
+    # Execute commands
+    if len(commands) == 1 and args.times == 1:
+        # Single command - run directly for better interactive experience
+        cmd_and_stdin, model, iteration = commands[0]
+        cmd, stdin_input = cmd_and_stdin
+        
+        if args.debug:
+            print(f"Debug: Executing: {' '.join(cmd)}", file=sys.stderr)
+            if stdin_input:
+                print(f"Debug: With stdin input: {len(stdin_input)} characters", file=sys.stderr)
+        
+        try:
+            if stdin_input:
+                result = subprocess.run(cmd, input=stdin_input, text=True, capture_output=True)
+            else:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            # Print output to user
+            if result.stdout:
+                print(result.stdout, end='')
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, end='')
+            
+            # Save transaction if not disabled
+            if not args.no_preserve and result.returncode == 0:
+                end_time = time.time()
+                save_multi_model_transaction(
+                    [model], 
+                    full_prompt, 
+                    [{"success": True, "output": result.stdout}],
+                    {"total_time": end_time - start_time, "parallel": False, "iterations": 1}
+                )
+                
+            if result.returncode != 0:
+                sys.exit(result.returncode)
+                
+        except KeyboardInterrupt:
+            print("\nInterrupted by user", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error executing command: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Multiple commands - need to capture output for preservation or pick-best
+        capture_output = not args.no_preserve or args.pick_best
+        
+        if len(commands) > 1:
+            print(f"Executing {len(commands)} requests in parallel...\n", file=sys.stderr)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(commands), 8)) as executor:
+            futures = []
+            for cmd_and_stdin, model, iteration in commands:
+                cmd, stdin_input = cmd_and_stdin
+                if args.debug:
+                    print(f"Debug: Queuing: {' '.join(cmd)}", file=sys.stderr)
+                    if stdin_input:
+                        print(f"Debug: With stdin input: {len(stdin_input)} characters", file=sys.stderr)
+                future = executor.submit(execute_command, cmd_and_stdin, model, iteration, capture_output)
+                futures.append(future)
+            
+            # Wait for all to complete
+            results = []
+            model_order = []
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                    model_order.append(result.get("model", "unknown"))
+                    
+                    # Print output as it arrives (if captured and not using pick-best)
+                    if not args.pick_best and result.get("output"):
+                        print(f"\n[{result.get('model', 'unknown')}]", file=sys.stderr)
+                        print(result["output"], end='')
+                    
+                    if not result["success"]:
+                        error_msg = result.get("error", f"Command failed with return code {result.get('returncode', 'unknown')}")
+                        print(f"Error in {result.get('model', 'unknown')}: {error_msg}", file=sys.stderr)
+                except Exception as e:
+                    print(f"Error executing command: {e}", file=sys.stderr)
+        
+        # Handle pick-best logic
+        best_model = None
+        reasoning = None
+        if args.pick_best and len(models) > 1:
+            # Prepare model responses for pick_best_response
+            model_responses = []
+            for model in models:
+                for result in results:
+                    if result.get("model") == model and result.get("success"):
+                        model_responses.append((model, result))
+                        break
+            
+            if len(model_responses) > 1:
+                print(f"\nAnalyzing {len(model_responses)} responses to pick the best one...", file=sys.stderr)
+                best_model, reasoning = pick_best_response(full_prompt, model_responses, args.decision_model)
+                
+                if best_model:
+                    # Find and display the best response
+                    for model, result in model_responses:
+                        if model == best_model:
+                            print(f"\n[Best Response: {best_model}]", file=sys.stderr)
+                            print(result["output"], end='')
+                            break
+                    
+                    if args.debug:
+                        print(f"\nDecision reasoning: {reasoning}", file=sys.stderr)
+                else:
+                    print("\nCould not determine best response", file=sys.stderr)
+            elif len(model_responses) == 1:
+                # Only one successful response, use it
+                model, result = model_responses[0]
+                print(f"\n[{model}]", file=sys.stderr)
+                print(result["output"], end='')
+        
+        # Summary
+        successful = sum(1 for r in results if r["success"])
+        print(f"\nCompleted: {successful}/{len(commands)} requests successful", file=sys.stderr)
+        
+        # Save transaction if not disabled and we have successful results
+        if capture_output and successful > 0:
+            end_time = time.time()
+            
+            # Sort results by model order for consistent output
+            sorted_results = []
+            sorted_models = []
+            for model in models:
+                for result in results:
+                    if result.get("model") == model and result not in sorted_results:
+                        sorted_results.append(result)
+                        sorted_models.append(model)
+                        break
+            
+            # Prepare metadata
+            metadata = {
+                "total_time": end_time - start_time, 
+                "parallel": len(commands) > 1, 
+                "iterations": args.times
+            }
+            
+            # Add pick-best metadata if applicable
+            if args.pick_best and len(models) > 1 and best_model:
+                metadata["best_model"] = best_model
+                metadata["decision_model"] = args.decision_model
+                metadata["decision_reasoning"] = reasoning
+            
+            save_multi_model_transaction(
+                sorted_models, 
+                full_prompt, 
+                sorted_results,
+                metadata
+            )
+
+if __name__ == "__main__":
+    main()
