@@ -12,6 +12,8 @@ import base64
 import mimetypes
 import time
 import select
+from datetime import datetime
+from pathlib import Path
 
 
 ctr_id: str|None = ""
@@ -67,6 +69,12 @@ parser.add_argument("--summary", action="store_true",
                     help="Show usage summary with token counts, timing, and costs in a formatted table")
 parser.add_argument("--dry-run", action="store_true",
                     help="Show what would be sent to the API without making the actual request")
+parser.add_argument("--no-preserve", action="store_true",
+                    help="Don't save the chat transaction to the second-brain markdown file")
+parser.add_argument("--use-context", action="store_true",
+                    help="Include today's chat history as context for the conversation")
+parser.add_argument("--use-context-from", 
+                    help="Include chat history from a specific date (YYYY-MM-DD format) as context")
 args = parser.parse_args()
 
 def get_auto_numbered_filename(base_name="output", extension=".png"):
@@ -101,6 +109,29 @@ def encode_image_to_base64(image_path):
     except Exception as e:
         print(f"Error reading image {image_path}: {e}", file=sys.stderr)
         exit(1)
+
+def load_context_from_file(date_str):
+    """Load chat history from a specific date's markdown file."""
+    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    filename = f"{date_str}.md"
+    file_path = base_path / filename
+    
+    if not file_path.exists():
+        if args.debug:
+            print(f"Debug: No context file found at {file_path}", file=sys.stderr)
+        return None
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        if args.debug:
+            print(f"Debug: Loaded {len(content)} characters of context from {filename}", file=sys.stderr)
+        
+        return f"=== Previous Chat History from {date_str} ===\n\n{content}\n\n=== End of Previous Chat History ===\n\n"
+    except Exception as e:
+        print(f"Warning: Could not load context from {file_path}: {e}", file=sys.stderr)
+        return None
 
 def calculate_cost(model, input_tokens, output_tokens):
     """Calculate cost based on Grok pricing (as of 2024)."""
@@ -223,6 +254,59 @@ def print_summary_table(model, input_tokens, output_tokens, total_time, first_to
     print(make_line(f"  {BOLD}Total cost:{END}", f"{BOLD}{MAGENTA}${cost_info['total_cost']:.6f}{END}"), file=sys.stderr)
     
     print(f"{BOLD}{CYAN}╚{'═' * width}╝{END}", file=sys.stderr)
+
+def save_chat_transaction(provider, model, prompt, response, metadata=None):
+    """Save chat transaction to markdown file organized by date."""
+    # Create directory structure if it doesn't exist
+    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    base_path.mkdir(parents=True, exist_ok=True)
+    
+    # Generate filename based on today's date
+    today = datetime.now()
+    filename = today.strftime("%Y-%m-%d.md")
+    file_path = base_path / filename
+    
+    # Generate timestamp for section header
+    timestamp = today.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Prepare content
+    content = f"\n# {timestamp}\n\n"
+    content += f"## Prompt\n\n```\n{prompt}\n```\n\n"
+    content += f"## Response\n\n{response}\n\n"
+    
+    # Add metadata if provided
+    if metadata:
+        content += f"## Metadata\n\n"
+        content += f"- **Provider**: {provider}\n"
+        content += f"- **Model**: {model}\n"
+        if 'input_tokens' in metadata:
+            content += f"- **Input Tokens**: {metadata['input_tokens']:,}\n"
+        if 'output_tokens' in metadata:
+            content += f"- **Output Tokens**: {metadata['output_tokens']:,}\n"
+        if 'total_tokens' in metadata:
+            content += f"- **Total Tokens**: {metadata['total_tokens']:,}\n"
+        if 'cost_info' in metadata:
+            cost_info = metadata['cost_info']
+            content += f"- **Input Cost**: ${cost_info['input_cost']:.6f}\n"
+            content += f"- **Output Cost**: ${cost_info['output_cost']:.6f}\n"
+            content += f"- **Total Cost**: ${cost_info['total_cost']:.6f}\n"
+        if 'total_time' in metadata:
+            content += f"- **Total Time**: {metadata['total_time']:.2f}s\n"
+        if 'first_token_time' in metadata and metadata['first_token_time']:
+            content += f"- **Time to First Token**: {metadata['first_token_time']:.2f}s\n"
+        if 'stream_mode' in metadata:
+            content += f"- **Streaming**: {metadata['stream_mode']}\n"
+        if 'images' in metadata and metadata['images']:
+            content += f"- **Images**: {len(metadata['images'])} included\n"
+    
+    content += "\n---\n"
+    
+    # Write to file (append if exists)
+    try:
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
 
 # Since outside of the distrobox we may not have these modules
 # quietly ignore the fact that they may not exist
@@ -407,6 +491,36 @@ try:
         query = "\n".join(combined_parts)
     else:
         query = ""
+    
+    # Load context if requested
+    context_parts = []
+    
+    # Load today's context if --use-context is specified
+    if args.use_context:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        context = load_context_from_file(today_str)
+        if context:
+            context_parts.append(context)
+    
+    # Load specific date's context if --use-context-from is specified
+    if args.use_context_from:
+        try:
+            # Validate date format
+            datetime.strptime(args.use_context_from, "%Y-%m-%d")
+            context = load_context_from_file(args.use_context_from)
+            if context:
+                context_parts.append(context)
+        except ValueError:
+            print(f"Error: Invalid date format '{args.use_context_from}'. Use YYYY-MM-DD format.", file=stderr)
+            exit(1)
+    
+    # Prepend context to query if any context was loaded
+    if context_parts:
+        context_str = "\n".join(context_parts)
+        if query:
+            query = context_str + "\nCurrent Query:\n" + query
+        else:
+            query = context_str
 
     # Set up API call
     headers = {
@@ -622,6 +736,34 @@ try:
                 is_estimated=is_estimated,
                 use_color=not args.no_color
             )
+        
+        # Save chat transaction if not disabled (for streaming)
+        if not args.no_preserve and not args.embedding and accumulated_content:
+            # Prepare metadata
+            metadata = {
+                'stream_mode': True,
+                'images': args.images
+            }
+            
+            # Add token counts if available
+            if input_tokens is not None:
+                metadata['input_tokens'] = input_tokens
+            if output_tokens is not None:
+                metadata['output_tokens'] = output_tokens
+            if input_tokens is not None and output_tokens is not None:
+                metadata['total_tokens'] = input_tokens + output_tokens
+            
+            # Add cost info if we have token counts
+            if 'input_tokens' in metadata and 'output_tokens' in metadata:
+                metadata['cost_info'] = cost_info
+            
+            # Add timing
+            if 'total_time' in locals():
+                metadata['total_time'] = total_time
+            if 'ttft' in locals():
+                metadata['first_token_time'] = ttft
+            
+            save_chat_transaction("Grok", args.model, query, accumulated_content, metadata)
     else:
         # Process non-streaming response (JSON or embedding)
         response_data = response.json()
@@ -700,6 +842,29 @@ try:
                         is_estimated=is_estimated,
                         use_color=not args.no_color
                     )
+                
+                # Save chat transaction if not disabled
+                if not args.no_preserve and not args.embedding and message_content:
+                    # Prepare metadata
+                    metadata = {
+                        'stream_mode': False,
+                        'images': args.images
+                    }
+                    
+                    # Add usage data if available
+                    if input_tokens > 0:
+                        metadata['input_tokens'] = input_tokens
+                    if output_tokens > 0:
+                        metadata['output_tokens'] = output_tokens
+                    if input_tokens > 0 and output_tokens > 0:
+                        metadata['total_tokens'] = input_tokens + output_tokens
+                        metadata['cost_info'] = cost_info
+                    
+                    # Add timing if available
+                    if 'total_time' in locals():
+                        metadata['total_time'] = total_time
+                    
+                    save_chat_transaction("Grok", args.model, query, message_content, metadata)
             except (KeyError, IndexError):
                 # Fallback to printing the full response
                 if args.json:
