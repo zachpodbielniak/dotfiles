@@ -145,7 +145,7 @@ def extract_user_prompt(full_prompt):
     # If no context found, return the original prompt
     return full_prompt
 
-def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None, context_ids=None, context_id=None, debug=False, dry_run=False, show_id=False):
+def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None, context_ids=None, context_id=None, debug=False, dry_run=False, show_id=False, auto_name=False):
     """Store chat interaction in the database with context_uuid support."""
     if not DB_AVAILABLE:
         if debug:
@@ -214,12 +214,14 @@ def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None
                     print(f"Warning: Chat ID {chat_id} not found, creating new context", file=sys.stderr)
         
         # Priority 3: Create new context if none found
+        new_context_created = False
         if not context_uuid:
             cursor.execute("""
                 INSERT INTO ai_chat_contexts (name) VALUES ('<untitled>')
                 RETURNING context_uuid
             """)
             context_uuid = cursor.fetchone()[0]
+            new_context_created = True
             if debug:
                 print(f"Created new context: {context_uuid}", file=sys.stderr)
         
@@ -286,6 +288,12 @@ def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None
         if show_id:
             print(f"New chat ID: {new_id}", file=sys.stderr)
             print(f"Context UUID: {context_uuid}", file=sys.stderr)
+        
+        # Auto-name new context if requested
+        if auto_name and new_context_created:
+            if debug:
+                print(f"Auto-naming new context {context_uuid}...", file=sys.stderr)
+            auto_generate_context_name(context_uuid, model, clean_prompt, response, debug)
         
         return str(new_id)
     
@@ -1691,6 +1699,155 @@ def resolve_context_id(context_identifier, debug=False):
             print(f"Error during context identifier resolution: {e}", file=sys.stderr)
         return None
 
+def get_last_chat_context(debug=False):
+    """Get the context UUID of the most recently added chat."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Error: Database dependencies not available", file=sys.stderr)
+        return None
+    
+    if not check_db_available(debug):
+        if debug:
+            print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return None
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Get the most recent chat's context_uuid
+        cursor.execute("""
+            SELECT a.context_uuid, c.name as context_name, a.request_timestamp
+            FROM ai_chats a
+            LEFT JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+            ORDER BY a.request_timestamp DESC
+            LIMIT 1
+        """)
+        
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if not result:
+            if debug:
+                print("No previous chats found in database", file=sys.stderr)
+            return None
+        
+        context_uuid = str(result['context_uuid'])
+        context_name = result['context_name'] or '<untitled>'
+        
+        if debug:
+            print(f"Found last chat context: {context_name} ({context_uuid})", file=sys.stderr)
+        
+        return context_uuid
+        
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Error getting last chat context: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        if debug:
+            print(f"Error during last chat context lookup: {e}", file=sys.stderr)
+        return None
+
+def auto_generate_context_name(context_uuid, model, prompt, response, debug=False):
+    """Automatically generate a name for a context based on the first chat."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Warning: Database not available for auto-naming", file=sys.stderr)
+        return False
+    
+    # Get provider for the model
+    provider = get_provider_for_model(model)
+    if not provider:
+        if debug:
+            print(f"Warning: No provider found for model {model} for auto-naming", file=sys.stderr)
+        return False
+    
+    try:
+        # Create name generation prompt based on the conversation content
+        name_prompt = f"""Based on the following conversation, generate a concise, descriptive name for this conversation context. The name should be 8 words or less and capture the main topic or purpose of the conversation.
+
+User Question:
+{prompt}
+
+AI Response:
+{response}
+
+Generate a name that is:
+- 8 words or less
+- Descriptive and clear
+- Suitable as a conversation title
+- Focused on the main topic
+
+Name:"""
+        
+        if debug:
+            print(f"Auto-generating context name using {provider}/{model}...", file=sys.stderr)
+        
+        # Run the name generation using the specified provider/model
+        import subprocess
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(name_prompt)
+            temp_file = f.name
+        
+        try:
+            cmd = [provider, "--model", model, "--no-preserve", "-f", temp_file]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode != 0:
+                if debug:
+                    print(f"Warning: Error running {provider} for auto-naming: {result.stderr}", file=sys.stderr)
+                return False
+            
+            generated_name = result.stdout.strip()
+            if not generated_name:
+                if debug:
+                    print("Warning: Empty name generated for auto-naming", file=sys.stderr)
+                return False
+            
+            # Clean up the generated name (remove quotes, limit length)
+            generated_name = generated_name.strip('"\'').strip()
+            words = generated_name.split()
+            if len(words) > 8:
+                generated_name = ' '.join(words[:8])
+            
+            # Update context with the new name
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute("""
+                UPDATE ai_chat_contexts 
+                SET name = %s
+                WHERE context_uuid = %s
+                RETURNING name
+            """, [generated_name, context_uuid])
+            
+            result_row = cursor.fetchone()
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            if debug:
+                print(f"Auto-generated context name: '{generated_name}' for {context_uuid}", file=sys.stderr)
+            
+            return True
+            
+        finally:
+            # Clean up temp file
+            import os
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+                
+    except Exception as e:
+        if debug:
+            print(f"Warning: Error during auto-naming: {e}", file=sys.stderr)
+        return False
+
 def format_chat_content_only(chat_data):
     """Format a single chat in content-only markdown format."""
     # Use full UUID for chat ID
@@ -1934,7 +2091,8 @@ def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=
                     context_id=context_id,
                     debug=debug, 
                     dry_run=dry_run,
-                    show_id=show_id
+                    show_id=show_id,
+                    auto_name=getattr(args, 'auto_name', False)
                 )
                 
                 # Store the new ID for summary display
@@ -2012,6 +2170,8 @@ Supported Providers: Claude, Grok, Gemini, OpenAI, Ollama, Perplexity
   aipy --chat-id 3740590a "Continue our discussion"
   aipy --chat-id 3740590a --chat-id 339e0ffc "Build on both conversations"
   aipy --chat-id 3740590a --tags "synthesis" "Synthesize our discussion"
+  aipy --continue "Continue from where we left off"
+  aipy --auto-name "Start a new conversation with auto-generated name"
 
 📊 TRACKING AND MONITORING
   aipy --show-id "New conversation"        # Shows UUID on stderr
@@ -2143,6 +2303,10 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                                    help="Search contexts by name, summary content, or tags")
     context_mgmt_group.add_argument("--context-id", metavar="CONTEXT",
                                    help="Add new chat to specific context (UUID, 8-char partial UUID, or name)")
+    context_mgmt_group.add_argument("--continue", action="store_true",
+                                   help="Continue conversation in the context of the most recent chat")
+    context_mgmt_group.add_argument("--auto-name", action="store_true",
+                                   help="Automatically generate name for new contexts using AI")
     
     # ━━━ SEARCH FILTERS ━━━
     filter_group = parser.add_argument_group("🔎 Search Filters")
@@ -3148,6 +3312,20 @@ def main():
         print("Error: No prompt provided. Use positional argument, --prompt flag, or stdin.", file=sys.stderr)
         sys.exit(1)
     
+    # Handle --continue option
+    if getattr(args, 'continue', False):
+        last_context_uuid = get_last_chat_context(debug=args.debug)
+        if last_context_uuid:
+            if args.debug:
+                print(f"Using --continue with context: {last_context_uuid}", file=sys.stderr)
+            # Set the context_id to the last chat's context
+            if args.context_id:
+                print("Warning: --continue overrides --context-id option", file=sys.stderr)
+            args.context_id = last_context_uuid
+        else:
+            print("Error: No previous chats found for --continue option", file=sys.stderr)
+            sys.exit(1)
+    
     # Load context from previous chats if requested
     context_chats = []
     if args.context_ids:
@@ -3280,7 +3458,8 @@ def main():
                         context_id=args.context_id,
                         debug=args.debug, 
                         dry_run=args.dry_run,
-                        show_id=args.show_id
+                        show_id=args.show_id,
+                        auto_name=getattr(args, 'auto_name', False)
                     )
                 
                 save_multi_model_transaction(
