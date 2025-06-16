@@ -2177,6 +2177,8 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                                help="Don't save chat transaction to database or files")
     advanced_group.add_argument("-y", "--yes", action="store_true",
                                help="Skip confirmation prompts (for delete operations)")
+    advanced_group.add_argument("--serve", action="store_true",
+                               help="Start web interface for browsing contexts and chats")
     advanced_group.add_argument("--endpoint", metavar="URL",
                                help="Ollama API endpoint")
     advanced_group.add_argument("--profile-performance", action="store_true",
@@ -2344,8 +2346,694 @@ def list_all_models():
     print("💡 Multiple models: aipy --model model1,model2 \"your prompt\"")
     print("💡 Model routing is automatic based on the model name")
 
+def start_web_server(debug=False, host='127.0.0.1', port=5000):
+    """Start the web interface for browsing contexts and chats."""
+    try:
+        from flask import Flask, render_template_string, request, jsonify, redirect, url_for
+        import markdown
+        import html
+    except ImportError:
+        print("Error: Flask and markdown are required for web server mode", file=sys.stderr)
+        print("Install with: pip install flask markdown", file=sys.stderr)
+        return False
+    
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available for web server", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    app = Flask(__name__)
+    app.config['SECRET_KEY'] = 'aipy-web-interface-secret'
+    
+    # HTML Template with HTMX and Dark Mode
+    HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIPy - Context Browser</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        :root[data-theme="light"] {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f8f9fa;
+            --bg-tertiary: #e9ecef;
+            --text-primary: #212529;
+            --text-secondary: #6c757d;
+            --border: #dee2e6;
+            --accent: #0d6efd;
+            --accent-hover: #0b5ed7;
+            --success: #198754;
+            --warning: #fd7e14;
+            --danger: #dc3545;
+        }
+        
+        :root[data-theme="dark"] {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --border: #30363d;
+            --accent: #58a6ff;
+            --accent-hover: #388bfd;
+            --success: #238636;
+            --warning: #f85149;
+            --danger: #f85149;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 30px;
+        }
+        
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--accent);
+        }
+        
+        .theme-toggle {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .theme-toggle:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .search-bar {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 16px;
+            margin-bottom: 20px;
+        }
+        
+        .search-bar:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+        }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 30px;
+        }
+        
+        .sidebar {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            height: fit-content;
+        }
+        
+        .content-area {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 600px;
+        }
+        
+        .context-item {
+            padding: 12px;
+            margin-bottom: 8px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .context-item:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--accent);
+        }
+        
+        .context-item.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .context-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        
+        .context-meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        
+        .context-item.active .context-meta {
+            color: rgba(255, 255, 255, 0.8);
+        }
+        
+        .chat-thread {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        
+        .chat-header {
+            background: var(--bg-tertiary);
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chat-content {
+            padding: 16px;
+        }
+        
+        .chat-prompt, .chat-response {
+            margin-bottom: 16px;
+        }
+        
+        .chat-prompt-label, .chat-response-label {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+        
+        .chat-text {
+            background: var(--bg-primary);
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            white-space: pre-wrap;
+            font-family: inherit;
+        }
+        
+        .context-summary {
+            background: var(--bg-tertiary);
+            padding: 16px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border);
+        }
+        
+        .summary-header {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        
+        .btn {
+            padding: 6px 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 12px;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .btn:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .btn.primary {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .btn.primary:hover {
+            background: var(--accent-hover);
+        }
+        
+        .loading {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+        }
+        
+        .empty-state h3 {
+            margin-bottom: 8px;
+        }
+        
+        .markdown-content {
+            line-height: 1.6;
+        }
+        
+        .markdown-content h1, .markdown-content h2, .markdown-content h3 {
+            margin-top: 24px;
+            margin-bottom: 12px;
+            color: var(--text-primary);
+        }
+        
+        .markdown-content h1 {
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 8px;
+        }
+        
+        .markdown-content h2 {
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 4px;
+        }
+        
+        .markdown-content p {
+            margin-bottom: 12px;
+        }
+        
+        .markdown-content pre {
+            background: var(--bg-primary);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            overflow-x: auto;
+            margin: 12px 0;
+        }
+        
+        .markdown-content code {
+            background: var(--bg-primary);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', 'Fira Code', monospace;
+        }
+        
+        .markdown-content blockquote {
+            border-left: 4px solid var(--accent);
+            padding-left: 16px;
+            margin: 12px 0;
+            color: var(--text-secondary);
+        }
+        
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .sidebar {
+                order: 2;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🤖 AIPy Context Browser</div>
+            <button class="theme-toggle" onclick="toggleTheme()">
+                🌙 Dark Mode
+            </button>
+        </div>
+        
+        <input type="text" 
+               class="search-bar" 
+               placeholder="Search contexts by name, summary, or tags..."
+               hx-get="/search"
+               hx-trigger="input changed delay:300ms"
+               hx-target="#context-list"
+               name="q">
+        
+        <div class="main-content">
+            <div class="sidebar">
+                <div id="context-list" hx-get="/contexts" hx-trigger="load">
+                    <div class="loading">Loading contexts...</div>
+                </div>
+            </div>
+            
+            <div class="content-area">
+                <div id="content-detail">
+                    <div class="empty-state">
+                        <h3>Welcome to AIPy Context Browser</h3>
+                        <p>Select a context from the sidebar to view its details</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function toggleTheme() {
+            const root = document.documentElement;
+            const current = root.getAttribute('data-theme');
+            const next = current === 'dark' ? 'light' : 'dark';
+            root.setAttribute('data-theme', next);
+            
+            const button = document.querySelector('.theme-toggle');
+            button.textContent = next === 'dark' ? '🌙 Dark Mode' : '☀️ Light Mode';
+            
+            localStorage.setItem('theme', next);
+        }
+        
+        // Load saved theme
+        const savedTheme = localStorage.getItem('theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+        document.querySelector('.theme-toggle').textContent = 
+            savedTheme === 'dark' ? '🌙 Dark Mode' : '☀️ Light Mode';
+    </script>
+</body>
+</html>
+    '''
+    
+    @app.route('/')
+    def index():
+        return render_template_string(HTML_TEMPLATE)
+    
+    @app.route('/contexts')
+    def get_contexts():
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute("""
+                SELECT 
+                    context_uuid,
+                    name,
+                    summary,
+                    tags,
+                    created_at,
+                    (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+                    (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+                FROM ai_chat_contexts ctx
+                ORDER BY last_chat_time DESC NULLS LAST, created_at DESC
+                LIMIT 50
+            """)
+            
+            contexts = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            html_content = ""
+            for ctx in contexts:
+                uuid_short = str(ctx['context_uuid'])[:8]
+                name = html.escape(ctx['name'] or '<untitled>')
+                chat_count = ctx['chat_count']
+                last_chat = ctx['last_chat_time'].strftime('%Y-%m-%d %H:%M') if ctx['last_chat_time'] else 'Never'
+                
+                html_content += f'''
+                <div class="context-item" 
+                     hx-get="/context/{ctx['context_uuid']}" 
+                     hx-target="#content-detail"
+                     onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active')); this.classList.add('active');">
+                    <div class="context-name">{name}</div>
+                    <div class="context-meta">{uuid_short}... • {chat_count} chats • {last_chat}</div>
+                </div>
+                '''
+            
+            return html_content
+            
+        except Exception as e:
+            return f'<div class="error">Error loading contexts: {e}</div>'
+    
+    @app.route('/search')
+    def search_contexts_web():
+        query = request.args.get('q', '').strip()
+        if not query:
+            return get_contexts()
+        
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            if query == '*':
+                where_clause = "TRUE"
+                params = []
+            else:
+                search_conditions = [
+                    "LOWER(name) LIKE LOWER(%s)",
+                    "to_tsvector('english', COALESCE(summary, '')) @@ plainto_tsquery('english', %s)",
+                    "tags @> ARRAY[%s] OR %s = ANY(tags)"
+                ]
+                where_clause = " OR ".join([f"({condition})" for condition in search_conditions])
+                params = [f"%{query}%", query, query.lower(), query.lower()]
+            
+            sql = f"""
+            SELECT 
+                context_uuid,
+                name,
+                summary,
+                tags,
+                created_at,
+                (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+                (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+            FROM ai_chat_contexts ctx
+            WHERE {where_clause}
+            ORDER BY last_chat_time DESC NULLS LAST, created_at DESC
+            LIMIT 50
+            """
+            
+            cursor.execute(sql, params)
+            contexts = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            html_content = ""
+            for ctx in contexts:
+                uuid_short = str(ctx['context_uuid'])[:8]
+                name = html.escape(ctx['name'] or '<untitled>')
+                chat_count = ctx['chat_count']
+                last_chat = ctx['last_chat_time'].strftime('%Y-%m-%d %H:%M') if ctx['last_chat_time'] else 'Never'
+                
+                html_content += f'''
+                <div class="context-item" 
+                     hx-get="/context/{ctx['context_uuid']}" 
+                     hx-target="#content-detail"
+                     onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active')); this.classList.add('active');">
+                    <div class="context-name">{name}</div>
+                    <div class="context-meta">{uuid_short}... • {chat_count} chats • {last_chat}</div>
+                </div>
+                '''
+            
+            if not contexts:
+                html_content = '<div class="empty-state"><h3>No contexts found</h3><p>Try a different search term</p></div>'
+            
+            return html_content
+            
+        except Exception as e:
+            return f'<div class="error">Error searching contexts: {e}</div>'
+    
+    @app.route('/context/<context_uuid>')
+    def get_context_detail(context_uuid):
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Get context info
+            cursor.execute("SELECT * FROM ai_chat_contexts WHERE context_uuid = %s", [context_uuid])
+            context = cursor.fetchone()
+            
+            if not context:
+                cursor.close()
+                conn.close()
+                return '<div class="error">Context not found</div>'
+            
+            # Get chats
+            cursor.execute("""
+                SELECT * FROM ai_chats 
+                WHERE context_uuid = %s 
+                ORDER BY request_timestamp ASC
+            """, [context_uuid])
+            
+            chats = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            name = html.escape(context['name'] or '<untitled>')
+            uuid_short = str(context['context_uuid'])[:8]
+            
+            html_content = f'''
+            <div class="context-detail">
+                <div class="context-header">
+                    <h2>{name}</h2>
+                    <div class="action-buttons">
+                        <button class="btn" 
+                                hx-post="/context/{context_uuid}/rename" 
+                                hx-prompt="Enter new name:"
+                                hx-target="closest .context-detail"
+                                hx-swap="outerHTML">
+                            ✏️ Rename
+                        </button>
+                        <button class="btn" 
+                                hx-post="/context/{context_uuid}/generate-name" 
+                                hx-target="closest .context-detail"
+                                hx-swap="outerHTML">
+                            🤖 Generate Name
+                        </button>
+                        <button class="btn" 
+                                hx-post="/context/{context_uuid}/summarize" 
+                                hx-target="closest .context-detail"
+                                hx-swap="outerHTML">
+                            📝 Generate Summary
+                        </button>
+                    </div>
+                </div>
+                <div class="context-meta">
+                    <strong>UUID:</strong> {context['context_uuid']}<br>
+                    <strong>Created:</strong> {context['created_at'].strftime('%Y-%m-%d %H:%M:%S')}<br>
+                    <strong>Chats:</strong> {len(chats)}
+                </div>
+            '''
+            
+            # Add summary if available
+            if context['summary']:
+                summary_html = markdown.markdown(context['summary'])
+                provider_model = ""
+                if context['summary_provider'] and context['summary_model']:
+                    provider_model = f" (Generated by {context['summary_provider']}/{context['summary_model']})"
+                
+                html_content += f'''
+                <div class="context-summary">
+                    <div class="summary-header">📄 Summary{provider_model}</div>
+                    <div class="markdown-content">{summary_html}</div>
+                </div>
+                '''
+            
+            # Add chats
+            for i, chat in enumerate(chats, 1):
+                chat_id_short = str(chat['id'])[:8]
+                timestamp = chat['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                
+                html_content += f'''
+                <div class="chat-thread">
+                    <div class="chat-header">
+                        <span>Chat {i} - {chat['provider']}/{chat['model']}</span>
+                        <span>{timestamp} ({chat_id_short}...)</span>
+                    </div>
+                    <div class="chat-content">
+                        <div class="chat-prompt">
+                            <div class="chat-prompt-label">🧑 User:</div>
+                            <div class="chat-text">{html.escape(chat['prompt'])}</div>
+                        </div>
+                        <div class="chat-response">
+                            <div class="chat-response-label">🤖 Assistant:</div>
+                            <div class="chat-text markdown-content">{markdown.markdown(chat['response'])}</div>
+                        </div>
+                    </div>
+                </div>
+                '''
+            
+            html_content += '</div>'
+            return html_content
+            
+        except Exception as e:
+            return f'<div class="error">Error loading context: {e}</div>'
+    
+    @app.route('/context/<context_uuid>/rename', methods=['POST'])
+    def rename_context(context_uuid):
+        new_name = request.headers.get('HX-Prompt')
+        if not new_name:
+            return get_context_detail(context_uuid)
+        
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE ai_chat_contexts 
+                SET name = %s 
+                WHERE context_uuid = %s
+            """, [new_name, context_uuid])
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            # Return context detail with out-of-band sidebar update
+            main_content = get_context_detail(context_uuid)
+            sidebar_content = get_contexts()
+            
+            return main_content + f'<div id="context-list" hx-swap-oob="true">{sidebar_content}</div>'
+            
+        except Exception as e:
+            return f'<div class="error">Error renaming context: {e}</div>'
+    
+    @app.route('/context/<context_uuid>/generate-name', methods=['POST'])
+    def generate_name_web(context_uuid):
+        success = generate_context_name(context_uuid, debug=debug)
+        # Return context detail with out-of-band sidebar update
+        main_content = get_context_detail(context_uuid)
+        sidebar_content = get_contexts()
+        
+        return main_content + f'<div id="context-list" hx-swap-oob="true">{sidebar_content}</div>'
+    
+    @app.route('/context/<context_uuid>/summarize', methods=['POST'])
+    def summarize_web(context_uuid):
+        success = summarize_context(context_uuid, debug=debug)
+        # Return context detail with out-of-band sidebar update
+        main_content = get_context_detail(context_uuid)
+        sidebar_content = get_contexts()
+        
+        return main_content + f'<div id="context-list" hx-swap-oob="true">{sidebar_content}</div>'
+    
+    print(f"🌐 Starting AIPy web server on http://{host}:{port}")
+    print("💡 Use Ctrl+C to stop the server")
+    
+    try:
+        app.run(host=host, port=port, debug=debug)
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down web server...")
+    except Exception as e:
+        print(f"Error starting web server: {e}", file=sys.stderr)
+        return False
+    
+    return True
+
 def main():
     args = parse_arguments()
+    
+    # Handle web server mode
+    if args.serve:
+        start_web_server(debug=args.debug)
+        return
     
     # Handle database operations first
     if args.search:
