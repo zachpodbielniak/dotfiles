@@ -613,6 +613,127 @@ export_data() {
     echo "Export completed: $output_file"
 }
 
+# Backup database
+backup_database() {
+    local db="${1:-$DEFAULT_DB_NAME}"
+    local backup_file="${2:-${db}_backup_$(date +%Y%m%d_%H%M%S).sql}"
+    
+    echo "Backing up database '$db' to $backup_file..."
+    
+    # Check if database exists
+    if ! database_exists "$db"; then
+        echo "Error: Database '$db' does not exist" >&2
+        return 1
+    fi
+    
+    # Get the container ID for the postgres service
+    local container_id=$(podman ps --filter "label=io.containers.autoupdate=registry" --format "{{.ID}} {{.Names}}" | grep -E "(postgres|pgvector)" | awk '{print $1}' | head -1)
+    
+    if [[ -z "$container_id" ]]; then
+        # Try another method - look for containers running postgres
+        container_id=$(podman ps --format "{{.ID}} {{.Image}}" | grep -E "(postgres|pgvector)" | awk '{print $1}' | head -1)
+    fi
+    
+    if [[ -z "$container_id" ]]; then
+        echo "Error: Could not find PostgreSQL container" >&2
+        return 1
+    fi
+    
+    echo "Using container: $container_id"
+    
+    # Use pg_dump from inside the container to avoid version mismatch
+    if podman exec "$container_id" pg_dump \
+        -h localhost \
+        -U "$DEFAULT_DB_USER" \
+        -d "$db" \
+        --no-owner \
+        --no-acl \
+        --clean \
+        --if-exists \
+        --create > "$backup_file" 2>&1; then
+        
+        # Compress the backup file
+        echo "Compressing backup..."
+        if gzip "$backup_file"; then
+            backup_file="${backup_file}.gz"
+            echo "Backup completed successfully: $backup_file"
+            
+            # Show backup file size
+            local size=$(ls -lh "$backup_file" | awk '{print $5}')
+            echo "Backup size: $size"
+        else
+            echo "Warning: Failed to compress backup, keeping uncompressed file"
+            echo "Backup completed: $backup_file"
+        fi
+    else
+        echo "Error: Failed to backup database '$db'" >&2
+        return 1
+    fi
+}
+
+# Backup all databases
+backup_all_databases() {
+    local backup_dir="${1:-backups_$(date +%Y%m%d_%H%M%S)}"
+    
+    echo "Backing up all databases to directory: $backup_dir"
+    
+    # Create backup directory
+    if ! mkdir -p "$backup_dir"; then
+        echo "Error: Failed to create backup directory '$backup_dir'" >&2
+        return 1
+    fi
+    
+    # Get list of databases to backup
+    local databases=()
+    
+    # Check which databases exist
+    if database_exists "transcriptions"; then
+        databases+=("transcriptions")
+    fi
+    
+    if database_exists "ai_chats"; then
+        databases+=("ai_chats")
+    fi
+    
+    # Always include postgres database (for second_brain_vectors)
+    databases+=("postgres")
+    
+    echo "Found databases to backup: ${databases[*]}"
+    echo ""
+    
+    local success_count=0
+    local fail_count=0
+    
+    # Backup each database
+    for db in "${databases[@]}"; do
+        echo "Backing up database: $db"
+        local backup_file="${backup_dir}/${db}_backup_$(date +%Y%m%d_%H%M%S).sql"
+        
+        if backup_database "$db" "$backup_file"; then
+            ((success_count++))
+        else
+            ((fail_count++))
+            echo "Error: Failed to backup database '$db'" >&2
+        fi
+        echo ""
+    done
+    
+    # Summary
+    echo "Backup summary:"
+    echo "  - Successful backups: $success_count"
+    echo "  - Failed backups: $fail_count"
+    echo "  - Backup directory: $backup_dir"
+    
+    # List backup files
+    if [[ $success_count -gt 0 ]]; then
+        echo ""
+        echo "Backup files:"
+        ls -lh "$backup_dir"/*.gz 2>/dev/null || ls -lh "$backup_dir"/*.sql 2>/dev/null
+    fi
+    
+    return $([[ $fail_count -eq 0 ]] && echo 0 || echo 1)
+}
+
 # Archive old data
 archive_old_data() {
     local db="${1}"
@@ -1098,6 +1219,7 @@ COMMANDS:
     export [FILE]       Export data to JSON file
     archive [DAYS]      Archive data older than DAYS (default: 365)
     sync                Sync databases from configured remote hosts
+    backup [FILE]       Backup database to SQL dump file
     
 OPTIONS:
     -h, --help          Show this help message
@@ -1105,7 +1227,7 @@ OPTIONS:
     --debug             Enable debug output (shows detailed error messages)
     -d, --database DB   Specify target database (required for maintain/export/archive)
                         Available: transcriptions, ai_chats, postgres
-                        Optional for stats (shows all databases if not specified)
+                        Optional for stats and backup (shows/backs up all databases if not specified)
     
 ENVIRONMENT VARIABLES:
     LOCAL_DB_HOST             Database host (default: 127.0.0.1)
@@ -1140,6 +1262,14 @@ EXAMPLES:
     $SCRIPT_NAME --database transcriptions archive 180
     $SCRIPT_NAME --database ai_chats archive 365
     
+    # Backup specific database
+    $SCRIPT_NAME --database transcriptions backup
+    $SCRIPT_NAME --database ai_chats backup my_chats_backup.sql
+    
+    # Backup all databases to a directory
+    $SCRIPT_NAME backup
+    $SCRIPT_NAME backup my_backups_dir
+    
     # Sync databases from remote hosts
     $SCRIPT_NAME sync
     
@@ -1173,7 +1303,7 @@ parse_args() {
                 fi
                 shift 2
                 ;;
-            setup|init|init-transcripts|init-ai|init-second-brain|maintain|stats|export|archive|sync)
+            setup|init|init-transcripts|init-ai|init-second-brain|maintain|stats|export|archive|backup|sync)
                 ACTION="$1"
                 shift
                 break
@@ -1206,7 +1336,7 @@ main() {
         exit 1
     fi
     
-    # Commands that require --database option
+    # Commands that require --database option for single database operations
     case "$ACTION" in
         maintain|export|archive)
             if [[ -z "$TARGET_DATABASE" ]]; then
@@ -1248,6 +1378,15 @@ main() {
             ;;
         archive)
             archive_old_data "$TARGET_DATABASE" "${ARGS[0]}"
+            ;;
+        backup)
+            if [[ -n "$TARGET_DATABASE" ]]; then
+                # Backup specific database
+                backup_database "$TARGET_DATABASE" "${ARGS[0]}"
+            else
+                # Backup all databases
+                backup_all_databases "${ARGS[0]}"
+            fi
             ;;
         sync)
             # Run sync in a subshell to prevent set -e from exiting early
