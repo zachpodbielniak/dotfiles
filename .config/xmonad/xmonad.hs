@@ -76,7 +76,7 @@ main = do
         <> backgroundPicture
 
     -- set Xorg settings
-    setXsettings
+    setXsettings hostName
 
     -- start xmonad
     xmonad 
@@ -113,17 +113,21 @@ myConfig = def
     , ("M-<XF86KbdBrightnessDown>", spawn "brightnessctl set 10%-")
     , ("M-<XF86Messenger>", spawn "brightnessctl set 10%+")
     , ("M-<XF86Search>", spawn "brightnessctl set 10%-")
-    , ("M-C-1", spawn $ toggleHassCmd "lamp-01")
-    , ("M-C-2", spawn $ toggleHassCmd "lamp-02")
-    , ("M-C-3", spawn $ toggleHassCmd "lamp-03")
-    , ("M-C-4", spawn $ toggleHassCmd "lamp-04")
-    , ("M-C-5", spawn $ toggleHassCmd "can-left")
-    , ("M-C-6", spawn $ toggleHassCmd "can-right")
-    , ("M-C-7", spawn $ toggleHassCmd "storage-room")
-    , ("M-C-8", spawn $ toggleHassCmd "server-room")
-    , ("M-C-9", spawn $ toggleHassCmd "fan-01")
-    , ("M-C-0", spawn $ toggleHassCmd "fan-02")
+    , ("C-M1-1", spawn $ toggleHassCmd "lamp-01")
+    , ("C-M1-2", spawn $ toggleHassCmd "lamp-02")
+    , ("C-M1-3", spawn $ toggleHassCmd "lamp-03")
+    , ("C-M1-4", spawn $ toggleHassCmd "lamp-04")
+    , ("C-M1-5", spawn $ toggleHassCmd "can-left")
+    , ("C-M1-6", spawn $ toggleHassCmd "can-right")
+    , ("C-M1-7", spawn $ toggleHassCmd "storage-room")
+    , ("C-M1-8", spawn $ toggleHassCmd "server-room")
+    , ("C-M1-9", spawn $ toggleHassCmd "fan-01")
+    , ("C-M1-0", spawn $ toggleHassCmd "fan-02")
     ]
+
+
+myStartupHook = do
+    
 
 
 -- layout settings
@@ -216,18 +220,38 @@ getEnvVar varName defaultValue = do
 --                        |___/                                              
 
 
-setXsettings :: IO ()
-setXsettings = do 
-    spawn getXsettings
+setXsettings :: String -> IO ()
+setXsettings hostName = do 
+    getXsettings hostName >>= spawn
 
 
+getXsettings :: String -> IO String
+getXsettings hostName = do 
+    specificSettings <- getXsettingsSpecificHost hostName
+    return $ intercalate "; " 
+        [ "xset s off -dpms"
+        , "xset r rate 200 50"
+        , ""
+        ] <> specificSettings
 
-getXsettings :: String 
-getXsettings = 
-    intercalate "; "
-    [ "xset s off -dpms"
-    , ""
-    ]
+getXsettingsSpecificHost :: String -> IO String
+getXsettingsSpecificHost "lt-zach" = do
+    touchPadProperty <- getXpropertyTouchpad "lt-zach"
+    return $ intercalate "; " 
+        [ "xinput set-prop " <> touchPadProperty <> " 295 1" -- https://askubuntu.com/questions/1000016/how-to-reverse-trackpoint-direction
+        , ""
+        ]
+getXsettingsSpecificHost _ = pure ""
+
+
+getXpropertyTouchpad :: String -> IO String 
+getXpropertyTouchpad "lt-zach" = do 
+    result <- readProcess 
+        "/usr/bin/bash" 
+        ["-c", "xinput list | grep -i Touchpad | awk '{print $6}' | awk -F= '{print $2}'"] 
+        "" 
+    return $ lines result !! 0
+
 
 
 --                   __ _          __ _ _                   _   _   _             
