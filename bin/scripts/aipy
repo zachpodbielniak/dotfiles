@@ -128,8 +128,24 @@ def check_db_available(debug=False):
             print(f"Warning: Could not connect to AI chats database: {e}", file=sys.stderr)
         return False
 
-def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None, context_ids=None, debug=False, dry_run=False, show_id=False):
-    """Store chat interaction in the database."""
+def extract_user_prompt(full_prompt):
+    """Extract the actual user prompt from a prompt that may include context."""
+    # Check if the prompt contains context
+    if "=== CONTEXT FROM PREVIOUS CONVERSATIONS ===" in full_prompt and "=== END CONTEXT ===" in full_prompt:
+        # Find the end of the context section
+        end_context_marker = "=== END CONTEXT ==="
+        context_end = full_prompt.find(end_context_marker)
+        if context_end != -1:
+            # Extract everything after the context section
+            user_prompt_start = context_end + len(end_context_marker)
+            user_prompt = full_prompt[user_prompt_start:].strip()
+            return user_prompt
+    
+    # If no context found, return the original prompt
+    return full_prompt
+
+def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None, context_ids=None, context_id=None, debug=False, dry_run=False, show_id=False):
+    """Store chat interaction in the database with context_uuid support."""
     if not DB_AVAILABLE:
         if debug:
             print("Warning: Database not available for chat storage", file=sys.stderr)
@@ -146,9 +162,65 @@ def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None
         conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
         cursor = conn.cursor()
         
-        # Generate hashes for prompt and response
-        prompt_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        # Extract the actual user prompt (without context)
+        clean_prompt = extract_user_prompt(prompt)
+        
+        # Generate hashes for the clean prompt and response
+        prompt_hash = hashlib.sha256(clean_prompt.encode('utf-8')).hexdigest()
         response_hash = hashlib.sha256(response.encode('utf-8')).hexdigest()
+        
+        # Determine context_uuid
+        context_uuid = None
+        
+        # Priority 1: Use directly specified context_id (--context-id)
+        if context_id:
+            # Close current cursor and use RealDictCursor for resolve_context_id
+            cursor.close()
+            resolved_context = resolve_context_id(context_id, debug)
+            if resolved_context:
+                context_uuid = resolved_context
+                if debug:
+                    print(f"Using specified context: {context_uuid}", file=sys.stderr)
+            else:
+                # Error already printed by resolve_context_id
+                conn.close()
+                return None
+            
+            # Reopen cursor for the rest of the function
+            cursor = conn.cursor()
+        
+        # Priority 2: Lookup context_uuid from existing chat_ids (--id)
+        elif context_ids:
+            # Lookup context_uuid from the first chat_id provided
+            chat_id = context_ids[0]
+            # Handle partial UUID (8 characters)
+            if len(chat_id) == 8:
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats WHERE CAST(id AS TEXT) LIKE %s LIMIT 1
+                """, [f"{chat_id}%"])
+            else:
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats WHERE id = %s::uuid
+                """, [chat_id])
+            
+            result = cursor.fetchone()
+            if result:
+                context_uuid = result[0]
+                if debug:
+                    print(f"Using existing context from chat: {context_uuid}", file=sys.stderr)
+            else:
+                if debug:
+                    print(f"Warning: Chat ID {chat_id} not found, creating new context", file=sys.stderr)
+        
+        # Priority 3: Create new context if none found
+        if not context_uuid:
+            cursor.execute("""
+                INSERT INTO ai_chat_contexts (name) VALUES ('<untitled>')
+                RETURNING context_uuid
+            """)
+            context_uuid = cursor.fetchone()[0]
+            if debug:
+                print(f"Created new context: {context_uuid}", file=sys.stderr)
         
         # Extract metadata
         request_timestamp = metadata.get('request_timestamp') if metadata else datetime.now()
@@ -161,25 +233,21 @@ def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None
         cost_total_usd = metadata.get('cost_total_usd') if metadata else None
         extra_metadata = metadata.get('extra_metadata', {}) if metadata else {}
         
-        # Add context references to metadata for conversation tracking
-        if context_ids:
-            extra_metadata['context_references'] = context_ids
-        
         # Process tags
         tags_array = tags if tags else []
         
         # Insert into database and return the UUID
         cursor.execute("""
             INSERT INTO ai_chats (
-                prompt, response, provider, model,
+                context_uuid, prompt, response, provider, model,
                 request_timestamp, response_timestamp, duration_ms,
                 tokens_input, tokens_output,
                 cost_input_usd, cost_output_usd, cost_total_usd,
                 prompt_hash, response_hash, tags, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
-            prompt, response, provider, model,
+            context_uuid, clean_prompt, response, provider, model,
             request_timestamp, response_timestamp, duration_ms,
             tokens_input, tokens_output,
             cost_input_usd, cost_output_usd, cost_total_usd,
@@ -187,6 +255,26 @@ def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None
         ))
         
         new_id = cursor.fetchone()[0]
+        
+        # Update context tags with all tags from chats in this context
+        if tags_array:  # Only update if this chat has tags
+            cursor.execute("""
+                UPDATE ai_chat_contexts 
+                SET tags = ARRAY(
+                    SELECT DISTINCT unnest(array_agg(tag))
+                    FROM (
+                        SELECT unnest(tags) as tag 
+                        FROM ai_chats 
+                        WHERE context_uuid = %s AND tags IS NOT NULL
+                    ) all_tags
+                    WHERE tag IS NOT NULL AND tag != ''
+                )
+                WHERE context_uuid = %s
+            """, [context_uuid, context_uuid])
+            
+            if debug:
+                print(f"Updated context tags for context: {context_uuid}", file=sys.stderr)
+        
         conn.commit()
         cursor.close()
         conn.close()
@@ -196,6 +284,7 @@ def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None
         
         if show_id:
             print(f"New chat ID: {new_id}", file=sys.stderr)
+            print(f"Context UUID: {context_uuid}", file=sys.stderr)
         
         return str(new_id)
     
@@ -225,24 +314,24 @@ def search_ai_chats(query, limit=10, provider_filter=None, model_filter=None, ta
         # Add text search if query is not a wildcard
         if query and query != "*":
             where_clauses.append(
-                "(to_tsvector('english', prompt) @@ plainto_tsquery('english', %s) OR "
-                "to_tsvector('english', response) @@ plainto_tsquery('english', %s))"
+                "(to_tsvector('english', a.prompt) @@ plainto_tsquery('english', %s) OR "
+                "to_tsvector('english', a.response) @@ plainto_tsquery('english', %s))"
             )
             params.extend([query, query])
         
         if provider_filter:
-            where_clauses.append("provider = %s")
+            where_clauses.append("a.provider = %s")
             params.append(provider_filter)
         
         if model_filter:
-            where_clauses.append("model = %s")
+            where_clauses.append("a.model = %s")
             params.append(model_filter)
         
         if tags_filter:
             # Support searching for any of the provided tags
             tag_conditions = []
             for tag in tags_filter:
-                tag_conditions.append("tags @> %s")
+                tag_conditions.append("a.tags @> %s")
                 params.append([tag.strip()])
             if tag_conditions:
                 where_clauses.append(f"({' OR '.join(tag_conditions)})")
@@ -253,41 +342,47 @@ def search_ai_chats(query, limit=10, provider_filter=None, model_filter=None, ta
         if query and query != "*":
             sql = f"""
             SELECT 
-                id,
-                LEFT(prompt, 100) as prompt_snippet,
-                LEFT(response, 100) as response_snippet,
-                provider,
-                model,
-                request_timestamp,
-                duration_ms,
-                cost_total_usd,
-                tags,
+                a.id,
+                LEFT(a.prompt, 100) as prompt_snippet,
+                LEFT(a.response, 100) as response_snippet,
+                a.provider,
+                a.model,
+                a.request_timestamp,
+                a.duration_ms,
+                a.cost_total_usd,
+                a.tags,
+                a.context_uuid,
+                c.name as context_name,
                 ts_rank(
-                    to_tsvector('english', prompt || ' ' || response), 
+                    to_tsvector('english', a.prompt || ' ' || a.response), 
                     plainto_tsquery('english', %s)
                 ) as rank
-            FROM ai_chats
+            FROM ai_chats a
+            JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
             WHERE {where_clause}
-            ORDER BY rank DESC, request_timestamp DESC
+            ORDER BY rank DESC, a.request_timestamp DESC
             LIMIT %s
             """
             params.extend([query, limit])
         else:
             sql = f"""
             SELECT 
-                id,
-                LEFT(prompt, 100) as prompt_snippet,
-                LEFT(response, 100) as response_snippet,
-                provider,
-                model,
-                request_timestamp,
-                duration_ms,
-                cost_total_usd,
-                tags,
+                a.id,
+                LEFT(a.prompt, 100) as prompt_snippet,
+                LEFT(a.response, 100) as response_snippet,
+                a.provider,
+                a.model,
+                a.request_timestamp,
+                a.duration_ms,
+                a.cost_total_usd,
+                a.tags,
+                a.context_uuid,
+                c.name as context_name,
                 0 as rank
-            FROM ai_chats
+            FROM ai_chats a
+            JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
             WHERE {where_clause}
-            ORDER BY request_timestamp DESC
+            ORDER BY a.request_timestamp DESC
             LIMIT %s
             """
             params.append(limit)
@@ -310,6 +405,7 @@ def search_ai_chats(query, limit=10, provider_filter=None, model_filter=None, ta
             
             for i, r in enumerate(results, 1):
                 print(f"\n{i}. [{str(r['id'])}] {r['provider']}/{r['model']}")
+                print(f"   Context: {r['context_name']} ({str(r['context_uuid'])[:8]}...)")
                 print(f"   Time: {r['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
                 if r['duration_ms']:
                     print(f"   Duration: {r['duration_ms']}ms")
@@ -328,7 +424,156 @@ def search_ai_chats(query, limit=10, provider_filter=None, model_filter=None, ta
         print(f"Error searching AI chats: {e}", file=sys.stderr)
         return False
 
-def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False, show_full_history=False, trace_mode=False):
+def search_contexts(query, limit=10, output_format='text', debug=False):
+    """Search AI chat contexts by name, summary content, or tags."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Handle wildcard search for all contexts
+        if query == '*':
+            where_clause = "TRUE"  # Show all contexts
+            params = []
+            order_params = []
+        else:
+            # Build search query with multiple conditions
+            search_conditions = []
+            params = []
+            
+            # Search in name (case insensitive)
+            search_conditions.append("LOWER(name) LIKE LOWER(%s)")
+            params.append(f"%{query}%")
+            
+            # Search in summary (full-text search if available, otherwise LIKE)
+            search_conditions.append("to_tsvector('english', COALESCE(summary, '')) @@ plainto_tsquery('english', %s)")
+            params.append(query)
+            
+            # Search in tags (using GIN array search)
+            search_conditions.append("tags @> ARRAY[%s] OR %s = ANY(tags)")
+            params.extend([query.lower(), query.lower()])
+            
+            # Combine all search conditions with OR
+            where_clause = " OR ".join([f"({condition})" for condition in search_conditions])
+            
+            # Parameters for ordering (only used when not wildcard)
+            order_params = [f"%{query}%", query.lower(), query.lower()]
+        
+        # Build SQL query with appropriate ordering
+        if query == '*':
+            # For wildcard, simple ordering by activity
+            sql = f"""
+            SELECT 
+                context_uuid,
+                name,
+                summary,
+                tags,
+                created_at,
+                updated_at,
+                summary_last_updated,
+                (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+                (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+            FROM ai_chat_contexts ctx
+            WHERE {where_clause}
+            ORDER BY 
+                last_chat_time DESC NULLS LAST,
+                created_at DESC
+            LIMIT %s
+            """
+            params.append(limit)
+        else:
+            # For regular search, relevance-based ordering
+            sql = f"""
+            SELECT 
+                context_uuid,
+                name,
+                summary,
+                tags,
+                created_at,
+                updated_at,
+                summary_last_updated,
+                (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+                (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+            FROM ai_chat_contexts ctx
+            WHERE {where_clause}
+            ORDER BY 
+                CASE 
+                    WHEN LOWER(name) LIKE LOWER(%s) THEN 1
+                    WHEN tags @> ARRAY[%s] OR %s = ANY(tags) THEN 2
+                    ELSE 3
+                END,
+                last_chat_time DESC NULLS LAST,
+                created_at DESC
+            LIMIT %s
+            """
+            # Add parameters for ordering and limit
+            params.extend(order_params + [limit])
+        
+        if debug:
+            print(f"Search SQL: {sql}", file=sys.stderr)
+            print(f"Parameters: {params}", file=sys.stderr)
+        
+        cursor.execute(sql, params)
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        if output_format == 'json':
+            print(json.dumps([dict(r) for r in results], default=str, indent=2))
+        else:
+            if not results:
+                if query == '*':
+                    print("No contexts found.")
+                else:
+                    print("No contexts found.")
+                return True
+            
+            if query == '*':
+                print(f"\nAll contexts ({len(results)} found):")
+            else:
+                print(f"\nContext search results for: \"{query}\"")
+            print("=" * 60)
+            
+            for i, r in enumerate(results, 1):
+                uuid_short = str(r['context_uuid'])[:8]
+                print(f"\n{i}. [{uuid_short}...] {r['name']}")
+                print(f"   UUID: {r['context_uuid']}")
+                print(f"   Created: {r['created_at'].strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"   Chats: {r['chat_count']}")
+                
+                if r['last_chat_time']:
+                    print(f"   Last Chat: {r['last_chat_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                if r['summary']:
+                    summary_preview = r['summary'][:150]
+                    print(f"   Summary: {summary_preview}{'...' if len(r['summary']) > 150 else ''}")
+                
+                if r['tags']:
+                    print(f"   Tags: {', '.join(r['tags'])}")
+                
+                if r['summary_last_updated']:
+                    print(f"   Summary Updated: {r['summary_last_updated'].strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            if query == '*':
+                print(f"\nShowing {len(results)} contexts.")
+            else:
+                print(f"\nFound {len(results)} contexts.")
+        
+        return True
+    
+    except psycopg2.Error as e:
+        print(f"Error searching contexts: {e}", file=sys.stderr)
+        return False
+
+def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False, show_full_history=False, trace_mode=False, content_only=False):
     """View full AI chat by UUID with optional conversation history."""
     if not DB_AVAILABLE:
         print("Error: Database dependencies not available", file=sys.stderr)
@@ -346,7 +591,10 @@ def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False,
         if len(chat_id) == 8:
             # Search for UUIDs starting with this prefix
             cursor.execute("""
-                SELECT * FROM ai_chats WHERE CAST(id AS TEXT) LIKE %s
+                SELECT a.*, c.name as context_name 
+                FROM ai_chats a 
+                JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid 
+                WHERE CAST(a.id AS TEXT) LIKE %s
             """, [f"{chat_id}%"])
             
             results = cursor.fetchall()
@@ -370,7 +618,10 @@ def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False,
         else:
             # Try to use as full UUID
             cursor.execute("""
-                SELECT * FROM ai_chats WHERE id = %s::uuid
+                SELECT a.*, c.name as context_name 
+                FROM ai_chats a 
+                JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid 
+                WHERE a.id = %s::uuid
             """, [chat_id])
             
             result = cursor.fetchone()
@@ -388,16 +639,20 @@ def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False,
         if show_history or show_full_history:
             history = build_conversation_history(chat_id, include_forward=show_full_history, debug=debug)
             if history:
-                print(format_conversation_history(history, trace_mode=trace_mode))
+                print(format_conversation_history(history, trace_mode=trace_mode, content_only=content_only))
                 return True
             elif show_history or show_full_history:
                 print("No conversation history found. Showing individual chat:")
         
-        if output_format == 'json':
+        # Handle content-only format
+        if content_only:
+            print(format_chat_content_only(result))
+        elif output_format == 'json':
             print(json.dumps(dict(result), default=str, indent=2))
         else:
             print("=" * 80)
             print(f"Chat ID: {result['id']}")
+            print(f"Context: {result['context_name']} ({result['context_uuid']})")
             print(f"Provider: {result['provider']}")
             print(f"Model: {result['model']}")
             print(f"Request Time: {result['request_timestamp']}")
@@ -604,7 +859,7 @@ def format_context_for_prompt(context_chats):
     return "\n".join(context_parts)
 
 def build_conversation_history(chat_id, include_forward=False, debug=False):
-    """Build conversation history by following context references."""
+    """Build conversation history by getting all chats in the same context."""
     if not DB_AVAILABLE:
         if debug:
             print("Warning: Database not available for history reconstruction", file=sys.stderr)
@@ -619,118 +874,903 @@ def build_conversation_history(chat_id, include_forward=False, debug=False):
         conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # Get all chats to build the graph
+        # First, get the context_uuid for the given chat_id
+        # Handle partial UUID (8 characters)
+        if len(chat_id) == 8:
+            cursor.execute("""
+                SELECT context_uuid FROM ai_chats WHERE CAST(id AS TEXT) LIKE %s LIMIT 1
+            """, [f"{chat_id}%"])
+        else:
+            cursor.execute("""
+                SELECT context_uuid FROM ai_chats WHERE id = %s::uuid
+            """, [chat_id])
+        
+        result = cursor.fetchone()
+        if not result:
+            cursor.close()
+            conn.close()
+            if debug:
+                print(f"Warning: Chat ID {chat_id} not found", file=sys.stderr)
+            return []
+        
+        context_uuid = result['context_uuid']
+        
+        # Get all chats in the same context, ordered by timestamp
         cursor.execute("""
-            SELECT id, prompt, response, provider, model, request_timestamp, tags, metadata
-            FROM ai_chats
-            ORDER BY request_timestamp ASC
-        """)
+            SELECT a.id, a.prompt, a.response, a.provider, a.model, a.request_timestamp, a.tags, a.metadata, 
+                   a.context_uuid, c.name as context_name
+            FROM ai_chats a
+            JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+            WHERE a.context_uuid = %s
+            ORDER BY a.request_timestamp ASC
+        """, [context_uuid])
         
         all_chats = cursor.fetchall()
         cursor.close()
         conn.close()
         
-        # Build chat lookup and reference graph
-        chat_lookup = {}
-        references = {}  # chat_id -> list of referenced chat_ids
-        referenced_by = {}  # chat_id -> list of chats that reference it
-        
+        # Convert to the expected format
+        conversation_history = []
         for chat in all_chats:
-            chat_id_str = str(chat['id'])
-            chat_lookup[chat_id_str] = {
-                'id': chat_id_str,
+            conversation_history.append({
+                'id': str(chat['id']),
                 'prompt': chat['prompt'],
                 'response': chat['response'],
                 'provider': chat['provider'],
                 'model': chat['model'],
                 'timestamp': chat['request_timestamp'],
-                'tags': chat['tags'] or []
-            }
-            
-            # Extract context references from metadata
-            metadata = chat['metadata']
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            
-            context_refs = metadata.get('context_references', []) if metadata else []
-            references[chat_id_str] = context_refs
-            
-            # Build reverse lookup
-            for ref_id in context_refs:
-                if ref_id not in referenced_by:
-                    referenced_by[ref_id] = []
-                referenced_by[ref_id].append(chat_id_str)
+                'tags': chat['tags'] or [],
+                'context_uuid': str(chat['context_uuid']),
+                'context_name': chat['context_name']
+            })
         
-        # Build history chain
-        history = []
-        visited = set()
+        if debug:
+            print(f"Found {len(conversation_history)} chats in context {context_uuid}", file=sys.stderr)
         
-        def collect_backward_history(current_id):
-            """Recursively collect chat history going backwards."""
-            if current_id in visited or current_id not in chat_lookup:
-                return
-            
-            visited.add(current_id)
-            
-            # First, collect all referenced chats (going backward)
-            for ref_id in references.get(current_id, []):
-                collect_backward_history(ref_id)
-            
-            # Then add this chat
-            history.append(chat_lookup[current_id])
-        
-        def collect_forward_history(current_id):
-            """Recursively collect chats that reference this one (going forward)."""
-            if current_id in visited or current_id not in chat_lookup:
-                return
-            
-            visited.add(current_id)
-            
-            # Add this chat first
-            history.append(chat_lookup[current_id])
-            
-            # Then collect all chats that reference this one (going forward)
-            for forward_id in referenced_by.get(current_id, []):
-                collect_forward_history(forward_id)
-        
-        # Start collection
-        if include_forward:
-            # For full history, we need to find the root of the conversation tree
-            # Start by finding all chats that are referenced by our target chat
-            target_refs = references.get(chat_id, [])
-            
-            # Collect backward history for each reference point
-            for ref_id in target_refs:
-                collect_backward_history(ref_id)
-            
-            # Add the target chat itself
-            if chat_id in chat_lookup and chat_id not in visited:
-                history.append(chat_lookup[chat_id])
-                visited.add(chat_id)
-            
-            # Then collect forward references
-            for forward_id in referenced_by.get(chat_id, []):
-                collect_forward_history(forward_id)
-        else:
-            # Just backward history to this chat
-            collect_backward_history(chat_id)
-        
-        # Sort by timestamp to maintain chronological order
-        history.sort(key=lambda x: x['timestamp'])
-        
-        return history
+        return conversation_history
     
     except psycopg2.Error as e:
         if debug:
             print(f"Warning: Failed to build conversation history: {e}", file=sys.stderr)
         return []
 
-def format_conversation_history(history, trace_mode=False):
+def view_context(context_uuid, output_format='text', debug=False, content_only=False, by_chat_uuid=False):
+    """View entire conversation context by context_uuid or by chat_uuid."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # If by_chat_uuid is True, lookup context_uuid from chat_uuid
+        if by_chat_uuid:
+            chat_uuid = context_uuid  # Rename for clarity
+            
+            # Handle partial chat UUID (8 characters)
+            if len(chat_uuid) == 8:
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats WHERE CAST(id AS TEXT) LIKE %s
+                """, [f"{chat_uuid}%"])
+                
+                results = cursor.fetchall()
+                
+                if not results:
+                    cursor.close()
+                    conn.close()
+                    print(f"No chat found with UUID starting with: {chat_uuid}")
+                    return False
+                elif len(results) > 1:
+                    cursor.close()
+                    conn.close()
+                    print(f"Multiple chats found with UUID starting with '{chat_uuid}':")
+                    # Get more details for disambiguation
+                    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    cursor.execute("""
+                        SELECT id, provider, model, request_timestamp 
+                        FROM ai_chats WHERE CAST(id AS TEXT) LIKE %s
+                        ORDER BY request_timestamp DESC
+                    """, [f"{chat_uuid}%"])
+                    chat_results = cursor.fetchall()
+                    for r in chat_results:
+                        print(f"  - {r['id']} ({r['provider']}/{r['model']}, {r['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')})")
+                    cursor.close()
+                    conn.close()
+                    print("Please provide the full chat UUID to view its context.")
+                    return False
+                else:
+                    context_uuid = str(results[0]['context_uuid'])
+            else:
+                # Full chat UUID
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats WHERE id = %s::uuid
+                """, [chat_uuid])
+                
+                result = cursor.fetchone()
+                if not result:
+                    cursor.close()
+                    conn.close()
+                    print(f"No chat found with UUID: {chat_uuid}")
+                    return False
+                
+                context_uuid = str(result['context_uuid'])
+            
+            if debug:
+                print(f"Found context UUID {context_uuid} for chat UUID {chat_uuid}", file=sys.stderr)
+        
+        # Handle partial context UUID (8 characters)
+        elif len(context_uuid) == 8:
+            cursor.execute("""
+                SELECT context_uuid FROM ai_chat_contexts WHERE CAST(context_uuid AS TEXT) LIKE %s
+            """, [f"{context_uuid}%"])
+            
+            results = cursor.fetchall()
+            
+            if not results:
+                cursor.close()
+                conn.close()
+                print(f"No context found with UUID starting with: {context_uuid}")
+                return False
+            elif len(results) > 1:
+                cursor.close()
+                conn.close()
+                print(f"Multiple contexts found with UUID starting with '{context_uuid}':")
+                for r in results:
+                    print(f"  - {r['context_uuid']}")
+                print("Please provide the full UUID to view a specific context.")
+                return False
+            else:
+                context_uuid = str(results[0]['context_uuid'])
+        
+        # Get context info
+        cursor.execute("""
+            SELECT * FROM ai_chat_contexts WHERE context_uuid = %s::uuid
+        """, [context_uuid])
+        
+        context_info = cursor.fetchone()
+        if not context_info:
+            cursor.close()
+            conn.close()
+            print(f"No context found with UUID: {context_uuid}")
+            return False
+        
+        # Get all chats in this context
+        cursor.execute("""
+            SELECT * FROM ai_chats WHERE context_uuid = %s
+            ORDER BY request_timestamp ASC
+        """, [context_uuid])
+        
+        chats = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not chats:
+            print(f"No chats found in context: {context_uuid}")
+            return False
+        
+        if content_only:
+            # Show content-only format
+            output = []
+            output.append(f"# {context_info['name']} ({context_info['context_uuid']})")
+            output.append("")
+            
+            # Add summary as first subsection if available
+            if context_info['summary']:
+                output.append("## Summary")
+                output.append("")
+                output.append(context_info['summary'])
+                output.append("")
+                output.append("---")
+                output.append("")
+            
+            for chat in chats:
+                full_id = str(chat['id'])
+                output.append(f"## Question ({full_id} - {chat['provider']}/{chat['model']})")
+                output.append("")
+                output.append(chat['prompt'])
+                output.append("")
+                output.append(f"## Response ({full_id} - {chat['provider']}/{chat['model']})")
+                output.append("")
+                output.append(chat['response'])
+                output.append("")
+                output.append("---")
+                output.append("")
+            
+            # Remove last separator
+            if output and output[-2] == "---":
+                output = output[:-2]
+            
+            print("\n".join(output))
+        elif output_format == 'json':
+            context_data = {
+                'context': dict(context_info),
+                'chats': [dict(chat) for chat in chats]
+            }
+            print(json.dumps(context_data, default=str, indent=2))
+        else:
+            # Regular format
+            print("=" * 80)
+            print(f"Context: {context_info['name']}")
+            print(f"Context UUID: {context_info['context_uuid']}")
+            print(f"Created: {context_info['created_at']}")
+            print(f"Updated: {context_info['updated_at']}")
+            print(f"Total Chats: {len(chats)}")
+            print("=" * 80)
+            
+            for i, chat in enumerate(chats, 1):
+                print(f"\n[{i}] {chat['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')} | {chat['provider']}/{chat['model']} | {str(chat['id'])[:8]}...")
+                if chat['tags']:
+                    print(f"   Tags: {', '.join(chat['tags'])}")
+                print("-" * 80)
+                print(f"PROMPT:\n{chat['prompt']}")
+                print(f"\nRESPONSE:\n{chat['response']}")
+            
+            # Display summary at the bottom if available
+            if context_info['summary']:
+                print("\n" + "=" * 80)
+                print("CONTEXT SUMMARY:")
+                print("=" * 80)
+                print(context_info['summary'])
+                if context_info['summary_last_updated']:
+                    print(f"\nLast updated: {context_info['summary_last_updated'].strftime('%Y-%m-%d %H:%M:%S')}")
+                if context_info['summary_provider'] and context_info['summary_model']:
+                    print(f"Generated by: {context_info['summary_provider']}/{context_info['summary_model']}")
+        
+        return True
+    
+    except psycopg2.Error as e:
+        print(f"Error viewing context: {e}", file=sys.stderr)
+        return False
+
+def edit_context(context_uuid, name=None, debug=False):
+    """Edit context properties like name."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    if not name:
+        print("Error: --name is required when using --edit-context", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Handle partial UUID (8 characters)
+        if len(context_uuid) == 8:
+            cursor.execute("""
+                SELECT context_uuid FROM ai_chat_contexts WHERE CAST(context_uuid AS TEXT) LIKE %s
+            """, [f"{context_uuid}%"])
+            
+            results = cursor.fetchall()
+            
+            if not results:
+                cursor.close()
+                conn.close()
+                print(f"No context found with UUID starting with: {context_uuid}")
+                return False
+            elif len(results) > 1:
+                cursor.close()
+                conn.close()
+                print(f"Multiple contexts found with UUID starting with '{context_uuid}':")
+                for r in results:
+                    print(f"  - {r['context_uuid']}")
+                print("Please provide the full UUID to edit a specific context.")
+                return False
+            else:
+                context_uuid = str(results[0]['context_uuid'])
+        
+        # Update the context name
+        cursor.execute("""
+            UPDATE ai_chat_contexts SET name = %s WHERE context_uuid = %s::uuid
+            RETURNING *
+        """, [name, context_uuid])
+        
+        result = cursor.fetchone()
+        if not result:
+            cursor.close()
+            conn.close()
+            print(f"No context found with UUID: {context_uuid}")
+            return False
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"Context updated successfully:")
+        print(f"  UUID: {result['context_uuid']}")
+        print(f"  Name: {result['name']}")
+        print(f"  Updated: {result['updated_at']}")
+        
+        return True
+    
+    except psycopg2.Error as e:
+        print(f"Error editing context: {e}", file=sys.stderr)
+        return False
+
+def summarize_context(context_uuid, model=None, debug=False):
+    """Generate a summary for a context using the specified model."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    # Use default model if not specified
+    if not model:
+        model = "grok-3"  # Default model
+    
+    # Get provider for the model
+    provider = get_provider_for_model(model)
+    if not provider:
+        print(f"Error: No provider found for model {model}", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Handle partial UUID (8 characters)
+        if len(context_uuid) == 8:
+            cursor.execute("""
+                SELECT context_uuid FROM ai_chat_contexts WHERE CAST(context_uuid AS TEXT) LIKE %s
+            """, [f"{context_uuid}%"])
+            
+            results = cursor.fetchall()
+            
+            if not results:
+                cursor.close()
+                conn.close()
+                print(f"No context found with UUID starting with: {context_uuid}")
+                return False
+            elif len(results) > 1:
+                cursor.close()
+                conn.close()
+                print(f"Multiple contexts found with UUID starting with '{context_uuid}':")
+                for r in results:
+                    print(f"  - {r['context_uuid']}")
+                print("Please provide the full UUID to summarize a specific context.")
+                return False
+            else:
+                context_uuid = str(results[0]['context_uuid'])
+        
+        # Get all chats in this context
+        cursor.execute("""
+            SELECT a.*, c.name as context_name
+            FROM ai_chats a
+            JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+            WHERE a.context_uuid = %s
+            ORDER BY a.request_timestamp ASC
+        """, [context_uuid])
+        
+        chats = cursor.fetchall()
+        
+        if not chats:
+            cursor.close()
+            conn.close()
+            print(f"No chats found in context: {context_uuid}")
+            return False
+        
+        # Build conversation text for summarization
+        conversation_text = []
+        for chat in chats:
+            conversation_text.append(f"User: {chat['prompt']}")
+            conversation_text.append(f"Assistant: {chat['response']}")
+        
+        full_conversation = "\n\n".join(conversation_text)
+        
+        # Create summarization prompt
+        summary_prompt = f"""Please provide a comprehensive summary of this conversation. Focus on the main topics discussed, key decisions made, and important information exchanged. Keep the summary informative but concise (2-3 paragraphs maximum).
+
+Conversation:
+{full_conversation}
+
+Summary:"""
+        
+        print(f"Generating summary using {provider}/{model}...")
+        
+        # Run the summarization using the specified provider/model
+        import subprocess
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(summary_prompt)
+            temp_file = f.name
+        
+        try:
+            cmd = [provider, "--model", model, "--no-preserve", "-f", temp_file]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            
+            if result.returncode != 0:
+                print(f"Error running {provider}: {result.stderr}", file=sys.stderr)
+                return False
+            
+            summary = result.stdout.strip()
+            if not summary:
+                print("Error: Empty summary generated", file=sys.stderr)
+                return False
+            
+            # Update context with summary
+            cursor.execute("""
+                UPDATE ai_chat_contexts 
+                SET summary = %s, summary_provider = %s, summary_model = %s, summary_last_updated = CURRENT_TIMESTAMP
+                WHERE context_uuid = %s
+                RETURNING *
+            """, [summary, provider, model, context_uuid])
+            
+            result_row = cursor.fetchone()
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            print(f"Summary generated successfully for context: {chats[0]['context_name']}")
+            print(f"Context UUID: {context_uuid}")
+            print(f"Summary Provider/Model: {provider}/{model}")
+            print(f"\nSummary:\n{summary}")
+            
+            return True
+            
+        finally:
+            import os
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+    
+    except psycopg2.Error as e:
+        print(f"Error summarizing context: {e}", file=sys.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        print("Error: Summary generation timed out", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Error during summarization: {e}", file=sys.stderr)
+        return False
+
+def generate_context_name(context_uuid, model=None, debug=False):
+    """Generate a name for a context based on its summary."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    # Use default model if not specified
+    if not model:
+        model = "grok-3"  # Default model
+    
+    # Get provider for the model
+    provider = get_provider_for_model(model)
+    if not provider:
+        print(f"Error: No provider found for model {model}", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Handle partial UUID (8 characters)
+        if len(context_uuid) == 8:
+            cursor.execute("""
+                SELECT context_uuid FROM ai_chat_contexts WHERE CAST(context_uuid AS TEXT) LIKE %s
+            """, [f"{context_uuid}%"])
+            
+            results = cursor.fetchall()
+            
+            if not results:
+                cursor.close()
+                conn.close()
+                print(f"No context found with UUID starting with: {context_uuid}")
+                return False
+            elif len(results) > 1:
+                cursor.close()
+                conn.close()
+                print(f"Multiple contexts found with UUID starting with '{context_uuid}':")
+                for r in results:
+                    print(f"  - {r['context_uuid']}")
+                print("Please provide the full UUID to generate a name for a specific context.")
+                return False
+            else:
+                context_uuid = str(results[0]['context_uuid'])
+        
+        # Get context info
+        cursor.execute("""
+            SELECT * FROM ai_chat_contexts WHERE context_uuid = %s
+        """, [context_uuid])
+        
+        context_info = cursor.fetchone()
+        if not context_info:
+            cursor.close()
+            conn.close()
+            print(f"No context found with UUID: {context_uuid}")
+            return False
+        
+        # Check if we have a summary
+        if not context_info['summary']:
+            print(f"No summary found for context. Generating summary first...")
+            cursor.close()
+            conn.close()
+            
+            # Generate summary first
+            if not summarize_context(context_uuid, model, debug):
+                return False
+            
+            # Re-fetch context info
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute("""
+                SELECT * FROM ai_chat_contexts WHERE context_uuid = %s
+            """, [context_uuid])
+            context_info = cursor.fetchone()
+        
+        summary = context_info['summary']
+        
+        # Create name generation prompt
+        name_prompt = f"""Based on the following conversation summary, generate a concise, descriptive name for this conversation context. The name should be 8 words or less and capture the main topic or purpose of the conversation.
+
+Summary:
+{summary}
+
+Generate a name that is:
+- 8 words or less
+- Descriptive and clear
+- Suitable as a conversation title
+- Focused on the main topic
+
+Name:"""
+        
+        print(f"Generating context name using {provider}/{model}...")
+        
+        # Run the name generation using the specified provider/model
+        import subprocess
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(name_prompt)
+            temp_file = f.name
+        
+        try:
+            cmd = [provider, "--model", model, "--no-preserve", "-f", temp_file]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode != 0:
+                print(f"Error running {provider}: {result.stderr}", file=sys.stderr)
+                return False
+            
+            generated_name = result.stdout.strip()
+            if not generated_name:
+                print("Error: Empty name generated", file=sys.stderr)
+                return False
+            
+            # Clean up the generated name (remove quotes, limit length)
+            generated_name = generated_name.strip('"\'').strip()
+            words = generated_name.split()
+            if len(words) > 8:
+                generated_name = ' '.join(words[:8])
+            
+            # Update context with the new name
+            cursor.execute("""
+                UPDATE ai_chat_contexts 
+                SET name = %s
+                WHERE context_uuid = %s
+                RETURNING *
+            """, [generated_name, context_uuid])
+            
+            result_row = cursor.fetchone()
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            print(f"Name generated successfully for context:")
+            print(f"Context UUID: {context_uuid}")
+            print(f"New Name: {generated_name}")
+            print(f"Generated by: {provider}/{model}")
+            
+            return True
+            
+        finally:
+            import os
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+    
+    except psycopg2.Error as e:
+        print(f"Error generating context name: {e}", file=sys.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        print("Error: Name generation timed out", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Error during name generation: {e}", file=sys.stderr)
+        return False
+
+def summarize_contexts_missing(model=None, debug=False):
+    """Summarize all contexts that don't have summaries."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    # Use default model if not specified
+    if not model:
+        model = "grok-3"  # Default model
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Find contexts without summaries
+        cursor.execute("""
+            SELECT context_uuid, name FROM ai_chat_contexts 
+            WHERE summary IS NULL OR summary = ''
+            ORDER BY created_at DESC
+        """)
+        
+        contexts_to_summarize = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not contexts_to_summarize:
+            print("No contexts found that need summaries.")
+            return True
+        
+        print(f"Found {len(contexts_to_summarize)} contexts without summaries.")
+        print(f"Will summarize using model: {model}")
+        
+        success_count = 0
+        failure_count = 0
+        
+        for context in contexts_to_summarize:
+            context_uuid = str(context['context_uuid'])
+            context_name = context['name'] or '<untitled>'
+            
+            print(f"\nSummarizing context: {context_name} ({context_uuid[:8]}...)")
+            
+            if summarize_context(context_uuid, model, debug):
+                success_count += 1
+                print(f"✓ Successfully summarized context {context_uuid[:8]}...")
+            else:
+                failure_count += 1
+                print(f"✗ Failed to summarize context {context_uuid[:8]}...")
+        
+        print(f"\nSummary complete:")
+        print(f"- Successfully summarized: {success_count}")
+        print(f"- Failed to summarize: {failure_count}")
+        
+        return failure_count == 0
+        
+    except psycopg2.Error as e:
+        print(f"Error finding contexts to summarize: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Error during batch summarization: {e}", file=sys.stderr)
+        return False
+
+def summarize_contexts_outdated(model=None, debug=False):
+    """Update summaries for contexts with newer chats than summary_last_updated."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    # Use default model if not specified
+    if not model:
+        model = "grok-3"  # Default model
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Find contexts that have chats newer than their summary_last_updated
+        cursor.execute("""
+            SELECT DISTINCT ctx.context_uuid, ctx.name, ctx.summary_last_updated,
+                   MAX(chat.request_timestamp) as latest_chat
+            FROM ai_chat_contexts ctx
+            JOIN ai_chats chat ON ctx.context_uuid = chat.context_uuid
+            WHERE ctx.summary IS NOT NULL 
+              AND ctx.summary != ''
+              AND (ctx.summary_last_updated IS NULL 
+                   OR chat.request_timestamp > ctx.summary_last_updated)
+            GROUP BY ctx.context_uuid, ctx.name, ctx.summary_last_updated
+            ORDER BY latest_chat DESC
+        """)
+        
+        contexts_to_update = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not contexts_to_update:
+            print("No contexts found with outdated summaries.")
+            return True
+        
+        print(f"Found {len(contexts_to_update)} contexts with outdated summaries.")
+        print(f"Will update summaries using model: {model}")
+        
+        success_count = 0
+        failure_count = 0
+        
+        for context in contexts_to_update:
+            context_uuid = str(context['context_uuid'])
+            context_name = context['name'] or '<untitled>'
+            last_updated = context['summary_last_updated']
+            latest_chat = context['latest_chat']
+            
+            print(f"\nUpdating summary for context: {context_name} ({context_uuid[:8]}...)")
+            if last_updated:
+                print(f"  Last summary update: {last_updated}")
+            else:
+                print(f"  Last summary update: Never")
+            print(f"  Latest chat: {latest_chat}")
+            
+            if summarize_context(context_uuid, model, debug):
+                success_count += 1
+                print(f"✓ Successfully updated summary for context {context_uuid[:8]}...")
+            else:
+                failure_count += 1
+                print(f"✗ Failed to update summary for context {context_uuid[:8]}...")
+        
+        print(f"\nSummary update complete:")
+        print(f"- Successfully updated: {success_count}")
+        print(f"- Failed to update: {failure_count}")
+        
+        return failure_count == 0
+        
+    except psycopg2.Error as e:
+        print(f"Error finding contexts to update: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Error during batch summary update: {e}", file=sys.stderr)
+        return False
+
+def resolve_context_id(context_id, debug=False):
+    """Resolve a context ID (supporting partial UUIDs) to a full context UUID."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Error: Database dependencies not available", file=sys.stderr)
+        return None
+    
+    if not check_db_available(debug):
+        if debug:
+            print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return None
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Handle partial UUID (8 characters)
+        if len(context_id) == 8:
+            cursor.execute("""
+                SELECT context_uuid, name FROM ai_chat_contexts 
+                WHERE CAST(context_uuid AS TEXT) LIKE %s
+            """, [f"{context_id}%"])
+            
+            results = cursor.fetchall()
+            
+            if not results:
+                cursor.close()
+                conn.close()
+                print(f"No context found with UUID starting with: {context_id}", file=sys.stderr)
+                return None
+            elif len(results) > 1:
+                cursor.close()
+                conn.close()
+                print(f"Multiple contexts found with UUID starting with '{context_id}':", file=sys.stderr)
+                for r in results:
+                    context_name = r['name'] or '<untitled>'
+                    print(f"  - {r['context_uuid']} ({context_name})", file=sys.stderr)
+                print("Please provide the full UUID to specify a unique context.", file=sys.stderr)
+                return None
+            else:
+                resolved_uuid = str(results[0]['context_uuid'])
+                if debug:
+                    context_name = results[0]['name'] or '<untitled>'
+                    print(f"Resolved context {context_id} to {resolved_uuid} ({context_name})", file=sys.stderr)
+                cursor.close()
+                conn.close()
+                return resolved_uuid
+        else:
+            # Full UUID - validate it exists
+            cursor.execute("""
+                SELECT context_uuid, name FROM ai_chat_contexts 
+                WHERE context_uuid = %s::uuid
+            """, [context_id])
+            
+            result = cursor.fetchone()
+            if not result:
+                cursor.close()
+                conn.close()
+                print(f"No context found with UUID: {context_id}", file=sys.stderr)
+                return None
+            
+            if debug:
+                context_name = result['name'] or '<untitled>'
+                print(f"Validated context {context_id} ({context_name})", file=sys.stderr)
+            
+            cursor.close()
+            conn.close()
+            return context_id
+    
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Error resolving context ID: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        if debug:
+            print(f"Error during context ID resolution: {e}", file=sys.stderr)
+        return None
+
+def format_chat_content_only(chat_data):
+    """Format a single chat in content-only markdown format."""
+    # Use full UUID for chat ID
+    full_id = str(chat_data['id'])
+    context_uuid = str(chat_data['context_uuid'])
+    context_name = chat_data.get('context_name', '<untitled>')
+    
+    output = []
+    output.append(f"# {context_name} ({context_uuid})")
+    output.append("")
+    output.append(f"## Question ({full_id} - {chat_data['provider']}/{chat_data['model']})")
+    output.append("")
+    output.append(chat_data['prompt'])
+    output.append("")
+    output.append(f"## Response ({full_id} - {chat_data['provider']}/{chat_data['model']})")
+    output.append("")
+    output.append(chat_data['response'])
+    
+    return "\n".join(output)
+
+def format_conversation_history(history, trace_mode=False, content_only=False):
     """Format conversation history for display."""
     if not history:
         return "No conversation history found."
     
-    if trace_mode:
+    if content_only:
+        # Show content-only format for the entire conversation
+        output = []
+        # Use the first chat's context info for the main header
+        if history:
+            first_chat = history[0]
+            context_name = first_chat.get('context_name', '<untitled>')
+            context_uuid = first_chat.get('context_uuid', 'unknown')
+            output.append(f"# {context_name} ({context_uuid})")
+            output.append("")
+        
+        for chat in history:
+            full_id = chat['id']
+            output.append(f"## Question ({full_id} - {chat['provider']}/{chat['model']})")
+            output.append("")
+            output.append(chat['prompt'])
+            output.append("")
+            output.append(f"## Response ({full_id} - {chat['provider']}/{chat['model']})")
+            output.append("")
+            output.append(chat['response'])
+            output.append("")
+            output.append("---")
+            output.append("")
+        
+        # Remove the last separator
+        if output and output[-2] == "---":
+            output = output[:-2]
+        
+        return "\n".join(output)
+    elif trace_mode:
         # Show trace format
         output = ["Conversation Flow Trace:"]
         output.append("=" * 40)
@@ -823,7 +1863,7 @@ Then provide a brief explanation of why that response is superior to the others.
     
     return None, "No successful responses to choose from"
 
-def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=None, context_ids=None, store_db=True, debug=False, dry_run=False, show_id=False):
+def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=None, context_ids=None, context_id=None, store_db=True, debug=False, dry_run=False, show_id=False):
     """Save multi-model chat transaction to markdown file organized by date and optionally to database."""
     # Create directory structure if it doesn't exist
     base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
@@ -915,7 +1955,8 @@ def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=
                     model, 
                     db_metadata,
                     tags=tags,
-                    context_ids=context_ids, 
+                    context_ids=context_ids,
+                    context_id=context_id,
                     debug=debug, 
                     dry_run=dry_run,
                     show_id=show_id
@@ -932,139 +1973,246 @@ def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Universal AI provider wrapper - intelligently routes to the appropriate AI service",
+        prog="aipy",
+        description="""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    Universal AI Provider Wrapper
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Intelligently routes requests to appropriate AI providers while maintaining
+conversation history, context threading, and advanced search capabilities.
+
+Supported Providers: Claude, Grok, Gemini, OpenAI, Ollama, Perplexity
+        """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Basic usage
-  aipy "What is quantum computing?"                    # Uses default model
-  aipy --model gpt-4o "Explain AI"                   # Routes to OpenAI
-  aipy --model sonar-pro "Latest news"               # Routes to Perplexity
-  aipy --model claude-3-5-sonnet-latest "Help me"    # Routes to Claude
-  aipy --model gpt-4o,claude-3-5-sonnet "Compare"    # Multiple models in parallel
-  aipy --times 3 --image-gen "A sunset"              # Generate 3 images
-  aipy -L                                             # List all available models
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 BASIC USAGE
+  aipy "What is quantum computing?"
+  aipy --model gpt-4o "Explain machine learning"
+  aipy --model claude-3-5-sonnet-latest "Help with coding"
+
+🔀 MULTI-MODEL COMPARISON
+  aipy --model "gpt-4o,claude-3-5-sonnet,grok-3" "Compare AI approaches"
+  aipy --model "gpt-4o,claude-3-5-sonnet" --pick-best "Complex analysis"
+
+🎨 IMAGE GENERATION
+  aipy --image-gen "A beautiful sunset over mountains"
+  aipy --times 3 --image-gen "Abstract art in blue tones"
+  aipy --image-gen --hd --output sunset.png "Photorealistic sunset"
+
+📁 FILE AND MEDIA INPUT
+  aipy -f config.yaml "Explain this configuration"
+  aipy -f script.py -f README.md "Review this code project"
+  aipy --image screenshot.png "What's shown in this image?"
+
+🔍 DATABASE OPERATIONS
+  # Search chat history
+  aipy --search "quantum computing"
+  aipy --search "python" --provider-filter claudpy
+  aipy --search "API" --model-filter gpt-4o
+  aipy --search "*" --tags-filter "work,coding"
+
+  # View conversations (supports partial UUIDs)
+  aipy --view 3740590a
+  aipy --view 3740590a-7356-4136-8247-2657318797b5
   
-  # Database operations
-  aipy --search "quantum computing"                   # Search chat history
-  aipy --search "python" --provider-filter claudpy   # Search by provider
-  aipy --search "API" --model-filter gpt-4o          # Search by model
-  aipy --search "*" --tags-filter "work,coding"      # Search by tags
-  aipy --view 12345678-1234-5678-9abc-123456789012   # View chat by UUID
-  aipy --delete 12345678-1234-5678-9abc-123456789012 # Delete chat
-  aipy --delete 12345678-1234-5678-9abc-123456789012 -y  # Delete without confirmation
-  
-  # Tagging conversations
-  aipy --tags "work,python,debugging" "Help fix my code"  # Tag conversation
-  aipy --tags "research,ai" "Explain transformers"        # Multiple tags
-  
-  # Using previous chats as context (auto-adds 'follow-up' tag)
-  aipy --id 12345678-1234-5678-9abc-123456789012 "Continue from where we left off"
-  aipy --id uuid1 --id uuid2 "Build on both previous conversations"
-  aipy --id uuid1 --tags "synthesis" "Next steps based on previous discussion"
-  
-  # Tracking new conversations
-  aipy --show-id "New conversation"                    # Shows UUID on stderr
-  aipy --summary "Another conversation"                # Shows UUID in summary
-  aipy --id uuid1 --show-id "Follow-up with tracking" # Shows both context and new ID
+  # View with conversation history
+  aipy --view 3740590a --history          # Show leading conversation
+  aipy --view 3740590a --full-history     # Show complete thread
+  aipy --view 3740590a --trace            # Show UUID/timestamp flow
+
+  # Delete conversations
+  aipy --delete 3740590a
+  aipy --delete 3740590a -y               # Skip confirmation
+
+🏷️  CONVERSATION TAGGING
+  aipy --tags "work,python,debugging" "Help fix my code"
+  aipy --tags "research,ai" "Explain transformers"
+
+🔗 CONTEXT THREADING (supports partial UUIDs)
+  aipy --chat-id 3740590a "Continue our discussion"
+  aipy --chat-id 3740590a --chat-id 339e0ffc "Build on both conversations"
+  aipy --chat-id 3740590a --tags "synthesis" "Synthesize our discussion"
+
+📊 TRACKING AND MONITORING
+  aipy --show-id "New conversation"        # Shows UUID on stderr
+  aipy --summary "Another conversation"    # Shows UUID in summary
+  aipy --debug "Test with debug info"      # Detailed execution info
+  aipy --dry-run "Preview request"         # Show what would be sent
+
+🛠️  UTILITY COMMANDS
+  aipy -L                                  # List all available models
+  aipy --search "*" --limit 20            # Show recent 20 conversations
+  aipy --view 3740590a --json             # Output in JSON format
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                           WORKFLOW EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📚 Research Workflow:
+  1. aipy --search "topic" | head -5           # Find relevant discussions
+  2. aipy --chat-id <uuid> --tags "research" "Expand on this topic"
+  3. aipy --view <new-uuid> --history          # Review conversation thread
+
+💻 Code Review Workflow:
+  1. aipy -f code.py --tags "review" "Review this code"
+  2. aipy --chat-id <uuid> --tags "follow-up" "Implement the suggestions"
+  3. aipy --view <uuid> --full-history         # See complete review process
+
+🤔 Decision Making:
+  aipy --model "gpt-4o,claude-3-5-sonnet,grok-3" --pick-best "Complex decision"
+
+For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
         """
     )
     
-    # Core options
-    parser.add_argument("prompt", nargs="?", help="The prompt to send to the AI")
-    parser.add_argument("--prompt", dest="prompt_flag", help="Prompt to prepend to the input")
-    parser.add_argument("--model", default="grok-3",
-                        help="Model(s) to use. Can specify multiple models comma-separated for parallel execution")
-    parser.add_argument("--times", type=int, default=1, 
-                        help="Number of times to repeat the request (useful for image generation)")
+    # Positional argument
+    parser.add_argument("prompt", nargs="?", 
+                        help="The prompt to send to the AI")
     
-    # Provider selection
-    parser.add_argument("--provider", choices=["claudpy", "grokpy", "geminpy", "openpy", "ollampy", "perpy"],
-                        help="Force a specific provider (overrides model-based routing)")
+    # ━━━ CORE OPTIONS ━━━
+    core_group = parser.add_argument_group("🚀 Core Options")
+    core_group.add_argument("--model", default="grok-3", metavar="MODEL",
+                           help="Model(s) to use. Comma-separated for parallel execution (default: grok-3)")
+    core_group.add_argument("--provider", choices=["claudpy", "grokpy", "geminpy", "openpy", "ollampy", "perpy"],
+                           help="Force specific provider (overrides model-based routing)")
+    core_group.add_argument("--prompt", dest="prompt_flag", metavar="TEXT",
+                           help="Prompt to prepend to the input")
+    core_group.add_argument("--times", type=int, default=1, metavar="N",
+                           help="Number of times to repeat request (useful for image generation)")
+    core_group.add_argument("-L", "--list-models", action="store_true",
+                           help="List all available models and exit")
     
-    # Output options
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-    parser.add_argument("--json", action="store_true", help="Return JSON response")
-    parser.add_argument("-S", "--no-streaming", action="store_true", help="Disable streaming")
-    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
-    parser.add_argument("--summary", action="store_true", help="Show usage summary")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be sent without executing")
+    # ━━━ INPUT OPTIONS ━━━  
+    input_group = parser.add_argument_group("📁 Input Options")
+    input_group.add_argument("-f", "--file", action="append", dest="files", metavar="FILE",
+                            help="Include file content (can be used multiple times)")
+    input_group.add_argument("--image", action="append", dest="images", metavar="IMAGE",
+                            help="Include image files for vision analysis")
     
-    # Content input
-    parser.add_argument("-f", "--file", action="append", dest="files",
-                        help="Include file content (can be used multiple times)")
-    parser.add_argument("--image", action="append", dest="images", 
-                        help="Include image files for vision analysis")
+    # ━━━ GENERATION MODES ━━━
+    gen_group = parser.add_argument_group("🎨 Generation Modes")
+    gen_group.add_argument("--image-gen", action="store_true",
+                          help="Generate images instead of text")
+    gen_group.add_argument("--embedding", action="store_true",
+                          help="Generate text embeddings")
+    gen_group.add_argument("--regen", action="store_true",
+                          help="Regenerate/enhance existing images")
+    gen_group.add_argument("--output", metavar="FILE",
+                          help="Output filename for generated content")
+    gen_group.add_argument("--size", metavar="SIZE",
+                          help="Image size (format depends on provider)")
+    gen_group.add_argument("--hd", action="store_true",
+                          help="Use HD quality for image generation")
     
-    # Generation modes
-    parser.add_argument("--image-gen", action="store_true", help="Generate images")
-    parser.add_argument("--embedding", action="store_true", help="Generate embeddings")
-    parser.add_argument("--regen", action="store_true", help="Regenerate/enhance images")
+    # ━━━ MULTI-MODEL OPTIONS ━━━
+    multi_group = parser.add_argument_group("🔀 Multi-Model Options")
+    multi_group.add_argument("--pick-best", action="store_true",
+                            help="Use reasoning model to pick best response from multiple models")
+    multi_group.add_argument("--decision-model", default=DEFAULT_DECISION_MODEL, metavar="MODEL",
+                            help=f"Model for picking best response (default: {DEFAULT_DECISION_MODEL})")
     
-    # Image generation options
-    parser.add_argument("--output", help="Output filename for generated content")
-    parser.add_argument("--size", help="Image size (format depends on provider)")
-    parser.add_argument("--hd", action="store_true", help="Use HD quality for image generation")
+    # ━━━ DATABASE OPERATIONS ━━━
+    db_group = parser.add_argument_group("🔍 Database Operations")
+    db_group.add_argument("--search", metavar="QUERY",
+                         help="Search AI chat history in database")
+    db_group.add_argument("--view", metavar="UUID",
+                         help="View AI chat by UUID (supports 8-char partial UUIDs)")
+    db_group.add_argument("--delete", metavar="UUID",
+                         help="Delete AI chat by UUID (supports 8-char partial UUIDs)")
+    db_group.add_argument("--content-only", action="store_true",
+                         help="When viewing, show only content in clean markdown format")
+    db_group.add_argument("--limit", type=int, default=10, metavar="N",
+                         help="Limit number of search results (default: 10)")
     
-    # Model/provider info
-    parser.add_argument("-L", "--list-models", action="store_true", help="List all available models")
+    # ━━━ HISTORY & CONTEXT ━━━
+    context_group = parser.add_argument_group("🔗 History & Context")
+    context_group.add_argument("--chat-id", action="append", dest="context_ids", metavar="UUID",
+                              help="Include previous chat as context (supports 8-char partial UUIDs)")
+    context_group.add_argument("--tags", metavar="TAGS",
+                              help="Tag conversation with comma-separated tags")
+    context_group.add_argument("--history", action="store_true",
+                              help="Show conversation history leading to this chat")
+    context_group.add_argument("--full-history", action="store_true",
+                              help="Show complete conversation thread including forward refs")
+    context_group.add_argument("--trace", action="store_true",
+                              help="Show conversation flow as UUID/timestamp trace")
+    context_group.add_argument("--use-context", action="store_true",
+                              help="Include today's chat history")
+    context_group.add_argument("--use-context-from", metavar="DATE",
+                              help="Include chat history from date (YYYY-MM-DD)")
     
-    # Context and personality
-    parser.add_argument("--use-context", action="store_true", help="Include today's chat history")
-    parser.add_argument("--use-context-from", help="Include chat history from specific date (YYYY-MM-DD)")
-    parser.add_argument("--personality", help="Set AI personality/role")
-    parser.add_argument("--no-preserve", action="store_true", help="Don't save chat transaction")
+    # ━━━ CONTEXT MANAGEMENT ━━━  
+    context_mgmt_group = parser.add_argument_group("🗂️  Context Management")
+    context_mgmt_group.add_argument("--view-context", metavar="CONTEXT_UUID",
+                                   help="View entire conversation context (supports 8-char partial UUIDs)")
+    context_mgmt_group.add_argument("--by-chat-uuid", action="store_true",
+                                   help="View context by chat UUID (use with --view-context)")
+    context_mgmt_group.add_argument("--edit-context", metavar="CONTEXT_UUID", 
+                                   help="Edit context properties (supports 8-char partial UUIDs)")
+    context_mgmt_group.add_argument("--name", metavar="NAME",
+                                   help="Set context name (use with --edit-context)")
+    context_mgmt_group.add_argument("--summarize-context", metavar="CONTEXT_UUID",
+                                   help="Generate summary for context (supports 8-char partial UUIDs)")
+    context_mgmt_group.add_argument("--generate-context-name", metavar="CONTEXT_UUID",
+                                   help="Generate name for context based on summary (supports 8-char partial UUIDs)")
+    context_mgmt_group.add_argument("--summarize-contexts-missing", action="store_true",
+                                   help="Summarize all contexts that don't have summaries")
+    context_mgmt_group.add_argument("--summarize-contexts-outdated", action="store_true",
+                                   help="Update summaries for contexts with newer chats")
+    context_mgmt_group.add_argument("--search-contexts", metavar="QUERY",
+                                   help="Search contexts by name, summary content, or tags")
+    context_mgmt_group.add_argument("--context-id", metavar="CONTEXT_UUID",
+                                   help="Add new chat to specific context (supports 8-char partial UUIDs)")
     
-    # Pick best feature
-    parser.add_argument("--pick-best", action="store_true", 
-                        help="When using multiple models, use a reasoning model to pick the best response")
-    parser.add_argument("--decision-model", default=DEFAULT_DECISION_MODEL,
-                        help=f"Model to use for picking the best response (default: {DEFAULT_DECISION_MODEL})")
+    # ━━━ SEARCH FILTERS ━━━
+    filter_group = parser.add_argument_group("🔎 Search Filters")
+    filter_group.add_argument("--provider-filter", metavar="PROVIDER",
+                             help="Filter search results by provider")
+    filter_group.add_argument("--model-filter", metavar="MODEL",
+                             help="Filter search results by model")
+    filter_group.add_argument("--tags-filter", metavar="TAGS",
+                             help="Filter search results by tags (comma-separated)")
     
-    # AI Chat database operations
-    parser.add_argument("--search", metavar="QUERY", 
-                        help="Search AI chat history in database")
-    parser.add_argument("--view", metavar="CHAT_ID", 
-                        help="View full AI chat by UUID")
-    parser.add_argument("--delete", metavar="CHAT_ID", 
-                        help="Delete AI chat by UUID")
+    # ━━━ OUTPUT & DEBUG ━━━
+    output_group = parser.add_argument_group("📊 Output & Debug")
+    output_group.add_argument("--json", action="store_true",
+                             help="Return response in JSON format")
+    output_group.add_argument("--summary", action="store_true",
+                             help="Show usage summary after execution")
+    output_group.add_argument("--show-id", action="store_true",
+                             help="Display UUID of newly created chat")
+    output_group.add_argument("--debug", action="store_true",
+                             help="Enable detailed debug output")
+    output_group.add_argument("--dry-run", action="store_true",
+                             help="Show what would be sent without executing")
+    output_group.add_argument("-S", "--no-streaming", action="store_true",
+                             help="Disable streaming output")
+    output_group.add_argument("--no-color", action="store_true",
+                             help="Disable colored output")
     
-    # View history options
-    parser.add_argument("--history", action="store_true",
-                        help="When viewing, show conversation history leading to this chat")
-    parser.add_argument("--full-history", action="store_true", 
-                        help="When viewing, show complete conversation thread including forward references")
-    parser.add_argument("--trace", action="store_true",
-                        help="Show conversation flow as UUID/timestamp trace instead of full content")
-    parser.add_argument("--limit", type=int, default=10, 
-                        help="Limit number of search results (default: 10)")
-    parser.add_argument("--provider-filter", 
-                        help="Filter search results by provider")
-    parser.add_argument("--model-filter", 
-                        help="Filter search results by model")
-    parser.add_argument("--tags-filter", 
-                        help="Filter search results by tags (comma-separated)")
-    parser.add_argument("-y", "--yes", action="store_true", 
-                        help="Skip confirmation prompts (for delete)")
-    
-    # Content tagging
-    parser.add_argument("--tags", 
-                        help="Tag the conversation with comma-separated tags")
-    
-    # Context from previous chats
-    parser.add_argument("--id", action="append", dest="context_ids",
-                        help="Include previous chat(s) as context by UUID (can be used multiple times)")
-    
-    # Output options for new chats
-    parser.add_argument("--show-id", action="store_true",
-                        help="Display the UUID of the newly created chat")
-    
-    # Ollama-specific options
-    parser.add_argument("--endpoint", help="Ollama API endpoint")
-    parser.add_argument("--profile-performance", action="store_true", help="Profile Ollama model performance")
-    parser.add_argument("--profile-prompt", help="Custom prompt for performance profiling")
-    parser.add_argument("--profile-models", help="Specific models to profile")
-    parser.add_argument("--profile-show-output", action="store_true", help="Show model outputs in performance table")
+    # ━━━ ADVANCED OPTIONS ━━━
+    advanced_group = parser.add_argument_group("⚙️  Advanced Options")
+    advanced_group.add_argument("--personality", metavar="ROLE",
+                               help="Set AI personality/role")
+    advanced_group.add_argument("--no-preserve", action="store_true",
+                               help="Don't save chat transaction to database or files")
+    advanced_group.add_argument("-y", "--yes", action="store_true",
+                               help="Skip confirmation prompts (for delete operations)")
+    advanced_group.add_argument("--endpoint", metavar="URL",
+                               help="Ollama API endpoint")
+    advanced_group.add_argument("--profile-performance", action="store_true",
+                               help="Profile Ollama model performance")
+    advanced_group.add_argument("--profile-prompt", metavar="TEXT",
+                               help="Custom prompt for performance profiling")
+    advanced_group.add_argument("--profile-models", metavar="MODELS",
+                               help="Specific models to profile")
+    advanced_group.add_argument("--profile-show-output", action="store_true",
+                               help="Show model outputs in performance table")
     
     return parser.parse_args()
 
@@ -1242,6 +2390,15 @@ def main():
         )
         return
     
+    if args.search_contexts:
+        search_contexts(
+            args.search_contexts,
+            limit=args.limit,
+            output_format='json' if args.json else 'text',
+            debug=args.debug
+        )
+        return
+    
     if args.view:
         view_ai_chat(
             args.view,
@@ -1249,7 +2406,8 @@ def main():
             debug=args.debug,
             show_history=args.history,
             show_full_history=args.full_history,
-            trace_mode=args.trace
+            trace_mode=args.trace,
+            content_only=args.content_only
         )
         return
     
@@ -1257,6 +2415,54 @@ def main():
         delete_ai_chat(
             args.delete,
             confirm=args.yes,
+            debug=args.debug
+        )
+        return
+    
+    if args.view_context:
+        view_context(
+            args.view_context,
+            output_format='json' if args.json else 'text',
+            debug=args.debug,
+            content_only=args.content_only,
+            by_chat_uuid=args.by_chat_uuid
+        )
+        return
+    
+    if args.edit_context:
+        edit_context(
+            args.edit_context,
+            name=args.name,
+            debug=args.debug
+        )
+        return
+    
+    if args.summarize_context:
+        summarize_context(
+            args.summarize_context,
+            model=args.model,
+            debug=args.debug
+        )
+        return
+    
+    if args.generate_context_name:
+        generate_context_name(
+            args.generate_context_name,
+            model=args.model,
+            debug=args.debug
+        )
+        return
+    
+    if args.summarize_contexts_missing:
+        summarize_contexts_missing(
+            model=args.model,
+            debug=args.debug
+        )
+        return
+    
+    if args.summarize_contexts_outdated:
+        summarize_contexts_outdated(
+            model=args.model,
             debug=args.debug
         )
         return
@@ -1407,7 +2613,8 @@ def main():
                         model, 
                         db_metadata,
                         tags=tags,
-                        context_ids=args.context_ids, 
+                        context_ids=args.context_ids,
+                        context_id=args.context_id,
                         debug=args.debug, 
                         dry_run=args.dry_run,
                         show_id=args.show_id
@@ -1420,6 +2627,7 @@ def main():
                     {"total_time": end_time - start_time, "parallel": False, "iterations": 1, "new_chat_ids": [new_id] if new_id else []},
                     tags=tags,
                     context_ids=args.context_ids,
+                    context_id=args.context_id,
                     store_db=False,  # Already stored above
                     debug=args.debug,
                     dry_run=args.dry_run,
@@ -1555,6 +2763,7 @@ def main():
                 metadata,
                 tags=tags,
                 context_ids=args.context_ids,
+                context_id=args.context_id,
                 store_db=True,
                 debug=args.debug,
                 dry_run=args.dry_run,

@@ -189,13 +189,28 @@ init_ai_chats_schema() {
     END;
     \$\$ language 'plpgsql';" "ai_chats" || return 1
     
-    # Add tags column if it doesn't exist
-    execute_sql "ALTER TABLE ai_chats ADD COLUMN IF NOT EXISTS tags TEXT[];" "ai_chats" || return 1
+    # Create ai_chat_contexts table first
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS ai_chat_contexts (
+        context_uuid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(255) DEFAULT '<untitled>',
+        summary TEXT,
+        summary_provider VARCHAR(50),
+        summary_model VARCHAR(200),
+        summary_last_updated TIMESTAMP WITH TIME ZONE,
+        tags TEXT[],
+        ingested BOOLEAN DEFAULT FALSE,
+        ingested_path VARCHAR(512),
+        ingested_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "ai_chats" || return 1
     
-    # Create main ai_chats table
+    # Create main ai_chats table with context_uuid
     execute_sql "
     CREATE TABLE IF NOT EXISTS ai_chats (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        context_uuid UUID NOT NULL,
         prompt TEXT NOT NULL,
         response TEXT NOT NULL,
         provider VARCHAR(50) NOT NULL,
@@ -213,11 +228,23 @@ init_ai_chats_schema() {
         tags TEXT[],
         metadata JSONB DEFAULT '{}',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT fk_ai_chats_context FOREIGN KEY (context_uuid) REFERENCES ai_chat_contexts(context_uuid) ON DELETE CASCADE
     );" "ai_chats" || return 1
+    
+    # Create indexes for ai_chat_contexts
+    echo "Creating ai_chat_contexts indexes..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chat_contexts_name ON ai_chat_contexts(name);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chat_contexts_created_at ON ai_chat_contexts(created_at DESC);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chat_contexts_summary_updated ON ai_chat_contexts(summary_last_updated DESC);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chat_contexts_tags ON ai_chat_contexts USING GIN(tags);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chat_contexts_summary_text ON ai_chat_contexts USING GIN(to_tsvector('english', COALESCE(summary, '')));" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chat_contexts_ingested ON ai_chat_contexts(ingested);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chat_contexts_ingested_at ON ai_chat_contexts(ingested_at DESC);" "ai_chats" || return 1
     
     # Create indexes for ai_chats
     echo "Creating ai_chats indexes..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_context_uuid ON ai_chats(context_uuid);" "ai_chats" || return 1
     execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_request_timestamp ON ai_chats(request_timestamp DESC);" "ai_chats" || return 1
     execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_provider ON ai_chats(provider);" "ai_chats" || return 1
     execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_model ON ai_chats(model);" "ai_chats" || return 1
@@ -230,7 +257,18 @@ init_ai_chats_schema() {
     execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_prompt_text ON ai_chats USING GIN(to_tsvector('english', prompt));" "ai_chats" || return 1
     execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_response_text ON ai_chats USING GIN(to_tsvector('english', response));" "ai_chats" || return 1
     
-    # Create trigger for updated_at
+    # Create triggers for updated_at on both tables
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_ai_chat_contexts_updated_at') THEN
+            CREATE TRIGGER update_ai_chat_contexts_updated_at 
+            BEFORE UPDATE ON ai_chat_contexts
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "ai_chats" || return 1
+    
     execute_sql "
     DO \$\$
     BEGIN
@@ -277,11 +315,16 @@ perform_maintenance() {
             execute_sql "DELETE FROM transcription_chunks WHERE transcription_id NOT IN (SELECT id FROM transcriptions);" "$db" || echo "Warning: Failed to clean orphaned chunks"
             ;;
         "ai_chats")
-            # Vacuum and analyze ai_chats table
+            # Vacuum and analyze ai_chats tables
+            execute_sql "VACUUM ANALYZE ai_chat_contexts;" "$db" || echo "Warning: Failed to vacuum ai_chat_contexts table"
             execute_sql "VACUUM ANALYZE ai_chats;" "$db" || echo "Warning: Failed to vacuum ai_chats table"
             
-            # Reindex ai_chats table
+            # Reindex ai_chats tables
+            execute_sql "REINDEX TABLE ai_chat_contexts;" "$db" || echo "Warning: Failed to reindex ai_chat_contexts table"
             execute_sql "REINDEX TABLE ai_chats;" "$db" || echo "Warning: Failed to reindex ai_chats table"
+            
+            # Clean up orphaned chats (shouldn't happen due to foreign key, but just in case)
+            execute_sql "DELETE FROM ai_chats WHERE context_uuid NOT IN (SELECT context_uuid FROM ai_chat_contexts);" "$db" || echo "Warning: Failed to clean orphaned chats"
             ;;
         "postgres")
             # Vacuum and analyze vector table if it exists
@@ -336,12 +379,21 @@ show_stats() {
             execute_sql "
             SELECT 
                 COUNT(*) as total_chats,
+                COUNT(DISTINCT context_uuid) as total_contexts,
                 COUNT(DISTINCT provider) as unique_providers,
                 COUNT(DISTINCT model) as unique_models,
                 COALESCE(SUM(tokens_input), 0) as total_input_tokens,
                 COALESCE(SUM(tokens_output), 0) as total_output_tokens,
                 COALESCE(SUM(cost_total_usd), 0) as total_cost_usd
             FROM ai_chats;" "$db" || return 1
+            
+            echo -e "\nContext Statistics:"
+            execute_sql "
+            SELECT 
+                COUNT(*) as total_contexts,
+                COUNT(CASE WHEN name != '<untitled>' THEN 1 END) as named_contexts,
+                COUNT(CASE WHEN name = '<untitled>' THEN 1 END) as untitled_contexts
+            FROM ai_chat_contexts;" "$db" || return 1
             
             echo -e "\nTop Providers:"
             execute_sql "
@@ -358,6 +410,20 @@ show_stats() {
             GROUP BY model 
             ORDER BY chat_count DESC 
             LIMIT 5;" "$db" || return 1
+            
+            echo -e "\nLargest Contexts (by chat count):"
+            execute_sql "
+            SELECT 
+                c.context_uuid,
+                c.name,
+                COUNT(a.id) as chat_count,
+                MIN(a.request_timestamp) as first_chat,
+                MAX(a.request_timestamp) as last_chat
+            FROM ai_chat_contexts c
+            LEFT JOIN ai_chats a ON c.context_uuid = a.context_uuid
+            GROUP BY c.context_uuid, c.name
+            ORDER BY chat_count DESC
+            LIMIT 10;" "$db" || return 1
             ;;
         "postgres")
             echo -e "\nVector Database Statistics:"
@@ -848,7 +914,7 @@ sync_databases() {
                     tables_to_sync=("transcriptions" "transcription_chunks")
                     ;;
                 "ai_chats")
-                    tables_to_sync=("ai_chats")
+                    tables_to_sync=("ai_chat_contexts" "ai_chats")
                     ;;
                 "postgres")
                     # For postgres db, sync the vector table if it exists
