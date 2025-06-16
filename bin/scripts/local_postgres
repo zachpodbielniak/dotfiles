@@ -18,6 +18,8 @@ SYNC_HOSTS=(
     # "laptop.tailnet-name.ts.net"
     # "desktop.tailnet-name.ts.net"
     # "100.64.0.2"
+    "100.72.0.41"
+    "100.72.0.43"
 )
 
 # Configuration file path
@@ -49,6 +51,7 @@ DEFAULT_DB_PASSWORD="${LOCAL_DB_PASSWORD:-${TRANSCRIPTION_DB_PASSWORD:-$CONFIG_D
 SCRIPT_NAME="$(basename "$0")"
 ACTION=""
 VERBOSE=false
+DEBUG=false
 TARGET_DATABASE=""
 
 # Database connection string
@@ -167,6 +170,61 @@ init_transcriptions_schema() {
     \$\$;" || return 1
     
     echo "Transcriptions schema initialized successfully"
+}
+
+# Initialize second brain vector schema
+init_second_brain_schema() {
+    echo "Initializing second brain vector schema..."
+    
+    # Enable pgvector extension if not already enabled
+    execute_sql "CREATE EXTENSION IF NOT EXISTS vector;" "postgres" || {
+        echo "Error: Failed to create vector extension" >&2
+        return 1
+    }
+    
+    # Check if table exists
+    local table_exists=$(psql -d "$(get_connection_string "" "" "postgres")" -tAc "
+    SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'second_brain_vectors')" 2>/dev/null || echo "f")
+    
+    if [[ "$table_exists" == "t" ]]; then
+        echo "Table 'second_brain_vectors' already exists"
+        
+        # Check if it has the expected structure
+        local has_provider=$(psql -d "$(get_connection_string "" "" "postgres")" -tAc "
+        SELECT COUNT(*) FROM information_schema.columns 
+        WHERE table_name = 'second_brain_vectors' AND column_name = 'provider'" 2>/dev/null || echo "0")
+        
+        if [[ "$has_provider" -eq 0 ]]; then
+            echo "Upgrading table to include provider and model columns..."
+            execute_sql "ALTER TABLE second_brain_vectors ADD COLUMN IF NOT EXISTS provider TEXT;" "postgres" || return 1
+            execute_sql "ALTER TABLE second_brain_vectors ADD COLUMN IF NOT EXISTS model TEXT;" "postgres" || return 1
+        fi
+    else
+        # Create table matching semantic_search expectations (768 dimensions for default ollampy provider)
+        execute_sql "
+        CREATE TABLE second_brain_vectors (
+            id TEXT PRIMARY KEY,
+            embedding vector(768),
+            path TEXT NOT NULL,
+            content_snippet TEXT,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            metadata JSONB
+        );" "postgres" || {
+            echo "Error: Failed to create second_brain_vectors table" >&2
+            return 1
+        }
+        echo "Created table 'second_brain_vectors' for vector embeddings with dimension 768"
+    fi
+    
+    # Create indexes if they don't exist
+    echo "Creating indexes for second_brain_vectors..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_second_brain_vectors_path ON second_brain_vectors(path);" "postgres" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_second_brain_vectors_provider ON second_brain_vectors(provider);" "postgres" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_second_brain_vectors_model ON second_brain_vectors(model);" "postgres" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_second_brain_vectors_metadata ON second_brain_vectors USING GIN(metadata);" "postgres" || return 1
+    
+    echo "Second brain vector schema initialized successfully"
 }
 
 # Initialize ai_chats schema
@@ -288,6 +346,7 @@ init_all_schemas() {
     create_database || return 1
     init_transcriptions_schema || return 1
     init_ai_chats_schema || return 1
+    init_second_brain_schema || return 1
     echo "All schemas initialized successfully"
 }
 
@@ -699,6 +758,15 @@ table_has_timestamps() {
 
 # Add timestamps to pgvector table if missing
 ensure_vector_table_timestamps() {
+    # Check if table exists first
+    local table_exists=$(psql -d "$(get_connection_string "" "" "postgres")" -tAc "
+    SELECT 1 FROM information_schema.tables 
+    WHERE table_name = 'second_brain_vectors' LIMIT 1;" 2>/dev/null || echo "0")
+    
+    if [[ "$table_exists" != "1" ]]; then
+        return 0  # Table doesn't exist, nothing to do
+    fi
+    
     local has_timestamps=$(psql -d "$(get_connection_string "" "" "postgres")" -tAc "
     SELECT COUNT(*) FROM information_schema.columns 
     WHERE table_name = 'second_brain_vectors' 
@@ -723,28 +791,65 @@ merge_sync_table() {
     
     echo "      → Syncing table: $table"
     
+    # Debug: Show connection info if debug is enabled
+    if [[ "$DEBUG" == true ]]; then
+        echo "        Debug: Connection string: $(get_connection_string "" "" "$db")"
+        echo "        Debug: Host: $DEFAULT_DB_HOST, Port: $DEFAULT_DB_PORT, DB: $db, User: $DEFAULT_DB_USER"
+    fi
+    
+    # Debug: Check if local table exists
+    local table_exists=$(psql -d "$(get_connection_string "" "" "$db")" -tAc "SELECT 1 FROM information_schema.tables WHERE table_name='$table' LIMIT 1" 2>&1)
+    if [[ "$table_exists" != "1" ]]; then
+        echo "        ✗ Local table '$table' does not exist"
+        [[ "$DEBUG" == true ]] && echo "        Debug info: $table_exists"
+        # Try to create the schema if it's missing
+        case "$db" in
+            "transcriptions")
+                echo "        → Attempting to initialize transcriptions schema..."
+                init_transcriptions_schema
+                ;;
+            "ai_chats")
+                echo "        → Attempting to initialize ai_chats schema..."
+                init_ai_chats_schema
+                ;;
+        esac
+    fi
+    
     # Create temporary table for remote data
     local temp_table="${table}_remote_sync_$$"
     
-    # Copy table structure
-    execute_sql "CREATE TEMP TABLE $temp_table (LIKE $table INCLUDING ALL);" "$db" >/dev/null 2>&1 || {
-        echo "        ✗ Failed to create temporary table"
+    # Copy table structure (use regular table, not TEMP, due to session isolation)
+    if [[ "$DEBUG" == true ]]; then
+        echo "        Debug: Creating staging table: $temp_table"
+        echo "        Debug: Executing: CREATE TABLE $temp_table (LIKE $table INCLUDING ALL);"
+    fi
+    local create_result=$(execute_sql "CREATE TABLE $temp_table (LIKE $table INCLUDING ALL);" "$db" 2>&1)
+    local create_exit_code=$?
+    if [[ $create_exit_code -ne 0 ]]; then
+        echo "        ✗ Failed to create staging table"
+        [[ "$DEBUG" == true ]] && echo "        Error: $create_result"
         return 1
-    }
+    fi
+    [[ "$DEBUG" == true ]] && echo "        Debug: Staging table created successfully"
     
     # Copy data from remote host
-    if PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
-        -h "$source_host" \
-        -p "$DEFAULT_DB_PORT" \
-        -U "$DEFAULT_DB_USER" \
-        -d "$db" \
-        -c "\\COPY $table TO STDOUT" 2>/dev/null | \
+    local error_file="/tmp/psql_sync_error_$$"
+    # Use a subshell to capture both exit codes
+    if (
+        set -o pipefail
         PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
-        -h "$DEFAULT_DB_HOST" \
-        -p "$DEFAULT_DB_PORT" \
-        -U "$DEFAULT_DB_USER" \
-        -d "$db" \
-        -c "\\COPY $temp_table FROM STDIN" 2>/dev/null; then
+            -h "$source_host" \
+            -p "$DEFAULT_DB_PORT" \
+            -U "$DEFAULT_DB_USER" \
+            -d "$db" \
+            -c "\\COPY $table TO STDOUT" 2>"${error_file}_remote" | \
+        PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+            -h "$DEFAULT_DB_HOST" \
+            -p "$DEFAULT_DB_PORT" \
+            -U "$DEFAULT_DB_USER" \
+            -d "$db" \
+            -c "\\COPY $temp_table FROM STDIN" 2>"${error_file}_local"
+    ); then
         
         # Perform the merge based on table type
         case "$table" in
@@ -801,27 +906,19 @@ merge_sync_table() {
                 ;;
             
             "second_brain_vectors")
-                # For vectors, use file path as key and update if remote is newer
-                if table_has_timestamps "$db" "$table"; then
-                    execute_sql "
-                    INSERT INTO $table 
-                    SELECT * FROM $temp_table
-                    ON CONFLICT (id) DO UPDATE SET
-                        embedding = EXCLUDED.embedding,
-                        path = EXCLUDED.path,
-                        content_snippet = EXCLUDED.content_snippet,
-                        provider = EXCLUDED.provider,
-                        model = EXCLUDED.model,
-                        metadata = EXCLUDED.metadata,
-                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
-                    WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
-                else
-                    # No timestamps, just insert new records
-                    execute_sql "
-                    INSERT INTO $table 
-                    SELECT * FROM $temp_table
-                    ON CONFLICT (id) DO NOTHING;" "$db" >/dev/null 2>&1
-                fi
+                # For second_brain_vectors, we don't use timestamps for merge logic
+                # Instead, we merge based on the ID and keep the latest version
+                execute_sql "
+                INSERT INTO $table (id, embedding, path, content_snippet, provider, model, metadata)
+                SELECT id, embedding, path, content_snippet, provider, model, metadata
+                FROM $temp_table
+                ON CONFLICT (id) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    path = EXCLUDED.path,
+                    content_snippet = EXCLUDED.content_snippet,
+                    provider = EXCLUDED.provider,
+                    model = EXCLUDED.model,
+                    metadata = EXCLUDED.metadata;" "$db" >/dev/null 2>&1
                 ;;
             
             *)
@@ -833,13 +930,29 @@ merge_sync_table() {
                 ;;
         esac
         
-        # Drop temporary table
+        # Drop staging table
         execute_sql "DROP TABLE IF EXISTS $temp_table;" "$db" >/dev/null 2>&1
         
+        # Clean up error files
+        rm -f "${error_file}_remote" "${error_file}_local"
         echo "        ✓ Merged successfully"
+        # Explicitly return 0 for success
         return 0
     else
         echo "        ✗ Failed to copy data from remote"
+        # Display error messages if debug mode is enabled
+        if [[ "$DEBUG" == true ]]; then
+            if [[ -s "${error_file}_remote" ]]; then
+                echo "        Remote error: $(cat "${error_file}_remote")"
+            fi
+            if [[ -s "${error_file}_local" ]]; then
+                echo "        Local error: $(cat "${error_file}_local")"
+            fi
+        fi
+        # Always clean up staging table on failure
+        execute_sql "DROP TABLE IF EXISTS $temp_table;" "$db" >/dev/null 2>&1
+        # Clean up error files
+        rm -f "${error_file}_remote" "${error_file}_local"
         return 1
     fi
 }
@@ -862,10 +975,8 @@ sync_databases() {
         return 0
     fi
     
-    # Ensure vector table has timestamps if it exists
-    if database_exists "postgres"; then
-        ensure_vector_table_timestamps
-    fi
+    # No need to ensure timestamps for vector table anymore
+    # semantic_search doesn't use timestamps
     
     local sync_success=0
     local sync_failed=0
@@ -894,6 +1005,7 @@ sync_databases() {
         # Sync each configured database
         for db in "${SYNC_DATABASES[@]}"; do
             echo "    Syncing database: $db"
+            [[ "$DEBUG" == true ]] && echo "      Debug: Processing database: $db"
             
             # Ensure database exists locally
             if ! database_exists "$db"; then
@@ -934,7 +1046,8 @@ sync_databases() {
             # Sync each table
             local db_sync_success=true
             for table in "${tables_to_sync[@]}"; do
-                if merge_sync_table "$host" "$db" "$table"; then
+                # Call merge_sync_table in a way that doesn't trigger set -e
+                if merge_sync_table "$host" "$db" "$table" || false; then
                     ((sync_success++))
                 else
                     ((sync_failed++))
@@ -976,9 +1089,10 @@ Supports multiple databases: transcriptions, ai_chats, postgres.
 
 COMMANDS:
     setup               Setup database and all schemas (alias for init)
-    init                Initialize all schemas (transcriptions + ai_chats)
+    init                Initialize all schemas (transcriptions + ai_chats + second_brain)
     init-transcripts    Initialize transcriptions schema only
     init-ai             Initialize ai_chats schema only
+    init-second-brain   Initialize second brain vector schema only
     maintain            Perform maintenance operations (vacuum, reindex, cleanup)
     stats               Show database statistics
     export [FILE]       Export data to JSON file
@@ -988,6 +1102,7 @@ COMMANDS:
 OPTIONS:
     -h, --help          Show this help message
     -v, --verbose       Enable verbose output
+    --debug             Enable debug output (shows detailed error messages)
     -d, --database DB   Specify target database (required for maintain/export/archive)
                         Available: transcriptions, ai_chats, postgres
                         Optional for stats (shows all databases if not specified)
@@ -1046,6 +1161,10 @@ parse_args() {
                 VERBOSE=true
                 shift
                 ;;
+            --debug)
+                DEBUG=true
+                shift
+                ;;
             -d|--database)
                 TARGET_DATABASE="$2"
                 if [[ -z "$TARGET_DATABASE" ]]; then
@@ -1054,7 +1173,7 @@ parse_args() {
                 fi
                 shift 2
                 ;;
-            setup|init|init-transcripts|init-ai|maintain|stats|export|archive|sync)
+            setup|init|init-transcripts|init-ai|init-second-brain|maintain|stats|export|archive|sync)
                 ACTION="$1"
                 shift
                 break
@@ -1111,6 +1230,9 @@ main() {
         init-ai)
             init_ai_chats_schema
             ;;
+        init-second-brain)
+            init_second_brain_schema
+            ;;
         maintain)
             perform_maintenance "$TARGET_DATABASE"
             ;;
@@ -1128,7 +1250,8 @@ main() {
             archive_old_data "$TARGET_DATABASE" "${ARGS[0]}"
             ;;
         sync)
-            sync_databases
+            # Run sync in a subshell to prevent set -e from exiting early
+            (sync_databases) || true
             ;;
         *)
             echo "Unknown command: $ACTION" >&2
