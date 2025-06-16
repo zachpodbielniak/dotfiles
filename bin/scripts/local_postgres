@@ -39,16 +39,17 @@ else
 fi
 
 # Default configuration (environment variables override config file)
-DEFAULT_DB_HOST="${TRANSCRIPTION_DB_HOST:-$CONFIG_DB_HOST}"
-DEFAULT_DB_PORT="${TRANSCRIPTION_DB_PORT:-$CONFIG_DB_PORT}"
-DEFAULT_DB_NAME="${TRANSCRIPTION_DB_NAME:-$CONFIG_DB_NAME}"
-DEFAULT_DB_USER="${TRANSCRIPTION_DB_USER:-$CONFIG_DB_USER}"
-DEFAULT_DB_PASSWORD="${TRANSCRIPTION_DB_PASSWORD:-$CONFIG_DB_PASSWORD}"
+DEFAULT_DB_HOST="${LOCAL_DB_HOST:-${TRANSCRIPTION_DB_HOST:-$CONFIG_DB_HOST}}"
+DEFAULT_DB_PORT="${LOCAL_DB_PORT:-${TRANSCRIPTION_DB_PORT:-$CONFIG_DB_PORT}}"
+DEFAULT_DB_NAME="${LOCAL_DB_NAME:-${TRANSCRIPTION_DB_NAME:-$CONFIG_DB_NAME}}"
+DEFAULT_DB_USER="${LOCAL_DB_USER:-${TRANSCRIPTION_DB_USER:-$CONFIG_DB_USER}}"
+DEFAULT_DB_PASSWORD="${LOCAL_DB_PASSWORD:-${TRANSCRIPTION_DB_PASSWORD:-$CONFIG_DB_PASSWORD}}"
 
 # Script variables
 SCRIPT_NAME="$(basename "$0")"
 ACTION=""
 VERBOSE=false
+TARGET_DATABASE=""
 
 # Database connection string
 get_connection_string() {
@@ -259,27 +260,49 @@ setup_all() {
 
 # Maintenance operations
 perform_maintenance() {
-    echo "Performing database maintenance..."
+    local db="${1:-$DEFAULT_DB_NAME}"
+    echo "Performing database maintenance on '$db'..."
     
-    # Vacuum and analyze all tables
-    execute_sql "VACUUM ANALYZE transcriptions;" || echo "Warning: Failed to vacuum transcriptions table"
-    execute_sql "VACUUM ANALYZE transcription_chunks;" || echo "Warning: Failed to vacuum transcription_chunks table"
+    case "$db" in
+        "transcriptions")
+            # Vacuum and analyze transcription tables
+            execute_sql "VACUUM ANALYZE transcriptions;" "$db" || echo "Warning: Failed to vacuum transcriptions table"
+            execute_sql "VACUUM ANALYZE transcription_chunks;" "$db" || echo "Warning: Failed to vacuum transcription_chunks table"
+            
+            # Reindex transcription tables
+            execute_sql "REINDEX TABLE transcriptions;" "$db" || echo "Warning: Failed to reindex transcriptions table"
+            execute_sql "REINDEX TABLE transcription_chunks;" "$db" || echo "Warning: Failed to reindex transcription_chunks table"
+            
+            # Clean up orphaned chunks
+            execute_sql "DELETE FROM transcription_chunks WHERE transcription_id NOT IN (SELECT id FROM transcriptions);" "$db" || echo "Warning: Failed to clean orphaned chunks"
+            ;;
+        "ai_chats")
+            # Vacuum and analyze ai_chats table
+            execute_sql "VACUUM ANALYZE ai_chats;" "$db" || echo "Warning: Failed to vacuum ai_chats table"
+            
+            # Reindex ai_chats table
+            execute_sql "REINDEX TABLE ai_chats;" "$db" || echo "Warning: Failed to reindex ai_chats table"
+            ;;
+        "postgres")
+            # Vacuum and analyze vector table if it exists
+            execute_sql "VACUUM ANALYZE second_brain_vectors;" "$db" || echo "Warning: Failed to vacuum second_brain_vectors table (may not exist)"
+            execute_sql "REINDEX TABLE second_brain_vectors;" "$db" || echo "Warning: Failed to reindex second_brain_vectors table (may not exist)"
+            ;;
+        *)
+            # Generic maintenance for unknown databases
+            echo "Performing generic maintenance on database '$db'..."
+            execute_sql "VACUUM ANALYZE;" "$db" || echo "Warning: Failed to vacuum database"
+            execute_sql "REINDEX DATABASE $db;" "postgres" || echo "Warning: Failed to reindex database"
+            ;;
+    esac
     
-    # Reindex
-    execute_sql "REINDEX TABLE transcriptions;" || echo "Warning: Failed to reindex transcriptions table"
-    execute_sql "REINDEX TABLE transcription_chunks;" || echo "Warning: Failed to reindex transcription_chunks table"
-    
-    # Clean up orphaned chunks
-    execute_sql "
-    DELETE FROM transcription_chunks 
-    WHERE transcription_id NOT IN (SELECT id FROM transcriptions);" || echo "Warning: Failed to clean orphaned chunks"
-    
-    echo "Maintenance completed"
+    echo "Maintenance completed on '$db'"
 }
 
 # Database statistics
 show_stats() {
-    echo "Database Statistics:"
+    local db="${1:-$DEFAULT_DB_NAME}"
+    echo "Database Statistics for '$db':"
     echo "==================="
     
     # Overall database size
@@ -287,7 +310,7 @@ show_stats() {
     SELECT pg_database.datname as database_name,
            pg_size_pretty(pg_database_size(pg_database.datname)) as size
     FROM pg_database
-    WHERE datname = '$DEFAULT_DB_NAME';" || return 1
+    WHERE datname = '$db';" "postgres" || return 1
     
     echo -e "\nTable Sizes:"
     execute_sql "
@@ -295,81 +318,240 @@ show_stats() {
            pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS size
     FROM pg_tables
     WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-    ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;" || return 1
+    ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;" "$db" || return 1
     
-    echo -e "\nTranscription Statistics:"
-    execute_sql "
-    SELECT 
-        COUNT(DISTINCT t.id) as total_transcriptions,
-        COUNT(tc.id) as total_chunks,
-        COALESCE(SUM(tc.character_count), 0) as total_characters
-    FROM transcriptions t
-    LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id;" || return 1
+    case "$db" in
+        "transcriptions")
+            echo -e "\nTranscription Statistics:"
+            execute_sql "
+            SELECT 
+                COUNT(DISTINCT t.id) as total_transcriptions,
+                COUNT(tc.id) as total_chunks,
+                COALESCE(SUM(tc.character_count), 0) as total_characters
+            FROM transcriptions t
+            LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id;" "$db" || return 1
+            ;;
+        "ai_chats")
+            echo -e "\nAI Chat Statistics:"
+            execute_sql "
+            SELECT 
+                COUNT(*) as total_chats,
+                COUNT(DISTINCT provider) as unique_providers,
+                COUNT(DISTINCT model) as unique_models,
+                COALESCE(SUM(tokens_input), 0) as total_input_tokens,
+                COALESCE(SUM(tokens_output), 0) as total_output_tokens,
+                COALESCE(SUM(cost_total_usd), 0) as total_cost_usd
+            FROM ai_chats;" "$db" || return 1
+            
+            echo -e "\nTop Providers:"
+            execute_sql "
+            SELECT provider, COUNT(*) as chat_count 
+            FROM ai_chats 
+            GROUP BY provider 
+            ORDER BY chat_count DESC 
+            LIMIT 5;" "$db" || return 1
+            
+            echo -e "\nTop Models:"
+            execute_sql "
+            SELECT model, COUNT(*) as chat_count 
+            FROM ai_chats 
+            GROUP BY model 
+            ORDER BY chat_count DESC 
+            LIMIT 5;" "$db" || return 1
+            ;;
+        "postgres")
+            echo -e "\nVector Database Statistics:"
+            execute_sql "
+            SELECT 
+                COUNT(*) as total_vectors,
+                COUNT(DISTINCT provider) as unique_providers,
+                COUNT(DISTINCT model) as unique_models
+            FROM second_brain_vectors;" "$db" 2>/dev/null || echo "No second_brain_vectors table found"
+            ;;
+        *)
+            echo -e "\nGeneric table count:"
+            execute_sql "
+            SELECT schemaname, tablename, n_tup_ins as inserts, n_tup_upd as updates, n_tup_del as deletes
+            FROM pg_stat_user_tables 
+            ORDER BY n_tup_ins DESC;" "$db" || return 1
+            ;;
+    esac
 }
 
-# Export transcriptions
-export_transcriptions() {
-    local output_file="${1:-transcriptions_export_$(date +%Y%m%d_%H%M%S).json}"
+# Show statistics for all databases
+show_all_stats() {
+    echo "PostgreSQL Database Statistics - All Databases"
+    echo "=============================================="
     
-    echo "Exporting transcriptions to $output_file..."
+    # Check which databases exist
+    local available_dbs=()
     
-    psql -d "$(get_connection_string)" -t -A -c "
-    SELECT json_agg(row_to_json(t))
-    FROM (
-        SELECT t.*, 
-               array_agg(
-                   json_build_object(
-                       'chunk_number', tc.chunk_number,
-                       'content', tc.content,
-                       'character_count', tc.character_count
-                   ) ORDER BY tc.chunk_number
-               ) as chunks
-        FROM transcriptions t
-        LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
-        GROUP BY t.id
-    ) t;" > "$output_file" || {
-        echo "Error exporting transcriptions" >&2
-        return 1
-    }
+    # Check for transcriptions database
+    if database_exists "transcriptions"; then
+        available_dbs+=("transcriptions")
+    fi
+    
+    # Check for ai_chats database
+    if database_exists "ai_chats"; then
+        available_dbs+=("ai_chats")
+    fi
+    
+    # Check for postgres database (always exists)
+    available_dbs+=("postgres")
+    
+    echo "Found databases: ${available_dbs[*]}"
+    echo ""
+    
+    # Show stats for each available database
+    for db in "${available_dbs[@]}"; do
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        show_stats "$db"
+        echo ""
+    done
+    
+    # Overall summary
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Overall Summary:"
+    echo "================"
+    
+    # Total size across all databases
+    execute_sql "
+    SELECT 
+        COUNT(*) as total_databases,
+        pg_size_pretty(SUM(pg_database_size(datname))) as total_size
+    FROM pg_database 
+    WHERE datname IN ('transcriptions', 'ai_chats', 'postgres');" "postgres" || return 1
+    
+    echo ""
+    echo "Individual database sizes:"
+    execute_sql "
+    SELECT 
+        datname as database,
+        pg_size_pretty(pg_database_size(datname)) as size
+    FROM pg_database 
+    WHERE datname IN ('transcriptions', 'ai_chats', 'postgres')
+    ORDER BY pg_database_size(datname) DESC;" "postgres" || return 1
+}
+
+# Export data
+export_data() {
+    local db="${1}"
+    local output_file="${2:-${db}_export_$(date +%Y%m%d_%H%M%S).json}"
+    
+    echo "Exporting data from database '$db' to $output_file..."
+    
+    case "$db" in
+        "transcriptions")
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM (
+                SELECT t.*, 
+                       array_agg(
+                           json_build_object(
+                               'chunk_number', tc.chunk_number,
+                               'content', tc.content,
+                               'character_count', tc.character_count
+                           ) ORDER BY tc.chunk_number
+                       ) as chunks
+                FROM transcriptions t
+                LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+                GROUP BY t.id
+            ) t;" > "$output_file" || {
+                echo "Error exporting transcriptions" >&2
+                return 1
+            }
+            ;;
+        "ai_chats")
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM ai_chats t
+            ORDER BY request_timestamp;" > "$output_file" || {
+                echo "Error exporting ai_chats" >&2
+                return 1
+            }
+            ;;
+        "postgres")
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM second_brain_vectors t;" > "$output_file" 2>/dev/null || {
+                echo "Error exporting vectors (table may not exist)" >&2
+                return 1
+            }
+            ;;
+        *)
+            echo "Error: Export not implemented for database '$db'" >&2
+            echo "Supported databases: transcriptions, ai_chats, postgres" >&2
+            return 1
+            ;;
+    esac
     
     echo "Export completed: $output_file"
 }
 
-# Archive old transcriptions
-archive_old_transcriptions() {
-    local days="${1:-365}"
-    local archive_file="transcriptions_archive_$(date +%Y%m%d_%H%M%S).json"
+# Archive old data
+archive_old_data() {
+    local db="${1}"
+    local days="${2:-365}"
+    local archive_file="${db}_archive_$(date +%Y%m%d_%H%M%S).json"
     
-    echo "Archiving transcriptions older than $days days..."
+    echo "Archiving data from database '$db' older than $days days..."
     
-    # First export old transcriptions
-    psql -d "$(get_connection_string)" -t -A -c "
-    SELECT json_agg(row_to_json(t))
-    FROM (
-        SELECT t.*, 
-               array_agg(
-                   json_build_object(
-                       'chunk_number', tc.chunk_number,
-                       'content', tc.content,
-                       'character_count', tc.character_count
-                   ) ORDER BY tc.chunk_number
-               ) as chunks
-        FROM transcriptions t
-        LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
-        WHERE t.created_at < CURRENT_DATE - INTERVAL '$days days'
-        GROUP BY t.id
-    ) t;" > "$archive_file" || {
-        echo "Error archiving transcriptions" >&2
-        return 1
-    }
-    
-    # Delete archived transcriptions
-    execute_sql "
-    DELETE FROM transcriptions 
-    WHERE created_at < CURRENT_DATE - INTERVAL '$days days';" || {
-        echo "Error deleting old transcriptions" >&2
-        return 1
-    }
+    case "$db" in
+        "transcriptions")
+            # First export old transcriptions
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM (
+                SELECT t.*, 
+                       array_agg(
+                           json_build_object(
+                               'chunk_number', tc.chunk_number,
+                               'content', tc.content,
+                               'character_count', tc.character_count
+                           ) ORDER BY tc.chunk_number
+                       ) as chunks
+                FROM transcriptions t
+                LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+                WHERE t.created_at < CURRENT_DATE - INTERVAL '$days days'
+                GROUP BY t.id
+            ) t;" > "$archive_file" || {
+                echo "Error archiving transcriptions" >&2
+                return 1
+            }
+            
+            # Delete archived transcriptions
+            execute_sql "DELETE FROM transcriptions WHERE created_at < CURRENT_DATE - INTERVAL '$days days';" "$db" || {
+                echo "Error deleting old transcriptions" >&2
+                return 1
+            }
+            ;;
+        "ai_chats")
+            # First export old ai_chats
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM ai_chats t
+            WHERE created_at < CURRENT_DATE - INTERVAL '$days days'
+            ORDER BY request_timestamp;" > "$archive_file" || {
+                echo "Error archiving ai_chats" >&2
+                return 1
+            }
+            
+            # Delete archived ai_chats
+            execute_sql "DELETE FROM ai_chats WHERE created_at < CURRENT_DATE - INTERVAL '$days days';" "$db" || {
+                echo "Error deleting old ai_chats" >&2
+                return 1
+            }
+            ;;
+        "postgres")
+            echo "Archiving not implemented for postgres database (vectors are typically persistent)"
+            return 1
+            ;;
+        *)
+            echo "Error: Archive not implemented for database '$db'" >&2
+            echo "Supported databases: transcriptions, ai_chats" >&2
+            return 1
+            ;;
+    esac
     
     echo "Archived to: $archive_file"
 }
@@ -724,7 +906,7 @@ usage() {
 Usage: $SCRIPT_NAME [OPTIONS] COMMAND
 
 Universal PostgreSQL management script for local dotfiles.
-Currently implements transcription storage functionality.
+Supports multiple databases: transcriptions, ai_chats, postgres.
 
 COMMANDS:
     setup               Setup database and all schemas (alias for init)
@@ -733,36 +915,49 @@ COMMANDS:
     init-ai             Initialize ai_chats schema only
     maintain            Perform maintenance operations (vacuum, reindex, cleanup)
     stats               Show database statistics
-    export [FILE]       Export all transcriptions to JSON file
-    archive [DAYS]      Archive transcriptions older than DAYS (default: 365)
+    export [FILE]       Export data to JSON file
+    archive [DAYS]      Archive data older than DAYS (default: 365)
     sync                Sync databases from configured remote hosts
     
 OPTIONS:
-    -h, --help      Show this help message
-    -v, --verbose   Enable verbose output
+    -h, --help          Show this help message
+    -v, --verbose       Enable verbose output
+    -d, --database DB   Specify target database (required for maintain/export/archive)
+                        Available: transcriptions, ai_chats, postgres
+                        Optional for stats (shows all databases if not specified)
     
 ENVIRONMENT VARIABLES:
-    TRANSCRIPTION_DB_HOST     Database host (default: 127.0.0.1)
-    TRANSCRIPTION_DB_PORT     Database port (default: 5432)
-    TRANSCRIPTION_DB_NAME     Database name (default: transcriptions)
-    TRANSCRIPTION_DB_USER     Database user (default: current user)
-    TRANSCRIPTION_DB_PASSWORD Database password (default: none)
+    LOCAL_DB_HOST             Database host (default: 127.0.0.1)
+    LOCAL_DB_PORT             Database port (default: 5432)
+    LOCAL_DB_NAME             Database name (default: transcriptions)
+    LOCAL_DB_USER             Database user (default: postgres)
+    LOCAL_DB_PASSWORD         Database password (default: none)
+    
+    Backward compatibility (deprecated):
+    TRANSCRIPTION_DB_*        Legacy environment variables (still supported)
 
 EXAMPLES:
     # Initial setup
     $SCRIPT_NAME setup
     
-    # Perform maintenance
-    $SCRIPT_NAME maintain
+    # Perform maintenance on specific databases
+    $SCRIPT_NAME --database transcriptions maintain
+    $SCRIPT_NAME --database ai_chats maintain
     
-    # Show statistics
+    # Show statistics for specific databases
+    $SCRIPT_NAME --database transcriptions stats
+    $SCRIPT_NAME --database ai_chats stats
+    
+    # Show statistics for all databases
     $SCRIPT_NAME stats
     
-    # Export transcriptions
-    $SCRIPT_NAME export my_transcriptions.json
+    # Export data from specific databases
+    $SCRIPT_NAME --database transcriptions export my_transcriptions.json
+    $SCRIPT_NAME --database ai_chats export my_chats.json
     
-    # Archive old transcriptions
-    $SCRIPT_NAME archive 180
+    # Archive old data from specific databases
+    $SCRIPT_NAME --database transcriptions archive 180
+    $SCRIPT_NAME --database ai_chats archive 365
     
     # Sync databases from remote hosts
     $SCRIPT_NAME sync
@@ -784,6 +979,14 @@ parse_args() {
             -v|--verbose)
                 VERBOSE=true
                 shift
+                ;;
+            -d|--database)
+                TARGET_DATABASE="$2"
+                if [[ -z "$TARGET_DATABASE" ]]; then
+                    echo "Error: --database requires a database name" >&2
+                    exit 1
+                fi
+                shift 2
                 ;;
             setup|init|init-transcripts|init-ai|maintain|stats|export|archive|sync)
                 ACTION="$1"
@@ -818,6 +1021,17 @@ main() {
         exit 1
     fi
     
+    # Commands that require --database option
+    case "$ACTION" in
+        maintain|export|archive)
+            if [[ -z "$TARGET_DATABASE" ]]; then
+                echo "Error: Command '$ACTION' requires --database option" >&2
+                echo "Available databases: transcriptions, ai_chats, postgres" >&2
+                exit 1
+            fi
+            ;;
+    esac
+    
     case "$ACTION" in
         setup)
             setup_all
@@ -832,16 +1046,20 @@ main() {
             init_ai_chats_schema
             ;;
         maintain)
-            perform_maintenance
+            perform_maintenance "$TARGET_DATABASE"
             ;;
         stats)
-            show_stats
+            if [[ -n "$TARGET_DATABASE" ]]; then
+                show_stats "$TARGET_DATABASE"
+            else
+                show_all_stats
+            fi
             ;;
         export)
-            export_transcriptions "${ARGS[0]}"
+            export_data "$TARGET_DATABASE" "${ARGS[0]}"
             ;;
         archive)
-            archive_old_transcriptions "${ARGS[0]}"
+            archive_old_data "$TARGET_DATABASE" "${ARGS[0]}"
             ;;
         sync)
             sync_databases
