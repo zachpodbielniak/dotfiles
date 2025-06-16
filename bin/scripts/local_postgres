@@ -8,6 +8,7 @@ set -euo pipefail
 # Sync configuration - add databases and hosts to sync here
 SYNC_DATABASES=(
     "transcriptions"
+    "ai_chats"
     "postgres"  # For pgvector/second_brain_vectors table
 )
 
@@ -167,11 +168,93 @@ init_transcriptions_schema() {
     echo "Transcriptions schema initialized successfully"
 }
 
-# Setup all schemas
-setup_all() {
+# Initialize ai_chats schema
+init_ai_chats_schema() {
+    echo "Initializing ai_chats schema..."
+    
+    # Create ai_chats database if it doesn't exist
+    if ! database_exists "ai_chats"; then
+        echo "Creating ai_chats database..."
+        execute_sql "CREATE DATABASE ai_chats" "postgres" || return 1
+    fi
+    
+    # Create update trigger function in ai_chats database
+    execute_sql "
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS \$\$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    \$\$ language 'plpgsql';" "ai_chats" || return 1
+    
+    # Add tags column if it doesn't exist
+    execute_sql "ALTER TABLE ai_chats ADD COLUMN IF NOT EXISTS tags TEXT[];" "ai_chats" || return 1
+    
+    # Create main ai_chats table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS ai_chats (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        prompt TEXT NOT NULL,
+        response TEXT NOT NULL,
+        provider VARCHAR(50) NOT NULL,
+        model VARCHAR(200) NOT NULL,
+        request_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        response_timestamp TIMESTAMP WITH TIME ZONE,
+        duration_ms INTEGER,
+        tokens_input INTEGER,
+        tokens_output INTEGER,
+        cost_input_usd DECIMAL(10,6),
+        cost_output_usd DECIMAL(10,6),
+        cost_total_usd DECIMAL(10,6),
+        prompt_hash VARCHAR(64),
+        response_hash VARCHAR(64),
+        tags TEXT[],
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "ai_chats" || return 1
+    
+    # Create indexes for ai_chats
+    echo "Creating ai_chats indexes..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_request_timestamp ON ai_chats(request_timestamp DESC);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_provider ON ai_chats(provider);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_model ON ai_chats(model);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_prompt_hash ON ai_chats(prompt_hash);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_metadata ON ai_chats USING GIN(metadata);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_cost ON ai_chats(cost_total_usd);" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_tags ON ai_chats USING GIN(tags);" "ai_chats" || return 1
+    
+    # Create text search index for prompts and responses
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_prompt_text ON ai_chats USING GIN(to_tsvector('english', prompt));" "ai_chats" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_ai_chats_response_text ON ai_chats USING GIN(to_tsvector('english', response));" "ai_chats" || return 1
+    
+    # Create trigger for updated_at
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_ai_chats_updated_at') THEN
+            CREATE TRIGGER update_ai_chats_updated_at 
+            BEFORE UPDATE ON ai_chats
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "ai_chats" || return 1
+    
+    echo "AI chats schema initialized successfully"
+}
+
+# Initialize all schemas
+init_all_schemas() {
     create_database || return 1
     init_transcriptions_schema || return 1
-    echo "All schemas setup completed"
+    init_ai_chats_schema || return 1
+    echo "All schemas initialized successfully"
+}
+
+# Setup all schemas (alias for backward compatibility)
+setup_all() {
+    init_all_schemas
 }
 
 # Maintenance operations
@@ -443,6 +526,32 @@ merge_sync_table() {
                 ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" "$db" >/dev/null 2>&1
                 ;;
             
+            "ai_chats")
+                # Merge AI chats using UUID and updated_at timestamp
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (id) DO UPDATE SET
+                    prompt = EXCLUDED.prompt,
+                    response = EXCLUDED.response,
+                    provider = EXCLUDED.provider,
+                    model = EXCLUDED.model,
+                    request_timestamp = EXCLUDED.request_timestamp,
+                    response_timestamp = EXCLUDED.response_timestamp,
+                    duration_ms = EXCLUDED.duration_ms,
+                    tokens_input = EXCLUDED.tokens_input,
+                    tokens_output = EXCLUDED.tokens_output,
+                    cost_input_usd = EXCLUDED.cost_input_usd,
+                    cost_output_usd = EXCLUDED.cost_output_usd,
+                    cost_total_usd = EXCLUDED.cost_total_usd,
+                    prompt_hash = EXCLUDED.prompt_hash,
+                    response_hash = EXCLUDED.response_hash,
+                    tags = EXCLUDED.tags,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                ;;
+            
             "second_brain_vectors")
                 # For vectors, use file path as key and update if remote is newer
                 if table_has_timestamps "$db" "$table"; then
@@ -543,6 +652,8 @@ sync_databases() {
                 echo "      → Creating local database..."
                 if [[ "$db" == "transcriptions" ]]; then
                     create_database
+                elif [[ "$db" == "ai_chats" ]]; then
+                    init_ai_chats_schema
                 else
                     execute_sql "CREATE DATABASE $db" "postgres" >/dev/null 2>&1
                 fi
@@ -553,6 +664,9 @@ sync_databases() {
             case "$db" in
                 "transcriptions")
                     tables_to_sync=("transcriptions" "transcription_chunks")
+                    ;;
+                "ai_chats")
+                    tables_to_sync=("ai_chats")
                     ;;
                 "postgres")
                     # For postgres db, sync the vector table if it exists
@@ -613,13 +727,15 @@ Universal PostgreSQL management script for local dotfiles.
 Currently implements transcription storage functionality.
 
 COMMANDS:
-    setup           Setup database and all schemas
-    init            Initialize transcriptions schema only
-    maintain        Perform maintenance operations (vacuum, reindex, cleanup)
-    stats           Show database statistics
-    export [FILE]   Export all transcriptions to JSON file
-    archive [DAYS]  Archive transcriptions older than DAYS (default: 365)
-    sync            Sync databases from configured remote hosts
+    setup               Setup database and all schemas (alias for init)
+    init                Initialize all schemas (transcriptions + ai_chats)
+    init-transcripts    Initialize transcriptions schema only
+    init-ai             Initialize ai_chats schema only
+    maintain            Perform maintenance operations (vacuum, reindex, cleanup)
+    stats               Show database statistics
+    export [FILE]       Export all transcriptions to JSON file
+    archive [DAYS]      Archive transcriptions older than DAYS (default: 365)
+    sync                Sync databases from configured remote hosts
     
 OPTIONS:
     -h, --help      Show this help message
@@ -669,7 +785,7 @@ parse_args() {
                 VERBOSE=true
                 shift
                 ;;
-            setup|init|maintain|stats|export|archive|sync)
+            setup|init|init-transcripts|init-ai|maintain|stats|export|archive|sync)
                 ACTION="$1"
                 shift
                 break
@@ -707,7 +823,13 @@ main() {
             setup_all
             ;;
         init)
+            init_all_schemas
+            ;;
+        init-transcripts)
             init_transcriptions_schema
+            ;;
+        init-ai)
+            init_ai_chats_schema
             ;;
         maintain)
             perform_maintenance

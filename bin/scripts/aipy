@@ -1,19 +1,47 @@
 #!/usr/bin/python3
 
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id = os.environ.get("CONTAINER_ID", "")
+if ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Now import everything else inside the dev container
 import argparse
 import asyncio
 import concurrent.futures
 import json
-import subprocess
-import sys
-import os
 import select
 import time
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
+# Try to import database dependencies
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extras import RealDictCursor
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+
 # Default decision model for --pick-best feature
 DEFAULT_DECISION_MODEL = "claude-opus-4-20250514"
+
+# Database configuration for AI chat storage
+AI_CHATS_DB_CONFIG = {
+    'host': os.environ.get('AI_CHATS_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('AI_CHATS_DB_PORT', '5432')),
+    'database': os.environ.get('AI_CHATS_DB_NAME', 'ai_chats'),
+    'user': os.environ.get('AI_CHATS_DB_USER', 'postgres'),
+    'password': os.environ.get('AI_CHATS_DB_PASSWORD', '')
+}
 
 # Model to provider mapping
 MODEL_PROVIDERS = {
@@ -84,6 +112,652 @@ def get_provider_for_model(model):
     """Get the provider for a given model, or return 'ollampy' as default for unknown models."""
     return MODEL_PROVIDERS.get(model, "ollampy")
 
+def check_db_available(debug=False):
+    """Check if the AI chats database is available."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Warning: Database dependencies not available (psycopg2)", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        conn.close()
+        return True
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Warning: Could not connect to AI chats database: {e}", file=sys.stderr)
+        return False
+
+def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None, context_ids=None, debug=False, dry_run=False, show_id=False):
+    """Store chat interaction in the database."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Warning: Database not available for chat storage", file=sys.stderr)
+        return None
+    
+    if dry_run:
+        print("Would store chat in AI chats database", file=sys.stderr)
+        return None
+    
+    if not check_db_available(debug):
+        return None
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor()
+        
+        # Generate hashes for prompt and response
+        prompt_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        response_hash = hashlib.sha256(response.encode('utf-8')).hexdigest()
+        
+        # Extract metadata
+        request_timestamp = metadata.get('request_timestamp') if metadata else datetime.now()
+        response_timestamp = metadata.get('response_timestamp') if metadata else datetime.now()
+        duration_ms = metadata.get('duration_ms') if metadata else None
+        tokens_input = metadata.get('tokens_input') if metadata else None
+        tokens_output = metadata.get('tokens_output') if metadata else None
+        cost_input_usd = metadata.get('cost_input_usd') if metadata else None
+        cost_output_usd = metadata.get('cost_output_usd') if metadata else None
+        cost_total_usd = metadata.get('cost_total_usd') if metadata else None
+        extra_metadata = metadata.get('extra_metadata', {}) if metadata else {}
+        
+        # Add context references to metadata for conversation tracking
+        if context_ids:
+            extra_metadata['context_references'] = context_ids
+        
+        # Process tags
+        tags_array = tags if tags else []
+        
+        # Insert into database and return the UUID
+        cursor.execute("""
+            INSERT INTO ai_chats (
+                prompt, response, provider, model,
+                request_timestamp, response_timestamp, duration_ms,
+                tokens_input, tokens_output,
+                cost_input_usd, cost_output_usd, cost_total_usd,
+                prompt_hash, response_hash, tags, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            prompt, response, provider, model,
+            request_timestamp, response_timestamp, duration_ms,
+            tokens_input, tokens_output,
+            cost_input_usd, cost_output_usd, cost_total_usd,
+            prompt_hash, response_hash, tags_array, json.dumps(extra_metadata)
+        ))
+        
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        if debug:
+            print("Chat stored in database successfully", file=sys.stderr)
+        
+        if show_id:
+            print(f"New chat ID: {new_id}", file=sys.stderr)
+        
+        return str(new_id)
+    
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Warning: Failed to store chat in database: {e}", file=sys.stderr)
+        return None
+
+def search_ai_chats(query, limit=10, provider_filter=None, model_filter=None, tags_filter=None, output_format='text', debug=False):
+    """Search AI chats using full-text search."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Build WHERE clauses
+        where_clauses = []
+        params = []
+        
+        # Add text search if query is not a wildcard
+        if query and query != "*":
+            where_clauses.append(
+                "(to_tsvector('english', prompt) @@ plainto_tsquery('english', %s) OR "
+                "to_tsvector('english', response) @@ plainto_tsquery('english', %s))"
+            )
+            params.extend([query, query])
+        
+        if provider_filter:
+            where_clauses.append("provider = %s")
+            params.append(provider_filter)
+        
+        if model_filter:
+            where_clauses.append("model = %s")
+            params.append(model_filter)
+        
+        if tags_filter:
+            # Support searching for any of the provided tags
+            tag_conditions = []
+            for tag in tags_filter:
+                tag_conditions.append("tags @> %s")
+                params.append([tag.strip()])
+            if tag_conditions:
+                where_clauses.append(f"({' OR '.join(tag_conditions)})")
+        
+        where_clause = " AND ".join(where_clauses) if where_clauses else "TRUE"
+        
+        # Search query with ranking
+        if query and query != "*":
+            sql = f"""
+            SELECT 
+                id,
+                LEFT(prompt, 100) as prompt_snippet,
+                LEFT(response, 100) as response_snippet,
+                provider,
+                model,
+                request_timestamp,
+                duration_ms,
+                cost_total_usd,
+                tags,
+                ts_rank(
+                    to_tsvector('english', prompt || ' ' || response), 
+                    plainto_tsquery('english', %s)
+                ) as rank
+            FROM ai_chats
+            WHERE {where_clause}
+            ORDER BY rank DESC, request_timestamp DESC
+            LIMIT %s
+            """
+            params.extend([query, limit])
+        else:
+            sql = f"""
+            SELECT 
+                id,
+                LEFT(prompt, 100) as prompt_snippet,
+                LEFT(response, 100) as response_snippet,
+                provider,
+                model,
+                request_timestamp,
+                duration_ms,
+                cost_total_usd,
+                tags,
+                0 as rank
+            FROM ai_chats
+            WHERE {where_clause}
+            ORDER BY request_timestamp DESC
+            LIMIT %s
+            """
+            params.append(limit)
+        
+        cursor.execute(sql, params)
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        if output_format == 'json':
+            print(json.dumps([dict(r) for r in results], default=str, indent=2))
+        else:
+            if not results:
+                print("No results found.")
+                return True
+            
+            print(f"\nSearch results for: \"{query}\"")
+            print("=" * 50)
+            
+            for i, r in enumerate(results, 1):
+                print(f"\n{i}. [{str(r['id'])}] {r['provider']}/{r['model']}")
+                print(f"   Time: {r['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+                if r['duration_ms']:
+                    print(f"   Duration: {r['duration_ms']}ms")
+                if r['cost_total_usd']:
+                    print(f"   Cost: ${r['cost_total_usd']:.4f}")
+                if r['tags']:
+                    print(f"   Tags: {', '.join(r['tags'])}")
+                print(f"   Prompt: {r['prompt_snippet']}{'...' if len(r['prompt_snippet']) >= 100 else ''}")
+                print(f"   Response: {r['response_snippet']}{'...' if len(r['response_snippet']) >= 100 else ''}")
+            
+            print(f"\nFound {len(results)} results.")
+        
+        return True
+    
+    except psycopg2.Error as e:
+        print(f"Error searching AI chats: {e}", file=sys.stderr)
+        return False
+
+def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False, show_full_history=False, trace_mode=False):
+    """View full AI chat by UUID with optional conversation history."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Check if chat_id is a partial UUID (8 characters)
+        if len(chat_id) == 8:
+            # Search for UUIDs starting with this prefix
+            cursor.execute("""
+                SELECT * FROM ai_chats WHERE CAST(id AS TEXT) LIKE %s
+            """, [f"{chat_id}%"])
+            
+            results = cursor.fetchall()
+            
+            if not results:
+                cursor.close()
+                conn.close()
+                print(f"No chat found with ID starting with: {chat_id}")
+                return False
+            elif len(results) > 1:
+                cursor.close()
+                conn.close()
+                print(f"Multiple chats found with ID starting with '{chat_id}':")
+                for r in results:
+                    print(f"  - {r['id']} ({r['provider']}/{r['model']}, {r['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')})")
+                print("Please provide the full UUID to view a specific chat.")
+                return False
+            else:
+                result = results[0]
+                chat_id = str(result['id'])  # Use full UUID for history functionality
+        else:
+            # Try to use as full UUID
+            cursor.execute("""
+                SELECT * FROM ai_chats WHERE id = %s::uuid
+            """, [chat_id])
+            
+            result = cursor.fetchone()
+            
+            if not result:
+                cursor.close()
+                conn.close()
+                print(f"No chat found with ID: {chat_id}")
+                return False
+        
+        cursor.close()
+        conn.close()
+        
+        # Handle history reconstruction if requested
+        if show_history or show_full_history:
+            history = build_conversation_history(chat_id, include_forward=show_full_history, debug=debug)
+            if history:
+                print(format_conversation_history(history, trace_mode=trace_mode))
+                return True
+            elif show_history or show_full_history:
+                print("No conversation history found. Showing individual chat:")
+        
+        if output_format == 'json':
+            print(json.dumps(dict(result), default=str, indent=2))
+        else:
+            print("=" * 80)
+            print(f"Chat ID: {result['id']}")
+            print(f"Provider: {result['provider']}")
+            print(f"Model: {result['model']}")
+            print(f"Request Time: {result['request_timestamp']}")
+            if result['response_timestamp']:
+                print(f"Response Time: {result['response_timestamp']}")
+            if result['duration_ms']:
+                print(f"Duration: {result['duration_ms']}ms")
+            if result['tokens_input']:
+                print(f"Input Tokens: {result['tokens_input']}")
+            if result['tokens_output']:
+                print(f"Output Tokens: {result['tokens_output']}")
+            if result['cost_total_usd']:
+                print(f"Total Cost: ${result['cost_total_usd']:.6f}")
+            if result['tags']:
+                print(f"Tags: {', '.join(result['tags'])}")
+            print("=" * 80)
+            print("\nPROMPT:")
+            print("-" * 40)
+            print(result['prompt'])
+            print("\nRESPONSE:")
+            print("-" * 40)
+            print(result['response'])
+            if result['metadata'] and result['metadata'] != '{}':
+                print("\nMETADATA:")
+                print("-" * 40)
+                metadata = json.loads(result['metadata']) if isinstance(result['metadata'], str) else result['metadata']
+                print(json.dumps(metadata, indent=2))
+        
+        return True
+    
+    except psycopg2.Error as e:
+        print(f"Error viewing AI chat: {e}", file=sys.stderr)
+        return False
+
+def delete_ai_chat(chat_id, confirm=False, debug=False):
+    """Delete AI chat by UUID."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # First, get the chat details
+        cursor.execute("""
+            SELECT id, LEFT(prompt, 100) as prompt_snippet, provider, model, request_timestamp
+            FROM ai_chats WHERE id = %s::uuid
+        """, [chat_id])
+        
+        result = cursor.fetchone()
+        
+        if not result:
+            print(f"No chat found with ID: {chat_id}")
+            cursor.close()
+            conn.close()
+            return False
+        
+        # Confirm deletion
+        if not confirm:
+            print("About to delete chat:")
+            print(f"  ID: {result['id']}")
+            print(f"  Provider/Model: {result['provider']}/{result['model']}")
+            print(f"  Time: {result['request_timestamp']}")
+            print(f"  Prompt: {result['prompt_snippet']}{'...' if len(result['prompt_snippet']) >= 100 else ''}")
+            response = input("Are you sure? (y/N): ")
+            if response.lower() != 'y':
+                print("Deletion cancelled.")
+                cursor.close()
+                conn.close()
+                return False
+        
+        # Delete the chat
+        cursor.execute("DELETE FROM ai_chats WHERE id = %s::uuid", [chat_id])
+        conn.commit()
+        
+        cursor.close()
+        conn.close()
+        
+        print("Chat deleted successfully.")
+        return True
+    
+    except psycopg2.Error as e:
+        print(f"Error deleting AI chat: {e}", file=sys.stderr)
+        return False
+
+def get_chat_context(chat_ids, debug=False):
+    """Retrieve chat content by UUIDs (full or partial 8-char) for use as context."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Warning: Database not available for context retrieval", file=sys.stderr)
+        return []
+    
+    if not check_db_available(debug):
+        if debug:
+            print("Warning: Could not connect to AI chats database for context", file=sys.stderr)
+        return []
+    
+    if not chat_ids:
+        return []
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Resolve partial UUIDs to full UUIDs first
+        resolved_ids = []
+        for chat_id in chat_ids:
+            if len(chat_id) == 8:
+                # Search for UUIDs starting with this prefix
+                cursor.execute("""
+                    SELECT id FROM ai_chats WHERE CAST(id AS TEXT) LIKE %s
+                """, [f"{chat_id}%"])
+                
+                matches = cursor.fetchall()
+                
+                if not matches:
+                    print(f"Error: No chat found with ID starting with: {chat_id}", file=sys.stderr)
+                    cursor.close()
+                    conn.close()
+                    return None  # Signal error to caller
+                elif len(matches) > 1:
+                    print(f"Error: Multiple chats found with ID starting with '{chat_id}':", file=sys.stderr)
+                    for match in matches:
+                        cursor.execute("""
+                            SELECT provider, model, request_timestamp 
+                            FROM ai_chats WHERE id = %s::uuid
+                        """, [str(match['id'])])
+                        details = cursor.fetchone()
+                        print(f"  - {match['id']} ({details['provider']}/{details['model']}, {details['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')})", file=sys.stderr)
+                    print("Please provide the full UUID to disambiguate.", file=sys.stderr)
+                    cursor.close()
+                    conn.close()
+                    return None  # Signal error to caller
+                else:
+                    resolved_ids.append(str(matches[0]['id']))
+            else:
+                # Use as full UUID
+                resolved_ids.append(chat_id)
+        
+        # Now query for all resolved UUIDs
+        placeholders = ', '.join(['%s::uuid'] * len(resolved_ids))
+        cursor.execute(f"""
+            SELECT id, prompt, response, provider, model, request_timestamp, tags
+            FROM ai_chats 
+            WHERE id IN ({placeholders})
+            ORDER BY request_timestamp ASC
+        """, resolved_ids)
+        
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        context_chats = []
+        found_ids = set()
+        
+        for result in results:
+            found_ids.add(str(result['id']))
+            context_chats.append({
+                'id': str(result['id']),
+                'prompt': result['prompt'],
+                'response': result['response'],
+                'provider': result['provider'],
+                'model': result['model'],
+                'timestamp': result['request_timestamp'],
+                'tags': result['tags'] or []
+            })
+        
+        # Report missing chats
+        missing_ids = set(resolved_ids) - found_ids
+        if missing_ids and debug:
+            print(f"Warning: Could not find chats: {', '.join(missing_ids)}", file=sys.stderr)
+        
+        return context_chats
+    
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Warning: Failed to retrieve chat context: {e}", file=sys.stderr)
+        return []
+
+def format_context_for_prompt(context_chats):
+    """Format retrieved chats into context text for the prompt."""
+    if not context_chats:
+        return ""
+    
+    context_parts = ["=== CONTEXT FROM PREVIOUS CONVERSATIONS ===\n"]
+    
+    for i, chat in enumerate(context_chats, 1):
+        context_parts.append(f"Context {i} (ID: {chat['id'][:8]}..., {chat['provider']}/{chat['model']}):")
+        
+        if chat['tags']:
+            context_parts.append(f"Tags: {', '.join(chat['tags'])}")
+        
+        context_parts.append(f"User: {chat['prompt']}")
+        context_parts.append(f"Assistant: {chat['response']}")
+        context_parts.append("")  # Empty line between contexts
+    
+    context_parts.append("=== END CONTEXT ===\n")
+    
+    return "\n".join(context_parts)
+
+def build_conversation_history(chat_id, include_forward=False, debug=False):
+    """Build conversation history by following context references."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Warning: Database not available for history reconstruction", file=sys.stderr)
+        return []
+    
+    if not check_db_available(debug):
+        if debug:
+            print("Warning: Could not connect to AI chats database for history", file=sys.stderr)
+        return []
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Get all chats to build the graph
+        cursor.execute("""
+            SELECT id, prompt, response, provider, model, request_timestamp, tags, metadata
+            FROM ai_chats
+            ORDER BY request_timestamp ASC
+        """)
+        
+        all_chats = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        # Build chat lookup and reference graph
+        chat_lookup = {}
+        references = {}  # chat_id -> list of referenced chat_ids
+        referenced_by = {}  # chat_id -> list of chats that reference it
+        
+        for chat in all_chats:
+            chat_id_str = str(chat['id'])
+            chat_lookup[chat_id_str] = {
+                'id': chat_id_str,
+                'prompt': chat['prompt'],
+                'response': chat['response'],
+                'provider': chat['provider'],
+                'model': chat['model'],
+                'timestamp': chat['request_timestamp'],
+                'tags': chat['tags'] or []
+            }
+            
+            # Extract context references from metadata
+            metadata = chat['metadata']
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            
+            context_refs = metadata.get('context_references', []) if metadata else []
+            references[chat_id_str] = context_refs
+            
+            # Build reverse lookup
+            for ref_id in context_refs:
+                if ref_id not in referenced_by:
+                    referenced_by[ref_id] = []
+                referenced_by[ref_id].append(chat_id_str)
+        
+        # Build history chain
+        history = []
+        visited = set()
+        
+        def collect_backward_history(current_id):
+            """Recursively collect chat history going backwards."""
+            if current_id in visited or current_id not in chat_lookup:
+                return
+            
+            visited.add(current_id)
+            
+            # First, collect all referenced chats (going backward)
+            for ref_id in references.get(current_id, []):
+                collect_backward_history(ref_id)
+            
+            # Then add this chat
+            history.append(chat_lookup[current_id])
+        
+        def collect_forward_history(current_id):
+            """Recursively collect chats that reference this one (going forward)."""
+            if current_id in visited or current_id not in chat_lookup:
+                return
+            
+            visited.add(current_id)
+            
+            # Add this chat first
+            history.append(chat_lookup[current_id])
+            
+            # Then collect all chats that reference this one (going forward)
+            for forward_id in referenced_by.get(current_id, []):
+                collect_forward_history(forward_id)
+        
+        # Start collection
+        if include_forward:
+            # For full history, we need to find the root of the conversation tree
+            # Start by finding all chats that are referenced by our target chat
+            target_refs = references.get(chat_id, [])
+            
+            # Collect backward history for each reference point
+            for ref_id in target_refs:
+                collect_backward_history(ref_id)
+            
+            # Add the target chat itself
+            if chat_id in chat_lookup and chat_id not in visited:
+                history.append(chat_lookup[chat_id])
+                visited.add(chat_id)
+            
+            # Then collect forward references
+            for forward_id in referenced_by.get(chat_id, []):
+                collect_forward_history(forward_id)
+        else:
+            # Just backward history to this chat
+            collect_backward_history(chat_id)
+        
+        # Sort by timestamp to maintain chronological order
+        history.sort(key=lambda x: x['timestamp'])
+        
+        return history
+    
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Warning: Failed to build conversation history: {e}", file=sys.stderr)
+        return []
+
+def format_conversation_history(history, trace_mode=False):
+    """Format conversation history for display."""
+    if not history:
+        return "No conversation history found."
+    
+    if trace_mode:
+        # Show trace format
+        output = ["Conversation Flow Trace:"]
+        output.append("=" * 40)
+        
+        for i, chat in enumerate(history):
+            timestamp = chat['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            tags_str = f" [{', '.join(chat['tags'])}]" if chat['tags'] else ""
+            output.append(f"{i+1:2d}. {chat['id'][:8]}... | {timestamp} | {chat['provider']}/{chat['model']}{tags_str}")
+        
+        return "\n".join(output)
+    else:
+        # Show full conversation format
+        output = ["Conversation History:"]
+        output.append("=" * 80)
+        
+        for i, chat in enumerate(history):
+            timestamp = chat['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            tags_str = f" [{', '.join(chat['tags'])}]" if chat['tags'] else ""
+            
+            output.append(f"\n[{i+1}] {timestamp} | {chat['provider']}/{chat['model']} | {chat['id'][:8]}...{tags_str}")
+            output.append("-" * 80)
+            output.append(f"User: {chat['prompt']}")
+            output.append(f"\nAssistant: {chat['response']}")
+            output.append("")
+        
+        return "\n".join(output)
+
 def pick_best_response(prompt, model_responses, decision_model):
     """Use a reasoning model to pick the best response from multiple models."""
     # Prepare the decision prompt
@@ -149,8 +823,8 @@ Then provide a brief explanation of why that response is superior to the others.
     
     return None, "No successful responses to choose from"
 
-def save_multi_model_transaction(models, prompt, responses, metadata=None):
-    """Save multi-model chat transaction to markdown file organized by date."""
+def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=None, context_ids=None, store_db=True, debug=False, dry_run=False, show_id=False):
+    """Save multi-model chat transaction to markdown file organized by date and optionally to database."""
     # Create directory structure if it doesn't exist
     base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
     base_path.mkdir(parents=True, exist_ok=True)
@@ -203,6 +877,57 @@ def save_multi_model_transaction(models, prompt, responses, metadata=None):
             f.write(content)
     except Exception as e:
         print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
+    
+    # Store in database if requested and available
+    if store_db:
+        # For multi-model responses, store each successful response separately
+        for i, (model, response) in enumerate(zip(models, responses)):
+            if response.get("success") and response.get('output'):
+                provider = get_provider_for_model(model)
+                
+                # Prepare database metadata
+                db_metadata = {
+                    'request_timestamp': today,
+                    'response_timestamp': today,
+                    'extra_metadata': {
+                        'source': 'aipy_multi_model',
+                        'model_index': i,
+                        'total_models': len(models),
+                        'is_best_response': metadata.get('best_model') == model if metadata else False,
+                        'execution_type': 'parallel' if metadata and metadata.get('parallel') else 'sequential',
+                        'iterations': metadata.get('iterations', 1) if metadata else 1
+                    }
+                }
+                
+                # Add timing if available
+                if metadata and 'total_time' in metadata:
+                    db_metadata['duration_ms'] = int(metadata['total_time'] * 1000)
+                
+                # Add decision info if available
+                if metadata and metadata.get('best_model') == model:
+                    db_metadata['extra_metadata']['decision_model'] = metadata.get('decision_model')
+                    db_metadata['extra_metadata']['decision_reasoning'] = metadata.get('decision_reasoning')
+                
+                new_id = store_chat_in_db(
+                    prompt, 
+                    response['output'], 
+                    provider, 
+                    model, 
+                    db_metadata,
+                    tags=tags,
+                    context_ids=context_ids, 
+                    debug=debug, 
+                    dry_run=dry_run,
+                    show_id=show_id
+                )
+                
+                # Store the new ID for summary display
+                if new_id and 'new_chat_ids' not in metadata:
+                    if not hasattr(metadata, 'get'):
+                        metadata = metadata or {}
+                    metadata['new_chat_ids'] = []
+                if new_id:
+                    metadata.setdefault('new_chat_ids', []).append(new_id)
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -211,6 +936,7 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Basic usage
   aipy "What is quantum computing?"                    # Uses default model
   aipy --model gpt-4o "Explain AI"                   # Routes to OpenAI
   aipy --model sonar-pro "Latest news"               # Routes to Perplexity
@@ -218,6 +944,29 @@ Examples:
   aipy --model gpt-4o,claude-3-5-sonnet "Compare"    # Multiple models in parallel
   aipy --times 3 --image-gen "A sunset"              # Generate 3 images
   aipy -L                                             # List all available models
+  
+  # Database operations
+  aipy --search "quantum computing"                   # Search chat history
+  aipy --search "python" --provider-filter claudpy   # Search by provider
+  aipy --search "API" --model-filter gpt-4o          # Search by model
+  aipy --search "*" --tags-filter "work,coding"      # Search by tags
+  aipy --view 12345678-1234-5678-9abc-123456789012   # View chat by UUID
+  aipy --delete 12345678-1234-5678-9abc-123456789012 # Delete chat
+  aipy --delete 12345678-1234-5678-9abc-123456789012 -y  # Delete without confirmation
+  
+  # Tagging conversations
+  aipy --tags "work,python,debugging" "Help fix my code"  # Tag conversation
+  aipy --tags "research,ai" "Explain transformers"        # Multiple tags
+  
+  # Using previous chats as context (auto-adds 'follow-up' tag)
+  aipy --id 12345678-1234-5678-9abc-123456789012 "Continue from where we left off"
+  aipy --id uuid1 --id uuid2 "Build on both previous conversations"
+  aipy --id uuid1 --tags "synthesis" "Next steps based on previous discussion"
+  
+  # Tracking new conversations
+  aipy --show-id "New conversation"                    # Shows UUID on stderr
+  aipy --summary "Another conversation"                # Shows UUID in summary
+  aipy --id uuid1 --show-id "Follow-up with tracking" # Shows both context and new ID
         """
     )
     
@@ -271,6 +1020,44 @@ Examples:
                         help="When using multiple models, use a reasoning model to pick the best response")
     parser.add_argument("--decision-model", default=DEFAULT_DECISION_MODEL,
                         help=f"Model to use for picking the best response (default: {DEFAULT_DECISION_MODEL})")
+    
+    # AI Chat database operations
+    parser.add_argument("--search", metavar="QUERY", 
+                        help="Search AI chat history in database")
+    parser.add_argument("--view", metavar="CHAT_ID", 
+                        help="View full AI chat by UUID")
+    parser.add_argument("--delete", metavar="CHAT_ID", 
+                        help="Delete AI chat by UUID")
+    
+    # View history options
+    parser.add_argument("--history", action="store_true",
+                        help="When viewing, show conversation history leading to this chat")
+    parser.add_argument("--full-history", action="store_true", 
+                        help="When viewing, show complete conversation thread including forward references")
+    parser.add_argument("--trace", action="store_true",
+                        help="Show conversation flow as UUID/timestamp trace instead of full content")
+    parser.add_argument("--limit", type=int, default=10, 
+                        help="Limit number of search results (default: 10)")
+    parser.add_argument("--provider-filter", 
+                        help="Filter search results by provider")
+    parser.add_argument("--model-filter", 
+                        help="Filter search results by model")
+    parser.add_argument("--tags-filter", 
+                        help="Filter search results by tags (comma-separated)")
+    parser.add_argument("-y", "--yes", action="store_true", 
+                        help="Skip confirmation prompts (for delete)")
+    
+    # Content tagging
+    parser.add_argument("--tags", 
+                        help="Tag the conversation with comma-separated tags")
+    
+    # Context from previous chats
+    parser.add_argument("--id", action="append", dest="context_ids",
+                        help="Include previous chat(s) as context by UUID (can be used multiple times)")
+    
+    # Output options for new chats
+    parser.add_argument("--show-id", action="store_true",
+                        help="Display the UUID of the newly created chat")
     
     # Ollama-specific options
     parser.add_argument("--endpoint", help="Ollama API endpoint")
@@ -438,6 +1225,42 @@ def list_all_models():
 def main():
     args = parse_arguments()
     
+    # Handle database operations first
+    if args.search:
+        tags_filter = None
+        if args.tags_filter:
+            tags_filter = [tag.strip() for tag in args.tags_filter.split(',') if tag.strip()]
+        
+        search_ai_chats(
+            args.search, 
+            limit=args.limit,
+            provider_filter=args.provider_filter,
+            model_filter=args.model_filter,
+            tags_filter=tags_filter,
+            output_format='json' if args.json else 'text',
+            debug=args.debug
+        )
+        return
+    
+    if args.view:
+        view_ai_chat(
+            args.view,
+            output_format='json' if args.json else 'text',
+            debug=args.debug,
+            show_history=args.history,
+            show_full_history=args.full_history,
+            trace_mode=args.trace
+        )
+        return
+    
+    if args.delete:
+        delete_ai_chat(
+            args.delete,
+            confirm=args.yes,
+            debug=args.debug
+        )
+        return
+    
     # Handle list-models specially
     if args.list_models:
         list_all_models()
@@ -456,10 +1279,23 @@ def main():
         print("Error: No prompt provided. Use positional argument, --prompt flag, or stdin.", file=sys.stderr)
         sys.exit(1)
     
+    # Load context from previous chats if requested
+    context_chats = []
+    if args.context_ids:
+        context_chats = get_chat_context(args.context_ids, debug=args.debug)
+        if context_chats is None:
+            # Error occurred (likely duplicate partial UUIDs)
+            sys.exit(1)
+    
     # Combine all input sources like grokpy does
     combined_parts = []
     
-    # Add file contents first if any
+    # Add context from previous chats first
+    if context_chats:
+        context_text = format_context_for_prompt(context_chats)
+        combined_parts.append(context_text)
+    
+    # Add file contents if any
     if args.files:
         for file_path in args.files:
             try:
@@ -486,6 +1322,19 @@ def main():
     
     # Store original prompt for --prompt flag
     args.original_prompt = args.prompt
+    
+    # Parse tags if provided
+    tags = []
+    if args.tags:
+        tags = [tag.strip() for tag in args.tags.split(',') if tag.strip()]
+    
+    # Automatically add 'follow-up' tag when using context
+    if args.context_ids:
+        if 'follow-up' not in tags:
+            tags.append('follow-up')
+    
+    # Convert back to None if empty for consistency
+    tags = tags if tags else None
     
     # Parse models (can be comma-separated)
     models = [m.strip() for m in args.model.split(",") if m.strip()]
@@ -536,12 +1385,50 @@ def main():
             # Save transaction if not disabled
             if not args.no_preserve and result.returncode == 0:
                 end_time = time.time()
+                provider = get_provider_for_model(model)
+                
+                # For single model, also store directly in DB
+                if not args.dry_run:
+                    db_metadata = {
+                        'request_timestamp': datetime.fromtimestamp(start_time),
+                        'response_timestamp': datetime.fromtimestamp(end_time),
+                        'duration_ms': int((end_time - start_time) * 1000),
+                        'extra_metadata': {
+                            'source': 'aipy_single_model',
+                            'execution_type': 'single',
+                            'iterations': 1
+                        }
+                    }
+                    
+                    new_id = store_chat_in_db(
+                        full_prompt, 
+                        result.stdout, 
+                        provider, 
+                        model, 
+                        db_metadata,
+                        tags=tags,
+                        context_ids=args.context_ids, 
+                        debug=args.debug, 
+                        dry_run=args.dry_run,
+                        show_id=args.show_id
+                    )
+                
                 save_multi_model_transaction(
                     [model], 
                     full_prompt, 
                     [{"success": True, "output": result.stdout}],
-                    {"total_time": end_time - start_time, "parallel": False, "iterations": 1}
+                    {"total_time": end_time - start_time, "parallel": False, "iterations": 1, "new_chat_ids": [new_id] if new_id else []},
+                    tags=tags,
+                    context_ids=args.context_ids,
+                    store_db=False,  # Already stored above
+                    debug=args.debug,
+                    dry_run=args.dry_run,
+                    show_id=args.show_id
                 )
+                
+                # Show summary for single model if requested
+                if args.summary and new_id:
+                    print(f"\nNew chat ID: {new_id}", file=sys.stderr)
                 
             if result.returncode != 0:
                 sys.exit(result.returncode)
@@ -628,8 +1515,14 @@ def main():
         successful = sum(1 for r in results if r["success"])
         print(f"\nCompleted: {successful}/{len(commands)} requests successful", file=sys.stderr)
         
+        # Show summary with new chat IDs if requested
+        if args.summary and metadata and metadata.get('new_chat_ids'):
+            print(f"\nNew chat IDs created:", file=sys.stderr)
+            for chat_id in metadata.get('new_chat_ids', []):
+                print(f"  {chat_id}", file=sys.stderr)
+        
         # Save transaction if not disabled and we have successful results
-        if capture_output and successful > 0:
+        if not args.no_preserve and successful > 0:
             end_time = time.time()
             
             # Sort results by model order for consistent output
@@ -659,7 +1552,13 @@ def main():
                 sorted_models, 
                 full_prompt, 
                 sorted_results,
-                metadata
+                metadata,
+                tags=tags,
+                context_ids=args.context_ids,
+                store_db=True,
+                debug=args.debug,
+                dry_run=args.dry_run,
+                show_id=args.show_id
             )
 
 if __name__ == "__main__":
