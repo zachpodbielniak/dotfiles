@@ -27,8 +27,11 @@ import XMonad.Config.Xfce
 
 import System.Environment
 import System.Process
+import System.Posix.Process (forkProcess)
+import Control.Concurrent (forkIO)
 import Data.IntMap (update)
 import Data.List
+import Data.Char
 
 -- main = do
 --      session <- getEnv "DESKTOP_SESSION"
@@ -45,6 +48,9 @@ terminalBin = "kitty"
 
 backgroundPicture :: String
 backgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png"
+
+myNoOp :: String 
+myNoOp = "sleep 0"
 
 
         
@@ -75,8 +81,9 @@ main = do
         <> homeDir 
         <> backgroundPicture
 
-    -- set Xorg settings
-    setXsettings hostName
+    -- set Xorg settings asynchronously  
+    _ <- spawn $ getXsettings hostName
+    -- _ <- forkProcess $ setXsettings hostName
 
     -- start xmonad
     xmonad 
@@ -123,11 +130,7 @@ myConfig = def
     , ("C-M1-8", spawn $ toggleHassCmd "server-room")
     , ("C-M1-9", spawn $ toggleHassCmd "fan-01")
     , ("C-M1-0", spawn $ toggleHassCmd "fan-02")
-    ]
-
-
-myStartupHook = do
-    
+    ]   
 
 
 -- layout settings
@@ -220,38 +223,55 @@ getEnvVar varName defaultValue = do
 --                        |___/                                              
 
 
-setXsettings :: String -> IO ()
-setXsettings hostName = do 
-    getXsettings hostName >>= spawn
+-- outside of XMonad context so we can't use spawn
+-- setXsettings :: String -> IO ()
+-- setXsettings hostName = do 
+--     _ <- readProcess "/usr/bin/bash" [] "echo 'setXsettings running' >  /tmp/xmonad-debug.log"
+--     _ <- readProcess "/usr/bin/bash" [] "echo 'about to print hostname' >> /tmp/xmonad-debug.log"
+--     _ <- system $ "echo \"" <> hostName <> "\" >> /tmp/xmonad-debug.log"
+--     -- command <- getXsettings hostName 
+--     let command = getXsettings hostName
+--     _ <- system "echo 'got command to run' >> /tmp/xmonad-debug.log"
+--     _ <- system $ "echo '" <> command <> "' >> /tmp/xmonad-debug.log"
+--     _ <- system command
+--     return ()
 
 
-getXsettings :: String -> IO String
-getXsettings hostName = do 
-    specificSettings <- getXsettingsSpecificHost hostName
-    return $ intercalate "; " 
+getXsettings :: String -> String
+getXsettings hostName = 
+    -- specificSettings <- getXsettingsSpecificHost hostName
+    intercalate "; " 
         [ "xset s off -dpms"
         , "xset r rate 200 50"
         , ""
-        ] <> specificSettings
+        ] -- <> specificSettings
 
-getXsettingsSpecificHost :: String -> IO String
-getXsettingsSpecificHost "lt-zach" = do
-    touchPadProperty <- getXpropertyTouchpad "lt-zach"
-    return $ intercalate "; " 
-        [ "xinput set-prop " <> touchPadProperty <> " 295 1" -- https://askubuntu.com/questions/1000016/how-to-reverse-trackpoint-direction
-        , ""
-        ]
-getXsettingsSpecificHost _ = pure ""
+-- unused
+-- getXsettingsSpecificHost :: String -> IO String
+-- getXsettingsSpecificHost "lt-zach" = do
+--     touchPadPropertyCmd <- getXpropertyTouchpadCmd "lt-zach"
+--     return $ intercalate "; " 
+--         [ "sleep 5"
+--         , touchPadPropertyCmd
+--         , ""
+--         ]
+-- getXsettingsSpecificHost _ = pure ""
 
 
-getXpropertyTouchpad :: String -> IO String 
-getXpropertyTouchpad "lt-zach" = do 
-    result <- readProcess 
-        "/usr/bin/bash" 
-        ["-c", "xinput list | grep -i Touchpad | awk '{print $6}' | awk -F= '{print $2}'"] 
-        "" 
-    return $ lines result !! 0
-
+-- https://askubuntu.com/questions/1000016/how-to-reverse-trackpoint-direction
+-- unused, see xsetup script
+-- getXpropertyTouchpadCmd :: String -> IO String 
+-- getXpropertyTouchpadCmd "lt-zach" = do 
+--     result <- readProcess 
+--         "/usr/bin/bash" 
+--         []
+--         "sleep 5; xinput list | grep -i Touchpad | awk '{print $6}' | awk -F= '{print $2}'" 
+--     let cleanResult = filter (not . null) $ lines $ trim result 
+--     if null cleanResult
+--         then return myNoOp
+--         else return $ "xinput set-prop " <> (head cleanResult) <> " 295 1"
+--     where 
+--         trim = reverse . dropWhile isSpace . reverse . dropWhile isSpace
 
 
 --                   __ _          __ _ _                   _   _   _             
