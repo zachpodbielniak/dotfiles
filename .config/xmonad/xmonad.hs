@@ -33,28 +33,50 @@ import Data.IntMap (update)
 import Data.List
 import Data.Char
 
--- main = do
---      session <- getEnv "DESKTOP_SESSION"
---      xmonad  $ maybe desktopConfig desktop session
---
--- desktop "gnome" = gnomeConfig
--- desktop "kde" = kde4Config
--- desktop "xfce" = xfceConfig
--- desktop "xmonad-mate" = gnomeConfig
--- desktop _ = desktopConfig
 
-terminalBin :: String
-terminalBin = "kitty"
+--                      _              _              _   _   _                 
+--   ___ ___  _ __  ___| |_ __ _ _ __ | |_   ___  ___| |_| |_(_)_ __   __ _ ___ 
+--  / __/ _ \| '_ \/ __| __/ _` | '_ \| __| / __|/ _ \ __| __| | '_ \ / _` / __|
+-- | (_| (_) | | | \__ \ || (_| | | | | |_  \__ \  __/ |_| |_| | | | | (_| \__ \
+--  \___\___/|_| |_|___/\__\__,_|_| |_|\__| |___/\___|\__|\__|_|_| |_|\__, |___/
+--                                                                    |___/     
 
-backgroundPicture :: String
-backgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png"
+
+myFont :: String 
+myFont = "xft:Hack Nerd Font Mono:regular:size=12:antialias=true:hinting=true"
+
+myModMask :: KeyMask 
+myModMask = mod4Mask  -- super key
+
+myTerminal :: String
+myTerminal = "kitty "
+
+myBrowser :: String 
+myBrowser = "flatpak --user run io.gitlab.librewolf-community " 
+
+myEditor :: String 
+myEditor = "nvim "
+
+openEditor :: String 
+openEditor = myTerminal <> myEditor 
+
+myBackgroundPicture :: String
+myBackgroundPicture = "/Pictures/Wallpapers/heroscreen-16042022-ROCKET-@3x.png"
+
 
 myNoOp :: String 
 myNoOp = "sleep 0"
 
 
-        
+ 
 
+
+--                  _       
+--  _ __ ___   __ _(_)_ __  
+-- | '_ ` _ \ / _` | | '_ \ 
+-- | | | | | | (_| | | | | |
+-- |_| |_| |_|\__,_|_|_| |_|
+                         
 
 main :: IO ()
 main = do
@@ -79,7 +101,7 @@ main = do
     -- set background
     _ <- spawn $ "sleep 2; feh --bg-fill " 
         <> homeDir 
-        <> backgroundPicture
+        <> myBackgroundPicture
 
     -- set Xorg settings asynchronously  
     _ <- spawn $ getXsettings hostName
@@ -98,15 +120,16 @@ myConfig = def
     { modMask = mod4Mask -- rebind mod to super
     , layoutHook = myLayout -- use custom layout
     , focusedBorderColor = "#0663d6"
+    , terminal = myTerminal
     }
     -- https://xmonad.github.io/xmonad-docs/xmonad-contrib/XMonad-Util-EZConfig.html
     -- to get keys:
     -- sudo showkey -k
     -- xmodmap -pke
     `additionalKeysP`
-    [ ("M-<Return>", spawn terminalBin)
+    [ ("M-<Return>", spawn myTerminal)
     , ("M-i", spawn "flatpak --user run io.gitlab.librewolf-community")
-    , ("M-y", spawn $ terminalBin <> " yazi")
+    , ("M-y", spawn $ myTerminal <> " yazi")
     , ("M-S-s", unGrab *> spawn "flatpak --user run org.flameshot.Flameshot gui")
     , ("M-d", spawn "rofi -show drun")
     , ("M-S-d", spawn "rofi -show run")
