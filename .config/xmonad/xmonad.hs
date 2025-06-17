@@ -49,7 +49,10 @@ myModMask :: KeyMask
 myModMask = mod4Mask  -- super key
 
 myTerminal :: String
-myTerminal = "kitty "
+myTerminal = "st "
+
+myTerminalAlt :: String 
+myTerminalAlt = "kitty "
 
 myBrowser :: String 
 myBrowser = "flatpak --user run io.gitlab.librewolf-community " 
@@ -128,6 +131,7 @@ myConfig = def
     -- xmodmap -pke
     `additionalKeysP`
     [ ("M-<Return>", spawn myTerminal)
+    , ("M-S-<Return>", spawn myTerminalAlt)
     , ("M-i", spawn "flatpak --user run io.gitlab.librewolf-community")
     , ("M-y", spawn $ myTerminal <> " yazi")
     , ("M-S-s", unGrab *> spawn "flatpak --user run org.flameshot.Flameshot gui")
