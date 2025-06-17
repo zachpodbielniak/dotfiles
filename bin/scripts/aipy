@@ -2485,6 +2485,10 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                            help="List all available models and exit")
     core_group.add_argument("--repl", action="store_true",
                            help="Start interactive REPL mode for chat conversation")
+    core_group.add_argument("--no-streaming", action="store_true",
+                           help="Disable streaming output (wait for complete response)")
+    core_group.add_argument("--no-summary", action="store_true",
+                           help="Skip displaying context summary in REPL mode")
     
     # ━━━ INPUT OPTIONS ━━━  
     input_group = parser.add_argument_group("📁 Input Options")
@@ -2601,8 +2605,6 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                              help="Enable detailed debug output")
     output_group.add_argument("--dry-run", action="store_true",
                              help="Show what would be sent without executing")
-    output_group.add_argument("-S", "--no-streaming", action="store_true",
-                             help="Disable streaming output")
     output_group.add_argument("--no-color", action="store_true",
                              help="Disable colored output")
     
@@ -2707,7 +2709,7 @@ def run_provider_command(provider, args, model=None, iteration=None, stdin_input
     
     return cmd, stdin_input
 
-def execute_command(cmd_and_stdin, model=None, iteration=None, capture_output=False):
+def execute_command(cmd_and_stdin, model=None, iteration=None, capture_output=False, stream_output=True):
     """Execute a command and return the result."""
     try:
         if isinstance(cmd_and_stdin, tuple):
@@ -2720,26 +2722,101 @@ def execute_command(cmd_and_stdin, model=None, iteration=None, capture_output=Fa
         elif model:
             print(f"[{model}]", file=sys.stderr)
         
-        # If we have stdin input, pass it to the command
-        if stdin_input:
-            result = subprocess.run(cmd, input=stdin_input, text=True, capture_output=capture_output)
-        else:
-            result = subprocess.run(cmd, capture_output=capture_output, text=True)
+        # Use streaming when enabled
+        if stream_output:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE if stdin_input else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
             
-        response = {
-            "success": result.returncode == 0,
-            "returncode": result.returncode,
-            "model": model,
-            "iteration": iteration,
-            "cmd": " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-        }
+            stdout_output = []
+            stderr_output = []
+            
+            # Send stdin input if provided
+            if stdin_input:
+                process.stdin.write(stdin_input)
+                process.stdin.close()
+            
+            # Stream output in real-time using threads
+            import threading
+            
+            def read_stream(stream, output_list, print_func):
+                """Read from a stream and both collect and print output."""
+                try:
+                    for line in iter(stream.readline, ''):
+                        if line:
+                            print_func(line, end='')
+                            output_list.append(line)
+                        else:
+                            break
+                except:
+                    pass
+                finally:
+                    stream.close()
+            
+            # Start threads to read stdout and stderr
+            stdout_thread = threading.Thread(
+                target=read_stream, 
+                args=(process.stdout, stdout_output, print)
+            )
+            stderr_thread = threading.Thread(
+                target=read_stream, 
+                args=(process.stderr, stderr_output, lambda x, **kwargs: print(x, file=sys.stderr, **kwargs))
+            )
+            
+            stdout_thread.start()
+            stderr_thread.start()
+            
+            # Wait for process to complete
+            returncode = process.wait()
+            
+            # Wait for all output to be read
+            stdout_thread.join()
+            stderr_thread.join()
+            
+            response = {
+                "success": returncode == 0,
+                "returncode": returncode,
+                "model": model,
+                "iteration": iteration,
+                "cmd": " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            }
+            
+            if capture_output:
+                response["output"] = ''.join(stdout_output)
+                if stderr_output:
+                    response["stderr"] = ''.join(stderr_output)
+                    
+            return response
         
-        if capture_output:
-            response["output"] = result.stdout
-            if result.stderr:
-                response["stderr"] = result.stderr
+        # Fallback to original non-streaming behavior
+        else:
+            # If we have stdin input, pass it to the command
+            if stdin_input:
+                result = subprocess.run(cmd, input=stdin_input, text=True, capture_output=capture_output)
+            else:
+                result = subprocess.run(cmd, capture_output=capture_output, text=True)
                 
-        return response
+            response = {
+                "success": result.returncode == 0,
+                "returncode": result.returncode,
+                "model": model,
+                "iteration": iteration,
+                "cmd": " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            }
+            
+            if capture_output:
+                response["output"] = result.stdout
+                if result.stderr:
+                    response["stderr"] = result.stderr
+                    
+            return response
+            
     except Exception as e:
         return {
             "success": False,
@@ -4452,7 +4529,7 @@ def display_context_info(context_uuid=None, chat_id=None, debug=False):
         if debug:
             print(f"Error displaying context: {e}", file=sys.stderr)
 
-def display_full_conversation_history(context_uuid, debug=False):
+def display_full_conversation_history(context_uuid=None, chat_id=None, debug=False, no_summary=False):
     """Display the full conversation history for a context in REPL with markdown rendering."""
     if not DB_AVAILABLE or not check_db_available(debug):
         print("⚠️  Database not available", file=sys.stderr)
@@ -4461,6 +4538,34 @@ def display_full_conversation_history(context_uuid, debug=False):
     try:
         conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # If chat_id provided, resolve to context_uuid
+        if chat_id and not context_uuid:
+            if len(chat_id) == 8:
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats 
+                    WHERE CAST(id as TEXT) LIKE %s
+                """, [f"{chat_id}%"])
+            else:
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats 
+                    WHERE id = %s
+                """, [chat_id])
+            
+            result = cursor.fetchone()
+            if result:
+                context_uuid = str(result['context_uuid'])
+            else:
+                print(f"⚠️  Chat {chat_id[:8]}... not found")
+                cursor.close()
+                conn.close()
+                return
+        
+        if not context_uuid:
+            print("⚠️  No context_uuid or chat_id provided")
+            cursor.close()
+            conn.close()
+            return
         
         # Get context info including summary
         cursor.execute("""
@@ -4510,8 +4615,8 @@ def display_full_conversation_history(context_uuid, debug=False):
         markdown_parts.append(f"**Total Chats:** {len(chats)}")
         markdown_parts.append("")
         
-        # Add context summary if available
-        if context_summary:
+        # Add context summary if available and not disabled
+        if context_summary and not no_summary:
             markdown_parts.append("## Summary")
             markdown_parts.append("")
             markdown_parts.append(context_summary)
@@ -4552,10 +4657,8 @@ def display_full_conversation_history(context_uuid, debug=False):
         # Render the markdown
         markdown_content = "\n".join(markdown_parts)
         rendered_output = render_markdown(markdown_content)
-        if rendered_output:  # Fallback if markdown rendering failed
+        if rendered_output:  # Only print if markdown rendering failed and returned fallback text
             print(rendered_output)
-        else:
-            print(markdown_content)
             
     except psycopg2.Error as e:
         print(f"⚠️  Error displaying conversation history: {e}", file=sys.stderr)
@@ -4987,9 +5090,9 @@ def start_repl(args):
     
     # Display context if available
     if context_id:
-        display_context_info(context_uuid=context_id, debug=args.debug)
+        display_full_conversation_history(context_uuid=context_id, debug=args.debug, no_summary=args.no_summary)
     elif args.context_ids:
-        display_context_info(chat_id=args.context_ids[0], debug=args.debug)
+        display_full_conversation_history(chat_id=args.context_ids[0], debug=args.debug, no_summary=args.no_summary)
     
     print("\n💡 Commands:")
     print("   Type your message and press Enter")
@@ -5056,7 +5159,7 @@ def start_repl(args):
                         new_context = repl_load_chat(chat_id, debug=args.debug)
                         if new_context:
                             context_id = new_context
-                            display_full_conversation_history(context_uuid=context_id, debug=args.debug)
+                            display_full_conversation_history(context_uuid=context_id, debug=args.debug, no_summary=args.no_summary)
                     else:
                         print("⚠️  Usage: /load-chat <chat-id>")
                     continue
@@ -5066,7 +5169,7 @@ def start_repl(args):
                         new_context = repl_load_context(ctx_id, debug=args.debug)
                         if new_context:
                             context_id = new_context
-                            display_full_conversation_history(context_uuid=context_id, debug=args.debug)
+                            display_full_conversation_history(context_uuid=context_id, debug=args.debug, no_summary=args.no_summary)
                     else:
                         print("⚠️  Usage: /load-context <context-id>")
                     continue
@@ -5169,13 +5272,16 @@ def start_repl(args):
                 if args.debug:
                     cmd_args.append("--debug")
                 
+                # Force no-streaming in REPL mode for better markdown rendering
+                cmd_args.append("--no-streaming")
+                
                 # Add the full prompt (with history if available)
                 cmd_args.append(full_prompt)
                 
                 print(f"\n🤖 {args.model}:")
                 print("─" * 40)
                 
-                # Execute the command - capture stderr to get context UUID
+                # Execute the command - REPL always uses markdown rendering (no streaming)
                 result = subprocess.run(cmd_args, capture_output=True, text=True)
                 
                 # Render the AI response as markdown
@@ -5186,7 +5292,8 @@ def start_repl(args):
                         if rendered_output:  # Fallback if markdown rendering failed
                             print(rendered_output, end='')
                 
-                # Check stderr for context UUID to maintain context continuity
+                # Check stderr for context UUID and chat ID to maintain context continuity
+                current_chat_id = None
                 if result.stderr:
                     stderr_lines = result.stderr.strip().split('\n')
                     for line in stderr_lines:
@@ -5208,16 +5315,27 @@ def start_repl(args):
                             new_chat_id = line.split('New chat ID: ')[-1].strip()
                             if new_chat_id:
                                 last_chat_id = new_chat_id
+                                current_chat_id = new_chat_id
                                 if args.debug:
                                     print(f"🔗 Captured chat ID: {last_chat_id[:8]}...", file=sys.stderr)
                         else:
                             # Print other stderr messages normally
                             print(line, file=sys.stderr)
                 
+                # Always display context and chat IDs after the response
+                print("─" * 40)
+                if context_id:
+                    print(f"🧠 Context: {context_id[:8]}...")
+                if current_chat_id:
+                    print(f"💬 Chat: {current_chat_id[:8]}...")
+                elif last_chat_id:
+                    print(f"💬 Chat: {last_chat_id[:8]}...")
+                print("─" * 40)
+                
                 if result.returncode != 0:
                     print(f"⚠️  Error: Command failed with return code {result.returncode}")
                 
-                print("\n" + "─" * 40)
+                print()
                 
             except KeyboardInterrupt:
                 print("\n\n👋 Interrupted. Type 'exit' to quit or continue chatting.")
@@ -5490,16 +5608,30 @@ def main():
                 print(f"Debug: With stdin input: {len(stdin_input)} characters", file=sys.stderr)
         
         try:
-            if stdin_input:
-                result = subprocess.run(cmd, input=stdin_input, text=True, capture_output=True)
-            else:
-                result = subprocess.run(cmd, capture_output=True, text=True)
+            # Use streaming unless disabled
+            stream_output = not args.no_streaming
+            # Always capture output when preserving chats to database
+            capture_output = not args.no_preserve
+            result = execute_command(cmd_and_stdin, model, iteration, capture_output=capture_output, stream_output=stream_output)
             
-            # Print output to user
-            if result.stdout:
-                print(result.stdout, end='')
-            if result.stderr:
-                print(result.stderr, file=sys.stderr, end='')
+            # Note: For streaming, output is already printed in execute_command
+            # For non-streaming, we need to print the captured output
+            if args.no_streaming:
+                if result.get("output"):
+                    print(result["output"], end='')
+                if result.get("stderr"):
+                    print(result["stderr"], file=sys.stderr, end='')
+            
+            # Convert execute_command result to subprocess-like result for compatibility
+            class MockResult:
+                def __init__(self, returncode, stdout="", stderr=""):
+                    self.returncode = returncode
+                    self.stdout = stdout
+                    self.stderr = stderr
+            
+            result_stdout = result.get("output", "")
+            result_stderr = result.get("stderr", "")
+            result = MockResult(result["returncode"], result_stdout, result_stderr)
             
             # Save transaction if not disabled
             if not args.no_preserve and result.returncode == 0:
@@ -5578,7 +5710,9 @@ def main():
                     print(f"Debug: Queuing: {' '.join(cmd)}", file=sys.stderr)
                     if stdin_input:
                         print(f"Debug: With stdin input: {len(stdin_input)} characters", file=sys.stderr)
-                future = executor.submit(execute_command, cmd_and_stdin, model, iteration, capture_output)
+                # Disable streaming for parallel execution to avoid confusing output
+                stream_output = False
+                future = executor.submit(execute_command, cmd_and_stdin, model, iteration, capture_output, stream_output)
                 futures.append(future)
             
             # Wait for all to complete
