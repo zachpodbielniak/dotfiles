@@ -21,7 +21,7 @@ import select
 import time
 import hashlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Try to import database dependencies
 try:
@@ -580,6 +580,111 @@ def search_contexts(query, limit=10, output_format='text', debug=False):
     
     except psycopg2.Error as e:
         print(f"Error searching contexts: {e}", file=sys.stderr)
+        return False
+
+def review_chats_by_date(date_str, trace_mode=False, content_only=False, output_format='text', debug=False):
+    """Review all chats from a specific date."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        # Validate date format
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            print(f"Error: Invalid date format '{date_str}'. Use YYYY-MM-DD", file=sys.stderr)
+            return False
+        
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Query for all chats from the specified date
+        sql = """
+        SELECT 
+            a.id,
+            a.prompt,
+            a.response,
+            a.provider,
+            a.model,
+            a.request_timestamp,
+            a.duration_ms,
+            a.cost_total_usd,
+            a.tags,
+            a.context_uuid,
+            c.name as context_name
+        FROM ai_chats a
+        JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+        WHERE DATE(a.request_timestamp) = %s
+        ORDER BY a.request_timestamp ASC
+        """
+        
+        cursor.execute(sql, [date_str])
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        if output_format == 'json':
+            print(json.dumps([dict(r) for r in results], default=str, indent=2))
+        else:
+            if not results:
+                print(f"No chats found for {date_str}.")
+                return True
+            
+            if trace_mode:
+                # Show table format with chat-id, context-id, and context title
+                print(f"\nChat Review for {date_str} (Trace Mode)")
+                print("=" * 80)
+                print(f"{'Chat ID':<12} {'Context ID':<12} {'Time':<10} {'Context Title':<30} {'Model':<15}")
+                print("-" * 80)
+                
+                for r in results:
+                    chat_id_short = str(r['id'])[:8]
+                    context_id_short = str(r['context_uuid'])[:8]
+                    time_str = r['request_timestamp'].strftime('%H:%M:%S')
+                    context_name = (r['context_name'] or 'Unnamed')[:28]
+                    model_name = r['model'][:13]
+                    
+                    print(f"{chat_id_short:<12} {context_id_short:<12} {time_str:<10} {context_name:<30} {model_name:<15}")
+                
+                print(f"\nTotal: {len(results)} chats")
+            
+            else:
+                # Show full content format
+                print(f"\nChat Review for {date_str}")
+                print("=" * 50)
+                
+                for i, r in enumerate(results, 1):
+                    print(f"\n{i}. [{str(r['id'])[:8]}] {r['provider']}/{r['model']}")
+                    print(f"   Context: {r['context_name']} ({str(r['context_uuid'])[:8]}...)")
+                    print(f"   Time: {r['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+                    if r['duration_ms']:
+                        print(f"   Duration: {r['duration_ms']}ms")
+                    if r['cost_total_usd']:
+                        print(f"   Cost: ${r['cost_total_usd']:.4f}")
+                    if r['tags']:
+                        print(f"   Tags: {', '.join(r['tags'])}")
+                    
+                    if content_only:
+                        print(f"\n   Prompt: {r['prompt']}")
+                        print(f"\n   Response: {r['response']}")
+                    else:
+                        prompt_snippet = r['prompt'][:200]
+                        response_snippet = r['response'][:200]
+                        print(f"   Prompt: {prompt_snippet}{'...' if len(r['prompt']) > 200 else ''}")
+                        print(f"   Response: {response_snippet}{'...' if len(r['response']) > 200 else ''}")
+                
+                print(f"\nTotal: {len(results)} chats")
+        
+        return True
+    
+    except psycopg2.Error as e:
+        print(f"Error reviewing chats: {e}", file=sys.stderr)
         return False
 
 def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False, show_full_history=False, trace_mode=False, content_only=False):
@@ -1995,60 +2100,63 @@ Then provide a brief explanation of why that response is superior to the others.
     
     return None, "No successful responses to choose from"
 
-def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=None, context_ids=None, context_id=None, store_db=True, debug=False, dry_run=False, show_id=False):
+def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=None, context_ids=None, context_id=None, store_db=True, save_sb_md=False, debug=False, dry_run=False, show_id=False):
     """Save multi-model chat transaction to markdown file organized by date and optionally to database."""
-    # Create directory structure if it doesn't exist
-    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
-    base_path.mkdir(parents=True, exist_ok=True)
     
-    # Generate filename based on today's date
-    today = datetime.now()
-    filename = today.strftime("%Y-%m-%d.md")
-    file_path = base_path / filename
-    
-    # Generate timestamp for section header
-    timestamp = today.strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Prepare content
-    content = f"\n# {timestamp} - Multi-Model Query (aipy)\n\n"
-    content += f"## Prompt\n\n```\n{prompt}\n```\n\n"
-    
-    # Add model responses
-    content += f"## Model Responses\n\n"
-    
-    for i, (model, response) in enumerate(zip(models, responses)):
-        content += f"### {i+1}. {model}\n\n"
-        if response.get("success"):
-            content += f"{response.get('output', 'No output captured')}\n\n"
-        else:
-            content += f"**Error**: {response.get('error', 'Unknown error')}\n\n"
-    
-    # Add metadata if provided
-    if metadata:
-        content += f"## Metadata\n\n"
-        content += f"- **Provider**: aipy (multi-model wrapper)\n"
-        content += f"- **Models**: {', '.join(models)}\n"
-        if 'total_time' in metadata:
-            content += f"- **Total Time**: {metadata['total_time']:.2f}s\n"
-        if 'parallel' in metadata:
-            content += f"- **Execution**: {'Parallel' if metadata['parallel'] else 'Sequential'}\n"
-        if 'iterations' in metadata:
-            content += f"- **Iterations**: {metadata['iterations']}\n"
-        if 'best_model' in metadata:
-            content += f"- **Best Response**: {metadata['best_model']}\n"
-        if 'decision_model' in metadata:
-            content += f"- **Decision Model**: {metadata['decision_model']}\n"
-        if 'decision_reasoning' in metadata:
-            content += f"\n### Decision Reasoning\n\n{metadata['decision_reasoning']}\n"
-    
-    content += "\n---\n"
-    
-    # Write to file (append if exists)
-    try:
-        with open(file_path, 'a', encoding='utf-8') as f:
-            f.write(content)
-    except Exception as e:
-        print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
+    # Save to second-brain markdown file if requested
+    if save_sb_md:
+        # Create directory structure if it doesn't exist
+        base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+        base_path.mkdir(parents=True, exist_ok=True)
+        
+        # Generate filename based on today's date
+        today = datetime.now()
+        filename = today.strftime("%Y-%m-%d.md")
+        file_path = base_path / filename
+        
+        # Generate timestamp for section header
+        timestamp = today.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Prepare content
+        content = f"\n# {timestamp} - Multi-Model Query (aipy)\n\n"
+        content += f"## Prompt\n\n```\n{prompt}\n```\n\n"
+        
+        # Add model responses
+        content += f"## Model Responses\n\n"
+        
+        for i, (model, response) in enumerate(zip(models, responses)):
+            content += f"### {i+1}. {model}\n\n"
+            if response.get("success"):
+                content += f"{response.get('output', 'No output captured')}\n\n"
+            else:
+                content += f"**Error**: {response.get('error', 'Unknown error')}\n\n"
+        
+        # Add metadata if provided
+        if metadata:
+            content += f"## Metadata\n\n"
+            content += f"- **Provider**: aipy (multi-model wrapper)\n"
+            content += f"- **Models**: {', '.join(models)}\n"
+            if 'total_time' in metadata:
+                content += f"- **Total Time**: {metadata['total_time']:.2f}s\n"
+            if 'parallel' in metadata:
+                content += f"- **Execution**: {'Parallel' if metadata['parallel'] else 'Sequential'}\n"
+            if 'iterations' in metadata:
+                content += f"- **Iterations**: {metadata['iterations']}\n"
+            if 'best_model' in metadata:
+                content += f"- **Best Response**: {metadata['best_model']}\n"
+            if 'decision_model' in metadata:
+                content += f"- **Decision Model**: {metadata['decision_model']}\n"
+            if 'decision_reasoning' in metadata:
+                content += f"\n### Decision Reasoning\n\n{metadata['decision_reasoning']}\n"
+        
+        content += "\n---\n"
+        
+        # Write to file (append if exists)
+        try:
+            with open(file_path, 'a', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as e:
+            print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
     
     # Store in database if requested and available
     if store_db:
@@ -2263,6 +2371,12 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                          help="When viewing, show only content in clean markdown format")
     db_group.add_argument("--limit", type=int, default=10, metavar="N",
                          help="Limit number of search results (default: 10)")
+    db_group.add_argument("--review-today", action="store_true",
+                         help="Review all chats from today")
+    db_group.add_argument("--review-yesterday", action="store_true",
+                         help="Review all chats from yesterday")
+    db_group.add_argument("--review-date", metavar="YYYY-MM-DD",
+                         help="Review all chats from a specific date")
     
     # ━━━ HISTORY & CONTEXT ━━━
     context_group = parser.add_argument_group("🔗 History & Context")
@@ -2340,6 +2454,8 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                                help="Set AI personality/role")
     advanced_group.add_argument("--no-preserve", action="store_true",
                                help="Don't save chat transaction to database or files")
+    advanced_group.add_argument("--do-sb-logging", action="store_true",
+                               help="Save chat transaction to second-brain markdown file (disabled by default)")
     advanced_group.add_argument("-y", "--yes", action="store_true",
                                help="Skip confirmation prompts (for delete operations)")
     advanced_group.add_argument("--serve", action="store_true",
@@ -3246,6 +3362,26 @@ def main():
         )
         return
     
+    # Handle review operations
+    if args.review_today or args.review_yesterday or args.review_date:
+        review_date = None
+        if args.review_today:
+            review_date = datetime.now().strftime("%Y-%m-%d")
+        elif args.review_yesterday:
+            yesterday = datetime.now() - timedelta(days=1)
+            review_date = yesterday.strftime("%Y-%m-%d")
+        elif args.review_date:
+            review_date = args.review_date
+        
+        review_chats_by_date(
+            review_date,
+            trace_mode=args.trace,
+            content_only=args.content_only,
+            output_format='json' if args.json else 'text',
+            debug=args.debug
+        )
+        return
+    
     if args.view_context:
         view_context(
             args.view_context,
@@ -3433,6 +3569,7 @@ def main():
             if not args.no_preserve and result.returncode == 0:
                 end_time = time.time()
                 provider = get_provider_for_model(model)
+                new_id = None  # Initialize to handle dry-run case
                 
                 # For single model, also store directly in DB
                 if not args.dry_run:
@@ -3471,6 +3608,7 @@ def main():
                     context_ids=args.context_ids,
                     context_id=args.context_id,
                     store_db=False,  # Already stored above
+                    save_sb_md=args.do_sb_logging,
                     debug=args.debug,
                     dry_run=args.dry_run,
                     show_id=args.show_id
@@ -3607,6 +3745,7 @@ def main():
                 context_ids=args.context_ids,
                 context_id=args.context_id,
                 store_db=True,
+                save_sb_md=args.do_sb_logging,
                 debug=args.debug,
                 dry_run=args.dry_run,
                 show_id=args.show_id
