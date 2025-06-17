@@ -17,7 +17,10 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
+import os
+import re
 import select
+import subprocess
 import time
 import hashlib
 from pathlib import Path
@@ -2329,6 +2332,8 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                            help="Number of times to repeat request (useful for image generation)")
     core_group.add_argument("-L", "--list-models", action="store_true",
                            help="List all available models and exit")
+    core_group.add_argument("--repl", action="store_true",
+                           help="Start interactive REPL mode for chat conversation")
     
     # ━━━ INPUT OPTIONS ━━━  
     input_group = parser.add_argument_group("📁 Input Options")
@@ -3308,12 +3313,711 @@ def start_web_server(debug=False, host='127.0.0.1', port=5000):
     
     return True
 
+def parse_file_references(text, debug=False):
+    """Parse @<file> and @image:<file> references in text."""
+    
+    files = []
+    images = []
+    
+    # Find @image:<file> references
+    image_pattern = r'@image:([^\s]+)'
+    image_matches = re.findall(image_pattern, text)
+    
+    for match in image_matches:
+        file_path = match.strip()
+        # Handle relative paths
+        if not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
+        
+        if os.path.exists(file_path):
+            images.append(file_path)
+            if debug:
+                print(f"📷 Found image: {file_path}", file=sys.stderr)
+        else:
+            print(f"⚠️  Image not found: {file_path}", file=sys.stderr)
+    
+    # Find @<file> references (excluding @image: ones)
+    file_pattern = r'@(?!image:)([^\s]+)'
+    file_matches = re.findall(file_pattern, text)
+    
+    for match in file_matches:
+        file_path = match.strip()
+        # Handle relative paths
+        if not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
+        
+        if os.path.exists(file_path):
+            files.append(file_path)
+            if debug:
+                print(f"📄 Found file: {file_path}", file=sys.stderr)
+        else:
+            print(f"⚠️  File not found: {file_path}", file=sys.stderr)
+    
+    # Remove file references from text
+    clean_text = re.sub(r'@image:[^\s]+', '', text)
+    clean_text = re.sub(r'@(?!image:)[^\s]+', '', clean_text)
+    clean_text = ' '.join(clean_text.split())  # Clean up extra whitespace
+    
+    return clean_text, files, images
+
+def display_context_info(context_uuid=None, chat_id=None, debug=False):
+    """Display context information for REPL."""
+    if not DB_AVAILABLE or not check_db_available(debug):
+        return
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        if chat_id:
+            # Get context from specific chat
+            if len(chat_id) == 8:
+                cursor.execute("""
+                    SELECT a.context_uuid, c.name as context_name
+                    FROM ai_chats a
+                    JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                    WHERE CAST(a.id as TEXT) LIKE %s
+                """, [f"{chat_id}%"])
+            else:
+                cursor.execute("""
+                    SELECT a.context_uuid, c.name as context_name  
+                    FROM ai_chats a
+                    JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                    WHERE a.id = %s
+                """, [chat_id])
+            
+            result = cursor.fetchone()
+            if result:
+                context_uuid = result['context_uuid']
+                context_name = result['context_name']
+            else:
+                print(f"⚠️  Chat {chat_id} not found", file=sys.stderr)
+                cursor.close()
+                conn.close()
+                return
+        elif context_uuid:
+            # Get context info directly
+            if len(context_uuid) == 8:
+                cursor.execute("""
+                    SELECT context_uuid, name as context_name
+                    FROM ai_chat_contexts 
+                    WHERE CAST(context_uuid as TEXT) LIKE %s
+                """, [f"{context_uuid}%"])
+            else:
+                cursor.execute("""
+                    SELECT context_uuid, name as context_name
+                    FROM ai_chat_contexts 
+                    WHERE context_uuid = %s
+                """, [context_uuid])
+            
+            result = cursor.fetchone()
+            if result:
+                context_uuid = result['context_uuid']
+                context_name = result['context_name']
+            else:
+                print(f"⚠️  Context {context_uuid} not found", file=sys.stderr)
+                cursor.close()
+                conn.close()
+                return
+        
+        # Get recent chats from this context
+        cursor.execute("""
+            SELECT 
+                id,
+                LEFT(prompt, 100) as prompt_snippet,
+                LEFT(response, 100) as response_snippet,
+                model,
+                request_timestamp
+            FROM ai_chats 
+            WHERE context_uuid = %s
+            ORDER BY request_timestamp DESC
+            LIMIT 5
+        """, [context_uuid])
+        
+        chats = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        print(f"\n🧠 Context: {context_name}")
+        print(f"📝 Context ID: {str(context_uuid)[:8]}...")
+        print(f"💭 Recent conversations ({len(chats)} shown):")
+        print("─" * 60)
+        
+        for i, chat in enumerate(reversed(chats), 1):  # Show oldest first
+            timestamp = chat['request_timestamp'].strftime('%H:%M:%S')
+            print(f"{i}. [{timestamp}] {chat['model']}")
+            print(f"   👤 {chat['prompt_snippet']}{'...' if len(chat['prompt_snippet']) >= 100 else ''}")
+            print(f"   🤖 {chat['response_snippet']}{'...' if len(chat['response_snippet']) >= 100 else ''}")
+            print()
+        
+        print("─" * 60)
+        
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Error displaying context: {e}", file=sys.stderr)
+
+def repl_search_chats(query, limit=5, debug=False):
+    """Search chats in REPL mode with compact output."""
+    if not DB_AVAILABLE or not check_db_available(debug):
+        print("⚠️  Database not available for search", file=sys.stderr)
+        return []
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Simple search query
+        sql = """
+        SELECT 
+            a.id,
+            LEFT(a.prompt, 80) as prompt_snippet,
+            LEFT(a.response, 80) as response_snippet,
+            a.model,
+            a.request_timestamp,
+            a.context_uuid,
+            c.name as context_name
+        FROM ai_chats a
+        JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+        WHERE (
+            to_tsvector('english', a.prompt) @@ plainto_tsquery('english', %s) OR 
+            to_tsvector('english', a.response) @@ plainto_tsquery('english', %s)
+        )
+        ORDER BY a.request_timestamp DESC
+        LIMIT %s
+        """
+        
+        cursor.execute(sql, [query, query, limit])
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        if not results:
+            print(f"🔍 No chats found for: '{query}'")
+            return []
+        
+        print(f"\n🔍 Found {len(results)} chats for: '{query}'")
+        print("─" * 60)
+        
+        for i, r in enumerate(results, 1):
+            chat_id = str(r['id'])[:8]
+            timestamp = r['request_timestamp'].strftime('%m-%d %H:%M')
+            context_name = (r['context_name'] or 'Unnamed')[:20]
+            
+            print(f"{i}. [{chat_id}] {timestamp} | {r['model']}")
+            print(f"   Context: {context_name}")
+            print(f"   👤 {r['prompt_snippet']}{'...' if len(r['prompt_snippet']) >= 80 else ''}")
+            print(f"   🤖 {r['response_snippet']}{'...' if len(r['response_snippet']) >= 80 else ''}")
+            print()
+        
+        return [str(r['id']) for r in results]
+        
+    except psycopg2.Error as e:
+        print(f"⚠️  Error searching chats: {e}", file=sys.stderr)
+        return []
+
+def repl_search_contexts(query, limit=5, debug=False):
+    """Search contexts in REPL mode with compact output."""
+    if not DB_AVAILABLE or not check_db_available(debug):
+        print("⚠️  Database not available for search", file=sys.stderr)
+        return []
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Search contexts
+        sql = """
+        SELECT 
+            context_uuid,
+            name,
+            LEFT(COALESCE(summary, ''), 100) as summary_snippet,
+            tags,
+            created_at,
+            (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+            (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+        FROM ai_chat_contexts ctx
+        WHERE (
+            LOWER(name) LIKE LOWER(%s) OR
+            to_tsvector('english', COALESCE(summary, '')) @@ plainto_tsquery('english', %s) OR
+            %s = ANY(LOWER(tags::text)::text[])
+        )
+        ORDER BY last_chat_time DESC NULLS LAST
+        LIMIT %s
+        """
+        
+        search_term = f"%{query}%"
+        cursor.execute(sql, [search_term, query, query.lower(), limit])
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        if not results:
+            print(f"🔍 No contexts found for: '{query}'")
+            return []
+        
+        print(f"\n🔍 Found {len(results)} contexts for: '{query}'")
+        print("─" * 60)
+        
+        for i, r in enumerate(results, 1):
+            context_id = str(r['context_uuid'])[:8]
+            name = (r['name'] or 'Unnamed')[:30]
+            chat_count = r['chat_count']
+            last_chat = r['last_chat_time'].strftime('%m-%d %H:%M') if r['last_chat_time'] else 'Never'
+            
+            print(f"{i}. [{context_id}] {name}")
+            print(f"   📊 {chat_count} chats | Last: {last_chat}")
+            if r['summary_snippet']:
+                print(f"   📝 {r['summary_snippet']}{'...' if len(r['summary_snippet']) >= 100 else ''}")
+            if r['tags']:
+                print(f"   🏷️  {', '.join(r['tags'])}")
+            print()
+        
+        return [str(r['context_uuid']) for r in results]
+        
+    except psycopg2.Error as e:
+        print(f"⚠️  Error searching contexts: {e}", file=sys.stderr)
+        return []
+
+def repl_load_chat(chat_id, debug=False):
+    """Load a chat's context into the current REPL session."""
+    if not DB_AVAILABLE or not check_db_available(debug):
+        print("⚠️  Database not available", file=sys.stderr)
+        return None
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Handle partial UUID
+        if len(chat_id) == 8:
+            cursor.execute("""
+                SELECT a.context_uuid, c.name as context_name
+                FROM ai_chats a
+                JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                WHERE CAST(a.id as TEXT) LIKE %s
+            """, [f"{chat_id}%"])
+        else:
+            cursor.execute("""
+                SELECT a.context_uuid, c.name as context_name
+                FROM ai_chats a
+                JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                WHERE a.id = %s
+            """, [chat_id])
+        
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if result:
+            context_uuid = str(result['context_uuid'])
+            context_name = result['context_name']
+            print(f"✅ Loaded chat context: {context_name}")
+            print(f"📝 Context ID: {context_uuid[:8]}...")
+            return context_uuid
+        else:
+            print(f"⚠️  Chat {chat_id} not found")
+            return None
+            
+    except psycopg2.Error as e:
+        print(f"⚠️  Error loading chat: {e}", file=sys.stderr)
+        return None
+
+def repl_load_context(context_id, debug=False):
+    """Load a context into the current REPL session."""
+    if not DB_AVAILABLE or not check_db_available(debug):
+        print("⚠️  Database not available", file=sys.stderr)
+        return None
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Handle partial UUID
+        if len(context_id) == 8:
+            cursor.execute("""
+                SELECT context_uuid, name
+                FROM ai_chat_contexts
+                WHERE CAST(context_uuid as TEXT) LIKE %s
+            """, [f"{context_id}%"])
+        else:
+            cursor.execute("""
+                SELECT context_uuid, name
+                FROM ai_chat_contexts
+                WHERE context_uuid = %s
+            """, [context_id])
+        
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if result:
+            context_uuid = str(result['context_uuid'])
+            context_name = result['name']
+            print(f"✅ Loaded context: {context_name}")
+            print(f"📝 Context ID: {context_uuid[:8]}...")
+            return context_uuid
+        else:
+            print(f"⚠️  Context {context_id} not found")
+            return None
+            
+    except psycopg2.Error as e:
+        print(f"⚠️  Error loading context: {e}", file=sys.stderr)
+        return None
+
+def get_conversation_history(id_value, is_chat_id=False, debug=False):
+    """Get conversation history for a chat ID or context ID."""
+    if not DB_AVAILABLE or not check_db_available(debug):
+        return None
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        if is_chat_id:
+            # Get context from chat ID, then get conversation history
+            if len(id_value) == 8:
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats 
+                    WHERE CAST(id as TEXT) LIKE %s
+                """, [f"{id_value}%"])
+            else:
+                cursor.execute("""
+                    SELECT context_uuid FROM ai_chats 
+                    WHERE id = %s
+                """, [id_value])
+            
+            result = cursor.fetchone()
+            if not result:
+                cursor.close()
+                conn.close()
+                return None
+            
+            context_uuid = result['context_uuid']
+        else:
+            # Use context ID directly
+            context_uuid = id_value
+        
+        # Get conversation history from context
+        cursor.execute("""
+            SELECT prompt, response, request_timestamp
+            FROM ai_chats 
+            WHERE context_uuid = %s
+            ORDER BY request_timestamp ASC
+        """, [context_uuid])
+        
+        chats = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not chats:
+            return None
+        
+        # Build conversation history string
+        history_parts = ["=== CONTEXT FROM PREVIOUS CONVERSATIONS ==="]
+        
+        for chat in chats:
+            timestamp = chat['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            history_parts.append(f"\n[{timestamp}]")
+            history_parts.append(f"Human: {chat['prompt']}")
+            history_parts.append(f"Assistant: {chat['response']}")
+        
+        history_parts.append("\n=== END CONTEXT ===")
+        
+        return "\n".join(history_parts)
+        
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Error getting conversation history: {e}", file=sys.stderr)
+        return None
+
+def start_repl(args):
+    """Start interactive REPL mode."""
+    print("🚀 Starting AIPy REPL Mode")
+    print("─" * 50)
+    print(f"🤖 Model: {args.model}")
+    
+    # Handle context continuation
+    context_id = None
+    if getattr(args, 'continue', False):
+        # Get most recent context
+        if DB_AVAILABLE and check_db_available(args.debug):
+            try:
+                conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+                cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cursor.execute("""
+                    SELECT context_uuid
+                    FROM ai_chats 
+                    ORDER BY request_timestamp DESC
+                    LIMIT 1
+                """)
+                result = cursor.fetchone()
+                if result:
+                    context_id = str(result['context_uuid'])
+                cursor.close()
+                conn.close()
+            except:
+                pass
+    elif args.context_id:
+        context_id = args.context_id
+    elif args.context_ids:
+        context_id = args.context_ids[0]  # Use first chat's context
+        # Need to resolve chat ID to context ID
+        if DB_AVAILABLE and check_db_available(args.debug):
+            try:
+                conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+                cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                
+                chat_id = args.context_ids[0]
+                if len(chat_id) == 8:
+                    cursor.execute("""
+                        SELECT context_uuid FROM ai_chats 
+                        WHERE CAST(id as TEXT) LIKE %s
+                    """, [f"{chat_id}%"])
+                else:
+                    cursor.execute("""
+                        SELECT context_uuid FROM ai_chats 
+                        WHERE id = %s
+                    """, [chat_id])
+                
+                result = cursor.fetchone()
+                if result:
+                    context_id = str(result['context_uuid'])
+                cursor.close()
+                conn.close()
+            except:
+                pass
+    
+    # Display context if available
+    if context_id:
+        display_context_info(context_uuid=context_id, debug=args.debug)
+    elif args.context_ids:
+        display_context_info(chat_id=args.context_ids[0], debug=args.debug)
+    
+    print("\n💡 Commands:")
+    print("   Type your message and press Enter")
+    print("   Use @<file> to include files")
+    print("   Use @image:<file> to include images")
+    print("   Type '/exit' to exit")
+    print("   Type '/help' for more commands")
+    print("─" * 50)
+    
+    conversation_count = 0
+    last_chat_id = None  # Track the last chat ID for conversation continuity
+    
+    try:
+        while True:
+            try:
+                # Get user input
+                user_input = input(f"\n🟢 You [{conversation_count + 1}]: ").strip()
+                
+                if not user_input:
+                    continue
+                
+                # Handle special commands
+                if user_input.lower() in ['/exit', '/quit']:
+                    print("\n👋 Goodbye!")
+                    break
+                elif user_input.lower() == '/help':
+                    print("\n💡 Available commands:")
+                    print("   /exit, /quit - Exit REPL")
+                    print("   /help - Show this help")
+                    print("   /search-chat <query> - Search chat history")
+                    print("   /search-context <query> - Search contexts")
+                    print("   /load-chat <chat-id> - Load chat's context")
+                    print("   /load-context <context-id> - Load context")
+                    print("   /model <model-name> - Change current model")
+                    print("   /model-list - List available models")
+                    print("   @<file> - Include file content")
+                    print("   @image:<file> - Include image")
+                    print("   Examples:")
+                    print("     /search-chat python debugging")
+                    print("     /load-chat c18ffd76")
+                    print("     /model claude-3-5-sonnet")
+                    print("     What is this? @script.py")
+                    continue
+                elif user_input.lower().startswith('/search-chat '):
+                    query = user_input[13:].strip()
+                    if query:
+                        repl_search_chats(query, debug=args.debug)
+                    else:
+                        print("⚠️  Usage: /search-chat <query>")
+                    continue
+                elif user_input.lower().startswith('/search-context '):
+                    query = user_input[16:].strip()
+                    if query:
+                        repl_search_contexts(query, debug=args.debug)
+                    else:
+                        print("⚠️  Usage: /search-context <query>")
+                    continue
+                elif user_input.lower().startswith('/load-chat '):
+                    chat_id = user_input[11:].strip()
+                    if chat_id:
+                        new_context = repl_load_chat(chat_id, debug=args.debug)
+                        if new_context:
+                            context_id = new_context
+                            display_context_info(context_uuid=context_id, debug=args.debug)
+                    else:
+                        print("⚠️  Usage: /load-chat <chat-id>")
+                    continue
+                elif user_input.lower().startswith('/load-context '):
+                    ctx_id = user_input[14:].strip()
+                    if ctx_id:
+                        new_context = repl_load_context(ctx_id, debug=args.debug)
+                        if new_context:
+                            context_id = new_context
+                            display_context_info(context_uuid=context_id, debug=args.debug)
+                    else:
+                        print("⚠️  Usage: /load-context <context-id>")
+                    continue
+                elif user_input.lower().startswith('/model '):
+                    new_model = user_input[7:].strip()
+                    if new_model:
+                        # Validate model exists in our mapping
+                        if new_model in MODEL_PROVIDERS or new_model == "grok-3":
+                            args.model = new_model
+                            print(f"✅ Model changed to: {new_model}")
+                        else:
+                            print(f"⚠️  Unknown model: {new_model}")
+                            print("💡 Use /model-list to see available models")
+                    else:
+                        print("⚠️  Usage: /model <model-name>")
+                    continue
+                elif user_input.lower() == '/model-list':
+                    print("\n📋 Available models:")
+                    print("─" * 40)
+                    
+                    # Group by provider
+                    providers = {}
+                    for model, provider in MODEL_PROVIDERS.items():
+                        if provider not in providers:
+                            providers[provider] = []
+                        providers[provider].append(model)
+                    
+                    # Add default model
+                    providers.setdefault("grokpy", []).insert(0, "grok-3")
+                    
+                    for provider, models in sorted(providers.items()):
+                        provider_name = provider.replace("py", "").title()
+                        print(f"\n🔧 {provider_name}:")
+                        for model in sorted(set(models)):
+                            current = " (current)" if model == args.model else ""
+                            print(f"   • {model}{current}")
+                    
+                    print(f"\n💡 Current model: {args.model}")
+                    print("💡 Use: /model <model-name> to switch")
+                    continue
+                
+                # Parse file references
+                clean_prompt, files, images = parse_file_references(user_input, args.debug)
+                
+                if not clean_prompt and not files and not images:
+                    print("⚠️  Empty prompt after parsing file references")
+                    continue
+                
+                conversation_count += 1
+                
+                # Build full prompt with conversation history if we have a context
+                full_prompt = clean_prompt
+                if last_chat_id or context_id:
+                    history = get_conversation_history(last_chat_id or context_id, is_chat_id=bool(last_chat_id), debug=args.debug)
+                    if history:
+                        full_prompt = history + "\n\n" + clean_prompt
+                
+                # Build command arguments (no context flags - we include history in prompt)
+                cmd_args = [
+                    sys.argv[0],  # Use current script path
+                    "--model", args.model,
+                    "--show-id"
+                ]
+                
+                # Add context flag to maintain context continuity
+                if context_id:
+                    cmd_args.extend(["--context-id", context_id])
+                
+                # Add files
+                for file_path in files:
+                    cmd_args.extend(["-f", file_path])
+                
+                # Add images
+                for image_path in images:
+                    cmd_args.extend(["--image", image_path])
+                
+                # Add debug if needed
+                if args.debug:
+                    cmd_args.append("--debug")
+                
+                # Add the full prompt (with history if available)
+                cmd_args.append(full_prompt)
+                
+                print(f"\n🤖 {args.model}:")
+                print("─" * 40)
+                
+                # Execute the command - capture stderr to get context UUID
+                result = subprocess.run(cmd_args, capture_output=True, text=True)
+                
+                # Print stdout (the actual response)
+                if result.stdout:
+                    print(result.stdout, end='')
+                
+                # Check stderr for context UUID to maintain context continuity
+                if result.stderr:
+                    stderr_lines = result.stderr.strip().split('\n')
+                    for line in stderr_lines:
+                        if 'Context UUID:' in line:
+                            # Extract the context UUID for future messages
+                            new_context_id = line.split('Context UUID: ')[-1].strip()
+                            if new_context_id:
+                                if not context_id:
+                                    context_id = new_context_id
+                                    if args.debug:
+                                        print(f"🔗 Captured new context ID: {context_id[:8]}...", file=sys.stderr)
+                                elif context_id != new_context_id:
+                                    # This shouldn't normally happen, but log if it does
+                                    if args.debug:
+                                        print(f"⚠️  Context ID changed from {context_id[:8]}... to {new_context_id[:8]}...", file=sys.stderr)
+                                    context_id = new_context_id
+                        elif 'New chat ID:' in line:
+                            # Capture the new chat ID for conversation continuity
+                            new_chat_id = line.split('New chat ID: ')[-1].strip()
+                            if new_chat_id:
+                                last_chat_id = new_chat_id
+                                if args.debug:
+                                    print(f"🔗 Captured chat ID: {last_chat_id[:8]}...", file=sys.stderr)
+                        else:
+                            # Print other stderr messages normally
+                            print(line, file=sys.stderr)
+                
+                if result.returncode != 0:
+                    print(f"⚠️  Error: Command failed with return code {result.returncode}")
+                
+                print("\n" + "─" * 40)
+                
+            except KeyboardInterrupt:
+                print("\n\n👋 Interrupted. Type 'exit' to quit or continue chatting.")
+                continue
+            except EOFError:
+                print("\n👋 Goodbye!")
+                break
+            except Exception as e:
+                print(f"⚠️  Error: {e}", file=sys.stderr)
+                continue
+    
+    except Exception as e:
+        print(f"⚠️  REPL error: {e}", file=sys.stderr)
+
 def main():
     args = parse_arguments()
     
     # Handle web server mode
     if args.serve:
         start_web_server(debug=args.debug)
+        return
+    
+    # Handle REPL mode
+    if args.repl:
+        start_repl(args)
         return
     
     # Handle database operations first
