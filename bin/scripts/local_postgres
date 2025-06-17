@@ -53,6 +53,7 @@ ACTION=""
 VERBOSE=false
 DEBUG=false
 TARGET_DATABASE=""
+BACKUP_ALL=false
 
 # Database connection string
 get_connection_string() {
@@ -710,9 +711,9 @@ backup_all_databases() {
         local backup_file="${backup_dir}/${db}_backup_$(date +%Y%m%d_%H%M%S).sql"
         
         if backup_database "$db" "$backup_file"; then
-            ((success_count++))
+            ((success_count++)) || true
         else
-            ((fail_count++))
+            ((fail_count++)) || true
             echo "Error: Failed to backup database '$db'" >&2
         fi
         echo ""
@@ -1026,6 +1027,25 @@ merge_sync_table() {
                 WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
                 ;;
             
+            "ai_chat_contexts")
+                # Merge AI chat contexts using UUID and updated_at timestamp
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (context_uuid) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    summary = EXCLUDED.summary,
+                    summary_provider = EXCLUDED.summary_provider,
+                    summary_model = EXCLUDED.summary_model,
+                    summary_last_updated = EXCLUDED.summary_last_updated,
+                    tags = EXCLUDED.tags,
+                    ingested = EXCLUDED.ingested,
+                    ingested_path = EXCLUDED.ingested_path,
+                    ingested_at = EXCLUDED.ingested_at,
+                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                ;;
+            
             "second_brain_vectors")
                 # For second_brain_vectors, we don't use timestamps for merge logic
                 # Instead, we merge based on the ID and keep the latest version
@@ -1078,9 +1098,213 @@ merge_sync_table() {
     fi
 }
 
-# Sync databases with remote hosts
+# Push data to remote host (bidirectional sync helper)
+push_sync_table() {
+    local target_host="$1"
+    local db="$2"
+    local table="$3"
+    
+    echo "      → Pushing table: $table"
+    
+    # Create temporary table on remote host for local data
+    local temp_table="${table}_local_sync_$$"
+    
+    # Copy table structure on remote host
+    if [[ "$DEBUG" == true ]]; then
+        echo "        Debug: Creating staging table on remote: $temp_table"
+    fi
+    
+    local create_result=$(PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+        -h "$target_host" \
+        -p "$DEFAULT_DB_PORT" \
+        -U "$DEFAULT_DB_USER" \
+        -d "$db" \
+        -c "CREATE TABLE $temp_table (LIKE $table INCLUDING ALL);" 2>&1)
+    local create_exit_code=$?
+    if [[ $create_exit_code -ne 0 ]]; then
+        echo "        ✗ Failed to create staging table on remote"
+        [[ "$DEBUG" == true ]] && echo "        Error: $create_result"
+        return 1
+    fi
+    [[ "$DEBUG" == true ]] && echo "        Debug: Remote staging table created successfully"
+    
+    # Copy data to remote host
+    local error_file="/tmp/psql_push_error_$$"
+    if (
+        set -o pipefail
+        PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+            -h "$DEFAULT_DB_HOST" \
+            -p "$DEFAULT_DB_PORT" \
+            -U "$DEFAULT_DB_USER" \
+            -d "$db" \
+            -c "\\COPY $table TO STDOUT" 2>"${error_file}_local" | \
+        PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+            -h "$target_host" \
+            -p "$DEFAULT_DB_PORT" \
+            -U "$DEFAULT_DB_USER" \
+            -d "$db" \
+            -c "\\COPY $temp_table FROM STDIN" 2>"${error_file}_remote"
+    ); then
+        
+        # Perform the merge on remote host using the same logic
+        case "$table" in
+            "transcriptions")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        filename = EXCLUDED.filename,
+                        file_path = EXCLUDED.file_path,
+                        file_hash = EXCLUDED.file_hash,
+                        transcribed_at = EXCLUDED.transcribed_at,
+                        duration_seconds = EXCLUDED.duration_seconds,
+                        model_used = EXCLUDED.model_used,
+                        language = EXCLUDED.language,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                ;;
+            
+            "transcription_chunks")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" >/dev/null 2>&1
+                ;;
+            
+            "ai_chats")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        prompt = EXCLUDED.prompt,
+                        response = EXCLUDED.response,
+                        provider = EXCLUDED.provider,
+                        model = EXCLUDED.model,
+                        request_timestamp = EXCLUDED.request_timestamp,
+                        response_timestamp = EXCLUDED.response_timestamp,
+                        duration_ms = EXCLUDED.duration_ms,
+                        tokens_input = EXCLUDED.tokens_input,
+                        tokens_output = EXCLUDED.tokens_output,
+                        cost_input_usd = EXCLUDED.cost_input_usd,
+                        cost_output_usd = EXCLUDED.cost_output_usd,
+                        cost_total_usd = EXCLUDED.cost_total_usd,
+                        prompt_hash = EXCLUDED.prompt_hash,
+                        response_hash = EXCLUDED.response_hash,
+                        tags = EXCLUDED.tags,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                ;;
+            
+            "ai_chat_contexts")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (context_uuid) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        summary = EXCLUDED.summary,
+                        summary_provider = EXCLUDED.summary_provider,
+                        summary_model = EXCLUDED.summary_model,
+                        summary_last_updated = EXCLUDED.summary_last_updated,
+                        tags = EXCLUDED.tags,
+                        ingested = EXCLUDED.ingested,
+                        ingested_path = EXCLUDED.ingested_path,
+                        ingested_at = EXCLUDED.ingested_at,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                ;;
+            
+            "second_brain_vectors")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table (id, embedding, path, content_snippet, provider, model, metadata)
+                    SELECT id, embedding, path, content_snippet, provider, model, metadata
+                    FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        embedding = EXCLUDED.embedding,
+                        path = EXCLUDED.path,
+                        content_snippet = EXCLUDED.content_snippet,
+                        provider = EXCLUDED.provider,
+                        model = EXCLUDED.model,
+                        metadata = EXCLUDED.metadata;" >/dev/null 2>&1
+                ;;
+            
+            *)
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT DO NOTHING;" >/dev/null 2>&1
+                ;;
+        esac
+        
+        # Drop staging table on remote host
+        PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+            -h "$target_host" \
+            -p "$DEFAULT_DB_PORT" \
+            -U "$DEFAULT_DB_USER" \
+            -d "$db" \
+            -c "DROP TABLE IF EXISTS $temp_table;" >/dev/null 2>&1
+        
+        # Clean up error files
+        rm -f "${error_file}_local" "${error_file}_remote"
+        echo "        ✓ Pushed successfully"
+        return 0
+    else
+        echo "        ✗ Failed to push data to remote"
+        if [[ "$DEBUG" == true ]]; then
+            if [[ -s "${error_file}_local" ]]; then
+                echo "        Local error: $(cat "${error_file}_local")"
+            fi
+            if [[ -s "${error_file}_remote" ]]; then
+                echo "        Remote error: $(cat "${error_file}_remote")"
+            fi
+        fi
+        # Clean up staging table on failure
+        PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+            -h "$target_host" \
+            -p "$DEFAULT_DB_PORT" \
+            -U "$DEFAULT_DB_USER" \
+            -d "$db" \
+            -c "DROP TABLE IF EXISTS $temp_table;" >/dev/null 2>&1
+        # Clean up error files
+        rm -f "${error_file}_local" "${error_file}_remote"
+        return 1
+    fi
+}
+
+# Sync databases with remote hosts (bidirectional)
 sync_databases() {
-    echo "Starting database synchronization (merge mode)..."
+    echo "Starting bidirectional database synchronization..."
     echo "Current host: $(get_host_info)"
     echo ""
     
@@ -1096,9 +1320,6 @@ sync_databases() {
         return 0
     fi
     
-    # No need to ensure timestamps for vector table anymore
-    # semantic_search doesn't use timestamps
-    
     local sync_success=0
     local sync_failed=0
     local sync_skipped=0
@@ -1110,18 +1331,18 @@ sync_databases() {
         # Skip if this is the current host
         if is_current_host "$host"; then
             echo "  → Skipping (current host)"
-            ((sync_skipped++))
+            ((sync_skipped++)) || true
             continue
         fi
         
         # Check if host is reachable
         if ! check_host_reachable "$host"; then
             echo "  → Host unreachable (soft fail)"
-            ((sync_skipped++))
+            ((sync_skipped++)) || true
             continue
         fi
         
-        echo "  → Host is reachable, syncing databases..."
+        echo "  → Host is reachable, performing bidirectional sync..."
         
         # Sync each configured database
         for db in "${SYNC_DATABASES[@]}"; do
@@ -1164,22 +1385,34 @@ sync_databases() {
                     ;;
             esac
             
-            # Sync each table
+            # Perform bidirectional sync for each table
             local db_sync_success=true
             for table in "${tables_to_sync[@]}"; do
-                # Call merge_sync_table in a way that doesn't trigger set -e
+                echo "      Bidirectional sync for table: $table"
+                
+                # PULL: Get data from remote host to local
+                echo "      ← Pulling from remote..."
                 if merge_sync_table "$host" "$db" "$table" || false; then
-                    ((sync_success++))
+                    ((sync_success++)) || true
                 else
-                    ((sync_failed++))
+                    ((sync_failed++)) || true
+                    db_sync_success=false
+                fi
+                
+                # PUSH: Send data from local to remote host
+                echo "      → Pushing to remote..."
+                if push_sync_table "$host" "$db" "$table" || false; then
+                    ((sync_success++)) || true
+                else
+                    ((sync_failed++)) || true
                     db_sync_success=false
                 fi
             done
             
             if [[ "$db_sync_success" == true ]]; then
-                echo "      ✓ Database sync completed"
+                echo "      ✓ Bidirectional database sync completed"
             else
-                echo "      ✗ Database sync had errors"
+                echo "      ✗ Bidirectional database sync had errors"
             fi
         done
         
@@ -1187,9 +1420,9 @@ sync_databases() {
     done
     
     # Print summary
-    echo "Synchronization complete:"
-    echo "  - Successful syncs: $sync_success"
-    echo "  - Failed syncs: $sync_failed"
+    echo "Bidirectional synchronization complete:"
+    echo "  - Successful operations: $sync_success"
+    echo "  - Failed operations: $sync_failed"
     echo "  - Skipped operations: $sync_skipped"
     
     # Return non-zero if all operations failed
@@ -1218,7 +1451,7 @@ COMMANDS:
     stats               Show database statistics
     export [FILE]       Export data to JSON file
     archive [DAYS]      Archive data older than DAYS (default: 365)
-    sync                Sync databases from configured remote hosts
+    sync                Bidirectional sync with configured remote hosts (keeps latest records)
     backup [FILE]       Backup database to SQL dump file
     
 OPTIONS:
@@ -1228,6 +1461,7 @@ OPTIONS:
     -d, --database DB   Specify target database (required for maintain/export/archive)
                         Available: transcriptions, ai_chats, postgres
                         Optional for stats and backup (shows/backs up all databases if not specified)
+    --all               Backup all databases (transcriptions, ai_chats, postgres)
     
 ENVIRONMENT VARIABLES:
     LOCAL_DB_HOST             Database host (default: 127.0.0.1)
@@ -1266,16 +1500,25 @@ EXAMPLES:
     $SCRIPT_NAME --database transcriptions backup
     $SCRIPT_NAME --database ai_chats backup my_chats_backup.sql
     
-    # Backup all databases to a directory
+    # Backup all databases explicitly
+    $SCRIPT_NAME --all backup
+    $SCRIPT_NAME --all backup my_backups_dir
+    
+    # Backup all databases to a directory (default behavior)
     $SCRIPT_NAME backup
     $SCRIPT_NAME backup my_backups_dir
     
-    # Sync databases from remote hosts
+    # Bidirectional sync with remote hosts
     $SCRIPT_NAME sync
     
 SYNC CONFIGURATION:
     Edit SYNC_DATABASES and SYNC_HOSTS arrays at the top of this script
     to configure which databases and hosts to sync with.
+    
+    Sync is bidirectional and uses timestamp-based conflict resolution:
+    - Data is both pulled from and pushed to each remote host
+    - Conflicts are resolved by keeping the most recent record (updated_at)
+    - UUIDs prevent duplicate records across hosts
 EOF
 }
 
@@ -1302,6 +1545,10 @@ parse_args() {
                     exit 1
                 fi
                 shift 2
+                ;;
+            --all)
+                BACKUP_ALL=true
+                shift
                 ;;
             setup|init|init-transcripts|init-ai|init-second-brain|maintain|stats|export|archive|backup|sync)
                 ACTION="$1"
@@ -1380,12 +1627,15 @@ main() {
             archive_old_data "$TARGET_DATABASE" "${ARGS[0]}"
             ;;
         backup)
-            if [[ -n "$TARGET_DATABASE" ]]; then
+            if [[ "$BACKUP_ALL" == true ]]; then
+                # Backup all databases (explicit --all flag)
+                backup_all_databases "${ARGS[0]:-}"
+            elif [[ -n "$TARGET_DATABASE" ]]; then
                 # Backup specific database
-                backup_database "$TARGET_DATABASE" "${ARGS[0]}"
+                backup_database "$TARGET_DATABASE" "${ARGS[0]:-}"
             else
-                # Backup all databases
-                backup_all_databases "${ARGS[0]}"
+                # Backup all databases (default behavior when no specific database is specified)
+                backup_all_databases "${ARGS[0]:-}"
             fi
             ;;
         sync)
