@@ -124,6 +124,7 @@ fi
 alias de="distrobox enter"
 alias dl="distrobox list"
 alias dr="distrobox rm"
+alias dbhi="distrobox-host-exec"
 
 # ovrerides, must be careful!
 _have nvim && alias less="nvim +Man!"
