@@ -1,0 +1,1832 @@
+#!/usr/bin/python3
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Now import everything else inside the dev container
+import argparse
+import asyncio
+import html
+import json
+import re
+import subprocess
+from datetime import datetime
+
+# Try to import database dependencies
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extras import RealDictCursor
+    DB_AVAILABLE = True
+except ImportError:
+    print("Error: psycopg2 is required for aipy-serve", file=sys.stderr)
+    print("Install with: pip install psycopg2-binary", file=sys.stderr)
+    sys.exit(1)
+
+# Try to import web server dependencies
+try:
+    from quart import Quart, render_template_string, request, jsonify, redirect, url_for
+    import markdown
+except ImportError:
+    print("Error: Quart and markdown are required for aipy-serve", file=sys.stderr)
+    print("Install with: pip install quart markdown", file=sys.stderr)
+    sys.exit(1)
+
+# Database configuration for AI chat storage
+AI_CHATS_DB_CONFIG = {
+    'host': os.environ.get('AI_CHATS_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('AI_CHATS_DB_PORT', '5432')),
+    'database': os.environ.get('AI_CHATS_DB_NAME', 'ai_chats'),
+    'user': os.environ.get('AI_CHATS_DB_USER', 'postgres'),
+    'password': os.environ.get('AI_CHATS_DB_PASSWORD', '')
+}
+
+async def check_db_available(debug=False):
+    """Check if the AI chats database is available."""
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        conn.close()
+        return True
+    except Exception as e:
+        if debug:
+            print(f"Database connection failed: {e}", file=sys.stderr)
+        return False
+
+async def run_aipy_command(args, timeout=120):
+    """Run aipy command asynchronously."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'python3', 'aipy', *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd='/var/home/zach/.dotfiles/bin/scripts'
+        )
+        
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        
+        return {
+            'returncode': proc.returncode,
+            'stdout': stdout.decode('utf-8'),
+            'stderr': stderr.decode('utf-8')
+        }
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return {
+            'returncode': 1,
+            'stdout': '',
+            'stderr': 'Command timed out'
+        }
+    except Exception as e:
+        return {
+            'returncode': 1,
+            'stdout': '',
+            'stderr': str(e)
+        }
+
+def create_app(debug=False):
+    """Create and configure the Quart application."""
+    app = Quart(__name__)
+    app.config['SECRET_KEY'] = 'aipy-web-interface-secret'
+    
+    # HTML Template with HTMX and Dark Mode
+    HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIPy - Context Browser</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        :root[data-theme="light"] {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f8f9fa;
+            --bg-tertiary: #e9ecef;
+            --text-primary: #212529;
+            --text-secondary: #6c757d;
+            --border: #dee2e6;
+            --accent: #0d6efd;
+            --accent-hover: #0b5ed7;
+            --success: #198754;
+            --warning: #fd7e14;
+            --danger: #dc3545;
+        }
+        
+        :root[data-theme="dark"] {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --border: #30363d;
+            --accent: #58a6ff;
+            --accent-hover: #388bfd;
+            --success: #238636;
+            --warning: #f85149;
+            --danger: #f85149;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 30px;
+        }
+        
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--accent);
+        }
+        
+        .theme-toggle {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .theme-toggle:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .search-bar {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 16px;
+            margin-bottom: 20px;
+        }
+        
+        .search-bar:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+        }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 30px;
+        }
+        
+        .sidebar {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            height: fit-content;
+        }
+        
+        .content-area {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 600px;
+        }
+        
+        .context-item {
+            padding: 12px;
+            margin-bottom: 8px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .context-item:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--accent);
+        }
+        
+        .context-item.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .context-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        
+        .context-meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        
+        .context-item.active .context-meta {
+            color: rgba(255, 255, 255, 0.8);
+        }
+        
+        .chat-thread {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        
+        .chat-header {
+            background: var(--bg-tertiary);
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chat-content {
+            padding: 16px;
+        }
+        
+        .chat-prompt, .chat-response {
+            margin-bottom: 16px;
+        }
+        
+        .chat-prompt-label, .chat-response-label {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+        
+        .chat-text {
+            background: var(--bg-primary);
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            white-space: pre-wrap;
+            font-family: inherit;
+        }
+        
+        .context-summary {
+            background: var(--bg-tertiary);
+            padding: 16px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border);
+        }
+        
+        .summary-header {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        
+        .btn {
+            padding: 6px 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 12px;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .btn:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .btn.primary {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .btn.primary:hover {
+            background: var(--accent-hover);
+        }
+        
+        .loading {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+        }
+        
+        .empty-state h3 {
+            margin-bottom: 8px;
+        }
+        
+        .markdown-content {
+            line-height: 1.6;
+        }
+        
+        .markdown-content h1, .markdown-content h2, .markdown-content h3 {
+            margin-top: 24px;
+            margin-bottom: 12px;
+            color: var(--text-primary);
+        }
+        
+        .markdown-content h1 {
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 8px;
+        }
+        
+        .markdown-content h2 {
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 4px;
+        }
+        
+        .markdown-content p {
+            margin-bottom: 12px;
+        }
+        
+        .markdown-content pre {
+            background: var(--bg-primary);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            overflow-x: auto;
+            margin: 12px 0;
+        }
+        
+        .markdown-content code {
+            background: var(--bg-primary);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', 'Fira Code', monospace;
+        }
+        
+        .markdown-content blockquote {
+            border-left: 4px solid var(--accent);
+            padding-left: 16px;
+            margin: 12px 0;
+            color: var(--text-secondary);
+        }
+        
+        /* Chat Interface Styles */
+        .chat-interface {
+            border-top: 2px solid var(--accent);
+            padding: 20px;
+            margin-top: 20px;
+            background: var(--bg-primary);
+            border-radius: 8px;
+        }
+        
+        .chat-interface h3 {
+            margin-bottom: 15px;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .chat-form {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .chat-input {
+            width: 100%;
+            min-height: 100px;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 14px;
+            resize: vertical;
+        }
+        
+        .chat-input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+        }
+        
+        .chat-controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .model-select {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+        
+        .model-select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .chat-submit {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        
+        .chat-submit:hover {
+            background: var(--accent-hover);
+        }
+        
+        .chat-submit:disabled {
+            background: var(--text-secondary);
+            cursor: not-allowed;
+        }
+        
+        .chat-loading {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+        
+        .chat-loading.active {
+            display: flex;
+        }
+        
+        .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border);
+            border-top: 2px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Copy Button Styles */
+        .copy-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            margin-left: 8px;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .copy-btn:hover {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .copy-btn.copied {
+            background: var(--success);
+            color: white;
+            border-color: var(--success);
+        }
+        
+        .copy-conversation-btn {
+            background: var(--accent);
+            color: white;
+            border: 1px solid var(--accent);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .copy-conversation-btn:hover {
+            background: var(--accent-hover);
+            border-color: var(--accent-hover);
+        }
+        
+        .copy-conversation-btn.copied {
+            background: var(--success);
+            border-color: var(--success);
+        }
+        
+        /* Delete Button Styles */
+        .delete-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            margin-left: 8px;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .delete-btn:hover {
+            background: var(--danger);
+            color: white;
+            border-color: var(--danger);
+        }
+        
+        .delete-btn.confirming {
+            background: var(--warning);
+            color: white;
+            border-color: var(--warning);
+        }
+        
+        .delete-context-btn {
+            background: var(--danger);
+            color: white;
+            border: 1px solid var(--danger);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .delete-context-btn:hover {
+            background: #d63384;
+            border-color: #d63384;
+        }
+        
+        .delete-context-btn.confirming {
+            background: var(--warning);
+            border-color: var(--warning);
+        }
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            margin-left: 8px;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .delete-btn:hover {
+            background: var(--danger);
+            color: white;
+            border-color: var(--danger);
+        }
+        
+        .delete-btn.confirming {
+            background: var(--warning);
+            color: white;
+            border-color: var(--warning);
+        }
+        
+        .new-chat-response {
+            margin-top: 20px;
+            padding: 15px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-tertiary);
+        }
+        
+        .response-header {
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+        
+        .tag {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            padding: 2px 6px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin-right: 4px;
+            display: inline-block;
+            border: 1px solid var(--border);
+        }
+        
+        .tag-editor {
+            margin-top: 10px;
+            padding: 10px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+        
+        .tag-editor.hidden {
+            display: none;
+        }
+        
+        .tag-input {
+            width: 200px;
+            padding: 4px 8px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 12px;
+            margin-right: 8px;
+        }
+        
+        .tag-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .tag-removable {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            padding: 2px 6px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin-right: 4px;
+            margin-bottom: 4px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            border: 1px solid var(--border);
+        }
+        
+        .tag-remove-btn {
+            background: var(--danger);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            font-size: 10px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+        }
+        
+        .tag-remove-btn:hover {
+            background: #d63384;
+        }
+        
+        .tags-container {
+            margin-bottom: 8px;
+        }
+        
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .sidebar {
+                order: 2;
+            }
+            
+            .chat-controls {
+                flex-direction: column;
+                align-items: stretch;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🤖 AIPy Context Browser</div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <button class="btn" 
+                        hx-get="/new-chat" 
+                        hx-target="#content-detail"
+                        onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active'));">
+                    💬 New Chat
+                </button>
+                <button class="theme-toggle" onclick="toggleTheme()">
+                    🌙 Dark Mode
+                </button>
+            </div>
+        </div>
+        
+        <input type="text" 
+               class="search-bar" 
+               placeholder="Search contexts by name, summary, or tags..."
+               hx-get="/search"
+               hx-trigger="input changed delay:300ms"
+               hx-target="#context-list"
+               name="q">
+        
+        <div class="main-content">
+            <div class="sidebar">
+                <div id="context-list" hx-get="/contexts" hx-trigger="load">
+                    <div class="loading">Loading contexts...</div>
+                </div>
+            </div>
+            
+            <div class="content-area">
+                <div id="content-detail">
+                    <div class="empty-state">
+                        <h3>Welcome to AIPy Context Browser</h3>
+                        <p>Select a context from the sidebar to view its details</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function toggleTheme() {
+            const root = document.documentElement;
+            const current = root.getAttribute('data-theme');
+            const next = current === 'dark' ? 'light' : 'dark';
+            root.setAttribute('data-theme', next);
+            
+            const button = document.querySelector('.theme-toggle');
+            button.textContent = next === 'dark' ? '🌙 Dark Mode' : '☀️ Light Mode';
+            
+            localStorage.setItem('theme', next);
+        }
+        
+        // Load saved theme
+        const savedTheme = localStorage.getItem('theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+        document.querySelector('.theme-toggle').textContent = 
+            savedTheme === 'dark' ? '🌙 Dark Mode' : '☀️ Light Mode';
+        
+        // Copy to clipboard functions
+        async function copyToClipboard(text, button) {
+            try {
+                await navigator.clipboard.writeText(text);
+                const originalText = button.textContent;
+                button.textContent = '✅ Copied!';
+                button.classList.add('copied');
+                
+                setTimeout(() => {
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }, 2000);
+            } catch (err) {
+                console.error('Failed to copy text: ', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = originalText;
+                }, 2000);
+            }
+        }
+        
+        async function copyConversationMarkdown(contextUuid, button) {
+            try {
+                const response = await fetch(`/context/${contextUuid}/markdown`);
+                const markdown = await response.text();
+                await copyToClipboard(markdown, button);
+            } catch (err) {
+                console.error('Failed to fetch conversation markdown: ', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = '📋 Copy Markdown';
+                }, 2000);
+            }
+        }
+        
+        function copyChatSection(content, button) {
+            copyToClipboard(content, button);
+        }
+        
+        // Delete confirmation functions
+        let deleteConfirmations = {};
+        
+        async function deleteContext(contextUuid, button) {
+            const confirmKey = `context_${contextUuid}`;
+            
+            if (!deleteConfirmations[confirmKey]) {
+                // First click - ask for confirmation
+                const originalText = button.textContent;
+                button.textContent = '⚠️ Click Again to Confirm';
+                button.classList.add('confirming');
+                deleteConfirmations[confirmKey] = true;
+                
+                // Reset confirmation after 5 seconds
+                setTimeout(() => {
+                    delete deleteConfirmations[confirmKey];
+                    button.textContent = originalText;
+                    button.classList.remove('confirming');
+                }, 5000);
+                return;
+            }
+            
+            // Second click - proceed with deletion
+            try {
+                const response = await fetch(`/context/${contextUuid}/delete`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    // Refresh the sidebar and clear content area
+                    htmx.ajax('GET', '/contexts', '#context-list');
+                    document.getElementById('content-detail').innerHTML = '<div class="context-detail"><h2>Context Deleted</h2><p>The context and all its chats have been deleted.</p></div>';
+                } else {
+                    button.textContent = '❌ Failed';
+                    setTimeout(() => {
+                        button.textContent = '🗑️ Delete Context';
+                        button.classList.remove('confirming');
+                    }, 2000);
+                }
+            } catch (err) {
+                console.error('Failed to delete context:', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = '🗑️ Delete Context';
+                    button.classList.remove('confirming');
+                }, 2000);
+            }
+            
+            delete deleteConfirmations[confirmKey];
+        }
+        
+        async function deleteChat(chatId, contextUuid, button) {
+            const confirmKey = `chat_${chatId}`;
+            
+            if (!deleteConfirmations[confirmKey]) {
+                // First click - ask for confirmation
+                const originalText = button.textContent;
+                button.textContent = '⚠️ Confirm';
+                button.classList.add('confirming');
+                deleteConfirmations[confirmKey] = true;
+                
+                // Reset confirmation after 5 seconds
+                setTimeout(() => {
+                    delete deleteConfirmations[confirmKey];
+                    button.textContent = originalText;
+                    button.classList.remove('confirming');
+                }, 5000);
+                return;
+            }
+            
+            // Second click - proceed with deletion
+            try {
+                const response = await fetch(`/chat/${chatId}/delete`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    // Refresh the context view and sidebar
+                    htmx.ajax('GET', `/context/${contextUuid}`, '#content-detail');
+                    htmx.ajax('GET', '/contexts', '#context-list');
+                } else {
+                    button.textContent = '❌ Failed';
+                    setTimeout(() => {
+                        button.textContent = '🗑️';
+                        button.classList.remove('confirming');
+                    }, 2000);
+                }
+            } catch (err) {
+                console.error('Failed to delete chat:', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = '🗑️';
+                    button.classList.remove('confirming');
+                }, 2000);
+            }
+            
+            delete deleteConfirmations[confirmKey];
+        }
+        
+        // Tag editing functions
+        function toggleTagEditor(contextUuid) {
+            const editor = document.getElementById(`tag-editor-${contextUuid}`);
+            editor.classList.toggle('hidden');
+            
+            if (!editor.classList.contains('hidden')) {
+                const input = editor.querySelector('.tag-input');
+                input.focus();
+            }
+        }
+        
+        async function addTag(contextUuid) {
+            const input = document.getElementById(`tag-input-${contextUuid}`);
+            const tagText = input.value.trim();
+            
+            if (!tagText) return;
+            
+            try {
+                const response = await fetch(`/context/${contextUuid}/add-tag`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ tag: tagText })
+                });
+                
+                if (response.ok) {
+                    // Refresh the context view and sidebar
+                    htmx.ajax('GET', `/context/${contextUuid}`, '#content-detail');
+                    htmx.ajax('GET', '/contexts', '#context-list');
+                    input.value = '';
+                } else {
+                    const error = await response.json();
+                    alert('Error adding tag: ' + (error.error || 'Unknown error'));
+                }
+            } catch (err) {
+                console.error('Failed to add tag:', err);
+                alert('Failed to add tag');
+            }
+        }
+        
+        async function removeTag(contextUuid, tag) {
+            try {
+                const response = await fetch(`/context/${contextUuid}/remove-tag`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ tag: tag })
+                });
+                
+                if (response.ok) {
+                    // Refresh the context view and sidebar
+                    htmx.ajax('GET', `/context/${contextUuid}`, '#content-detail');
+                    htmx.ajax('GET', '/contexts', '#context-list');
+                } else {
+                    const error = await response.json();
+                    alert('Error removing tag: ' + (error.error || 'Unknown error'));
+                }
+            } catch (err) {
+                console.error('Failed to remove tag:', err);
+                alert('Failed to remove tag');
+            }
+        }
+        
+        // Handle Enter key in tag input
+        function handleTagInputKeydown(event, contextUuid) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                addTag(contextUuid);
+            }
+        }
+    </script>
+</body>
+</html>
+    '''
+    
+    @app.route('/')
+    async def index():
+        return await render_template_string(HTML_TEMPLATE)
+    
+    @app.route('/contexts')
+    async def get_contexts():
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute("""
+                SELECT 
+                    context_uuid,
+                    name,
+                    summary,
+                    tags,
+                    created_at,
+                    (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+                    (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+                FROM ai_chat_contexts ctx
+                ORDER BY last_chat_time DESC NULLS LAST, created_at DESC
+                LIMIT 50
+            """)
+            
+            contexts = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            html_content = ""
+            for ctx in contexts:
+                uuid_short = str(ctx['context_uuid'])[:8]
+                name = html.escape(ctx['name'] or '<untitled>')
+                chat_count = ctx['chat_count']
+                last_chat = ctx['last_chat_time'].strftime('%Y-%m-%d %H:%M') if ctx['last_chat_time'] else 'Never'
+                
+                html_content += f'''
+                <div class="context-item" 
+                     hx-get="/context/{ctx['context_uuid']}" 
+                     hx-target="#content-detail"
+                     onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active')); this.classList.add('active');">
+                    <div class="context-name">{name}</div>
+                    <div class="context-meta">{uuid_short}... • {chat_count} chats • {last_chat}</div>
+                </div>
+                '''
+            
+            return html_content
+            
+        except Exception as e:
+            return f'<div class="error">Error loading contexts: {e}</div>'
+    
+    @app.route('/search')
+    async def search_contexts_web():
+        query = (await request.args).get('q', '').strip()
+        if not query:
+            return await get_contexts()
+        
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            if query == '*':
+                where_clause = "TRUE"
+                params = []
+            else:
+                search_conditions = [
+                    "LOWER(name) LIKE LOWER(%s)",
+                    "to_tsvector('english', COALESCE(summary, '')) @@ plainto_tsquery('english', %s)",
+                    "tags @> ARRAY[%s] OR %s = ANY(tags)"
+                ]
+                where_clause = " OR ".join([f"({condition})" for condition in search_conditions])
+                params = [f"%{query}%", query, query.lower(), query.lower()]
+            
+            sql = f"""
+            SELECT 
+                context_uuid,
+                name,
+                summary,
+                tags,
+                created_at,
+                (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+                (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+            FROM ai_chat_contexts ctx
+            WHERE {where_clause}
+            ORDER BY last_chat_time DESC NULLS LAST, created_at DESC
+            LIMIT 50
+            """
+            
+            cursor.execute(sql, params)
+            contexts = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            html_content = ""
+            for ctx in contexts:
+                uuid_short = str(ctx['context_uuid'])[:8]
+                name = html.escape(ctx['name'] or '<untitled>')
+                chat_count = ctx['chat_count']
+                last_chat = ctx['last_chat_time'].strftime('%Y-%m-%d %H:%M') if ctx['last_chat_time'] else 'Never'
+                
+                html_content += f'''
+                <div class="context-item" 
+                     hx-get="/context/{ctx['context_uuid']}" 
+                     hx-target="#content-detail"
+                     onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active')); this.classList.add('active');">
+                    <div class="context-name">{name}</div>
+                    <div class="context-meta">{uuid_short}... • {chat_count} chats • {last_chat}</div>
+                </div>
+                '''
+            
+            if not contexts:
+                html_content = '<div class="empty-state"><h3>No contexts found</h3><p>Try a different search term</p></div>'
+            
+            return html_content
+            
+        except Exception as e:
+            return f'<div class="error">Error searching contexts: {e}</div>'
+    
+    def render_tags_with_remove(tags, context_uuid):
+        """Render tags with remove buttons."""
+        if not tags:
+            return '<span class="tag">No tags</span>'
+        
+        tag_html = []
+        for tag in tags:
+            escaped_tag = html.escape(tag)
+            tag_html.append(f'''
+                <span class="tag-removable">
+                    {escaped_tag}
+                    <button class="tag-remove-btn" onclick="removeTag('{context_uuid}', '{escaped_tag}')" title="Remove tag">×</button>
+                </span>
+            ''')
+        return ''.join(tag_html)
+
+    @app.route('/context/<context_uuid>')
+    async def get_context_detail(context_uuid):
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Get context info
+            cursor.execute("SELECT * FROM ai_chat_contexts WHERE context_uuid = %s", [context_uuid])
+            context = cursor.fetchone()
+            
+            if not context:
+                cursor.close()
+                conn.close()
+                return '<div class="error">Context not found</div>'
+            
+            # Get chats
+            cursor.execute("""
+                SELECT * FROM ai_chats 
+                WHERE context_uuid = %s 
+                ORDER BY request_timestamp ASC
+            """, [context_uuid])
+            
+            chats = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            name = html.escape(context['name'] or '<untitled>')
+            
+            html_content = f'''
+            <div class="context-detail">
+                <div class="context-header">
+                    <h2>{name}</h2>
+                    <div class="action-buttons">
+                        <button class="copy-conversation-btn" 
+                                onclick="copyConversationMarkdown('{context_uuid}', this)">
+                            📋 Copy Markdown
+                        </button>
+                        <button class="btn" 
+                                hx-post="/context/{context_uuid}/rename" 
+                                hx-prompt="Enter new name:"
+                                hx-target="closest .context-detail"
+                                hx-swap="outerHTML">
+                            ✏️ Rename
+                        </button>
+                        <button class="btn" 
+                                hx-post="/context/{context_uuid}/generate-name" 
+                                hx-target="closest .context-detail"
+                                hx-swap="outerHTML">
+                            🤖 Generate Name
+                        </button>
+                        <button class="btn" 
+                                hx-post="/context/{context_uuid}/summarize" 
+                                hx-target="closest .context-detail"
+                                hx-swap="outerHTML">
+                            📝 Generate Summary
+                        </button>
+                        <button class="delete-context-btn" 
+                                onclick="deleteContext('{context_uuid}', this)">
+                            🗑️ Delete Context
+                        </button>
+                        <button class="btn" 
+                                onclick="toggleTagEditor('{context_uuid}')">
+                            🏷️ Edit Tags
+                        </button>
+                    </div>
+                </div>
+                <div class="context-meta">
+                    <strong>UUID:</strong> {context['context_uuid']}<br>
+                    <strong>Created:</strong> {context['created_at'].strftime('%Y-%m-%d %H:%M:%S')}<br>
+                    <strong>Chats:</strong> {len(chats)}<br>
+                    <div class="tags-section">
+                        <strong>Tags:</strong>
+                        <div class="tags-container">
+                            {render_tags_with_remove(context["tags"], context_uuid) if context["tags"] else '<span class="tag">No tags</span>'}
+                        </div>
+                        <div id="tag-editor-{context_uuid}" class="tag-editor hidden">
+                            <input type="text" 
+                                   id="tag-input-{context_uuid}" 
+                                   class="tag-input" 
+                                   placeholder="Enter new tag..."
+                                   onkeydown="handleTagInputKeydown(event, '{context_uuid}')">
+                            <button class="btn" onclick="addTag('{context_uuid}')">Add Tag</button>
+                        </div>
+                    </div>
+                </div>
+            '''
+            
+            # Add summary if available
+            if context['summary']:
+                summary_html = markdown.markdown(
+                    context['summary'], 
+                    extensions=['codehilite', 'fenced_code', 'tables', 'toc']
+                )
+                provider_model = ""
+                if context['summary_provider'] and context['summary_model']:
+                    provider_model = f" (Generated by {context['summary_provider']}/{context['summary_model']})"
+                
+                html_content += f'''
+                <div class="context-summary">
+                    <div class="summary-header">📄 Summary{provider_model}</div>
+                    <div class="markdown-content">{summary_html}</div>
+                </div>
+                '''
+            
+            # Add chats
+            for i, chat in enumerate(chats, 1):
+                chat_id_short = str(chat['id'])[:8]
+                timestamp = chat['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                
+                html_content += f'''
+                <div class="chat-thread">
+                    <div class="chat-header">
+                        <span>Chat {i} - {chat['provider']}/{chat['model']}</span>
+                        <span>{timestamp} ({chat_id_short}...)</span>
+                    </div>
+                    <div class="chat-content">
+                        <div class="chat-prompt">
+                            <div class="chat-prompt-label">
+                                🧑 User:
+                                <button class="copy-btn" onclick="copyChatSection({html.escape(repr(chat['prompt']))}, this)">
+                                    📋 Copy
+                                </button>
+                                <button class="delete-btn" onclick="deleteChat('{chat['id']}', '{context_uuid}', this)">
+                                    🗑️ Delete
+                                </button>
+                            </div>
+                            <div class="chat-text">{html.escape(chat['prompt'])}</div>
+                        </div>
+                        <div class="chat-response">
+                            <div class="chat-response-label">
+                                🤖 Assistant:
+                                <button class="copy-btn" onclick="copyChatSection({html.escape(repr(chat['response']))}, this)">
+                                    📋 Copy
+                                </button>
+                                <button class="delete-btn" onclick="deleteChat('{chat['id']}', '{context_uuid}', this)">
+                                    🗑️ Delete
+                                </button>
+                            </div>
+                            <div class="chat-text markdown-content">{markdown.markdown(chat['response'], extensions=['codehilite', 'fenced_code', 'tables', 'toc'])}</div>
+                        </div>
+                    </div>
+                </div>
+                '''
+            
+            # Add chat interface
+            html_content += f'''
+            <div class="chat-interface">
+                <h3>💬 Continue Conversation</h3>
+                <form class="chat-form" hx-post="/context/{context_uuid}/chat" hx-target="#chat-response-area" hx-swap="innerHTML">
+                    <textarea class="chat-input" name="prompt" placeholder="Type your message here..." required></textarea>
+                    <div class="chat-controls">
+                        <select class="model-select" name="model">
+                            <option value="grok-3">grok-3 (Default)</option>
+                            <option value="claude-3-5-sonnet-latest">claude-3-5-sonnet-latest</option>
+                            <option value="claude-sonnet-4-20250514">claude-sonnet-4-20250514</option>
+                            <option value="gpt-4o">gpt-4o</option>
+                            <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+                        </select>
+                        <button type="submit" class="chat-submit">Send Message</button>
+                        <div class="chat-loading">
+                            <div class="spinner"></div>
+                            <span>Processing...</span>
+                        </div>
+                    </div>
+                </form>
+                <div id="chat-response-area"></div>
+            </div>
+            
+            <script>
+                // Show loading state when chat form is submitted
+                document.body.addEventListener('htmx:beforeRequest', function(evt) {{
+                    if (evt.target.closest('.chat-form')) {{
+                        const form = evt.target.closest('.chat-form');
+                        const submitBtn = form.querySelector('.chat-submit');
+                        const loading = form.querySelector('.chat-loading');
+                        submitBtn.disabled = true;
+                        loading.classList.add('active');
+                    }}
+                }});
+                
+                // Hide loading state when response arrives
+                document.body.addEventListener('htmx:afterRequest', function(evt) {{
+                    if (evt.target.closest('.chat-form')) {{
+                        const form = evt.target.closest('.chat-form');
+                        const submitBtn = form.querySelector('.chat-submit');
+                        const loading = form.querySelector('.chat-loading');
+                        const textarea = form.querySelector('.chat-input');
+                        submitBtn.disabled = false;
+                        loading.classList.remove('active');
+                        
+                        // Clear textarea and refresh context view if successful
+                        if (evt.detail.xhr.status === 200) {{
+                            textarea.value = '';
+                            // Refresh the entire context view to show new chat
+                            setTimeout(() => {{
+                                htmx.ajax('GET', '/context/{context_uuid}', '#content-detail');
+                            }}, 1000);
+                        }}
+                    }}
+                }});
+            </script>
+            '''
+            
+            html_content += '</div>'
+            return html_content
+            
+        except Exception as e:
+            return f'<div class="error">Error loading context: {e}</div>'
+    
+    @app.route('/context/<context_uuid>/chat', methods=['POST'])
+    async def chat_in_context(context_uuid):
+        try:
+            form = await request.form
+            prompt = form.get('prompt')
+            model = form.get('model', 'grok-3')
+            
+            if not prompt:
+                return '<div class="error">No prompt provided</div>'
+            
+            # Build the aipy command with context
+            args = ['--model', model, '--context-id', context_uuid, prompt]
+            
+            # Run the chat command asynchronously
+            result = await run_aipy_command(args, timeout=120)
+            
+            if result['returncode'] == 0:
+                # Convert response to markdown with extensions
+                response_html = markdown.markdown(
+                    result['stdout'], 
+                    extensions=['codehilite', 'fenced_code', 'tables', 'toc']
+                )
+                return f'''
+                <div class="new-chat-response">
+                    <div class="response-header">✅ Response from {model}</div>
+                    <div class="markdown-content">{response_html}</div>
+                </div>
+                '''
+            else:
+                error_msg = result['stderr'] or result['stdout'] or 'Unknown error occurred'
+                return f'''
+                <div class="new-chat-response">
+                    <div class="response-header">❌ Error</div>
+                    <div class="error">{html.escape(error_msg)}</div>
+                </div>
+                '''
+                
+        except Exception as e:
+            return f'''
+            <div class="new-chat-response">
+                <div class="response-header">❌ Error</div>
+                <div class="error">Error processing chat: {html.escape(str(e))}</div>
+            </div>
+            '''
+    
+    @app.route('/new-chat')
+    async def new_chat():
+        """Create a new chat interface for starting fresh conversations."""
+        return f'''
+        <div class="context-detail">
+            <div class="context-header">
+                <h2>🆕 New Conversation</h2>
+            </div>
+            
+            <div class="chat-interface">
+                <h3>💬 Start New Chat</h3>
+                <form class="chat-form" hx-post="/new-chat/send" hx-target="#chat-response-area" hx-swap="innerHTML">
+                    <textarea class="chat-input" name="prompt" placeholder="Type your message to start a new conversation..." required></textarea>
+                    <div class="chat-controls">
+                        <select class="model-select" name="model">
+                            <option value="grok-3">grok-3 (Default)</option>
+                            <option value="claude-3-5-sonnet-latest">claude-3-5-sonnet-latest</option>
+                            <option value="claude-sonnet-4-20250514">claude-sonnet-4-20250514</option>
+                            <option value="gpt-4o">gpt-4o</option>
+                            <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+                        </select>
+                        <label>
+                            <input type="checkbox" name="auto_name" checked> Auto-name context
+                        </label>
+                        <button type="submit" class="chat-submit">Start Chat</button>
+                        <div class="chat-loading">
+                            <div class="spinner"></div>
+                            <span>Processing...</span>
+                        </div>
+                    </div>
+                </form>
+                <div id="chat-response-area"></div>
+            </div>
+            
+            <script>
+                // Show loading state when chat form is submitted
+                document.body.addEventListener('htmx:beforeRequest', function(evt) {{
+                    if (evt.target.closest('.chat-form')) {{
+                        const form = evt.target.closest('.chat-form');
+                        const submitBtn = form.querySelector('.chat-submit');
+                        const loading = form.querySelector('.chat-loading');
+                        submitBtn.disabled = true;
+                        loading.classList.add('active');
+                    }}
+                }});
+                
+                // Hide loading state when response arrives
+                document.body.addEventListener('htmx:afterRequest', function(evt) {{
+                    if (evt.target.closest('.chat-form')) {{
+                        const form = evt.target.closest('.chat-form');
+                        const submitBtn = form.querySelector('.chat-submit');
+                        const loading = form.querySelector('.chat-loading');
+                        const textarea = form.querySelector('.chat-input');
+                        submitBtn.disabled = false;
+                        loading.classList.remove('active');
+                        
+                        // Clear textarea on success and refresh sidebar
+                        if (evt.detail.xhr.status === 200) {{
+                            textarea.value = '';
+                            setTimeout(() => {{
+                                htmx.ajax('GET', '/contexts', '#context-list');
+                            }}, 1000);
+                        }}
+                    }}
+                }});
+            </script>
+        </div>
+        '''
+    
+    @app.route('/new-chat/send', methods=['POST'])
+    async def new_chat_send():
+        try:
+            form = await request.form
+            prompt = form.get('prompt')
+            model = form.get('model', 'grok-3')
+            auto_name = form.get('auto_name') == 'on'
+            
+            if not prompt:
+                return '<div class="error">No prompt provided</div>'
+            
+            # Build the aipy command for new chat
+            args = ['--model', model]
+            if auto_name:
+                args.append('--auto-name')
+            args.append(prompt)
+            
+            # Run the chat command asynchronously
+            result = await run_aipy_command(args, timeout=120)
+            
+            if result['returncode'] == 0:
+                # Convert response to markdown with extensions
+                response_html = markdown.markdown(
+                    result['stdout'], 
+                    extensions=['codehilite', 'fenced_code', 'tables', 'toc']
+                )
+                return f'''
+                <div class="new-chat-response">
+                    <div class="response-header">✅ New chat started with {model}</div>
+                    <div class="markdown-content">{response_html}</div>
+                </div>
+                '''
+            else:
+                error_msg = result['stderr'] or result['stdout'] or 'Unknown error occurred'
+                return f'''
+                <div class="new-chat-response">
+                    <div class="response-header">❌ Error</div>
+                    <div class="error">{html.escape(error_msg)}</div>
+                </div>
+                '''
+                
+        except Exception as e:
+            return f'''
+            <div class="new-chat-response">
+                <div class="response-header">❌ Error</div>
+                <div class="error">Error processing new chat: {html.escape(str(e))}</div>
+            </div>
+            '''
+    
+    @app.route('/context/<context_uuid>/rename', methods=['POST'])
+    async def rename_context(context_uuid):
+        new_name = request.headers.get('HX-Prompt')
+        if not new_name:
+            return await get_context_detail(context_uuid)
+        
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE ai_chat_contexts 
+                SET name = %s 
+                WHERE context_uuid = %s
+            """, [new_name, context_uuid])
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            # Return context detail with out-of-band sidebar update
+            main_content = await get_context_detail(context_uuid)
+            sidebar_content = await get_contexts()
+            
+            return main_content + f'<div id="context-list" hx-swap-oob="true">{sidebar_content}</div>'
+            
+        except Exception as e:
+            return f'<div class="error">Error renaming context: {e}</div>'
+    
+    @app.route('/context/<context_uuid>/generate-name', methods=['POST'])
+    async def generate_name_web(context_uuid):
+        try:
+            # Use aipy command to generate name
+            result = await run_aipy_command(['--generate-context-name', context_uuid], timeout=60)
+            
+            # Return context detail with out-of-band sidebar update
+            main_content = await get_context_detail(context_uuid)
+            sidebar_content = await get_contexts()
+            
+            return main_content + f'<div id="context-list" hx-swap-oob="true">{sidebar_content}</div>'
+        except Exception as e:
+            return f'<div class="error">Error generating name: {e}</div>'
+    
+    @app.route('/context/<context_uuid>/summarize', methods=['POST'])
+    async def summarize_web(context_uuid):
+        try:
+            # Use aipy command to summarize context
+            result = await run_aipy_command(['--summarize-context', context_uuid], timeout=120)
+            
+            # Return context detail with out-of-band sidebar update
+            main_content = await get_context_detail(context_uuid)
+            sidebar_content = await get_contexts()
+            
+            return main_content + f'<div id="context-list" hx-swap-oob="true">{sidebar_content}</div>'
+        except Exception as e:
+            return f'<div class="error">Error summarizing context: {e}</div>'
+    
+    @app.route('/context/<context_uuid>/delete', methods=['POST'])
+    async def delete_context_route(context_uuid):
+        """Delete a context and all its associated chats."""
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor()
+            
+            # First, delete all chats in this context
+            cursor.execute("DELETE FROM ai_chats WHERE context_uuid = %s", [context_uuid])
+            deleted_chats = cursor.rowcount
+            
+            # Then delete the context itself
+            cursor.execute("DELETE FROM ai_chat_contexts WHERE context_uuid = %s", [context_uuid])
+            deleted_contexts = cursor.rowcount
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            if deleted_contexts > 0:
+                return {'success': True, 'message': f'Deleted context and {deleted_chats} associated chats'}, 200
+            else:
+                return {'error': 'Context not found'}, 404
+                
+        except Exception as e:
+            return {'error': f'Error deleting context: {e}'}, 500
+    
+    @app.route('/chat/<chat_id>/delete', methods=['POST'])
+    async def delete_chat_route(chat_id):
+        """Delete an individual chat record."""
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor()
+            
+            # Delete the chat
+            cursor.execute("DELETE FROM ai_chats WHERE id = %s", [chat_id])
+            deleted_count = cursor.rowcount
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            if deleted_count > 0:
+                return {'success': True, 'message': 'Chat deleted successfully'}, 200
+            else:
+                return {'error': 'Chat not found'}, 404
+                
+        except Exception as e:
+            return {'error': f'Error deleting chat: {e}'}, 500
+    
+    @app.route('/context/<context_uuid>/add-tag', methods=['POST'])
+    async def add_tag(context_uuid):
+        """Add a tag to a context."""
+        try:
+            data = await request.get_json()
+            tag = data.get('tag', '').strip()
+            
+            if not tag:
+                return {'error': 'Tag cannot be empty'}, 400
+            
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Get current tags
+            cursor.execute("SELECT tags FROM ai_chat_contexts WHERE context_uuid = %s", [context_uuid])
+            result = cursor.fetchone()
+            
+            if not result:
+                cursor.close()
+                conn.close()
+                return {'error': 'Context not found'}, 404
+            
+            current_tags = result['tags'] or []
+            
+            # Add tag if not already present
+            if tag not in current_tags:
+                current_tags.append(tag)
+                
+                # Update the database
+                cursor.execute("""
+                    UPDATE ai_chat_contexts 
+                    SET tags = %s 
+                    WHERE context_uuid = %s
+                """, [current_tags, context_uuid])
+                
+                conn.commit()
+            
+            cursor.close()
+            conn.close()
+            
+            return {'success': True, 'message': 'Tag added successfully'}, 200
+            
+        except Exception as e:
+            return {'error': f'Error adding tag: {e}'}, 500
+    
+    @app.route('/context/<context_uuid>/remove-tag', methods=['POST'])
+    async def remove_tag(context_uuid):
+        """Remove a tag from a context."""
+        try:
+            data = await request.get_json()
+            tag = data.get('tag', '').strip()
+            
+            if not tag:
+                return {'error': 'Tag cannot be empty'}, 400
+            
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Get current tags
+            cursor.execute("SELECT tags FROM ai_chat_contexts WHERE context_uuid = %s", [context_uuid])
+            result = cursor.fetchone()
+            
+            if not result:
+                cursor.close()
+                conn.close()
+                return {'error': 'Context not found'}, 404
+            
+            current_tags = result['tags'] or []
+            
+            # Remove tag if present
+            if tag in current_tags:
+                current_tags.remove(tag)
+                
+                # Update the database
+                cursor.execute("""
+                    UPDATE ai_chat_contexts 
+                    SET tags = %s 
+                    WHERE context_uuid = %s
+                """, [current_tags, context_uuid])
+                
+                conn.commit()
+            
+            cursor.close()
+            conn.close()
+            
+            return {'success': True, 'message': 'Tag removed successfully'}, 200
+            
+        except Exception as e:
+            return {'error': f'Error removing tag: {e}'}, 500
+
+    @app.route('/context/<context_uuid>/markdown')
+    async def get_context_markdown(context_uuid):
+        """Export context as markdown."""
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Get context info
+            cursor.execute("SELECT * FROM ai_chat_contexts WHERE context_uuid = %s", [context_uuid])
+            context = cursor.fetchone()
+            
+            if not context:
+                cursor.close()
+                conn.close()
+                return 'Context not found', 404
+            
+            # Get chats
+            cursor.execute("""
+                SELECT * FROM ai_chats 
+                WHERE context_uuid = %s 
+                ORDER BY request_timestamp ASC
+            """, [context_uuid])
+            
+            chats = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            # Build markdown content
+            markdown_content = f"# {context['name'] or 'Untitled Context'}\n\n"
+            markdown_content += f"**Context UUID:** {context['context_uuid']}\n"
+            markdown_content += f"**Created:** {context['created_at'].strftime('%Y-%m-%d %H:%M:%S')}\n"
+            markdown_content += f"**Total Chats:** {len(chats)}\n\n"
+            
+            if context['summary']:
+                markdown_content += "## Summary\n\n"
+                markdown_content += context['summary'] + "\n\n"
+            
+            markdown_content += "## Conversation\n\n"
+            
+            for i, chat in enumerate(chats, 1):
+                timestamp = chat['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                markdown_content += f"### Chat {i} ({chat['provider']}/{chat['model']}) - {timestamp}\n\n"
+                markdown_content += "**User:**\n\n"
+                markdown_content += chat['prompt'] + "\n\n"
+                markdown_content += "**Assistant:**\n\n"
+                markdown_content += chat['response'] + "\n\n"
+                markdown_content += "---\n\n"
+            
+            return markdown_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+            
+        except Exception as e:
+            return f'Error exporting context: {e}', 500
+    
+    return app
+
+async def start_web_server(debug=False, host='127.0.0.1', port=5000):
+    """Start the async web interface for browsing contexts and chats."""
+    if not await check_db_available(debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    app = create_app(debug)
+    
+    try:
+        print(f"🚀 Starting AIPy Web Server on http://{host}:{port}")
+        print("Press Ctrl+C to stop")
+        await app.run_task(host=host, port=port, debug=debug)
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down web server...")
+    except Exception as e:
+        print(f"Error starting web server: {e}", file=sys.stderr)
+        return False
+    
+    return True
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="aipy-serve",
+        description="AIPy Web Server - Async web interface for browsing AI chat contexts",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument("--host", default="127.0.0.1",
+                       help="Host to bind the server to (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=5000,
+                       help="Port to bind the server to (default: 5000)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug mode")
+    
+    return parser.parse_args()
+
+async def main():
+    """Main entry point."""
+    args = parse_arguments()
+    await start_web_server(debug=args.debug, host=args.host, port=args.port)
+
+if __name__ == '__main__':
+    asyncio.run(main())
