@@ -34,7 +34,7 @@ except ImportError:
 
 # Try to import web server dependencies
 try:
-    from quart import Quart, render_template_string, request, jsonify, redirect, url_for
+    from quart import Quart, render_template_string, request, jsonify, redirect, url_for, make_response
     import markdown
 except ImportError:
     print("Error: Quart and markdown are required for aipy-serve", file=sys.stderr)
@@ -93,13 +93,137 @@ async def run_aipy_command(args, timeout=120):
             'stderr': str(e)
         }
 
+def render_enhanced_markdown(text):
+    """Render markdown with enhanced styling and syntax highlighting."""
+    if not text:
+        return ""
+    
+    # Configure markdown with extensive extensions
+    md_extensions = [
+        'codehilite',
+        'fenced_code', 
+        'tables',
+        'toc',
+        'nl2br',          # Convert newlines to <br>
+        'sane_lists',     # Better list handling
+        'smarty',         # Smart quotes and typography
+        'attr_list',      # Add attributes to elements
+        'def_list',       # Definition lists
+        'footnotes',      # Footnote support
+        'md_in_html',     # Markdown inside HTML
+        'wikilinks'       # [[Wiki]] style links
+    ]
+    
+    # Configure codehilite for better syntax highlighting
+    extension_configs = {
+        'codehilite': {
+            'css_class': 'highlight',
+            'use_pygments': True,
+            'noclasses': False,
+            'linenos': True
+        },
+        'toc': {
+            'permalink': True,
+            'permalink_class': 'toc-link'
+        }
+    }
+    
+    try:
+        return markdown.markdown(
+            text, 
+            extensions=md_extensions,
+            extension_configs=extension_configs
+        )
+    except Exception:
+        # Fallback to basic rendering if enhanced fails
+        return markdown.markdown(text, extensions=['codehilite', 'fenced_code', 'tables'])
+
+def parse_advanced_search(query):
+    """Parse advanced search query with boolean operators."""
+    import re
+    
+    # Replace boolean operators with SQL equivalents
+    query = query.replace(' AND ', ' __AND__ ').replace(' OR ', ' __OR__ ').replace(' NOT ', ' __NOT__ ')
+    
+    # Split by boolean operators while preserving them
+    tokens = re.split(r'(__AND__|__OR__|__NOT__)', query)
+    tokens = [token.strip() for token in tokens if token.strip()]
+    
+    conditions = []
+    params = []
+    
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        
+        if token in ['__AND__', '__OR__', '__NOT__']:
+            if token == '__AND__':
+                conditions.append(' AND ')
+            elif token == '__OR__':
+                conditions.append(' OR ')
+            elif token == '__NOT__':
+                conditions.append(' NOT ')
+            i += 1
+            continue
+        
+        # Parse individual search term
+        if token.startswith('tag:'):
+            tag_search = token[4:].strip()
+            conditions.append("(tags @> ARRAY[%s] OR %s = ANY(tags))")
+            params.extend([tag_search.lower(), tag_search.lower()])
+        elif token.startswith('summary:"') and token.endswith('"'):
+            summary_search = token[9:-1]
+            conditions.append("(to_tsvector('english', COALESCE(summary, '')) @@ plainto_tsquery('english', %s))")
+            params.append(summary_search)
+        elif token.startswith('name:"') and token.endswith('"'):
+            name_search = token[6:-1]
+            conditions.append("(LOWER(name) LIKE LOWER(%s))")
+            params.append(f"%{name_search}%")
+        elif token.startswith('created:'):
+            # Date search: created:2024-01-01 or created:>2024-01-01
+            date_search = token[8:].strip()
+            if date_search.startswith('>'):
+                conditions.append("(created_at > %s)")
+                params.append(date_search[1:])
+            elif date_search.startswith('<'):
+                conditions.append("(created_at < %s)")
+                params.append(date_search[1:])
+            else:
+                conditions.append("(DATE(created_at) = %s)")
+                params.append(date_search)
+        elif token.startswith('chats:'):
+            # Chat count search: chats:>5 or chats:0
+            chat_search = token[6:].strip()
+            if chat_search.startswith('>'):
+                conditions.append("((SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) > %s)")
+                params.append(int(chat_search[1:]))
+            elif chat_search.startswith('<'):
+                conditions.append("((SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) < %s)")
+                params.append(int(chat_search[1:]))
+            else:
+                conditions.append("((SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) = %s)")
+                params.append(int(chat_search))
+        else:
+            # Default search across all fields
+            conditions.append("(LOWER(name) LIKE LOWER(%s) OR to_tsvector('english', COALESCE(summary, '')) @@ plainto_tsquery('english', %s) OR tags @> ARRAY[%s] OR %s = ANY(tags))")
+            params.extend([f"%{token}%", token, token.lower(), token.lower()])
+        
+        i += 1
+    
+    # Join all conditions
+    if not conditions:
+        return "TRUE", []
+    
+    where_clause = ''.join(conditions)
+    return where_clause, params
+
 def create_app(debug=False):
     """Create and configure the Quart application."""
     app = Quart(__name__)
     app.config['SECRET_KEY'] = 'aipy-web-interface-secret'
     
-    # HTML Template with HTMX and Dark Mode
-    HTML_TEMPLATE = '''
+    # Context List Template
+    CONTEXT_LIST_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -150,9 +274,31 @@ def create_app(debug=False):
         }
         
         .container {
-            max-width: 1200px;
+            max-width: 95%;
+            width: 100%;
             margin: 0 auto;
             padding: 20px;
+        }
+        
+        @media (min-width: 768px) {
+            .container {
+                max-width: 90%;
+                padding: 30px;
+            }
+        }
+        
+        @media (min-width: 1200px) {
+            .container {
+                max-width: 85%;
+                padding: 40px;
+            }
+        }
+        
+        @media (min-width: 1600px) {
+            .container {
+                max-width: 80%;
+                padding: 50px;
+            }
         }
         
         .header {
@@ -168,6 +314,18 @@ def create_app(debug=False):
             font-size: 24px;
             font-weight: bold;
             color: var(--accent);
+        }
+        
+        @media (min-width: 768px) {
+            .logo {
+                font-size: 28px;
+            }
+        }
+        
+        @media (min-width: 1200px) {
+            .logo {
+                font-size: 32px;
+            }
         }
         
         .theme-toggle {
@@ -193,6 +351,15 @@ def create_app(debug=False):
             color: var(--text-primary);
             font-size: 16px;
             margin-bottom: 20px;
+            max-width: 600px;
+        }
+        
+        @media (min-width: 1200px) {
+            .search-bar {
+                max-width: 800px;
+                font-size: 18px;
+                padding: 14px 20px;
+            }
         }
         
         .search-bar:focus {
@@ -202,59 +369,128 @@ def create_app(debug=False):
         }
         
         .main-content {
+            width: 100%;
+            margin: 0 auto;
+        }
+        
+        .contexts-grid {
             display: grid;
-            grid-template-columns: 350px 1fr;
-            gap: 30px;
+            grid-template-columns: 1fr;
+            gap: 16px;
+            margin-top: 20px;
         }
         
-        .sidebar {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 20px;
-            height: fit-content;
+        @media (min-width: 768px) {
+            .contexts-grid {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 20px;
+            }
         }
         
-        .content-area {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 20px;
-            min-height: 600px;
+        @media (min-width: 1200px) {
+            .contexts-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+        
+        @media (min-width: 1600px) {
+            .contexts-grid {
+                grid-template-columns: repeat(4, 1fr);
+            }
+        }
+        
+        @media (min-width: 2000px) {
+            .contexts-grid {
+                grid-template-columns: repeat(5, 1fr);
+            }
         }
         
         .context-item {
-            padding: 12px;
-            margin-bottom: 8px;
+            background: var(--bg-secondary);
             border: 1px solid var(--border);
-            border-radius: 6px;
+            border-radius: 8px;
+            padding: 16px;
             cursor: pointer;
             transition: all 0.2s;
+            text-decoration: none;
+            color: inherit;
+            display: block;
+            min-height: 120px;
+        }
+        
+        @media (min-width: 768px) {
+            .context-item {
+                padding: 20px;
+                min-height: 140px;
+            }
+        }
+        
+        @media (min-width: 1200px) {
+            .context-item {
+                padding: 24px;
+                min-height: 160px;
+            }
         }
         
         .context-item:hover {
             background: var(--bg-tertiary);
             border-color: var(--accent);
-        }
-        
-        .context-item.active {
-            background: var(--accent);
-            color: white;
-            border-color: var(--accent);
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
         }
         
         .context-name {
             font-weight: 600;
-            margin-bottom: 4px;
+            margin-bottom: 8px;
+            color: var(--text-primary);
+            font-size: 16px;
+        }
+        
+        @media (min-width: 768px) {
+            .context-name {
+                font-size: 18px;
+                margin-bottom: 10px;
+            }
+        }
+        
+        @media (min-width: 1200px) {
+            .context-name {
+                font-size: 20px;
+                margin-bottom: 12px;
+            }
         }
         
         .context-meta {
             font-size: 12px;
             color: var(--text-secondary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
         }
         
-        .context-item.active .context-meta {
-            color: rgba(255, 255, 255, 0.8);
+        .context-summary {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        
+        @media (min-width: 768px) {
+            .context-summary {
+                font-size: 14px;
+                -webkit-line-clamp: 3;
+            }
+        }
+        
+        @media (min-width: 1200px) {
+            .context-summary {
+                font-size: 15px;
+                line-height: 1.5;
+            }
         }
         
         .chat-thread {
@@ -400,10 +636,166 @@ def create_app(debug=False):
         
         .markdown-content blockquote {
             border-left: 4px solid var(--accent);
-            padding-left: 16px;
-            margin: 12px 0;
-            color: var(--text-secondary);
+            padding: 16px 20px;
+            margin: 16px 0;
+            background: var(--bg-secondary);
+            border-radius: 0 6px 6px 0;
+            font-style: italic;
         }
+        
+        /* Enhanced markdown content styling */
+        .markdown-content {
+            font-size: 15px;
+        }
+        
+        .markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 {
+            font-weight: 600;
+        }
+        
+        .markdown-content h1 {
+            font-size: 28px;
+            border-bottom: 2px solid var(--border);
+            padding-bottom: 12px;
+        }
+        
+        .markdown-content h2 {
+            font-size: 24px;
+        }
+        
+        .markdown-content h3 {
+            font-size: 20px;
+        }
+        
+        .markdown-content h4 {
+            font-size: 18px;
+        }
+        
+        .markdown-content p {
+            line-height: 1.7;
+        }
+        
+        .markdown-content ul, .markdown-content ol {
+            margin: 16px 0;
+            padding-left: 24px;
+        }
+        
+        .markdown-content li {
+            margin-bottom: 8px;
+            line-height: 1.6;
+        }
+        
+        .markdown-content table {
+            border-collapse: collapse;
+            margin: 16px 0;
+            width: 100%;
+            border: 1px solid var(--border);
+        }
+        
+        .markdown-content th, .markdown-content td {
+            border: 1px solid var(--border);
+            padding: 8px 12px;
+            text-align: left;
+        }
+        
+        .markdown-content th {
+            background: var(--bg-tertiary);
+            font-weight: 600;
+        }
+        
+        .markdown-content tr:nth-child(even) {
+            background: var(--bg-tertiary);
+        }
+        
+        .markdown-content .highlight {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 16px 0;
+        }
+        
+        .markdown-content .highlight pre {
+            background: transparent;
+            border: none;
+            margin: 0;
+            padding: 16px;
+        }
+        
+        .markdown-content pre code {
+            background: transparent;
+            padding: 0;
+            border: none;
+            font-size: 14px;
+        }
+        
+        .markdown-content a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+        
+        .markdown-content a:hover {
+            text-decoration: underline;
+        }
+        
+        .markdown-content hr {
+            border: none;
+            border-top: 1px solid var(--border);
+            margin: 24px 0;
+        }
+        
+        /* Syntax highlighting for code blocks */
+        .markdown-content .highlight .c { color: #75715e; font-style: italic } /* Comment */
+        .markdown-content .highlight .k { color: #66d9ef; font-weight: bold } /* Keyword */
+        .markdown-content .highlight .s { color: #a6e22e } /* String */
+        .markdown-content .highlight .m { color: #ae81ff } /* Number */
+        .markdown-content .highlight .nf { color: #a6e22e } /* Function */
+        .markdown-content .highlight .nc { color: #a6e22e } /* Class */
+        .markdown-content .highlight .o { color: #f92672 } /* Operator */
+        .markdown-content .highlight .kc { color: #ae81ff } /* Keyword.Constant */
+        .markdown-content .highlight .kd { color: #66d9ef } /* Keyword.Declaration */
+        .markdown-content .highlight .kn { color: #f92672 } /* Keyword.Namespace */
+        .markdown-content .highlight .kp { color: #66d9ef } /* Keyword.Pseudo */
+        .markdown-content .highlight .kr { color: #66d9ef } /* Keyword.Reserved */
+        .markdown-content .highlight .kt { color: #66d9ef } /* Keyword.Type */
+        .markdown-content .highlight .s1 { color: #a6e22e } /* String.Single */
+        .markdown-content .highlight .s2 { color: #a6e22e } /* String.Double */
+        .markdown-content .highlight .sd { color: #75715e; font-style: italic } /* String.Doc */
+        .markdown-content .highlight .nb { color: #f8f8f2 } /* Name.Builtin */
+        .markdown-content .highlight .bp { color: #f8f8f2 } /* Name.Builtin.Pseudo */
+        .markdown-content .highlight .c1 { color: #75715e; font-style: italic } /* Comment.Single */
+        .markdown-content .highlight .cm { color: #75715e; font-style: italic } /* Comment.Multiline */
+        .markdown-content .highlight .cp { color: #75715e } /* Comment.Preproc */
+        .markdown-content .highlight .err { color: #f92672; background-color: #1e0010 } /* Error */
+        .markdown-content .highlight .gd { color: #f92672 } /* Generic.Deleted */
+        .markdown-content .highlight .ge { font-style: italic } /* Generic.Emph */
+        .markdown-content .highlight .gi { color: #a6e22e } /* Generic.Inserted */
+        .markdown-content .highlight .gs { font-weight: bold } /* Generic.Strong */
+        .markdown-content .highlight .gu { color: #75715e } /* Generic.Subheading */
+        .markdown-content .highlight .mf { color: #ae81ff } /* Literal.Number.Float */
+        .markdown-content .highlight .mh { color: #ae81ff } /* Literal.Number.Hex */
+        .markdown-content .highlight .mi { color: #ae81ff } /* Literal.Number.Integer */
+        .markdown-content .highlight .mo { color: #ae81ff } /* Literal.Number.Oct */
+        .markdown-content .highlight .na { color: #a6e22e } /* Name.Attribute */
+        .markdown-content .highlight .nd { color: #a6e22e } /* Name.Decorator */
+        .markdown-content .highlight .ne { color: #a6e22e } /* Name.Exception */
+        .markdown-content .highlight .nl { color: #a6e22e } /* Name.Label */
+        .markdown-content .highlight .nn { color: #f8f8f2 } /* Name.Namespace */
+        .markdown-content .highlight .nt { color: #f92672 } /* Name.Tag */
+        .markdown-content .highlight .nv { color: #f8f8f2 } /* Name.Variable */
+        .markdown-content .highlight .ow { color: #f92672 } /* Operator.Word */
+        .markdown-content .highlight .w { color: #f8f8f2 } /* Text.Whitespace */
+        .markdown-content .highlight .mb { color: #ae81ff } /* Literal.Number.Bin */
+        .markdown-content .highlight .sb { color: #a6e22e } /* Literal.String.Backtick */
+        .markdown-content .highlight .sc { color: #a6e22e } /* Literal.String.Char */
+        .markdown-content .highlight .se { color: #ae81ff } /* Literal.String.Escape */
+        .markdown-content .highlight .sh { color: #a6e22e } /* Literal.String.Heredoc */
+        .markdown-content .highlight .si { color: #a6e22e } /* Literal.String.Interpol */
+        .markdown-content .highlight .sx { color: #a6e22e } /* Literal.String.Other */
+        .markdown-content .highlight .sr { color: #a6e22e } /* Literal.String.Regex */
+        .markdown-content .highlight .ss { color: #a6e22e } /* Literal.String.Symbol */
+        .markdown-content .highlight .vc { color: #f8f8f2 } /* Name.Variable.Class */
+        .markdown-content .highlight .vg { color: #f8f8f2 } /* Name.Variable.Global */
+        .markdown-content .highlight .vi { color: #f8f8f2 } /* Name.Variable.Instance */
+        .markdown-content .highlight .il { color: #ae81ff } /* Literal.Number.Integer.Long */
         
         /* Chat Interface Styles */
         .chat-interface {
@@ -736,18 +1128,100 @@ def create_app(debug=False):
             margin-bottom: 8px;
         }
         
+        .back-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+            margin-bottom: 20px;
+            transition: color 0.2s;
+        }
+        
+        .back-button:hover {
+            color: var(--accent-hover);
+        }
+        
+        /* Help page styles */
+        .help-section {
+            margin-bottom: 40px;
+            padding-bottom: 30px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .help-section:last-child {
+            border-bottom: none;
+        }
+        
+        .help-section h2 {
+            color: var(--accent);
+            margin-bottom: 16px;
+            font-size: 24px;
+        }
+        
+        .help-section h3 {
+            color: var(--text-primary);
+            margin: 20px 0 12px 0;
+            font-size: 18px;
+        }
+        
+        .help-section p {
+            margin-bottom: 16px;
+            line-height: 1.6;
+        }
+        
+        .help-section ul, .help-section ol {
+            margin: 16px 0;
+            padding-left: 24px;
+        }
+        
+        .help-section li {
+            margin-bottom: 8px;
+            line-height: 1.5;
+        }
+        
+        .help-examples {
+            margin: 16px 0;
+        }
+        
+        .help-example {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin: 8px 0;
+            font-family: 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', 'Fira Code', monospace;
+        }
+        
+        .help-example code {
+            background: transparent;
+            padding: 0;
+            color: var(--accent);
+            font-weight: 600;
+        }
+        
+        .help-section code {
+            background: var(--bg-primary);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', 'Fira Code', monospace;
+            color: var(--accent);
+            border: 1px solid var(--border);
+        }
+        
         @media (max-width: 768px) {
-            .main-content {
-                grid-template-columns: 1fr;
-            }
-            
-            .sidebar {
-                order: 2;
-            }
-            
             .chat-controls {
                 flex-direction: column;
                 align-items: stretch;
+            }
+            
+            .help-section h2 {
+                font-size: 20px;
+            }
+            
+            .help-section h3 {
+                font-size: 16px;
             }
         }
     </style>
@@ -757,12 +1231,12 @@ def create_app(debug=False):
         <div class="header">
             <div class="logo">🤖 AIPy Context Browser</div>
             <div style="display: flex; gap: 12px; align-items: center;">
-                <button class="btn" 
-                        hx-get="/new-chat" 
-                        hx-target="#content-detail"
-                        onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active'));">
+                <a href="/help" class="btn primary">
+                    📚 Help
+                </a>
+                <a href="/new-chat" class="btn">
                     💬 New Chat
-                </button>
+                </a>
                 <button class="theme-toggle" onclick="toggleTheme()">
                     🌙 Dark Mode
                 </button>
@@ -771,26 +1245,15 @@ def create_app(debug=False):
         
         <input type="text" 
                class="search-bar" 
-               placeholder="Search contexts by name, summary, or tags..."
+               placeholder="Search contexts... (try: tag:tmux AND summary:&quot;config&quot;, chats:&gt;5, created:&gt;2024-01-01)"
                hx-get="/search"
                hx-trigger="input changed delay:300ms"
-               hx-target="#context-list"
+               hx-target="#contexts-grid"
                name="q">
         
         <div class="main-content">
-            <div class="sidebar">
-                <div id="context-list" hx-get="/contexts" hx-trigger="load">
-                    <div class="loading">Loading contexts...</div>
-                </div>
-            </div>
-            
-            <div class="content-area">
-                <div id="content-detail">
-                    <div class="empty-state">
-                        <h3>Welcome to AIPy Context Browser</h3>
-                        <p>Select a context from the sidebar to view its details</p>
-                    </div>
-                </div>
+            <div class="contexts-grid" id="contexts-grid" hx-get="/contexts" hx-trigger="load">
+                <div class="loading">Loading contexts...</div>
             </div>
         </div>
     </div>
@@ -882,9 +1345,8 @@ def create_app(debug=False):
                 });
                 
                 if (response.ok) {
-                    // Refresh the sidebar and clear content area
-                    htmx.ajax('GET', '/contexts', '#context-list');
-                    document.getElementById('content-detail').innerHTML = '<div class="context-detail"><h2>Context Deleted</h2><p>The context and all its chats have been deleted.</p></div>';
+                    // Navigate back to context list
+                    window.location.href = '/';
                 } else {
                     button.textContent = '❌ Failed';
                     setTimeout(() => {
@@ -1029,9 +1491,1173 @@ def create_app(debug=False):
 </html>
     '''
     
+    # Conversation Detail Template  
+    CONVERSATION_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIPy - {{context_name}}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        :root[data-theme="light"] {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f8f9fa;
+            --bg-tertiary: #e9ecef;
+            --text-primary: #212529;
+            --text-secondary: #6c757d;
+            --border: #dee2e6;
+            --accent: #0d6efd;
+            --accent-hover: #0b5ed7;
+            --success: #198754;
+            --warning: #fd7e14;
+            --danger: #dc3545;
+        }
+        
+        :root[data-theme="dark"] {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --border: #30363d;
+            --accent: #58a6ff;
+            --accent-hover: #388bfd;
+            --success: #238636;
+            --warning: #f85149;
+            --danger: #f85149;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 95%;
+            width: 100%;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        @media (min-width: 768px) {
+            .container {
+                max-width: 90%;
+                padding: 30px;
+            }
+        }
+        
+        @media (min-width: 1200px) {
+            .container {
+                max-width: 85%;
+                padding: 40px;
+            }
+        }
+        
+        @media (min-width: 1600px) {
+            .container {
+                max-width: 80%;
+                padding: 50px;
+            }
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 30px;
+        }
+        
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--accent);
+        }
+        
+        @media (min-width: 768px) {
+            .logo {
+                font-size: 28px;
+            }
+        }
+        
+        @media (min-width: 1200px) {
+            .logo {
+                font-size: 32px;
+            }
+        }
+        
+        .theme-toggle {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .theme-toggle:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .back-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+            margin-bottom: 20px;
+            transition: color 0.2s;
+        }
+        
+        .back-button:hover {
+            color: var(--accent-hover);
+        }
+        
+        .context-header {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .context-title {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 16px;
+            color: var(--text-primary);
+        }
+        
+        .context-summary {
+            background: var(--bg-tertiary);
+            padding: 16px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border);
+        }
+        
+        .summary-header {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 12px;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+        
+        .btn:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .btn.primary {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .btn.primary:hover {
+            background: var(--accent-hover);
+        }
+        
+        .tags-container {
+            margin-bottom: 12px;
+        }
+        
+        .tag {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin-right: 6px;
+            margin-bottom: 4px;
+            display: inline-block;
+            border: 1px solid var(--border);
+        }
+        
+        .tag-editor {
+            margin-top: 10px;
+            padding: 12px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+        
+        .tag-editor.hidden {
+            display: none;
+        }
+        
+        .tag-input {
+            width: 200px;
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 12px;
+            margin-right: 8px;
+        }
+        
+        .tag-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .tag-removable {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin-right: 6px;
+            margin-bottom: 4px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            border: 1px solid var(--border);
+        }
+        
+        .tag-remove-btn {
+            background: var(--danger);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            font-size: 10px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+        }
+        
+        .tag-remove-btn:hover {
+            background: #d63384;
+        }
+        
+        .conversation-content {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+        }
+        
+        @media (min-width: 1200px) {
+            .conversation-content {
+                padding: 30px;
+            }
+        }
+        
+        .chat-thread {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        
+        .chat-header {
+            background: var(--bg-tertiary);
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chat-content {
+            padding: 16px;
+        }
+        
+        .chat-prompt, .chat-response {
+            margin-bottom: 16px;
+        }
+        
+        .chat-prompt-label, .chat-response-label {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+        
+        .chat-text {
+            background: var(--bg-primary);
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            white-space: pre-wrap;
+            font-family: inherit;
+        }
+        
+        .markdown-content {
+            line-height: 1.6;
+        }
+        
+        .markdown-content h1, .markdown-content h2, .markdown-content h3 {
+            margin-top: 24px;
+            margin-bottom: 12px;
+            color: var(--text-primary);
+        }
+        
+        .markdown-content h1 {
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 8px;
+        }
+        
+        .markdown-content h2 {
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 4px;
+        }
+        
+        .markdown-content p {
+            margin-bottom: 12px;
+        }
+        
+        .markdown-content pre {
+            background: var(--bg-primary);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            overflow-x: auto;
+            margin: 12px 0;
+        }
+        
+        .markdown-content code {
+            background: var(--bg-primary);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', 'Fira Code', monospace;
+        }
+        
+        .markdown-content blockquote {
+            border-left: 4px solid var(--accent);
+            padding: 16px 20px;
+            margin: 16px 0;
+            background: var(--bg-secondary);
+            border-radius: 0 6px 6px 0;
+            font-style: italic;
+        }
+        
+        /* Enhanced markdown content styling */
+        .markdown-content {
+            font-size: 15px;
+        }
+        
+        .markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 {
+            font-weight: 600;
+        }
+        
+        .markdown-content h1 {
+            font-size: 28px;
+            border-bottom: 2px solid var(--border);
+            padding-bottom: 12px;
+        }
+        
+        .markdown-content h2 {
+            font-size: 24px;
+        }
+        
+        .markdown-content h3 {
+            font-size: 20px;
+        }
+        
+        .markdown-content h4 {
+            font-size: 18px;
+        }
+        
+        .markdown-content p {
+            line-height: 1.7;
+        }
+        
+        .markdown-content ul, .markdown-content ol {
+            margin: 16px 0;
+            padding-left: 24px;
+        }
+        
+        .markdown-content li {
+            margin-bottom: 8px;
+            line-height: 1.6;
+        }
+        
+        .markdown-content table {
+            border-collapse: collapse;
+            margin: 16px 0;
+            width: 100%;
+            border: 1px solid var(--border);
+        }
+        
+        .markdown-content th, .markdown-content td {
+            border: 1px solid var(--border);
+            padding: 8px 12px;
+            text-align: left;
+        }
+        
+        .markdown-content th {
+            background: var(--bg-tertiary);
+            font-weight: 600;
+        }
+        
+        .markdown-content tr:nth-child(even) {
+            background: var(--bg-tertiary);
+        }
+        
+        .markdown-content .highlight {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 16px 0;
+        }
+        
+        .markdown-content .highlight pre {
+            background: transparent;
+            border: none;
+            margin: 0;
+            padding: 16px;
+        }
+        
+        .markdown-content pre code {
+            background: transparent;
+            padding: 0;
+            border: none;
+            font-size: 14px;
+        }
+        
+        .markdown-content a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+        
+        .markdown-content a:hover {
+            text-decoration: underline;
+        }
+        
+        .markdown-content hr {
+            border: none;
+            border-top: 1px solid var(--border);
+            margin: 24px 0;
+        }
+        
+        /* Syntax highlighting for code blocks */
+        .markdown-content .highlight .c { color: #75715e; font-style: italic } /* Comment */
+        .markdown-content .highlight .k { color: #66d9ef; font-weight: bold } /* Keyword */
+        .markdown-content .highlight .s { color: #a6e22e } /* String */
+        .markdown-content .highlight .m { color: #ae81ff } /* Number */
+        .markdown-content .highlight .nf { color: #a6e22e } /* Function */
+        .markdown-content .highlight .nc { color: #a6e22e } /* Class */
+        .markdown-content .highlight .o { color: #f92672 } /* Operator */
+        .markdown-content .highlight .kc { color: #ae81ff } /* Keyword.Constant */
+        .markdown-content .highlight .kd { color: #66d9ef } /* Keyword.Declaration */
+        .markdown-content .highlight .kn { color: #f92672 } /* Keyword.Namespace */
+        .markdown-content .highlight .kp { color: #66d9ef } /* Keyword.Pseudo */
+        .markdown-content .highlight .kr { color: #66d9ef } /* Keyword.Reserved */
+        .markdown-content .highlight .kt { color: #66d9ef } /* Keyword.Type */
+        .markdown-content .highlight .s1 { color: #a6e22e } /* String.Single */
+        .markdown-content .highlight .s2 { color: #a6e22e } /* String.Double */
+        .markdown-content .highlight .sd { color: #75715e; font-style: italic } /* String.Doc */
+        .markdown-content .highlight .nb { color: #f8f8f2 } /* Name.Builtin */
+        .markdown-content .highlight .bp { color: #f8f8f2 } /* Name.Builtin.Pseudo */
+        .markdown-content .highlight .c1 { color: #75715e; font-style: italic } /* Comment.Single */
+        .markdown-content .highlight .cm { color: #75715e; font-style: italic } /* Comment.Multiline */
+        .markdown-content .highlight .cp { color: #75715e } /* Comment.Preproc */
+        .markdown-content .highlight .err { color: #f92672; background-color: #1e0010 } /* Error */
+        .markdown-content .highlight .gd { color: #f92672 } /* Generic.Deleted */
+        .markdown-content .highlight .ge { font-style: italic } /* Generic.Emph */
+        .markdown-content .highlight .gi { color: #a6e22e } /* Generic.Inserted */
+        .markdown-content .highlight .gs { font-weight: bold } /* Generic.Strong */
+        .markdown-content .highlight .gu { color: #75715e } /* Generic.Subheading */
+        .markdown-content .highlight .mf { color: #ae81ff } /* Literal.Number.Float */
+        .markdown-content .highlight .mh { color: #ae81ff } /* Literal.Number.Hex */
+        .markdown-content .highlight .mi { color: #ae81ff } /* Literal.Number.Integer */
+        .markdown-content .highlight .mo { color: #ae81ff } /* Literal.Number.Oct */
+        .markdown-content .highlight .na { color: #a6e22e } /* Name.Attribute */
+        .markdown-content .highlight .nd { color: #a6e22e } /* Name.Decorator */
+        .markdown-content .highlight .ne { color: #a6e22e } /* Name.Exception */
+        .markdown-content .highlight .nl { color: #a6e22e } /* Name.Label */
+        .markdown-content .highlight .nn { color: #f8f8f2 } /* Name.Namespace */
+        .markdown-content .highlight .nt { color: #f92672 } /* Name.Tag */
+        .markdown-content .highlight .nv { color: #f8f8f2 } /* Name.Variable */
+        .markdown-content .highlight .ow { color: #f92672 } /* Operator.Word */
+        .markdown-content .highlight .w { color: #f8f8f2 } /* Text.Whitespace */
+        .markdown-content .highlight .mb { color: #ae81ff } /* Literal.Number.Bin */
+        .markdown-content .highlight .sb { color: #a6e22e } /* Literal.String.Backtick */
+        .markdown-content .highlight .sc { color: #a6e22e } /* Literal.String.Char */
+        .markdown-content .highlight .se { color: #ae81ff } /* Literal.String.Escape */
+        .markdown-content .highlight .sh { color: #a6e22e } /* Literal.String.Heredoc */
+        .markdown-content .highlight .si { color: #a6e22e } /* Literal.String.Interpol */
+        .markdown-content .highlight .sx { color: #a6e22e } /* Literal.String.Other */
+        .markdown-content .highlight .sr { color: #a6e22e } /* Literal.String.Regex */
+        .markdown-content .highlight .ss { color: #a6e22e } /* Literal.String.Symbol */
+        .markdown-content .highlight .vc { color: #f8f8f2 } /* Name.Variable.Class */
+        .markdown-content .highlight .vg { color: #f8f8f2 } /* Name.Variable.Global */
+        .markdown-content .highlight .vi { color: #f8f8f2 } /* Name.Variable.Instance */
+        .markdown-content .highlight .il { color: #ae81ff } /* Literal.Number.Integer.Long */
+        
+        /* Copy Button Styles */
+        .copy-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            margin-left: 8px;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .copy-btn:hover {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        
+        .copy-btn.copied {
+            background: var(--success);
+            color: white;
+            border-color: var(--success);
+        }
+        
+        .copy-conversation-btn {
+            background: var(--accent);
+            color: white;
+            border: 1px solid var(--accent);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .copy-conversation-btn:hover {
+            background: var(--accent-hover);
+            border-color: var(--accent-hover);
+        }
+        
+        .copy-conversation-btn.copied {
+            background: var(--success);
+            border-color: var(--success);
+        }
+        
+        /* Delete Button Styles */
+        .delete-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            margin-left: 8px;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .delete-btn:hover {
+            background: var(--danger);
+            color: white;
+            border-color: var(--danger);
+        }
+        
+        .delete-btn.confirming {
+            background: var(--warning);
+            color: white;
+            border-color: var(--warning);
+        }
+        
+        .delete-context-btn {
+            background: var(--danger);
+            color: white;
+            border: 1px solid var(--danger);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .delete-context-btn:hover {
+            background: #d63384;
+            border-color: #d63384;
+        }
+        
+        .delete-context-btn.confirming {
+            background: var(--warning);
+            border-color: var(--warning);
+        }
+        
+        /* Chat Interface Styles */
+        .chat-interface {
+            border-top: 2px solid var(--accent);
+            padding: 20px;
+            margin-top: 20px;
+            background: var(--bg-primary);
+            border-radius: 8px;
+        }
+        
+        .chat-interface h3 {
+            margin-bottom: 15px;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .chat-form {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .chat-input {
+            width: 100%;
+            min-height: 100px;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 14px;
+            resize: vertical;
+        }
+        
+        .chat-input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+        }
+        
+        .chat-controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .model-select {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+        
+        .model-select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .chat-submit {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        
+        .chat-submit:hover {
+            background: var(--accent-hover);
+        }
+        
+        .chat-submit:disabled {
+            background: var(--text-secondary);
+            cursor: not-allowed;
+        }
+        
+        .chat-loading {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+        
+        .chat-loading.active {
+            display: flex;
+        }
+        
+        .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border);
+            border-top: 2px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Help page styles */
+        .help-section {
+            margin-bottom: 40px;
+            padding-bottom: 30px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .help-section:last-child {
+            border-bottom: none;
+        }
+        
+        .help-section h2 {
+            color: var(--accent);
+            margin-bottom: 16px;
+            font-size: 24px;
+        }
+        
+        .help-section h3 {
+            color: var(--text-primary);
+            margin: 20px 0 12px 0;
+            font-size: 18px;
+        }
+        
+        .help-section p {
+            margin-bottom: 16px;
+            line-height: 1.6;
+        }
+        
+        .help-section ul, .help-section ol {
+            margin: 16px 0;
+            padding-left: 24px;
+        }
+        
+        .help-section li {
+            margin-bottom: 8px;
+            line-height: 1.5;
+        }
+        
+        .help-examples {
+            margin: 16px 0;
+        }
+        
+        .help-example {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin: 8px 0;
+            font-family: 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', 'Fira Code', monospace;
+        }
+        
+        .help-example code {
+            background: transparent;
+            padding: 0;
+            color: var(--accent);
+            font-weight: 600;
+        }
+        
+        .help-section code {
+            background: var(--bg-primary);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, Inconsolata, 'Roboto Mono', 'Fira Code', monospace;
+            color: var(--accent);
+            border: 1px solid var(--border);
+        }
+        
+        @media (max-width: 768px) {
+            .action-buttons {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .chat-controls {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .help-section h2 {
+                font-size: 20px;
+            }
+            
+            .help-section h3 {
+                font-size: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🤖 AIPy Context Browser</div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <a href="/help" class="btn primary">
+                    📚 Help
+                </a>
+                <a href="/new-chat" class="btn">
+                    💬 New Chat
+                </a>
+                <button class="theme-toggle" onclick="toggleTheme()">
+                    🌙 Dark Mode
+                </button>
+            </div>
+        </div>
+        
+        <a href="/" class="back-button">
+            ← Back to Context List
+        </a>
+        
+        {{content}}
+    </div>
+    
+    <script>
+        function toggleTheme() {
+            const root = document.documentElement;
+            const current = root.getAttribute('data-theme');
+            const next = current === 'dark' ? 'light' : 'dark';
+            root.setAttribute('data-theme', next);
+            
+            const button = document.querySelector('.theme-toggle');
+            button.textContent = next === 'dark' ? '🌙 Dark Mode' : '☀️ Light Mode';
+            
+            localStorage.setItem('theme', next);
+        }
+        
+        // Load saved theme
+        const savedTheme = localStorage.getItem('theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+        document.querySelector('.theme-toggle').textContent = 
+            savedTheme === 'dark' ? '🌙 Dark Mode' : '☀️ Light Mode';
+        
+        // Copy to clipboard functions
+        async function copyToClipboard(text, button) {
+            try {
+                await navigator.clipboard.writeText(text);
+                const originalText = button.textContent;
+                button.textContent = '✅ Copied!';
+                button.classList.add('copied');
+                
+                setTimeout(() => {
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }, 2000);
+            } catch (err) {
+                console.error('Failed to copy text: ', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = originalText;
+                }, 2000);
+            }
+        }
+        
+        async function copyConversationMarkdown(contextUuid, button) {
+            try {
+                const response = await fetch(`/context/${contextUuid}/markdown`);
+                const markdown = await response.text();
+                await copyToClipboard(markdown, button);
+            } catch (err) {
+                console.error('Failed to fetch conversation markdown: ', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = '📋 Copy Markdown';
+                }, 2000);
+            }
+        }
+        
+        function copyChatSection(content, button) {
+            copyToClipboard(content, button);
+        }
+        
+        // Delete confirmation functions
+        let deleteConfirmations = {};
+        
+        async function deleteContext(contextUuid, button) {
+            const confirmKey = `context_${contextUuid}`;
+            
+            if (!deleteConfirmations[confirmKey]) {
+                // First click - ask for confirmation
+                const originalText = button.textContent;
+                button.textContent = '⚠️ Click Again to Confirm';
+                button.classList.add('confirming');
+                deleteConfirmations[confirmKey] = true;
+                
+                // Reset confirmation after 5 seconds
+                setTimeout(() => {
+                    delete deleteConfirmations[confirmKey];
+                    button.textContent = originalText;
+                    button.classList.remove('confirming');
+                }, 5000);
+                return;
+            }
+            
+            // Second click - proceed with deletion
+            try {
+                const response = await fetch(`/context/${contextUuid}/delete`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    // Navigate back to context list
+                    window.location.href = '/';
+                } else {
+                    button.textContent = '❌ Failed';
+                    setTimeout(() => {
+                        button.textContent = '🗑️ Delete Context';
+                        button.classList.remove('confirming');
+                    }, 2000);
+                }
+            } catch (err) {
+                console.error('Failed to delete context:', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = '🗑️ Delete Context';
+                    button.classList.remove('confirming');
+                }, 2000);
+            }
+            
+            delete deleteConfirmations[confirmKey];
+        }
+        
+        async function deleteChat(chatId, contextUuid, button) {
+            const confirmKey = `chat_${chatId}`;
+            
+            if (!deleteConfirmations[confirmKey]) {
+                // First click - ask for confirmation
+                const originalText = button.textContent;
+                button.textContent = '⚠️ Confirm';
+                button.classList.add('confirming');
+                deleteConfirmations[confirmKey] = true;
+                
+                // Reset confirmation after 5 seconds
+                setTimeout(() => {
+                    delete deleteConfirmations[confirmKey];
+                    button.textContent = originalText;
+                    button.classList.remove('confirming');
+                }, 5000);
+                return;
+            }
+            
+            // Second click - proceed with deletion
+            try {
+                const response = await fetch(`/chat/${chatId}/delete`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    // Reload the page to refresh the view
+                    window.location.reload();
+                } else {
+                    button.textContent = '❌ Failed';
+                    setTimeout(() => {
+                        button.textContent = '🗑️';
+                        button.classList.remove('confirming');
+                    }, 2000);
+                }
+            } catch (err) {
+                console.error('Failed to delete chat:', err);
+                button.textContent = '❌ Failed';
+                setTimeout(() => {
+                    button.textContent = '🗑️';
+                    button.classList.remove('confirming');
+                }, 2000);
+            }
+            
+            delete deleteConfirmations[confirmKey];
+        }
+        
+        // Tag editing functions
+        function toggleTagEditor(contextUuid) {
+            const editor = document.getElementById(`tag-editor-${contextUuid}`);
+            editor.classList.toggle('hidden');
+            
+            if (!editor.classList.contains('hidden')) {
+                const input = editor.querySelector('.tag-input');
+                input.focus();
+            }
+        }
+        
+        async function addTag(contextUuid) {
+            const input = document.getElementById(`tag-input-${contextUuid}`);
+            const tagText = input.value.trim();
+            
+            if (!tagText) return;
+            
+            try {
+                const response = await fetch(`/context/${contextUuid}/add-tag`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ tag: tagText })
+                });
+                
+                if (response.ok) {
+                    // Reload the page to show updated tags
+                    window.location.reload();
+                } else {
+                    const error = await response.json();
+                    alert('Error adding tag: ' + (error.error || 'Unknown error'));
+                }
+            } catch (err) {
+                console.error('Failed to add tag:', err);
+                alert('Failed to add tag');
+            }
+        }
+        
+        async function removeTag(contextUuid, tag) {
+            try {
+                const response = await fetch(`/context/${contextUuid}/remove-tag`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ tag: tag })
+                });
+                
+                if (response.ok) {
+                    // Reload the page to show updated tags
+                    window.location.reload();
+                } else {
+                    const error = await response.json();
+                    alert('Error removing tag: ' + (error.error || 'Unknown error'));
+                }
+            } catch (err) {
+                console.error('Failed to remove tag:', err);
+                alert('Failed to remove tag');
+            }
+        }
+        
+        // Handle Enter key in tag input
+        function handleTagInputKeydown(event, contextUuid) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                addTag(contextUuid);
+            }
+        }
+        
+        // Chat form handling
+        async function sendChat(event, contextUuid) {
+            event.preventDefault();
+            
+            const form = event.target;
+            const formData = new FormData(form);
+            const submitBtn = form.querySelector('.chat-submit');
+            const loadingDiv = form.querySelector('.chat-loading');
+            
+            // Show loading state
+            submitBtn.disabled = true;
+            loadingDiv.classList.add('active');
+            
+            try {
+                const response = await fetch(`/context/${contextUuid}/chat`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (response.ok) {
+                    // Reload the page to show the new chat
+                    window.location.reload();
+                } else {
+                    const error = await response.text();
+                    alert('Error sending chat: ' + error);
+                }
+            } catch (err) {
+                console.error('Failed to send chat:', err);
+                alert('Failed to send chat');
+            } finally {
+                // Hide loading state
+                submitBtn.disabled = false;
+                loadingDiv.classList.remove('active');
+            }
+        }
+        
+        // Generate name function
+        async function generateName(contextUuid) {
+            try {
+                const response = await fetch(`/context/${contextUuid}/generate-name`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    window.location.reload();
+                } else {
+                    const error = await response.text();
+                    alert('Error generating name: ' + error);
+                }
+            } catch (err) {
+                console.error('Failed to generate name:', err);
+                alert('Failed to generate name');
+            }
+        }
+        
+        // Generate summary function
+        async function generateSummary(contextUuid) {
+            try {
+                const response = await fetch(`/context/${contextUuid}/summarize`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    window.location.reload();
+                } else {
+                    const error = await response.text();
+                    alert('Error generating summary: ' + error);
+                }
+            } catch (err) {
+                console.error('Failed to generate summary:', err);
+                alert('Failed to generate summary');
+            }
+        }
+    </script>
+</body>
+</html>
+    '''
+    
     @app.route('/')
     async def index():
-        return await render_template_string(HTML_TEMPLATE)
+        return await render_template_string(CONTEXT_LIST_TEMPLATE)
     
     @app.route('/contexts')
     async def get_contexts():
@@ -1061,17 +2687,28 @@ def create_app(debug=False):
             for ctx in contexts:
                 uuid_short = str(ctx['context_uuid'])[:8]
                 name = html.escape(ctx['name'] or '<untitled>')
+                summary = html.escape(ctx['summary'] or 'No summary available')[:200] + ('...' if len(ctx['summary'] or '') > 200 else '')
                 chat_count = ctx['chat_count']
                 last_chat = ctx['last_chat_time'].strftime('%Y-%m-%d %H:%M') if ctx['last_chat_time'] else 'Never'
                 
+                # Format tags
+                tags_html = ""
+                if ctx['tags']:
+                    for tag in ctx['tags'][:3]:  # Show max 3 tags in list
+                        tags_html += f'<span class="tag">{html.escape(tag)}</span>'
+                    if len(ctx['tags']) > 3:
+                        tags_html += f'<span class="tag">+{len(ctx['tags']) - 3} more</span>'
+                
                 html_content += f'''
-                <div class="context-item" 
-                     hx-get="/context/{ctx['context_uuid']}" 
-                     hx-target="#content-detail"
-                     onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active')); this.classList.add('active');">
+                <a href="/context/{ctx['context_uuid']}" class="context-item">
                     <div class="context-name">{name}</div>
-                    <div class="context-meta">{uuid_short}... • {chat_count} chats • {last_chat}</div>
-                </div>
+                    <div class="context-meta">
+                        <span>{uuid_short}... • {chat_count} chats</span>
+                        <span>{last_chat}</span>
+                    </div>
+                    <div class="context-summary">{summary}</div>
+                    {f'<div class="tags-container">{tags_html}</div>' if tags_html else ''}
+                </a>
                 '''
             
             return html_content
@@ -1081,7 +2718,7 @@ def create_app(debug=False):
     
     @app.route('/search')
     async def search_contexts_web():
-        query = (await request.args).get('q', '').strip()
+        query = request.args.get('q', '').strip()
         if not query:
             return await get_contexts()
         
@@ -1093,13 +2730,8 @@ def create_app(debug=False):
                 where_clause = "TRUE"
                 params = []
             else:
-                search_conditions = [
-                    "LOWER(name) LIKE LOWER(%s)",
-                    "to_tsvector('english', COALESCE(summary, '')) @@ plainto_tsquery('english', %s)",
-                    "tags @> ARRAY[%s] OR %s = ANY(tags)"
-                ]
-                where_clause = " OR ".join([f"({condition})" for condition in search_conditions])
-                params = [f"%{query}%", query, query.lower(), query.lower()]
+                # Parse advanced search with boolean operators
+                where_clause, params = parse_advanced_search(query)
             
             sql = f"""
             SELECT 
@@ -1125,17 +2757,28 @@ def create_app(debug=False):
             for ctx in contexts:
                 uuid_short = str(ctx['context_uuid'])[:8]
                 name = html.escape(ctx['name'] or '<untitled>')
+                summary = html.escape(ctx['summary'] or 'No summary available')[:200] + ('...' if len(ctx['summary'] or '') > 200 else '')
                 chat_count = ctx['chat_count']
                 last_chat = ctx['last_chat_time'].strftime('%Y-%m-%d %H:%M') if ctx['last_chat_time'] else 'Never'
                 
+                # Format tags
+                tags_html = ""
+                if ctx['tags']:
+                    for tag in ctx['tags'][:3]:  # Show max 3 tags in list
+                        tags_html += f'<span class="tag">{html.escape(tag)}</span>'
+                    if len(ctx['tags']) > 3:
+                        tags_html += f'<span class="tag">+{len(ctx['tags']) - 3} more</span>'
+                
                 html_content += f'''
-                <div class="context-item" 
-                     hx-get="/context/{ctx['context_uuid']}" 
-                     hx-target="#content-detail"
-                     onclick="document.querySelectorAll('.context-item').forEach(el => el.classList.remove('active')); this.classList.add('active');">
+                <a href="/context/{ctx['context_uuid']}" class="context-item">
                     <div class="context-name">{name}</div>
-                    <div class="context-meta">{uuid_short}... • {chat_count} chats • {last_chat}</div>
-                </div>
+                    <div class="context-meta">
+                        <span>{uuid_short}... • {chat_count} chats</span>
+                        <span>{last_chat}</span>
+                    </div>
+                    <div class="context-summary">{summary}</div>
+                    {f'<div class="tags-container">{tags_html}</div>' if tags_html else ''}
+                </a>
                 '''
             
             if not contexts:
@@ -1175,7 +2818,7 @@ def create_app(debug=False):
             if not context:
                 cursor.close()
                 conn.close()
-                return '<div class="error">Context not found</div>'
+                return await render_template_string(CONVERSATION_TEMPLATE.replace('{{context_name}}', "Not Found").replace('{{content}}', '<div class="context-header"><h1>Context Not Found</h1><p>The requested context could not be found.</p></div>'))
             
             # Get chats
             cursor.execute("""
@@ -1190,44 +2833,10 @@ def create_app(debug=False):
             
             name = html.escape(context['name'] or '<untitled>')
             
-            html_content = f'''
-            <div class="context-detail">
-                <div class="context-header">
-                    <h2>{name}</h2>
-                    <div class="action-buttons">
-                        <button class="copy-conversation-btn" 
-                                onclick="copyConversationMarkdown('{context_uuid}', this)">
-                            📋 Copy Markdown
-                        </button>
-                        <button class="btn" 
-                                hx-post="/context/{context_uuid}/rename" 
-                                hx-prompt="Enter new name:"
-                                hx-target="closest .context-detail"
-                                hx-swap="outerHTML">
-                            ✏️ Rename
-                        </button>
-                        <button class="btn" 
-                                hx-post="/context/{context_uuid}/generate-name" 
-                                hx-target="closest .context-detail"
-                                hx-swap="outerHTML">
-                            🤖 Generate Name
-                        </button>
-                        <button class="btn" 
-                                hx-post="/context/{context_uuid}/summarize" 
-                                hx-target="closest .context-detail"
-                                hx-swap="outerHTML">
-                            📝 Generate Summary
-                        </button>
-                        <button class="delete-context-btn" 
-                                onclick="deleteContext('{context_uuid}', this)">
-                            🗑️ Delete Context
-                        </button>
-                        <button class="btn" 
-                                onclick="toggleTagEditor('{context_uuid}')">
-                            🏷️ Edit Tags
-                        </button>
-                    </div>
-                </div>
+            # Build the context content
+            content_html = f'''
+            <div class="context-header">
+                <h1 class="context-title">{name}</h1>
                 <div class="context-meta">
                     <strong>UUID:</strong> {context['context_uuid']}<br>
                     <strong>Created:</strong> {context['created_at'].strftime('%Y-%m-%d %H:%M:%S')}<br>
@@ -1247,31 +2856,61 @@ def create_app(debug=False):
                         </div>
                     </div>
                 </div>
+                <div class="action-buttons">
+                    <button class="copy-conversation-btn" 
+                            onclick="copyConversationMarkdown('{context_uuid}', this)">
+                        📋 Copy Markdown
+                    </button>
+                    <a href="/context/{context_uuid}/download?format=md" class="btn primary" download>
+                        💾 Download Markdown
+                    </a>
+                    <button class="btn" 
+                            onclick="window.location.href='/context/{context_uuid}/rename'">
+                        ✏️ Rename
+                    </button>
+                    <button class="btn" 
+                            onclick="generateName('{context_uuid}')">
+                        🤖 Generate Name
+                    </button>
+                    <button class="btn" 
+                            onclick="generateSummary('{context_uuid}')">
+                        📝 Generate Summary
+                    </button>
+                    <button class="delete-context-btn" 
+                            onclick="deleteContext('{context_uuid}', this)">
+                        🗑️ Delete Context
+                    </button>
+                    <button class="btn" 
+                            onclick="toggleTagEditor('{context_uuid}')">
+                        🏷️ Edit Tags
+                    </button>
+                </div>
+            </div>
             '''
             
             # Add summary if available
             if context['summary']:
-                summary_html = markdown.markdown(
-                    context['summary'], 
-                    extensions=['codehilite', 'fenced_code', 'tables', 'toc']
-                )
+                summary_html = render_enhanced_markdown(context['summary'])
                 provider_model = ""
                 if context['summary_provider'] and context['summary_model']:
                     provider_model = f" (Generated by {context['summary_provider']}/{context['summary_model']})"
                 
-                html_content += f'''
+                content_html += f'''
                 <div class="context-summary">
                     <div class="summary-header">📄 Summary{provider_model}</div>
                     <div class="markdown-content">{summary_html}</div>
                 </div>
                 '''
             
+            # Add conversation content
+            content_html += '<div class="conversation-content">'
+            
             # Add chats
             for i, chat in enumerate(chats, 1):
                 chat_id_short = str(chat['id'])[:8]
                 timestamp = chat['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
                 
-                html_content += f'''
+                content_html += f'''
                 <div class="chat-thread">
                     <div class="chat-header">
                         <span>Chat {i} - {chat['provider']}/{chat['model']}</span>
@@ -1300,17 +2939,17 @@ def create_app(debug=False):
                                     🗑️ Delete
                                 </button>
                             </div>
-                            <div class="chat-text markdown-content">{markdown.markdown(chat['response'], extensions=['codehilite', 'fenced_code', 'tables', 'toc'])}</div>
+                            <div class="chat-text markdown-content">{render_enhanced_markdown(chat['response'])}</div>
                         </div>
                     </div>
                 </div>
                 '''
             
             # Add chat interface
-            html_content += f'''
+            content_html += f'''
             <div class="chat-interface">
                 <h3>💬 Continue Conversation</h3>
-                <form class="chat-form" hx-post="/context/{context_uuid}/chat" hx-target="#chat-response-area" hx-swap="innerHTML">
+                <form class="chat-form" onsubmit="sendChat(event, '{context_uuid}')">
                     <textarea class="chat-input" name="prompt" placeholder="Type your message here..." required></textarea>
                     <div class="chat-controls">
                         <select class="model-select" name="model">
@@ -1327,49 +2966,14 @@ def create_app(debug=False):
                         </div>
                     </div>
                 </form>
-                <div id="chat-response-area"></div>
             </div>
-            
-            <script>
-                // Show loading state when chat form is submitted
-                document.body.addEventListener('htmx:beforeRequest', function(evt) {{
-                    if (evt.target.closest('.chat-form')) {{
-                        const form = evt.target.closest('.chat-form');
-                        const submitBtn = form.querySelector('.chat-submit');
-                        const loading = form.querySelector('.chat-loading');
-                        submitBtn.disabled = true;
-                        loading.classList.add('active');
-                    }}
-                }});
-                
-                // Hide loading state when response arrives
-                document.body.addEventListener('htmx:afterRequest', function(evt) {{
-                    if (evt.target.closest('.chat-form')) {{
-                        const form = evt.target.closest('.chat-form');
-                        const submitBtn = form.querySelector('.chat-submit');
-                        const loading = form.querySelector('.chat-loading');
-                        const textarea = form.querySelector('.chat-input');
-                        submitBtn.disabled = false;
-                        loading.classList.remove('active');
-                        
-                        // Clear textarea and refresh context view if successful
-                        if (evt.detail.xhr.status === 200) {{
-                            textarea.value = '';
-                            // Refresh the entire context view to show new chat
-                            setTimeout(() => {{
-                                htmx.ajax('GET', '/context/{context_uuid}', '#content-detail');
-                            }}, 1000);
-                        }}
-                    }}
-                }});
-            </script>
+            </div>
             '''
             
-            html_content += '</div>'
-            return html_content
+            return await render_template_string(CONVERSATION_TEMPLATE.replace('{{context_name}}', name).replace('{{content}}', content_html))
             
         except Exception as e:
-            return f'<div class="error">Error loading context: {e}</div>'
+            return await render_template_string(CONVERSATION_TEMPLATE.replace('{{context_name}}', "Error").replace('{{content}}', f'<div class="context-header"><h1>Error</h1><p>Error loading context: {e}</p></div>'))
     
     @app.route('/context/<context_uuid>/chat', methods=['POST'])
     async def chat_in_context(context_uuid):
@@ -1419,15 +3023,16 @@ def create_app(debug=False):
     @app.route('/new-chat')
     async def new_chat():
         """Create a new chat interface for starting fresh conversations."""
-        return f'''
-        <div class="context-detail">
-            <div class="context-header">
-                <h2>🆕 New Conversation</h2>
-            </div>
-            
+        content_html = '''
+        <div class="context-header">
+            <h1 class="context-title">🆕 New Conversation</h1>
+            <p>Start a new conversation with an AI assistant.</p>
+        </div>
+        
+        <div class="conversation-content">
             <div class="chat-interface">
                 <h3>💬 Start New Chat</h3>
-                <form class="chat-form" hx-post="/new-chat/send" hx-target="#chat-response-area" hx-swap="innerHTML">
+                <form class="chat-form" onsubmit="sendNewChat(event)">
                     <textarea class="chat-input" name="prompt" placeholder="Type your message to start a new conversation..." required></textarea>
                     <div class="chat-controls">
                         <select class="model-select" name="model">
@@ -1447,43 +3052,56 @@ def create_app(debug=False):
                         </div>
                     </div>
                 </form>
-                <div id="chat-response-area"></div>
             </div>
-            
-            <script>
-                // Show loading state when chat form is submitted
-                document.body.addEventListener('htmx:beforeRequest', function(evt) {{
-                    if (evt.target.closest('.chat-form')) {{
-                        const form = evt.target.closest('.chat-form');
-                        const submitBtn = form.querySelector('.chat-submit');
-                        const loading = form.querySelector('.chat-loading');
-                        submitBtn.disabled = true;
-                        loading.classList.add('active');
-                    }}
-                }});
-                
-                // Hide loading state when response arrives
-                document.body.addEventListener('htmx:afterRequest', function(evt) {{
-                    if (evt.target.closest('.chat-form')) {{
-                        const form = evt.target.closest('.chat-form');
-                        const submitBtn = form.querySelector('.chat-submit');
-                        const loading = form.querySelector('.chat-loading');
-                        const textarea = form.querySelector('.chat-input');
-                        submitBtn.disabled = false;
-                        loading.classList.remove('active');
-                        
-                        // Clear textarea on success and refresh sidebar
-                        if (evt.detail.xhr.status === 200) {{
-                            textarea.value = '';
-                            setTimeout(() => {{
-                                htmx.ajax('GET', '/contexts', '#context-list');
-                            }}, 1000);
-                        }}
-                    }}
-                }});
-            </script>
         </div>
+        
+        <script>
+            // Send new chat function
+            async function sendNewChat(event) {
+                event.preventDefault();
+                
+                const form = event.target;
+                const formData = new FormData(form);
+                const submitBtn = form.querySelector('.chat-submit');
+                const loadingDiv = form.querySelector('.chat-loading');
+                
+                // Show loading state
+                submitBtn.disabled = true;
+                loadingDiv.classList.add('active');
+                
+                try {
+                    const response = await fetch('/new-chat/send', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (response.ok) {
+                        const result = await response.text();
+                        // Navigate to the new context
+                        const contextMatch = result.match(/context_uuid['"]\\s*:\\s*['"]([^'"]+)['"]/);
+                        if (contextMatch) {
+                            window.location.href = `/context/${contextMatch[1]}`;
+                        } else {
+                            // Fallback: go back to context list
+                            window.location.href = '/';
+                        }
+                    } else {
+                        const error = await response.text();
+                        alert('Error starting chat: ' + error);
+                    }
+                } catch (err) {
+                    console.error('Failed to start chat:', err);
+                    alert('Failed to start chat');
+                } finally {
+                    // Hide loading state
+                    submitBtn.disabled = false;
+                    loadingDiv.classList.remove('active');
+                }
+            }
+        </script>
         '''
+        
+        return await render_template_string(CONVERSATION_TEMPLATE.replace('{{context_name}}', "New Conversation").replace('{{content}}', content_html))
     
     @app.route('/new-chat/send', methods=['POST'])
     async def new_chat_send():
@@ -1783,6 +3401,310 @@ def create_app(debug=False):
             
         except Exception as e:
             return f'Error exporting context: {e}', 500
+    
+    @app.route('/context/<context_uuid>/download')
+    async def download_context(context_uuid):
+        """Download context in specified format (default: markdown)."""
+        try:
+            # Get format parameter (default to 'md' for markdown)
+            format_type = request.args.get('format', 'md').lower()
+            
+            # For now, only support markdown format
+            if format_type not in ['md', 'markdown']:
+                return 'Unsupported format. Currently supported: md (markdown)', 400
+            
+            # Get the context data using the existing markdown export function
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Get context info
+            cursor.execute("SELECT * FROM ai_chat_contexts WHERE context_uuid = %s", [context_uuid])
+            context = cursor.fetchone()
+            
+            if not context:
+                cursor.close()
+                conn.close()
+                return 'Context not found', 404
+            
+            # Get chats
+            cursor.execute("""
+                SELECT * FROM ai_chats 
+                WHERE context_uuid = %s 
+                ORDER BY request_timestamp ASC
+            """, [context_uuid])
+            
+            chats = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            # Build markdown content
+            markdown_content = f"# {context['name'] or 'Untitled Context'}\n\n"
+            markdown_content += f"**Context UUID:** {context['context_uuid']}\n"
+            markdown_content += f"**Created:** {context['created_at'].strftime('%Y-%m-%d %H:%M:%S')}\n"
+            markdown_content += f"**Total Chats:** {len(chats)}\n\n"
+            
+            if context['tags']:
+                tags_str = ', '.join(context['tags'])
+                markdown_content += f"**Tags:** {tags_str}\n\n"
+            
+            if context['summary']:
+                markdown_content += "## Summary\n\n"
+                markdown_content += context['summary'] + "\n\n"
+            
+            markdown_content += "## Conversation\n\n"
+            
+            for i, chat in enumerate(chats, 1):
+                timestamp = chat['request_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                markdown_content += f"### Chat {i} ({chat['provider']}/{chat['model']}) - {timestamp}\n\n"
+                markdown_content += "**User:**\n\n"
+                markdown_content += chat['prompt'] + "\n\n"
+                markdown_content += "**Assistant:**\n\n"
+                markdown_content += chat['response'] + "\n\n"
+                markdown_content += "---\n\n"
+            
+            # Generate filename
+            safe_name = (context['name'] or 'untitled').replace(' ', '_').replace('/', '_')
+            filename = f"{safe_name}_{str(context_uuid)[:8]}.md"
+            
+            # Return file for download
+            response = await make_response(markdown_content)
+            response.headers['Content-Type'] = 'text/markdown; charset=utf-8'
+            response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return response
+            
+        except Exception as e:
+            return f'Error downloading context: {e}', 500
+    
+    @app.route('/help')
+    async def help_page():
+        """Display comprehensive help and documentation."""
+        help_content = '''
+        <div class="context-header">
+            <h1 class="context-title">📚 AIPy Context Browser Help</h1>
+            <p>Complete guide to using the AIPy Context Browser effectively.</p>
+        </div>
+        
+        <div class="conversation-content">
+            <div class="help-section">
+                <h2>🔍 Search Features</h2>
+                <p>The AIPy Context Browser supports powerful search capabilities with boolean operators and field-specific searches.</p>
+                
+                <h3>Basic Search</h3>
+                <div class="help-example">
+                    <code>tmux</code> - Searches for "tmux" in names, summaries, and tags
+                </div>
+                
+                <h3>Field-Specific Search</h3>
+                <div class="help-examples">
+                    <div class="help-example">
+                        <code>tag:development</code> - Find contexts with "development" tag
+                    </div>
+                    <div class="help-example">
+                        <code>name:"Copy Mode"</code> - Find contexts with "Copy Mode" in the name
+                    </div>
+                    <div class="help-example">
+                        <code>summary:"configuration"</code> - Find contexts with "configuration" in the summary
+                    </div>
+                    <div class="help-example">
+                        <code>created:2024-01-01</code> - Find contexts created on specific date
+                    </div>
+                    <div class="help-example">
+                        <code>created:>2024-01-01</code> - Find contexts created after date
+                    </div>
+                    <div class="help-example">
+                        <code>created:<2024-01-01</code> - Find contexts created before date
+                    </div>
+                    <div class="help-example">
+                        <code>chats:>5</code> - Find contexts with more than 5 chats
+                    </div>
+                    <div class="help-example">
+                        <code>chats:0</code> - Find contexts with exactly 0 chats
+                    </div>
+                </div>
+                
+                <h3>Boolean Operators</h3>
+                <p>Combine multiple search terms with boolean operators:</p>
+                <div class="help-examples">
+                    <div class="help-example">
+                        <code>tag:tmux AND summary:"keybinding"</code> - Contexts tagged with "tmux" AND containing "keybinding" in summary
+                    </div>
+                    <div class="help-example">
+                        <code>tag:development OR tag:coding</code> - Contexts with either "development" or "coding" tags
+                    </div>
+                    <div class="help-example">
+                        <code>tag:tmux AND NOT name:"obsolete"</code> - Tmux contexts that don't have "obsolete" in the name
+                    </div>
+                    <div class="help-example">
+                        <code>chats:>3 AND created:>2024-01-01</code> - Recent contexts with multiple chats
+                    </div>
+                </div>
+                
+                <h3>Special Searches</h3>
+                <div class="help-examples">
+                    <div class="help-example">
+                        <code>*</code> - Show all contexts
+                    </div>
+                </div>
+            </div>
+            
+            <div class="help-section">
+                <h2>🏷️ Tag Management</h2>
+                <p>Tags help organize and categorize your conversations for easy retrieval.</p>
+                
+                <h3>Adding Tags</h3>
+                <ol>
+                    <li>Open any context conversation page</li>
+                    <li>Click the "🏷️ Edit Tags" button</li>
+                    <li>Type a new tag in the input field</li>
+                    <li>Press Enter or click "Add Tag"</li>
+                </ol>
+                
+                <h3>Removing Tags</h3>
+                <ol>
+                    <li>Open the tag editor as above</li>
+                    <li>Click the "×" button next to any tag to remove it</li>
+                </ol>
+                
+                <h3>Tag Best Practices</h3>
+                <ul>
+                    <li>Use lowercase for consistency</li>
+                    <li>Create broad categories: <code>development</code>, <code>configuration</code>, <code>troubleshooting</code></li>
+                    <li>Add specific technologies: <code>tmux</code>, <code>python</code>, <code>docker</code></li>
+                    <li>Include project names: <code>project-alpha</code>, <code>client-work</code></li>
+                </ul>
+            </div>
+            
+            <div class="help-section">
+                <h2>💬 Context Management</h2>
+                <p>Each context represents a conversation thread with an AI assistant.</p>
+                
+                <h3>Creating New Contexts</h3>
+                <ol>
+                    <li>Click "💬 New Chat" from any page</li>
+                    <li>Type your initial message</li>
+                    <li>Select your preferred AI model</li>
+                    <li>Enable "Auto-name context" for automatic naming</li>
+                    <li>Click "Start Chat"</li>
+                </ol>
+                
+                <h3>Context Actions</h3>
+                <ul>
+                    <li><strong>📋 Copy Markdown:</strong> Export entire conversation as markdown</li>
+                    <li><strong>💾 Download Markdown:</strong> Download conversation as .md file</li>
+                    <li><strong>✏️ Rename:</strong> Change the context name</li>
+                    <li><strong>🤖 Generate Name:</strong> AI-suggested name based on content</li>
+                    <li><strong>📝 Generate Summary:</strong> AI-generated summary of the conversation</li>
+                    <li><strong>🗑️ Delete Context:</strong> Permanently remove the context and all chats</li>
+                </ul>
+                
+                <h3>Individual Chat Actions</h3>
+                <ul>
+                    <li><strong>📋 Copy:</strong> Copy individual messages</li>
+                    <li><strong>🗑️ Delete:</strong> Remove specific exchanges from the conversation</li>
+                </ul>
+            </div>
+            
+            <div class="help-section">
+                <h2>🎨 Interface Features</h2>
+                
+                <h3>Theme</h3>
+                <p>Toggle between dark and light modes using the theme button in the header. Your preference is saved automatically.</p>
+                
+                <h3>Responsive Design</h3>
+                <p>The interface adapts to your screen size:</p>
+                <ul>
+                    <li><strong>Mobile:</strong> Single column layout</li>
+                    <li><strong>Tablet:</strong> 2-column grid</li>
+                    <li><strong>Desktop:</strong> 3-column grid</li>
+                    <li><strong>Large screens:</strong> 4-5 column grid for maximum efficiency</li>
+                </ul>
+                
+                <h3>Navigation</h3>
+                <ul>
+                    <li><strong>Home (/):</strong> Context list with search</li>
+                    <li><strong>Context pages:</strong> Individual conversation views</li>
+                    <li><strong>Back button:</strong> Return to context list from any conversation</li>
+                </ul>
+            </div>
+            
+            <div class="help-section">
+                <h2>⚡ Tips & Tricks</h2>
+                
+                <h3>Workflow Suggestions</h3>
+                <ul>
+                    <li><strong>Project Organization:</strong> Tag conversations by project for easy filtering</li>
+                    <li><strong>Knowledge Base:</strong> Use descriptive names and summaries to build a searchable knowledge base</li>
+                    <li><strong>Regular Cleanup:</strong> Delete or archive old conversations to keep the interface clean</li>
+                    <li><strong>Search Efficiency:</strong> Use specific field searches to quickly find relevant contexts</li>
+                </ul>
+                
+                <h3>Advanced Search Examples</h3>
+                <div class="help-examples">
+                    <div class="help-example">
+                        <code>tag:python AND chats:>2</code> - Active Python discussions
+                    </div>
+                    <div class="help-example">
+                        <code>created:>2024-01-01 AND tag:work</code> - Recent work conversations
+                    </div>
+                    <div class="help-example">
+                        <code>summary:"error" OR summary:"bug"</code> - Troubleshooting conversations
+                    </div>
+                </div>
+                
+                <h3>Model Selection</h3>
+                <p>Choose the appropriate AI model for your needs:</p>
+                <ul>
+                    <li><strong>grok-3:</strong> Fast, general-purpose conversations</li>
+                    <li><strong>claude-sonnet-4:</strong> High-quality reasoning and analysis</li>
+                    <li><strong>gpt-4o:</strong> Strong coding and technical discussions</li>
+                    <li><strong>gemini-2.0-flash:</strong> Quick responses and brainstorming</li>
+                </ul>
+            </div>
+            
+            <div class="help-section">
+                <h2>🔧 Troubleshooting</h2>
+                
+                <h3>Common Issues</h3>
+                <ul>
+                    <li><strong>Search not working:</strong> Check your boolean operator syntax (use AND, OR, NOT in capitals)</li>
+                    <li><strong>Tags not saving:</strong> Ensure you're connected to the database</li>
+                    <li><strong>Slow performance:</strong> Try more specific searches to reduce result sets</li>
+                </ul>
+                
+                <h3>Database Requirements</h3>
+                <p>AIPy Context Browser requires a PostgreSQL database with the ai_chats schema. Ensure the database is running and accessible.</p>
+            </div>
+            
+            <div class="help-section">
+                <h2>🔗 API & Scripting</h2>
+                
+                <h3>Download API</h3>
+                <p>You can programmatically download conversations using the download API:</p>
+                <div class="help-examples">
+                    <div class="help-example">
+                        <code>GET /context/{uuid}/download?format=md</code> - Download as markdown (default)
+                    </div>
+                    <div class="help-example">
+                        <code>GET /context/{uuid}/download</code> - Download as markdown (format=md is default)
+                    </div>
+                </div>
+                
+                <h3>Scripting Examples</h3>
+                <div class="help-examples">
+                    <div class="help-example">
+                        <code>curl "http://localhost:5000/context/abc12345/download?format=md" -o conversation.md</code>
+                    </div>
+                    <div class="help-example">
+                        <code>wget "http://localhost:5000/context/abc12345/download" -O my_chat.md</code>
+                    </div>
+                </div>
+                
+                <p>The downloaded file will be named automatically based on the context name and UUID.</p>
+            </div>
+        </div>
+        '''
+        
+        return await render_template_string(CONVERSATION_TEMPLATE.replace('{{context_name}}', "Help & Documentation").replace('{{content}}', help_content))
     
     return app
 
