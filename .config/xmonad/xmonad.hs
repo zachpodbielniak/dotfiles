@@ -101,6 +101,9 @@ main = do
     -- spawn xmobar 
     _ <- spawn "xmobar"
 
+    -- spawn trayer 
+    _ <- spawn "trayer --monitor primary --edge top --align right --SetDockType true --SetPartialStrut true --expand true --width 8 --transparent true --tint 0x000000 --height 16"
+
     -- set background
     _ <- spawn $ "sleep 2; feh --bg-fill " 
         <> homeDir 
