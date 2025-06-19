@@ -34,7 +34,7 @@ except ImportError:
 
 # Try to import web server dependencies
 try:
-    from quart import Quart, render_template_string, request, jsonify, redirect, url_for, make_response
+    from quart import Quart, render_template_string, request, jsonify, redirect, url_for, make_response, current_app
     import markdown
 except ImportError:
     print("Error: Quart and markdown are required for aipy-serve", file=sys.stderr)
@@ -93,7 +93,7 @@ async def run_aipy_command(args, timeout=120):
             'stderr': str(e)
         }
 
-def render_enhanced_markdown(text):
+def render_enhanced_markdown(text, debug=False):
     """Render markdown with enhanced styling and syntax highlighting."""
     if not text:
         return ""
@@ -129,14 +129,132 @@ def render_enhanced_markdown(text):
     }
     
     try:
-        return markdown.markdown(
+        html = markdown.markdown(
             text, 
             extensions=md_extensions,
             extension_configs=extension_configs
         )
+        # Add copy buttons to code blocks
+        html = add_copy_buttons_to_code_blocks(html, debug=debug)
+        return html
     except Exception:
         # Fallback to basic rendering if enhanced fails
-        return markdown.markdown(text, extensions=['codehilite', 'fenced_code', 'tables'])
+        html = markdown.markdown(text, extensions=['codehilite', 'fenced_code', 'tables'])
+        html = add_copy_buttons_to_code_blocks(html, debug=debug)
+        return html
+
+def add_copy_buttons_to_code_blocks(html, debug=False):
+    """Add copy buttons to code blocks in HTML."""
+    import re
+    from html import escape, unescape
+    
+    # Debug: Let's see what we're actually working with
+    if debug and ('<div class="highlight">' in html or '<pre>' in html):
+        print(f"DEBUG: Found code blocks in HTML, length: {len(html)}", file=sys.stderr)
+        highlight_count = html.count('<div class="highlight">')
+        pre_count = html.count('<pre>')
+        print(f"DEBUG: highlight divs: {highlight_count}, pre tags: {pre_count}", file=sys.stderr)
+    
+    # Process highlight divs first (these are the main code blocks from syntax highlighting)
+    highlight_pattern = r'(<div class="highlight"[^>]*>.*?</div>)'
+    
+    # Then process standalone pre tags that are NOT already inside a processed highlight div
+    pre_pattern = r'(<pre><code[^>]*>.*?</code></pre>|<pre[^>]*>(?:(?!<code).).*?</pre>)'
+    
+    def add_copy_button(match):
+        code_block = match.group(1)
+        
+        # Skip if already processed (has copy button)
+        if 'code-copy-btn' in code_block:
+            return code_block
+        
+        # Debug: Show the code block structure
+        if debug:
+            print(f"DEBUG: Processing code block: {code_block[:300]}...", file=sys.stderr)
+        
+        # Extract the raw code content
+        raw_code = ""
+        
+        # Try different extraction methods
+        if '<code' in code_block:
+            # Extract from code tags
+            code_match = re.search(r'<code[^>]*>(.*?)</code>', code_block, re.DOTALL)
+            if code_match:
+                raw_code = code_match.group(1)
+        else:
+            # Extract from pre tags directly
+            pre_match = re.search(r'<pre[^>]*>(.*?)</pre>', code_block, re.DOTALL)
+            if pre_match:
+                raw_code = pre_match.group(1)
+        
+        if not raw_code:
+            return code_block  # Return unchanged if we can't extract code
+        
+        # Debug: Let's see what we extracted
+        if debug:
+            print(f"DEBUG: Raw code before cleanup: {raw_code[:200]}...", file=sys.stderr)
+        
+        # Clean up the raw code
+        raw_code = re.sub(r'<[^>]+>', '', raw_code)  # Remove HTML tags
+        raw_code = unescape(raw_code)  # Decode HTML entities
+        
+        if debug:
+            print(f"DEBUG: Raw code after tag removal: {raw_code[:200]}...", file=sys.stderr)
+        
+        # Clean up line numbers and extra whitespace
+        lines = raw_code.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            # Remove line numbers (they appear as numbers at the start) - be more aggressive
+            # Line numbers from pygments appear as standalone numbers on their own lines
+            line = line.strip()
+            if line.isdigit():
+                # Skip pure line number lines
+                continue
+            # Also remove line numbers at the start of lines
+            cleaned_line = re.sub(r'^\s*\d+\s*', '', line)
+            if cleaned_line:  # Only add non-empty lines
+                cleaned_lines.append(cleaned_line)
+        raw_code = '\n'.join(cleaned_lines).strip()
+        
+        if not raw_code:  # If no code content, return unchanged
+            return code_block
+        
+        # Escape the code for HTML data attribute (base64 encode to avoid all escaping issues)
+        import base64
+        import json
+        
+        # Convert to JSON then base64 to completely avoid escaping issues
+        json_code = json.dumps(raw_code)
+        encoded_code = base64.b64encode(json_code.encode('utf-8')).decode('ascii')
+        
+        # Add the copy button directly to the code block without breaking hierarchy
+        # Insert the copy button right after the opening tag
+        if code_block.startswith('<div class="highlight"'):
+            # Find the end of the opening div tag
+            first_close = code_block.find('>')
+            if first_close != -1:
+                return (code_block[:first_close + 1] + 
+                       f'<div class="code-block-header"><button class="code-copy-btn" data-code="{encoded_code}" onclick="copyCodeBlockFromData(this)" title="Copy code">📋 Copy</button></div>' +
+                       code_block[first_close + 1:])
+        elif code_block.startswith('<pre'):
+            # For pre tags, wrap differently
+            first_close = code_block.find('>')
+            if first_close != -1:
+                return (f'<div class="code-block-container">' +
+                       f'<div class="code-block-header"><button class="code-copy-btn" data-code="{encoded_code}" onclick="copyCodeBlockFromData(this)" title="Copy code">📋 Copy</button></div>' +
+                       code_block + '</div>')
+        
+        return code_block  # Return unchanged if we can't modify it
+    
+    # Apply transformations - highlight divs first, then standalone pre tags
+    html = re.sub(highlight_pattern, add_copy_button, html, flags=re.DOTALL)
+    
+    # Only process pre tags if they don't already contain copy buttons
+    if 'code-copy-btn' not in html:
+        html = re.sub(pre_pattern, add_copy_button, html, flags=re.DOTALL)
+    
+    return html
 
 def parse_advanced_search(query):
     """Parse advanced search query with boolean operators."""
@@ -221,6 +339,7 @@ def create_app(debug=False):
     """Create and configure the Quart application."""
     app = Quart(__name__)
     app.config['SECRET_KEY'] = 'aipy-web-interface-secret'
+    app.config['DEBUG_MODE'] = debug
     
     # Context List Template
     CONTEXT_LIST_TEMPLATE = '''
@@ -706,14 +825,15 @@ def create_app(debug=False):
             background: var(--bg-tertiary);
         }
         
-        .markdown-content .highlight {
+        .markdown-content .highlight, .markdown-content .code-block-container .highlight {
             background: var(--bg-primary);
             border-radius: 8px;
             overflow-x: auto;
             margin: 16px 0;
+            position: relative;
         }
         
-        .markdown-content .highlight pre {
+        .markdown-content .highlight pre, .markdown-content .code-block-container .highlight pre {
             background: transparent;
             border: none;
             margin: 0;
@@ -1279,9 +1399,33 @@ def create_app(debug=False):
         
         // Copy to clipboard functions
         async function copyToClipboard(text, button) {
+            const originalText = button.textContent;
+            
             try {
-                await navigator.clipboard.writeText(text);
-                const originalText = button.textContent;
+                // Try modern clipboard API first
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                    console.log('Copied using modern clipboard API');
+                } else {
+                    // Fallback method for older browsers or non-HTTPS
+                    const textArea = document.createElement('textarea');
+                    textArea.value = text;
+                    textArea.style.position = 'fixed';
+                    textArea.style.left = '-999999px';
+                    textArea.style.top = '-999999px';
+                    document.body.appendChild(textArea);
+                    textArea.focus();
+                    textArea.select();
+                    
+                    const successful = document.execCommand('copy');
+                    document.body.removeChild(textArea);
+                    
+                    if (!successful) {
+                        throw new Error('execCommand copy failed');
+                    }
+                    console.log('Copied using fallback method');
+                }
+                
                 button.textContent = '✅ Copied!';
                 button.classList.add('copied');
                 
@@ -1289,6 +1433,7 @@ def create_app(debug=False):
                     button.textContent = originalText;
                     button.classList.remove('copied');
                 }, 2000);
+                
             } catch (err) {
                 console.error('Failed to copy text: ', err);
                 button.textContent = '❌ Failed';
@@ -1297,6 +1442,49 @@ def create_app(debug=False):
                 }, 2000);
             }
         }
+        
+        async function copyCodeBlockFromData(button) {
+            console.log('copyCodeBlockFromData called!');
+            console.log('Button:', button);
+            
+            try {
+                // Get the base64 encoded code from data attribute
+                const encodedCode = button.getAttribute('data-code');
+                if (!encodedCode) {
+                    throw new Error('No code data found on button');
+                }
+                
+                console.log('Encoded code length:', encodedCode.length);
+                
+                // Decode: base64 -> JSON string -> actual code
+                const jsonString = atob(encodedCode);
+                const decodedCode = JSON.parse(jsonString);
+                
+                console.log('Decoded code preview:', decodedCode.substring(0, 200) + '...');
+                console.log('Calling copyToClipboard...');
+                await copyToClipboard(decodedCode, button);
+                console.log('copyToClipboard completed');
+            } catch (err) {
+                console.error('Error in copyCodeBlockFromData:', err);
+                button.textContent = '❌ Error';
+                setTimeout(() => {
+                    button.textContent = '📋 Copy';
+                }, 2000);
+            }
+        }
+        
+        // Keep the old function for backward compatibility (but it won't be used)
+        async function copyCodeBlock(code, button) {
+            console.log('Old copyCodeBlock called - this should not happen');
+            await copyCodeBlockFromData(button);
+        }
+        
+        // Make sure the functions are globally accessible
+        window.copyCodeBlockFromData = copyCodeBlockFromData;
+        window.copyCodeBlock = copyCodeBlock;
+        
+        // Debug: Log that the script has loaded
+        console.log('copyCodeBlock functions defined and made global');
         
         async function copyConversationMarkdown(contextUuid, button) {
             try {
@@ -1933,14 +2121,15 @@ def create_app(debug=False):
             background: var(--bg-tertiary);
         }
         
-        .markdown-content .highlight {
+        .markdown-content .highlight, .markdown-content .code-block-container .highlight {
             background: var(--bg-primary);
             border-radius: 8px;
             overflow-x: auto;
             margin: 16px 0;
+            position: relative;
         }
         
-        .markdown-content .highlight pre {
+        .markdown-content .highlight pre, .markdown-content .code-block-container .highlight pre {
             background: transparent;
             border: none;
             margin: 0;
@@ -2023,6 +2212,58 @@ def create_app(debug=False):
         .markdown-content .highlight .vg { color: #f8f8f2 } /* Name.Variable.Global */
         .markdown-content .highlight .vi { color: #f8f8f2 } /* Name.Variable.Instance */
         .markdown-content .highlight .il { color: #ae81ff } /* Literal.Number.Integer.Long */
+        
+        /* Code Block Container Styles */
+        .code-block-container {
+            position: relative;
+            margin: 12px 0;
+        }
+        
+        .code-block-header {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 10;
+        }
+        
+        .highlight .code-block-header {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 10;
+        }
+        
+        .code-copy-btn {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            opacity: 0.7;
+        }
+        
+        .code-copy-btn:hover {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+            opacity: 1;
+        }
+        
+        .code-copy-btn.copied {
+            background: #28a745;
+            color: white;
+            border-color: #28a745;
+        }
+        
+        .code-block-container:hover .code-copy-btn, .highlight:hover .code-copy-btn {
+            opacity: 1;
+        }
         
         /* Copy Button Styles */
         .copy-btn {
@@ -2373,9 +2614,33 @@ def create_app(debug=False):
         
         // Copy to clipboard functions
         async function copyToClipboard(text, button) {
+            const originalText = button.textContent;
+            
             try {
-                await navigator.clipboard.writeText(text);
-                const originalText = button.textContent;
+                // Try modern clipboard API first
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                    console.log('Copied using modern clipboard API');
+                } else {
+                    // Fallback method for older browsers or non-HTTPS
+                    const textArea = document.createElement('textarea');
+                    textArea.value = text;
+                    textArea.style.position = 'fixed';
+                    textArea.style.left = '-999999px';
+                    textArea.style.top = '-999999px';
+                    document.body.appendChild(textArea);
+                    textArea.focus();
+                    textArea.select();
+                    
+                    const successful = document.execCommand('copy');
+                    document.body.removeChild(textArea);
+                    
+                    if (!successful) {
+                        throw new Error('execCommand copy failed');
+                    }
+                    console.log('Copied using fallback method');
+                }
+                
                 button.textContent = '✅ Copied!';
                 button.classList.add('copied');
                 
@@ -2383,6 +2648,7 @@ def create_app(debug=False):
                     button.textContent = originalText;
                     button.classList.remove('copied');
                 }, 2000);
+                
             } catch (err) {
                 console.error('Failed to copy text: ', err);
                 button.textContent = '❌ Failed';
@@ -2391,6 +2657,49 @@ def create_app(debug=False):
                 }, 2000);
             }
         }
+        
+        async function copyCodeBlockFromData(button) {
+            console.log('copyCodeBlockFromData called!');
+            console.log('Button:', button);
+            
+            try {
+                // Get the base64 encoded code from data attribute
+                const encodedCode = button.getAttribute('data-code');
+                if (!encodedCode) {
+                    throw new Error('No code data found on button');
+                }
+                
+                console.log('Encoded code length:', encodedCode.length);
+                
+                // Decode: base64 -> JSON string -> actual code
+                const jsonString = atob(encodedCode);
+                const decodedCode = JSON.parse(jsonString);
+                
+                console.log('Decoded code preview:', decodedCode.substring(0, 200) + '...');
+                console.log('Calling copyToClipboard...');
+                await copyToClipboard(decodedCode, button);
+                console.log('copyToClipboard completed');
+            } catch (err) {
+                console.error('Error in copyCodeBlockFromData:', err);
+                button.textContent = '❌ Error';
+                setTimeout(() => {
+                    button.textContent = '📋 Copy';
+                }, 2000);
+            }
+        }
+        
+        // Keep the old function for backward compatibility (but it won't be used)
+        async function copyCodeBlock(code, button) {
+            console.log('Old copyCodeBlock called - this should not happen');
+            await copyCodeBlockFromData(button);
+        }
+        
+        // Make sure the functions are globally accessible
+        window.copyCodeBlockFromData = copyCodeBlockFromData;
+        window.copyCodeBlock = copyCodeBlock;
+        
+        // Debug: Log that the script has loaded
+        console.log('copyCodeBlock functions defined and made global');
         
         async function copyConversationMarkdown(contextUuid, button) {
             try {
@@ -2890,7 +3199,7 @@ def create_app(debug=False):
             
             # Add summary if available
             if context['summary']:
-                summary_html = render_enhanced_markdown(context['summary'])
+                summary_html = render_enhanced_markdown(context['summary'], debug=current_app.config.get('DEBUG_MODE', False))
                 provider_model = ""
                 if context['summary_provider'] and context['summary_model']:
                     provider_model = f" (Generated by {context['summary_provider']}/{context['summary_model']})"
@@ -2939,7 +3248,7 @@ def create_app(debug=False):
                                     🗑️ Delete
                                 </button>
                             </div>
-                            <div class="chat-text markdown-content">{render_enhanced_markdown(chat['response'])}</div>
+                            <div class="chat-text markdown-content">{render_enhanced_markdown(chat['response'], debug=current_app.config.get('DEBUG_MODE', False))}</div>
                         </div>
                     </div>
                 </div>
