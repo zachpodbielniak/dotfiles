@@ -45,22 +45,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - Allows custom filenames with `--name-seed`
   - Automatically categorizes content into PARA structure
   - Directory listing with `--list` and `--list-files`
-  - second-brain file located with our second-brain mcp at 02_areas/repos/dotfiles/sbi.norg
+  - second-brain file located with our second-brain mcp at 02_areas/repos/dotfiles/sbi.md
 
 - Media Processing:
   - `strip_audio`: Extracts audio from video files using FFmpeg
   - `transcribe_audio`: Transcribes audio to text using Whisper
   - `ai_summary_as_neorg`: Generates summaries in Neorg format
   - `ai_summary_as_markdown`: Generates summaries in Markdown format
-
-## Neorg
-- Neorg format is used for a lot of outputs.
-  - You can access the Neorg spec file under second-brain mcp at '03_resources/technical/software/neorg-spec.norg' and a cheatsheat at '03_resources/technical/software/neorg-cheatsheet.norg'
-- Common Neorg patterns:
-  - Document headers with `* Title`
-  - Code blocks with `@code language` and `@end`
-  - Bullets with `-` characters
-  - Tagged sections for metadata
 
 ## Environment
 - Any file under ./bin/scripts is part of $PATH so no need for absolute pathing
@@ -80,12 +71,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - 02_areas: Ongoing responsibilities with standards
   - 03_resources: Topics and themes of interest
   - 04_archives: Inactive items from other categories
-- Default location: ~/Documents/notes
+- Default location: $HOME/Documents/notes
+- can use our second_brain MCP to interact with this 
 
 ## Script Documentation
 
 - For any scripts in ./bin/scripts, to understand details:
-  - Check the corresponding Neorg file at with out second-brain mcp 02_areas/repos/dotfiles/<script_name>.norg
+  - Check the corresponding Neorg file at with out second-brain mcp 02_areas/repos/dotfiles/<script_name>.md
   - If the Neorg file does not exist, create one with:
     - Script details and purpose
     - Logic flow
