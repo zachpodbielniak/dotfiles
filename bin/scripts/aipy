@@ -593,6 +593,306 @@ def search_contexts(query, limit=10, output_format='text', debug=False):
         print(f"Error searching contexts: {e}", file=sys.stderr)
         return False
 
+def fzf_search_chats(args):
+    """Search chats using fzf with preview."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(args.debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Get all chats
+        cursor.execute("""
+            SELECT 
+                id,
+                prompt,
+                response,
+                provider,
+                model,
+                request_timestamp,
+                tags,
+                context_uuid
+            FROM ai_chats
+            ORDER BY request_timestamp DESC
+        """)
+        
+        chats = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not chats:
+            print("No chats found.")
+            return False
+        
+        # Create temporary file with chat entries for fzf
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            for chat in chats:
+                # Format: UUID | timestamp | provider/model | first line of prompt
+                timestamp = chat['request_timestamp'].strftime('%Y-%m-%d %H:%M')
+                prompt_preview = chat['prompt'].split('\n')[0][:80]
+                tags_str = f" [{', '.join(chat['tags'])}]" if chat['tags'] else ""
+                line = f"{str(chat['id'])[:8]} | {timestamp} | {chat['provider']}/{chat['model']}{tags_str} | {prompt_preview}"
+                f.write(line + '\n')
+            temp_file = f.name
+        
+        # Set PGPASSWORD if available
+        if AI_CHATS_DB_CONFIG.get('password'):
+            os.environ['PGPASSWORD'] = AI_CHATS_DB_CONFIG['password']
+        
+        # Create preview script
+        preview_script = """#!/bin/bash
+export PGPASSWORD='{}'
+uuid="${{1%% *}}"
+# Find full UUID from partial
+full_uuid=$(psql -h {} -p {} -d {} -U {} -t -c "SELECT id FROM ai_chats WHERE id::text LIKE '$uuid%' LIMIT 1" 2>/dev/null | tr -d ' ')
+if [ -z "$full_uuid" ]; then
+    echo "Chat not found"
+    exit 1
+fi
+# Get chat details
+psql -h {} -p {} -d {} -U {} -t -c "
+SELECT 
+    '━━━ PROMPT ━━━' || E'\\n' || prompt || E'\\n\\n' ||
+    '━━━ RESPONSE ━━━' || E'\\n' || response
+FROM ai_chats 
+WHERE id = '$full_uuid'::uuid
+" 2>/dev/null
+""".format(
+            AI_CHATS_DB_CONFIG.get('password', ''),
+            AI_CHATS_DB_CONFIG['host'],
+            AI_CHATS_DB_CONFIG['port'],
+            AI_CHATS_DB_CONFIG['database'],
+            AI_CHATS_DB_CONFIG['user'],
+            AI_CHATS_DB_CONFIG['host'],
+            AI_CHATS_DB_CONFIG['port'],
+            AI_CHATS_DB_CONFIG['database'],
+            AI_CHATS_DB_CONFIG['user']
+        )
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(preview_script)
+            preview_file = f.name
+        
+        os.chmod(preview_file, 0o755)
+        
+        try:
+            # Find fzf command
+            import shutil
+            fzf_path = shutil.which('fzf')
+            if not fzf_path:
+                print("Error: fzf command not found. Please install fzf.", file=sys.stderr)
+                return False
+            
+            # Run fzf
+            fzf_cmd = [
+                fzf_path,
+                '--preview', f'{preview_file} {{}}',
+                '--preview-window', 'down:70%:wrap',
+                '--header', 'Select a chat (Enter to view/continue, Ctrl-C to cancel)',
+                '--bind', 'ctrl-/:toggle-preview'
+            ]
+            
+            result = subprocess.run(fzf_cmd, stdin=open(temp_file), capture_output=True, text=True)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                selected = result.stdout.strip()
+                chat_uuid = selected.split(' | ')[0]
+                
+                # View or continue based on --repl flag
+                if args.repl:
+                    # Get full UUID and continue in REPL mode
+                    conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id FROM ai_chats WHERE id::text LIKE %s LIMIT 1", [f"{chat_uuid}%"])
+                    full_uuid = cursor.fetchone()[0]
+                    cursor.close()
+                    conn.close()
+                    
+                    # Continue conversation
+                    args.chat_id = [str(full_uuid)]
+                    args.context_ids = [str(full_uuid)]
+                    start_repl(args)
+                else:
+                    # Just view the chat
+                    view_ai_chat(chat_uuid, output_format='text', debug=args.debug, 
+                                content_only=args.content_only, show_history=args.history,
+                                show_full_history=args.full_history, trace_mode=args.trace,
+                                render=args.render)
+                
+                return True
+            
+        finally:
+            os.unlink(temp_file)
+            os.unlink(preview_file)
+            if 'PGPASSWORD' in os.environ:
+                del os.environ['PGPASSWORD']
+    
+    except Exception as e:
+        print(f"Error in fzf chat search: {e}", file=sys.stderr)
+        return False
+
+def fzf_search_contexts(args):
+    """Search contexts using fzf with preview."""
+    if not DB_AVAILABLE:
+        print("Error: Database dependencies not available", file=sys.stderr)
+        return False
+    
+    if not check_db_available(args.debug):
+        print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return False
+    
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Get all contexts with chat count
+        cursor.execute("""
+            SELECT 
+                ctx.context_uuid,
+                ctx.name,
+                ctx.summary,
+                ctx.tags,
+                ctx.created_at,
+                ctx.updated_at,
+                (SELECT COUNT(*) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as chat_count,
+                (SELECT MAX(request_timestamp) FROM ai_chats WHERE context_uuid = ctx.context_uuid) as last_chat_time
+            FROM ai_chat_contexts ctx
+            ORDER BY last_chat_time DESC NULLS LAST, created_at DESC
+        """)
+        
+        contexts = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not contexts:
+            print("No contexts found.")
+            return False
+        
+        # Create temporary file with context entries for fzf
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            for ctx in contexts:
+                # Format: UUID | name | chat_count | last_chat | summary preview
+                uuid_short = str(ctx['context_uuid'])[:8]
+                last_chat = ctx['last_chat_time'].strftime('%Y-%m-%d %H:%M') if ctx['last_chat_time'] else 'Never'
+                summary_preview = ctx['summary'][:60] + '...' if ctx['summary'] and len(ctx['summary']) > 60 else (ctx['summary'] or 'No summary')
+                tags_str = f" [{', '.join(ctx['tags'])}]" if ctx['tags'] else ""
+                line = f"{uuid_short} | {ctx['name']}{tags_str} | {ctx['chat_count']} chats | Last: {last_chat} | {summary_preview}"
+                f.write(line + '\n')
+            temp_file = f.name
+        
+        # Set PGPASSWORD if available
+        if AI_CHATS_DB_CONFIG.get('password'):
+            os.environ['PGPASSWORD'] = AI_CHATS_DB_CONFIG['password']
+        
+        # Create preview script
+        preview_script = """#!/bin/bash
+export PGPASSWORD='{}'
+uuid="${{1%% *}}"
+# Find full UUID from partial
+full_uuid=$(psql -h {} -p {} -d {} -U {} -t -c "SELECT context_uuid FROM ai_chat_contexts WHERE context_uuid::text LIKE '$uuid%' LIMIT 1" 2>/dev/null | tr -d ' ')
+if [ -z "$full_uuid" ]; then
+    echo "Context not found"
+    exit 1
+fi
+# Get context details
+psql -h {} -p {} -d {} -U {} -t -c "
+SELECT 
+    '━━━ CONTEXT: ' || name || ' ━━━' || E'\\n' ||
+    'UUID: ' || context_uuid || E'\\n' ||
+    'Created: ' || created_at || E'\\n' ||
+    'Updated: ' || updated_at || E'\\n' ||
+    CASE WHEN array_length(tags, 1) > 0 THEN 'Tags: ' || array_to_string(tags, ', ') || E'\\n' ELSE '' END ||
+    E'\\n━━━ SUMMARY ━━━\\n' || COALESCE(summary, 'No summary available')
+FROM ai_chat_contexts 
+WHERE context_uuid = '$full_uuid'::uuid
+" 2>/dev/null
+
+echo -e "\\n━━━ RECENT CHATS ━━━"
+psql -h {} -p {} -d {} -U {} -t -c "
+SELECT 
+    '• ' || to_char(request_timestamp, 'YYYY-MM-DD HH24:MI') || ' | ' || 
+    provider || '/' || model || ' | ' || 
+    LEFT(regexp_replace(prompt, E'[\\n\\r]+', ' ', 'g'), 60) || '...'
+FROM ai_chats 
+WHERE context_uuid = '$full_uuid'::uuid
+ORDER BY request_timestamp DESC
+LIMIT 5
+" 2>/dev/null
+""".format(
+            AI_CHATS_DB_CONFIG.get('password', ''),
+            AI_CHATS_DB_CONFIG['host'],
+            AI_CHATS_DB_CONFIG['port'],
+            AI_CHATS_DB_CONFIG['database'],
+            AI_CHATS_DB_CONFIG['user'],
+            AI_CHATS_DB_CONFIG['host'],
+            AI_CHATS_DB_CONFIG['port'],
+            AI_CHATS_DB_CONFIG['database'],
+            AI_CHATS_DB_CONFIG['user'],
+            AI_CHATS_DB_CONFIG['host'],
+            AI_CHATS_DB_CONFIG['port'],
+            AI_CHATS_DB_CONFIG['database'],
+            AI_CHATS_DB_CONFIG['user']
+        )
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(preview_script)
+            preview_file = f.name
+        
+        os.chmod(preview_file, 0o755)
+        
+        try:
+            # Find fzf command
+            import shutil
+            fzf_path = shutil.which('fzf')
+            if not fzf_path:
+                print("Error: fzf command not found. Please install fzf.", file=sys.stderr)
+                return False
+            
+            # Run fzf
+            fzf_cmd = [
+                fzf_path,
+                '--preview', f'{preview_file} {{}}',
+                '--preview-window', 'down:70%:wrap',
+                '--header', 'Select a context (Enter to view/continue, Ctrl-C to cancel)',
+                '--bind', 'ctrl-/:toggle-preview'
+            ]
+            
+            result = subprocess.run(fzf_cmd, stdin=open(temp_file), capture_output=True, text=True)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                selected = result.stdout.strip()
+                context_uuid = selected.split(' | ')[0]
+                
+                # View or continue based on --repl flag
+                if args.repl:
+                    # Continue conversation in this context
+                    args.context_id = context_uuid
+                    start_repl(args)
+                else:
+                    # Just view the context
+                    view_context(context_uuid, output_format='text', debug=args.debug, 
+                                content_only=args.content_only, render=args.render)
+                
+                return True
+            
+        finally:
+            os.unlink(temp_file)
+            os.unlink(preview_file)
+            if 'PGPASSWORD' in os.environ:
+                del os.environ['PGPASSWORD']
+    
+    except Exception as e:
+        print(f"Error in fzf context search: {e}", file=sys.stderr)
+        return False
+
 def review_chats_by_date(date_str, trace_mode=False, content_only=False, output_format='text', debug=False):
     """Review all chats from a specific date."""
     if not DB_AVAILABLE:
@@ -737,7 +1037,7 @@ def review_chats_by_date(date_str, trace_mode=False, content_only=False, output_
         print(f"Error reviewing chats: {e}", file=sys.stderr)
         return False
 
-def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False, show_full_history=False, trace_mode=False, content_only=False):
+def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False, show_full_history=False, trace_mode=False, content_only=False, render=False):
     """View full AI chat by UUID with optional conversation history."""
     if not DB_AVAILABLE:
         print("Error: Database dependencies not available", file=sys.stderr)
@@ -849,7 +1149,10 @@ def view_ai_chat(chat_id, output_format='text', debug=False, show_history=False,
             print(result['prompt'])
             print("\nRESPONSE:")
             print("-" * 40)
-            print(result['response'])
+            if render:
+                render_markdown(result['response'])
+            else:
+                print(result['response'])
             if result['metadata'] and result['metadata'] != '{}':
                 print("\nMETADATA:")
                 print("-" * 40)
@@ -1109,7 +1412,7 @@ def build_conversation_history(chat_id, include_forward=False, debug=False):
             print(f"Warning: Failed to build conversation history: {e}", file=sys.stderr)
         return []
 
-def view_context(context_uuid, output_format='text', debug=False, content_only=False, by_chat_uuid=False):
+def view_context(context_uuid, output_format='text', debug=False, content_only=False, by_chat_uuid=False, render=False):
     """View entire conversation context by context_uuid or by chat_uuid."""
     if not DB_AVAILABLE:
         print("Error: Database dependencies not available", file=sys.stderr)
@@ -1271,7 +1574,11 @@ def view_context(context_uuid, output_format='text', debug=False, content_only=F
                     print(f"   Tags: {', '.join(chat['tags'])}")
                 print("-" * 80)
                 print(f"PROMPT:\n{chat['prompt']}")
-                print(f"\nRESPONSE:\n{chat['response']}")
+                print(f"\nRESPONSE:")
+                if render:
+                    render_markdown(chat['response'])
+                else:
+                    print(chat['response'])
             
             # Display summary at the bottom if available
             if context_info['summary']:
@@ -2489,6 +2796,8 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                            help="Disable streaming output (wait for complete response)")
     core_group.add_argument("--no-summary", action="store_true",
                            help="Skip displaying context summary in REPL mode")
+    core_group.add_argument("--render", action="store_true",
+                           help="Render markdown output beautifully (like in REPL mode)")
     
     # ━━━ INPUT OPTIONS ━━━  
     input_group = parser.add_argument_group("📁 Input Options")
@@ -2592,6 +2901,10 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                              help="Filter search results by model")
     filter_group.add_argument("--tags-filter", metavar="TAGS",
                              help="Filter search results by tags (comma-separated)")
+    filter_group.add_argument("--fzf-chat", action="store_true",
+                             help="Search chats using fzf with preview")
+    filter_group.add_argument("--fzf-context", action="store_true",
+                             help="Search contexts using fzf with preview")
     
     # ━━━ OUTPUT & DEBUG ━━━
     output_group = parser.add_argument_group("📊 Output & Debug")
@@ -4130,6 +4443,15 @@ def main():
         )
         return
     
+    # Handle FZF search options
+    if args.fzf_chat:
+        fzf_search_chats(args)
+        return
+    
+    if args.fzf_context:
+        fzf_search_contexts(args)
+        return
+    
     if args.view:
         view_ai_chat(
             args.view,
@@ -4138,7 +4460,8 @@ def main():
             show_history=args.history,
             show_full_history=args.full_history,
             trace_mode=args.trace,
-            content_only=args.content_only
+            content_only=args.content_only,
+            render=args.render
         )
         return
     
@@ -4176,7 +4499,8 @@ def main():
             output_format='json' if args.json else 'text',
             debug=args.debug,
             content_only=args.content_only,
-            by_chat_uuid=args.by_chat_uuid
+            by_chat_uuid=args.by_chat_uuid,
+            render=args.render
         )
         return
     
@@ -4349,17 +4673,21 @@ def main():
                 print(f"Debug: With stdin input: {len(stdin_input)} characters", file=sys.stderr)
         
         try:
-            # Use streaming unless disabled
-            stream_output = not args.no_streaming
-            # Always capture output when preserving chats to database
-            capture_output = not args.no_preserve
+            # Use streaming unless disabled or render mode is active
+            stream_output = not args.no_streaming and not args.render
+            # Always capture output when preserving chats to database or when rendering
+            capture_output = not args.no_preserve or args.render
             result = execute_command(cmd_and_stdin, model, iteration, capture_output=capture_output, stream_output=stream_output)
             
             # Note: For streaming, output is already printed in execute_command
-            # For non-streaming, we need to print the captured output
-            if args.no_streaming:
+            # For non-streaming or render mode, we need to print the captured output
+            if args.no_streaming or args.render:
                 if result.get("output"):
-                    print(result["output"], end='')
+                    if args.render:
+                        # Use markdown rendering if requested
+                        render_markdown(result["output"])
+                    else:
+                        print(result["output"], end='')
                 if result.get("stderr"):
                     print(result["stderr"], file=sys.stderr, end='')
             
@@ -4468,7 +4796,11 @@ def main():
                     # Print output as it arrives (if captured and not using pick-best)
                     if not args.pick_best and result.get("output"):
                         print(f"\n[{result.get('model', 'unknown')}]", file=sys.stderr)
-                        print(result["output"], end='')
+                        if args.render:
+                            # Use markdown rendering if requested
+                            render_markdown(result["output"])
+                        else:
+                            print(result["output"], end='')
                     
                     if not result["success"]:
                         error_msg = result.get("error", f"Command failed with return code {result.get('returncode', 'unknown')}")
@@ -4497,7 +4829,11 @@ def main():
                     for model, result in model_responses:
                         if model == best_model:
                             print(f"\n[Best Response: {best_model}]", file=sys.stderr)
-                            print(result["output"], end='')
+                            if args.render:
+                                # Use markdown rendering if requested
+                                render_markdown(result["output"])
+                            else:
+                                print(result["output"], end='')
                             break
                     
                     if args.debug:
@@ -4508,7 +4844,11 @@ def main():
                 # Only one successful response, use it
                 model, result = model_responses[0]
                 print(f"\n[{model}]", file=sys.stderr)
-                print(result["output"], end='')
+                if args.render:
+                    # Use markdown rendering if requested
+                    render_markdown(result["output"])
+                else:
+                    print(result["output"], end='')
         
         # Summary
         successful = sum(1 for r in results if r["success"])
