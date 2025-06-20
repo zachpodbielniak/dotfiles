@@ -222,7 +222,7 @@ bind -x '"\C-n":fopen_note'
 
 
 # Starship
-if [[ $(_have starship) ]]
+if command -v starship &>/dev/null
 then 
     eval "$(starship init bash)"
 else
