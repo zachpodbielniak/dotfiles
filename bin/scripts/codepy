@@ -1,0 +1,808 @@
+#!/usr/bin/python3
+
+from os import environ
+from subprocess import run, PIPE, Popen
+from sys import argv, exit, stdin, stderr
+import argparse
+import json
+import sys
+import os
+import base64
+import mimetypes
+import time
+import select
+from datetime import datetime
+from pathlib import Path
+import subprocess
+import uuid
+
+ctr_id: str|None = ""
+
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# Store the original working directory before any distrobox re-execution
+original_cwd = os.getcwd()
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    # Pass the original working directory as an environment variable
+    env = environ.copy()
+    env['CODEPY_ORIGINAL_CWD'] = original_cwd
+    
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+
+    run(cmd, env=env)
+    exit(0)
+
+# Parse arguments
+parser = argparse.ArgumentParser(description="Query Claude Code CLI")
+parser.add_argument("--prompt", help="Prompt to prepend to the input")
+parser.add_argument("--model", 
+                    help="Model to use. Available models: claude-sonnet-4-20250514, claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022, claude-3-opus-20240229")
+parser.add_argument("--debug", action="store_true", help="Enable debug mode (shows request details)")
+parser.add_argument("--json", action="store_true", help="Return JSON response with metadata")
+parser.add_argument("--stream-json", action="store_true", help="Stream JSON output as it arrives")
+parser.add_argument("-S", "--no-streaming", action="store_true", help="Disable streaming mode for cleaner output capture")
+parser.add_argument("-f", "--file", action="append", dest="files",
+                    help="Include file content in the context (can be specified multiple times)")
+parser.add_argument("--no-color", action="store_true",
+                    help="Disable colored output")
+parser.add_argument("--output", help="Output filename for saving session logs")
+parser.add_argument("--summary", action="store_true",
+                    help="Show usage summary with token counts, timing, and costs in a formatted table")
+parser.add_argument("--dry-run", action="store_true",
+                    help="Show what would be sent to Claude Code without making the actual request")
+parser.add_argument("--no-preserve", action="store_true",
+                    help="Don't save the chat transaction to the second-brain markdown file")
+parser.add_argument("--use-context", action="store_true",
+                    help="Include today's chat history as context for the conversation")
+parser.add_argument("--use-context-from", 
+                    help="Include chat history from a specific date (YYYY-MM-DD format) as context")
+parser.add_argument("--personality", 
+                    help="Set a personality/role for the AI. Available: cfp, swe, teacher, doctor, lawyer, chef, therapist, scientist, historian, artist, coach, journalist, philosopher, librarian, tutor, consultant, translator, critic, comedian, mentor, investor, cybersecurity. You can also use custom descriptions.")
+parser.add_argument("--resume", 
+                    help="Resume a specific conversation by session UUID")
+parser.add_argument("--continue", action="store_true",
+                    help="Continue the most recent conversation")
+parser.add_argument("--generate-new-session-id", action="store_true",
+                    help="Generate and return a new session UUID")
+parser.add_argument("--exclude-tool", action="append", dest="excluded_tools",
+                    help="Exclude specific tools from being available (can be specified multiple times)")
+parser.add_argument("--list-tools", action="store_true",
+                    help="List all available Claude Code tools")
+parser.add_argument("--max-turns", type=int,
+                    help="Limit agentic turns in non-interactive mode")
+parser.add_argument("--system-prompt", 
+                    help="Override system prompt (only with --print)")
+parser.add_argument("--append-system-prompt", 
+                    help="Append to system prompt (only with --print)")
+parser.add_argument("--verbose", action="store_true", 
+                    help="Enable verbose logging")
+parser.add_argument("-p", "--print", action="store_true",
+                    help="Run in non-interactive mode")
+args = parser.parse_args()
+
+# Personality definitions
+PERSONALITIES = {
+    "cfp": "You are a Certified Financial Planner (CFP) with extensive knowledge of personal finance, investment strategies, tax planning, retirement planning, and estate planning. Provide professional, ethical financial advice while always reminding users to consult with their own financial advisor for personalized guidance.",
+    
+    "swe": "You are a Senior Software Engineer with deep expertise in software architecture, design patterns, code quality, and best practices. Focus on writing clean, maintainable, and efficient code. Consider scalability, security, and performance in your recommendations.",
+    
+    "teacher": "You are a patient and encouraging teacher who excels at breaking down complex topics into understandable concepts. Use analogies, examples, and step-by-step explanations. Adapt your teaching style to the learner's level and encourage questions.",
+    
+    "doctor": "You are a knowledgeable medical professional who provides general health information and guidance. Always emphasize that your advice is educational only and users should consult with healthcare providers for medical diagnosis and treatment.",
+    
+    "lawyer": "You are a legal expert who provides general legal information and explains legal concepts clearly. Always clarify that this is not legal advice and users should consult with an attorney for specific legal matters.",
+    
+    "chef": "You are a professional chef with expertise in various cuisines, cooking techniques, and food science. Share recipes, cooking tips, and culinary knowledge with enthusiasm. Consider dietary restrictions and preferences when making suggestions.",
+    
+    "therapist": "You are a supportive mental health professional who provides emotional support and coping strategies. Always encourage users to seek professional help for serious mental health concerns while offering compassionate guidance.",
+    
+    "scientist": "You are a research scientist with broad knowledge across multiple scientific disciplines. Explain scientific concepts clearly, cite evidence-based information, and maintain scientific accuracy while making complex topics accessible.",
+    
+    "historian": "You are a historian with deep knowledge of world history, cultures, and historical analysis. Provide context, multiple perspectives, and help users understand how past events connect to the present.",
+    
+    "artist": "You are a creative artist with expertise in various art forms, techniques, and art history. Encourage creativity, provide constructive feedback, and help users explore their artistic expression.",
+    
+    "coach": "You are a life coach focused on helping people achieve their goals, overcome obstacles, and maximize their potential. Use motivational techniques, ask powerful questions, and help users create actionable plans.",
+    
+    "journalist": "You are an investigative journalist skilled in research, fact-checking, and clear communication. Help users understand complex issues, identify reliable sources, and think critically about information.",
+    
+    "philosopher": "You are a philosopher who explores deep questions about existence, ethics, knowledge, and reality. Engage in thoughtful dialogue, present multiple philosophical perspectives, and encourage critical thinking.",
+    
+    "librarian": "You are a research librarian with expertise in finding, evaluating, and organizing information. Help users with research strategies, source evaluation, and information literacy.",
+    
+    "tutor": "You are a subject-specific tutor who helps students understand difficult concepts, complete assignments, and prepare for exams. Focus on building understanding rather than just providing answers.",
+    
+    "consultant": "You are a business consultant with expertise in strategy, operations, and organizational development. Provide practical business advice, analyze problems systematically, and offer actionable recommendations.",
+    
+    "translator": "You are a professional translator and linguist with expertise in multiple languages and cultures. Help with translations, explain linguistic nuances, and provide cultural context.",
+    
+    "critic": "You are a thoughtful critic who analyzes literature, films, art, and media with depth and insight. Provide balanced critiques that consider both strengths and weaknesses while respecting different perspectives.",
+    
+    "comedian": "You are a witty comedian who uses humor appropriately to lighten conversations while remaining helpful. Balance entertainment with usefulness, and be sensitive to context and audience.",
+    
+    "mentor": "You are a wise mentor who guides others based on experience and wisdom. Offer perspective, share relevant experiences, and help mentees navigate challenges while encouraging their growth.",
+    
+    "investor": "You are an experienced investment professional with deep knowledge of financial markets, portfolio management, risk assessment, and investment strategies. Provide insights on stocks, bonds, real estate, alternative investments, and market analysis while emphasizing the importance of diversification and risk management.",
+    
+    "cybersecurity": "You are a cybersecurity expert with extensive knowledge of information security, threat analysis, network security, and digital privacy. Help users understand security best practices, identify vulnerabilities, and implement protective measures while staying current with emerging threats and security technologies."
+}
+
+def get_personality_prompt(personality_key):
+    """Get the personality prompt for the given key, or return empty string if not found."""
+    if not personality_key:
+        return ""
+    
+    personality_key = personality_key.lower()
+    if personality_key in PERSONALITIES:
+        return PERSONALITIES[personality_key] + "\n\n"
+    else:
+        # If not a predefined personality, treat it as a custom personality description
+        return f"You are {personality_key}.\n\n"
+
+def load_context_from_file(date_str):
+    """Load chat history from a specific date's markdown file."""
+    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    filename = f"{date_str}.md"
+    file_path = base_path / filename
+    
+    if not file_path.exists():
+        if args.debug:
+            print(f"Debug: No context file found at {file_path}", file=sys.stderr)
+        return None
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        if args.debug:
+            print(f"Debug: Loaded {len(content)} characters of context from {filename}", file=sys.stderr)
+        
+        return f"=== Previous Chat History from {date_str} ===\n\n{content}\n\n=== End of Previous Chat History ===\n\n"
+    except Exception as e:
+        print(f"Warning: Could not load context from {file_path}: {e}", file=sys.stderr)
+        return None
+
+def calculate_cost(model, input_tokens, output_tokens):
+    """Calculate cost based on Claude pricing (as of 2024)."""
+    # Pricing per 1M tokens (in dollars)
+    pricing = {
+        # Claude 4 models
+        "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+        # Claude 3.5 models
+        "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
+        "claude-3-5-haiku-20241022": {"input": 1.00, "output": 5.00},
+        # Claude 3 models
+        "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
+    }
+    
+    # Get pricing for the model, default to Sonnet if not found
+    model_pricing = pricing.get(model, pricing.get("claude-3-5-sonnet-20241022"))
+    
+    # Calculate costs (convert from per million to actual tokens)
+    input_cost = (input_tokens / 1_000_000) * model_pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * model_pricing["output"]
+    total_cost = input_cost + output_cost
+    
+    return {
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": total_cost
+    }
+
+def print_summary_table(model, input_tokens, output_tokens, total_time, first_token_time, cost_info, is_estimated=False, use_color=True):
+    """Print a formatted summary table with color support."""
+    # ANSI color codes (conditionally set based on use_color)
+    if use_color:
+        CYAN = '\033[96m'
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        BLUE = '\033[94m'
+        MAGENTA = '\033[95m'
+        BOLD = '\033[1m'
+        END = '\033[0m'
+    else:
+        CYAN = GREEN = YELLOW = BLUE = MAGENTA = BOLD = END = ''
+    
+    # Calculate total tokens
+    total_tokens = input_tokens + output_tokens
+    
+    # Table width (inner content width)
+    width = 50
+    
+    # Helper to strip ANSI codes
+    import re
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    
+    def strip_ansi(text):
+        return ansi_escape.sub('', text)
+    
+    # Helper to create a padded line
+    def make_line(left, right, left_width=22):
+        """Create a line with left and right parts, properly padded."""
+        left_plain = strip_ansi(left)
+        right_plain = strip_ansi(right)
+        
+        # Total inner content must be exactly 48 characters
+        # Left part: left_text + padding to reach left_width
+        left_part = left + ' ' * (left_width - len(left_plain))
+        
+        # Right part: right_text + padding to fill remaining space
+        remaining_width = 48 - left_width - 1  # -1 for space between left and right
+        right_part = right + ' ' * (remaining_width - len(right_plain))
+        
+        # Combine: left_part + space + right_part = exactly 48 chars
+        content = f"{left_part} {right_part}"
+        
+        return f"{CYAN}║{END} {content} {CYAN}║{END}"
+    
+    # Build the table
+    print(f"\n{BOLD}{CYAN}╔{'═' * width}╗{END}", file=sys.stderr)
+    
+    # Title
+    title = "Claude Code Usage Summary"
+    title_pad_left = (width - len(title)) // 2
+    title_pad_right = width - len(title) - title_pad_left
+    print(f"{BOLD}{CYAN}║{' ' * title_pad_left}{title}{' ' * title_pad_right}║{END}", file=sys.stderr)
+    
+    print(f"{BOLD}{CYAN}╠{'═' * width}╣{END}", file=sys.stderr)
+    
+    # Model info
+    model_display = model if len(model) <= 30 else model[:27] + "..."
+    print(make_line(f"{BOLD}Model:{END}", f"{GREEN}{model_display}{END}"), file=sys.stderr)
+    print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
+    
+    # Token usage
+    print(make_line(f"{BOLD}Token Usage:{END}", ""), file=sys.stderr)
+    
+    est_marker = " (est)" if is_estimated else ""
+    print(make_line("  Input:", f"{YELLOW}{input_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
+    print(make_line("  Output:", f"{YELLOW}{output_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
+    print(make_line("  Total:", f"{BOLD}{YELLOW}{total_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
+    print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
+    
+    # Performance
+    print(make_line(f"{BOLD}Performance:{END}", ""), file=sys.stderr)
+    
+    if first_token_time:
+        print(make_line("  Time to first token:", f"{BLUE}{first_token_time:.2f}s{END}"), file=sys.stderr)
+    
+    print(make_line("  Total time:", f"{BLUE}{total_time:.2f}s{END}"), file=sys.stderr)
+    
+    if output_tokens > 0 and total_time > 0:
+        tokens_per_sec = output_tokens / total_time
+        print(make_line("  Tokens/second:", f"{BLUE}{tokens_per_sec:.1f}{END}"), file=sys.stderr)
+    
+    print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
+    
+    # Cost
+    print(make_line(f"{BOLD}Cost Breakdown:{END}", ""), file=sys.stderr)
+    
+    print(make_line("  Input cost:", f"{MAGENTA}${cost_info['input_cost']:.6f}{END}"), file=sys.stderr)
+    print(make_line("  Output cost:", f"{MAGENTA}${cost_info['output_cost']:.6f}{END}"), file=sys.stderr)
+    print(make_line(f"  {BOLD}Total cost:{END}", f"{BOLD}{MAGENTA}${cost_info['total_cost']:.6f}{END}"), file=sys.stderr)
+    
+    print(f"{BOLD}{CYAN}╚{'═' * width}╝{END}", file=sys.stderr)
+
+def save_chat_transaction(provider, model, prompt, response, metadata=None):
+    """Save chat transaction to markdown file organized by date."""
+    # Create directory structure if it doesn't exist
+    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    base_path.mkdir(parents=True, exist_ok=True)
+    
+    # Generate filename based on today's date
+    today = datetime.now()
+    filename = today.strftime("%Y-%m-%d.md")
+    file_path = base_path / filename
+    
+    # Generate timestamp for section header
+    timestamp = today.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Prepare content
+    content = f"\n# {timestamp}\n\n"
+    content += f"## Prompt\n\n```\n{prompt}\n```\n\n"
+    content += f"## Response\n\n{response}\n\n"
+    
+    # Add metadata if provided
+    if metadata:
+        content += f"## Metadata\n\n"
+        content += f"- **Provider**: {provider}\n"
+        content += f"- **Model**: {model}\n"
+        if 'input_tokens' in metadata:
+            content += f"- **Input Tokens**: {metadata['input_tokens']:,}\n"
+        if 'output_tokens' in metadata:
+            content += f"- **Output Tokens**: {metadata['output_tokens']:,}\n"
+        if 'total_tokens' in metadata:
+            content += f"- **Total Tokens**: {metadata['total_tokens']:,}\n"
+        if 'cost_info' in metadata:
+            cost_info = metadata['cost_info']
+            content += f"- **Input Cost**: ${cost_info['input_cost']:.6f}\n"
+            content += f"- **Output Cost**: ${cost_info['output_cost']:.6f}\n"
+            content += f"- **Total Cost**: ${cost_info['total_cost']:.6f}\n"
+        if 'total_time' in metadata:
+            content += f"- **Total Time**: {metadata['total_time']:.2f}s\n"
+        if 'first_token_time' in metadata and metadata['first_token_time']:
+            content += f"- **Time to First Token**: {metadata['first_token_time']:.2f}s\n"
+        if 'stream_mode' in metadata:
+            content += f"- **Streaming**: {metadata['stream_mode']}\n"
+        if 'session_id' in metadata:
+            content += f"- **Session ID**: {metadata['session_id']}\n"
+    
+    content += "\n---\n"
+    
+    # Write to file (append if exists)
+    try:
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
+
+def generate_new_session_id():
+    """Generate a new session UUID using claude status command."""
+    try:
+        # Use claude status command to get a new session ID
+        cmd = ['claude', '-p', '--output-format', 'json']
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = process.communicate(input="/status\n")
+        
+        if process.returncode == 0:
+            try:
+                status_data = json.loads(stdout)
+                session_id = status_data.get('session_id')
+                if session_id:
+                    return session_id
+            except json.JSONDecodeError:
+                pass
+        
+        # Fallback to generating UUID ourselves
+        return str(uuid.uuid4())
+    except Exception:
+        return str(uuid.uuid4())
+
+def list_claude_tools():
+    """List all available Claude Code tools."""
+    # Standard Claude Code tools
+    tools = [
+        "Bash",
+        "Glob", 
+        "Grep",
+        "LS",
+        "Read",
+        "Edit",
+        "MultiEdit",
+        "Write",
+        "NotebookRead",
+        "NotebookEdit",
+        "WebFetch",
+        "TodoRead",
+        "TodoWrite",
+        "WebSearch"
+    ]
+    
+    use_colors = not args.no_color and os.environ.get("NO_COLOR", "").lower() not in ("1", "true")
+    
+    # ANSI color codes (conditionally set based on use_colors)
+    CYAN = '\033[96m' if use_colors else ''
+    GREEN = '\033[92m' if use_colors else ''
+    YELLOW = '\033[93m' if use_colors else ''
+    BLUE = '\033[94m' if use_colors else ''
+    BOLD = '\033[1m' if use_colors else ''
+    END = '\033[0m' if use_colors else ''
+    
+    # Tool descriptions
+    tool_descriptions = {
+        "Bash": "Execute shell commands",
+        "Glob": "Find files by pattern",
+        "Grep": "Search file contents",
+        "LS": "List directory contents",
+        "Read": "Read file contents",
+        "Edit": "Edit files (single replacement)",
+        "MultiEdit": "Edit files (multiple replacements)",
+        "Write": "Write new files",
+        "NotebookRead": "Read Jupyter notebooks",
+        "NotebookEdit": "Edit Jupyter notebooks",
+        "WebFetch": "Fetch web content",
+        "TodoRead": "Read todo list",
+        "TodoWrite": "Write todo list",
+        "WebSearch": "Search the web"
+    }
+    
+    # Calculate column widths
+    max_tool_width = max(len(tool) for tool in tools)
+    max_desc_width = max(len(desc) for desc in tool_descriptions.values())
+    
+    # Print header
+    print(f"\n{BOLD}{CYAN}Available Claude Code Tools:{END}")
+    print(f"{BOLD}{'─' * (max_tool_width + max_desc_width + 3)}{END}")
+    
+    # Print table header
+    print(f"{BOLD}{YELLOW}{'Tool':<{max_tool_width}} {'Description':<{max_desc_width}}{END}")
+    print(f"{BOLD}{'─' * max_tool_width} {'─' * max_desc_width}{END}")
+    
+    # Print tools
+    for i, tool in enumerate(tools):
+        description = tool_descriptions.get(tool, "")
+        # Alternate row colors
+        color = GREEN if i % 2 == 0 else BLUE
+        print(f"{color}{tool:<{max_tool_width}}{END} {description}")
+    
+    print(f"{BOLD}{'─' * (max_tool_width + max_desc_width + 3)}{END}")
+    print(f"{BOLD}Total tools: {GREEN}{len(tools)}{END}")
+    print(f"\n{YELLOW}Usage:{END} codepy --exclude-tool Bash --exclude-tool Write")
+    print(f"{YELLOW}Note:{END} MCP tools (if configured) follow the pattern: mcp__serverName__toolName\n")
+
+# Since outside of the distrobox we may not have these modules
+# quietly ignore the fact that they may not exist
+try:
+    # Handle generate-new-session-id option first
+    if args.generate_new_session_id:
+        session_id = generate_new_session_id()
+        print(session_id)
+        exit(0)
+    
+    # Handle list-tools option
+    if args.list_tools:
+        list_claude_tools()
+        exit(0)
+    
+    # Read file contents if any files were specified
+    file_contents = []
+    if args.files:
+        for file_path in args.files:
+            try:
+                with open(file_path, 'r') as f:
+                    file_content = f.read()
+                    file_contents.append(f"=== File: {file_path} ===\n{file_content}\n")
+            except IOError as e:
+                print(f"Warning: Could not read file {file_path}: {e}", file=stderr)
+    
+    # Read from standard input only if there's data available
+    query = ""
+    # Check if stdin has data (not a terminal and has content)
+    if not stdin.isatty() or stdin in select.select([stdin], [], [], 0)[0]:
+        query = stdin.read()
+    # If no stdin and no prompt/files provided, show error
+    elif not args.prompt and not args.files:
+        print("Error: No input provided. Use --prompt, -f/--file, or pipe input via stdin", file=stderr)
+        exit(1)
+
+    # Combine file contents with query
+    combined_parts = []
+    
+    # Add file contents first if any
+    if file_contents:
+        combined_parts.extend(file_contents)
+    
+    # Add prompt if provided
+    if args.prompt:
+        combined_parts.append(args.prompt)
+    
+    # Add stdin content if any
+    if query:
+        combined_parts.append(query)
+    
+    # Combine all parts
+    if combined_parts:
+        query = "\n".join(combined_parts)
+    else:
+        query = ""
+    
+    # Load context if requested
+    context_parts = []
+    
+    # Load today's context if --use-context is specified
+    if args.use_context:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        context = load_context_from_file(today_str)
+        if context:
+            context_parts.append(context)
+    
+    # Load specific date's context if --use-context-from is specified
+    if args.use_context_from:
+        try:
+            # Validate date format
+            datetime.strptime(args.use_context_from, "%Y-%m-%d")
+            context = load_context_from_file(args.use_context_from)
+            if context:
+                context_parts.append(context)
+        except ValueError:
+            print(f"Error: Invalid date format '{args.use_context_from}'. Use YYYY-MM-DD format.", file=stderr)
+            exit(1)
+    
+    # Prepend context to query if any context was loaded
+    if context_parts:
+        context_str = "\n".join(context_parts)
+        if query:
+            query = context_str + "\nCurrent Query:\n" + query
+        else:
+            query = context_str
+    
+    # Prepend personality prompt if specified
+    if args.personality:
+        personality_prompt = get_personality_prompt(args.personality)
+        if personality_prompt:
+            if query:
+                query = personality_prompt + query
+            else:
+                query = personality_prompt.rstrip()  # Remove trailing newlines if no other content
+
+    # Build Claude Code command
+    claude_cmd = ['claude']
+    
+    # Always use print mode for programmatic access
+    claude_cmd.append('-p')
+    
+    # Bypass permission checks for non-interactive use
+    claude_cmd.append('--dangerously-skip-permissions')
+    
+    # Add output format
+    if args.stream_json:
+        claude_cmd.extend(['--output-format', 'stream-json'])
+    elif args.json:
+        claude_cmd.extend(['--output-format', 'json'])
+    else:
+        claude_cmd.extend(['--output-format', 'text'])
+    
+    # Add model if specified
+    if args.model:
+        claude_cmd.extend(['--model', args.model])
+    
+    # Add resume/continue options
+    if args.resume:
+        claude_cmd.extend(['--resume', args.resume])
+    elif getattr(args, 'continue', False):
+        claude_cmd.append('--continue')
+    
+    # Add max turns if specified
+    if args.max_turns:
+        claude_cmd.extend(['--max-turns', str(args.max_turns)])
+    
+    # Add system prompt options
+    if args.system_prompt:
+        claude_cmd.extend(['--system-prompt', args.system_prompt])
+    
+    if args.append_system_prompt:
+        claude_cmd.extend(['--append-system-prompt', args.append_system_prompt])
+    
+    # Add verbose flag
+    if args.verbose:
+        claude_cmd.append('--verbose')
+    
+    # Handle tool exclusions - by default allow all tools, then exclude specified ones
+    if args.excluded_tools:
+        # Create a disallowed tools list
+        disallowed_tools = ','.join(args.excluded_tools)
+        claude_cmd.extend(['--disallowedTools', disallowed_tools])
+    
+    # Get the original working directory from when the script was called
+    # This handles both direct execution and distrobox re-execution
+    final_cwd = environ.get('CODEPY_ORIGINAL_CWD', original_cwd)
+    
+    # Print debug info if requested
+    if args.debug:
+        print(f"Debug: Claude Code command: {' '.join(claude_cmd)}", file=sys.stderr)
+        print(f"Debug: Working directory: {final_cwd}", file=sys.stderr)
+        print(f"Debug: Query length: {len(query)} characters", file=sys.stderr)
+        if args.files:
+            print(f"Debug: Processing {len(args.files)} file(s): {', '.join(args.files)}", file=sys.stderr)
+    
+    # Handle dry-run mode
+    if args.dry_run:
+        print("=== DRY RUN MODE ===", file=sys.stderr)
+        print(f"\nClaude Code Command: {' '.join(claude_cmd)}", file=sys.stderr)
+        print(f"\nQuery ({len(query)} characters):", file=sys.stderr)
+        if len(query) > 1000:
+            print(query[:1000] + "... [truncated]", file=sys.stderr)
+        else:
+            print(query, file=sys.stderr)
+        
+        print("\n=== END DRY RUN ===", file=sys.stderr)
+        exit(0)
+    
+    # Track timing if summary mode
+    start_time = time.time() if args.summary else None
+    first_token_time = None
+    accumulated_content = ""
+    session_id = None
+    
+    # Send request to Claude Code
+    if args.stream_json:
+        # Handle streaming JSON mode
+        process = Popen(claude_cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True, cwd=final_cwd)
+        
+        # Send the query
+        stdout, stderr_output = process.communicate(input=query)
+        
+        if process.returncode != 0:
+            print(f"Error: Claude Code failed with exit code {process.returncode}", file=sys.stderr)
+            if stderr_output:
+                print(stderr_output, file=sys.stderr)
+            exit(1)
+        
+        # Process streaming JSON output
+        for line in stdout.strip().split('\n'):
+            if line:
+                try:
+                    message = json.loads(line)
+                    
+                    # Extract session ID from first message
+                    if message.get('type') == 'system' and message.get('subtype') == 'init':
+                        session_id = message.get('session_id')
+                    
+                    # Handle assistant messages
+                    elif message.get('type') == 'assistant':
+                        content = message.get('message', {}).get('content', '')
+                        if isinstance(content, list):
+                            # Handle content blocks
+                            for block in content:
+                                if block.get('type') == 'text':
+                                    text_content = block.get('text', '')
+                                    print(text_content, end='', flush=True)
+                                    
+                                    # Track first token time
+                                    if args.summary and first_token_time is None and text_content:
+                                        first_token_time = time.time()
+                                    
+                                    accumulated_content += text_content
+                        elif isinstance(content, str):
+                            print(content, end='', flush=True)
+                            
+                            # Track first token time
+                            if args.summary and first_token_time is None and content:
+                                first_token_time = time.time()
+                            
+                            accumulated_content += content
+                    
+                    # Handle result message
+                    elif message.get('type') == 'result':
+                        if args.summary:
+                            # Extract token counts and other metadata from result
+                            input_tokens = 0  # Will be estimated
+                            output_tokens = 0  # Will be estimated
+                            
+                            # Estimate tokens since Claude Code doesn't provide exact counts in streaming
+                            input_tokens = len(query) // 4
+                            output_tokens = len(accumulated_content) // 4
+                            
+                except json.JSONDecodeError:
+                    continue
+    else:
+        # Handle non-streaming mode
+        process = Popen(claude_cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True, cwd=final_cwd)
+        
+        # Send the query
+        stdout, stderr_output = process.communicate(input=query)
+        
+        if process.returncode != 0:
+            print(f"Error: Claude Code failed with exit code {process.returncode}", file=sys.stderr)
+            if stderr_output:
+                print(stderr_output, file=sys.stderr)
+            exit(1)
+        
+        if args.json:
+            # Parse JSON response
+            try:
+                response_data = json.loads(stdout)
+                
+                # Extract session ID
+                session_id = response_data.get('session_id')
+                
+                # Extract the result text
+                accumulated_content = response_data.get('result', '')
+                print(accumulated_content)
+                
+                # Extract token counts if available
+                if args.summary:
+                    # Estimate tokens since exact counts may not be available
+                    input_tokens = len(query) // 4
+                    output_tokens = len(accumulated_content) // 4
+                
+            except json.JSONDecodeError:
+                print(stdout)
+                accumulated_content = stdout
+        else:
+            # Plain text output
+            print(stdout, end='')
+            accumulated_content = stdout
+            
+            # For text mode, try to extract session ID using status command
+            if args.summary:
+                try:
+                    status_cmd = ['claude', '-p', '--output-format', 'json']
+                    status_process = subprocess.Popen(status_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=final_cwd)
+                    status_stdout, _ = status_process.communicate(input="/status\n")
+                    
+                    if status_process.returncode == 0:
+                        try:
+                            status_data = json.loads(status_stdout)
+                            session_id = status_data.get('session_id')
+                        except json.JSONDecodeError:
+                            pass
+                except Exception:
+                    pass
+    
+    # Summary output
+    if args.summary:
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        # Add newline before summary if not already present
+        if not accumulated_content.endswith('\n'):
+            print(file=sys.stderr)
+        
+        # Estimate tokens if not already set
+        if 'input_tokens' not in locals():
+            input_tokens = len(query) // 4
+        if 'output_tokens' not in locals():
+            output_tokens = len(accumulated_content) // 4
+        
+        # Use default model if not specified
+        model_name = args.model or "claude-3-5-sonnet-20241022"
+        
+        # Calculate cost
+        cost_info = calculate_cost(
+            model_name,
+            input_tokens,
+            output_tokens
+        )
+        
+        # Calculate time to first token
+        ttft = (first_token_time - start_time) if first_token_time else None
+        
+        # Print summary table
+        print_summary_table(
+            model=model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_time=total_time,
+            first_token_time=ttft,
+            cost_info=cost_info,
+            is_estimated=True,
+            use_color=not args.no_color
+        )
+    
+    # Save chat transaction if not disabled
+    if not args.no_preserve and accumulated_content:
+        # Prepare metadata
+        metadata = {
+            'stream_mode': args.stream_json,
+            'files': args.files
+        }
+        
+        # Add token counts if available
+        if 'input_tokens' in locals():
+            metadata['input_tokens'] = input_tokens
+        if 'output_tokens' in locals():
+            metadata['output_tokens'] = output_tokens
+        if 'input_tokens' in locals() and 'output_tokens' in locals():
+            metadata['total_tokens'] = input_tokens + output_tokens
+            metadata['cost_info'] = cost_info
+        
+        # Add timing if available
+        if 'total_time' in locals():
+            metadata['total_time'] = total_time
+        if 'ttft' in locals() and ttft:
+            metadata['first_token_time'] = ttft
+        
+        # Add session ID if available
+        if session_id:
+            metadata['session_id'] = session_id
+        
+        model_name = args.model or "claude-3-5-sonnet-20241022"
+        save_chat_transaction("Claude Code", model_name, query, accumulated_content, metadata)
+
+except (ImportError, Exception) as e:
+    print(f"Error: {e}")
+    exit(1)
