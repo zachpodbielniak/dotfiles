@@ -1,0 +1,329 @@
+#!/usr/bin/python3
+"""
+md_table_sort - Sort markdown tables by column(s)
+
+Usage:
+  md_table_sort --by column_name [--desc] [--numeric column_name] [--input file] [--output file]
+  cat table.md | md_table_sort --by score --desc
+  md_table_sort --by name,grade --numeric score
+
+This script sorts markdown tables by one or more columns with support for
+ascending/descending order and numeric vs alphabetic sorting.
+
+Sort Options:
+  --by column1,column2     Sort by columns (comma-separated for multiple)
+  --desc                   Sort in descending order (default: ascending)
+  --numeric col1,col2      Treat specified columns as numeric for sorting
+  --case-sensitive         Case-sensitive text sorting (default: case-insensitive)
+
+Examples:
+  # Sort by single column (ascending)
+  md_table_sort --by score
+
+  # Sort by single column (descending)
+  md_table_sort --by score --desc
+
+  # Sort by multiple columns
+  md_table_sort --by department,salary --desc
+
+  # Mixed sorting with numeric columns
+  md_table_sort --by name,score --numeric score
+  
+  # Pipeline usage
+  cat data.md | md_table_sort --by score --desc | md_table_calc "AVG(B)"
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import re
+from typing import List, Optional
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 1:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat all rows as data with generated headers
+        data_lines = table_lines
+        headers = [f"Column{i+1}" for i in range(len(headers))]
+        data_start = 0
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines and separator_idx is not None:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=headers)
+    
+    return df
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """Convert pandas DataFrame to markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Add header row
+    headers = [str(col) for col in df.columns]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+    
+    # Add data rows
+    for _, row in df.iterrows():
+        row_data = []
+        for val in row:
+            # Handle different data types
+            if pd.isna(val):
+                row_data.append("")
+            else:
+                # Escape pipes in cell content
+                cell_content = str(val).replace("|", "\\|")
+                row_data.append(cell_content)
+        
+        lines.append("| " + " | ".join(row_data) + " |")
+    
+    return "\n".join(lines) + "\n"
+
+def prepare_sort_columns(df: pd.DataFrame, sort_columns: List[str], numeric_columns: List[str], case_sensitive: bool = False) -> pd.DataFrame:
+    """Prepare DataFrame for sorting by converting column types"""
+    # Create a copy to avoid modifying original
+    df_copy = df.copy()
+    
+    for col in sort_columns:
+        if col not in df_copy.columns:
+            raise ValueError(f"Column '{col}' not found in table")
+        
+        if col in numeric_columns:
+            # Convert to numeric, handling non-numeric values
+            def try_convert_numeric(val):
+                if pd.isna(val) or val == '':
+                    return np.nan
+                try:
+                    # Remove common non-numeric characters
+                    clean_val = str(val).replace('$', '').replace(',', '').strip()
+                    return float(clean_val)
+                except (ValueError, TypeError):
+                    return np.nan
+            
+            df_copy[col] = df_copy[col].apply(try_convert_numeric)
+        else:
+            # Text sorting - handle case sensitivity
+            if not case_sensitive:
+                # Create a sort key that's lowercase for sorting, but preserve original values
+                df_copy[f'_{col}_sort_key'] = df_copy[col].astype(str).str.lower()
+    
+    return df_copy
+
+def sort_table(df: pd.DataFrame, sort_columns: List[str], descending: bool = False, 
+              numeric_columns: List[str] = None, case_sensitive: bool = False) -> pd.DataFrame:
+    """Sort DataFrame by specified columns"""
+    if df.empty:
+        return df
+    
+    if numeric_columns is None:
+        numeric_columns = []
+    
+    # Prepare DataFrame for sorting
+    df_prepared = prepare_sort_columns(df, sort_columns, numeric_columns, case_sensitive)
+    
+    # Build sort keys - use sort keys for case-insensitive text columns
+    sort_keys = []
+    for col in sort_columns:
+        if col in numeric_columns:
+            sort_keys.append(col)
+        elif not case_sensitive:
+            sort_keys.append(f'_{col}_sort_key')
+        else:
+            sort_keys.append(col)
+    
+    # Sort the DataFrame
+    try:
+        sorted_df = df_prepared.sort_values(
+            by=sort_keys, 
+            ascending=not descending,
+            na_position='last'  # Put NaN/missing values at the end
+        )
+        
+        # Remove temporary sort key columns
+        for col in sort_columns:
+            if f'_{col}_sort_key' in sorted_df.columns:
+                sorted_df = sorted_df.drop(columns=[f'_{col}_sort_key'])
+        
+        # Return sorted DataFrame with original columns only
+        return sorted_df[df.columns]
+        
+    except Exception as e:
+        raise ValueError(f"Error sorting table: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Sort markdown tables by column(s)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Sort by single column (ascending)
+  md_table_sort --by score
+  
+  # Sort by single column (descending) 
+  md_table_sort --by score --desc
+  
+  # Sort by multiple columns (primary: name, secondary: score)
+  md_table_sort --by name,score
+  
+  # Sort with numeric column handling
+  md_table_sort --by department,salary --numeric salary --desc
+  
+  # Case-sensitive text sorting
+  md_table_sort --by name --case-sensitive
+  
+  # Pipeline usage
+  cat data.md | md_table_sort --by score --desc | head -10
+  md_table_sort --by grade --numeric grade < students.md > sorted.md
+        """
+    )
+    
+    parser.add_argument('--by', '-b', required=True, 
+                       help='Column(s) to sort by (comma-separated for multiple)')
+    parser.add_argument('--desc', '-d', action='store_true', 
+                       help='Sort in descending order (default: ascending)')
+    parser.add_argument('--numeric', '-n', default='',
+                       help='Comma-separated list of columns to treat as numeric')
+    parser.add_argument('--case-sensitive', '-c', action='store_true',
+                       help='Case-sensitive text sorting (default: case-insensitive)')
+    parser.add_argument('--input', '-i', help='Input markdown file. Default: stdin')
+    parser.add_argument('--output', '-o', help='Output markdown file. Default: stdout')
+    
+    args = parser.parse_args()
+    
+    # Parse sort columns
+    sort_columns = [col.strip() for col in args.by.split(',') if col.strip()]
+    if not sort_columns:
+        print("Error: No sort columns specified", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse numeric columns
+    numeric_columns = []
+    if args.numeric:
+        numeric_columns = [col.strip() for col in args.numeric.split(',') if col.strip()]
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        
+        if df is None:
+            print("Error: No valid markdown table found in input", file=sys.stderr)
+            sys.exit(1)
+        
+        if df.empty:
+            print("Warning: Empty table found", file=sys.stderr)
+        
+        # Sort the table
+        sorted_df = sort_table(df, sort_columns, args.desc, numeric_columns, args.case_sensitive)
+        
+        # Convert back to markdown
+        markdown_output = dataframe_to_markdown(sorted_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(markdown_output)
+            rows = len(sorted_df)
+            sort_desc = "descending" if args.desc else "ascending"
+            cols_desc = ", ".join(sort_columns)
+            print(f"Sorted {rows} rows by {cols_desc} ({sort_desc}): {args.output}", file=sys.stderr)
+        else:
+            print(markdown_output, end='')
+            
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

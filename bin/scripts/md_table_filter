@@ -1,0 +1,475 @@
+#!/usr/bin/python3
+"""
+md_table_filter - Filter markdown table rows by conditions
+
+Usage:
+  md_table_filter --where "condition" [--input file] [--output file]
+  cat table.md | md_table_filter --where "score > 80"
+  md_table_filter --where "status == 'active' AND score >= 85"
+
+This script filters markdown table rows based on conditional expressions.
+Supports comparison operators and logical combinations.
+
+Condition Syntax:
+  Comparison operators: >, <, >=, <=, ==, !=
+  Logical operators: AND, OR, NOT
+  Column references: Use column names directly
+  Text values: Use single or double quotes
+  Numeric values: Use without quotes
+
+Examples:
+  # Numeric comparisons
+  md_table_filter --where "score > 80"
+  md_table_filter --where "price <= 100.50"
+  md_table_filter --where "age >= 18"
+
+  # Text comparisons  
+  md_table_filter --where "status == 'active'"
+  md_table_filter --where "name != 'admin'"
+  md_table_filter --where "category == 'food'"
+
+  # Complex conditions with logical operators
+  md_table_filter --where "score > 80 AND grade == 'A'"
+  md_table_filter --where "status == 'active' OR priority == 'high'"
+  md_table_filter --where "age >= 18 AND (score > 85 OR grade == 'A')"
+  md_table_filter --where "NOT (status == 'inactive')"
+
+  # Pipeline usage  
+  cat data.md | md_table_filter --where "score > 85" | md_table_calc "AVG(score)"
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import re
+from typing import List, Optional, Any
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 1:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat all rows as data with generated headers
+        data_lines = table_lines
+        headers = [f"Column{i+1}" for i in range(len(headers))]
+        data_start = 0
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines and separator_idx is not None:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=headers)
+    
+    return df
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """Convert pandas DataFrame to markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Add header row
+    headers = [str(col) for col in df.columns]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+    
+    # Add data rows
+    for _, row in df.iterrows():
+        row_data = []
+        for val in row:
+            # Handle different data types
+            if pd.isna(val):
+                row_data.append("")
+            else:
+                # Escape pipes in cell content
+                cell_content = str(val).replace("|", "\\|")
+                row_data.append(cell_content)
+        
+        lines.append("| " + " | ".join(row_data) + " |")
+    
+    return "\n".join(lines) + "\n"
+
+def safe_convert_value(value: str) -> Any:
+    """Safely convert string value to appropriate type (numeric or string)"""
+    if pd.isna(value) or value == '':
+        return value
+    
+    value_str = str(value).strip()
+    
+    # Try to convert to number (int or float)
+    try:
+        # Remove common formatting characters
+        clean_value = value_str.replace('$', '').replace(',', '')
+        
+        # Try integer first
+        if '.' not in clean_value:
+            return int(clean_value)
+        else:
+            return float(clean_value)
+    except (ValueError, TypeError):
+        # Return as string if numeric conversion fails
+        return value_str
+
+def parse_condition(condition: str, df: pd.DataFrame) -> pd.Series:
+    """Parse and evaluate a condition string against DataFrame rows"""
+    # Tokenize the condition
+    tokens = tokenize_condition(condition)
+    
+    # Build the evaluation expression
+    try:
+        result = evaluate_tokens(tokens, df)
+        return result
+    except Exception as e:
+        raise ValueError(f"Error evaluating condition '{condition}': {e}")
+
+def tokenize_condition(condition: str) -> List[str]:
+    """Tokenize condition string into components"""
+    # Pattern to match: column names, operators, values (quoted or unquoted), parentheses
+    pattern = r"""
+        (?P<QUOTED_STRING>'[^']*'|"[^"]*")|      # Quoted strings
+        (?P<NUMBER>-?\d+\.?\d*)|                   # Numbers (int/float)
+        (?P<OPERATOR>>=|<=|==|!=|>|<)|            # Comparison operators
+        (?P<LOGICAL>AND|OR|NOT)|                  # Logical operators
+        (?P<PAREN>\(|\))|                         # Parentheses
+        (?P<IDENTIFIER>[a-zA-Z_][a-zA-Z0-9_]*)|  # Column names/identifiers
+        (?P<WHITESPACE>\s+)                       # Whitespace
+    """
+    
+    tokens = []
+    for match in re.finditer(pattern, condition, re.VERBOSE):
+        token_type = match.lastgroup
+        token_value = match.group()
+        
+        if token_type != 'WHITESPACE':  # Skip whitespace
+            tokens.append(token_value)
+    
+    return tokens
+
+def evaluate_tokens(tokens: List[str], df: pd.DataFrame) -> pd.Series:
+    """Evaluate tokenized condition against DataFrame"""
+    if not tokens:
+        raise ValueError("Empty condition")
+    
+    # Convert to postfix notation and evaluate
+    return evaluate_infix_expression(tokens, df)
+
+def evaluate_infix_expression(tokens: List[str], df: pd.DataFrame) -> pd.Series:
+    """Evaluate infix expression with proper operator precedence"""
+    
+    def get_precedence(op: str) -> int:
+        precedence = {
+            'OR': 1,
+            'AND': 2,
+            'NOT': 3,
+            '==': 4, '!=': 4, '<': 4, '<=': 4, '>': 4, '>=': 4
+        }
+        return precedence.get(op, 0)
+    
+    def is_operator(token: str) -> bool:
+        return token in ['AND', 'OR', 'NOT', '==', '!=', '<', '<=', '>', '>=']
+    
+    def apply_operator(op: str, operands: List[pd.Series]) -> pd.Series:
+        if op == 'NOT':
+            if len(operands) < 1:
+                raise ValueError("NOT operator requires one operand")
+            return ~operands[-1]
+        elif op == 'AND':
+            if len(operands) < 2:
+                raise ValueError("AND operator requires two operands")
+            return operands[-2] & operands[-1]
+        elif op == 'OR':
+            if len(operands) < 2:
+                raise ValueError("OR operator requires two operands")
+            return operands[-2] | operands[-1]
+        else:
+            # Comparison operators - should have been handled in parse phase
+            raise ValueError(f"Unexpected operator in apply_operator: {op}")
+    
+    # Convert simple comparisons to boolean Series first
+    processed_tokens = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        
+        # Check for comparison pattern: identifier operator value
+        if (i + 2 < len(tokens) and 
+            token not in ['AND', 'OR', 'NOT', '(', ')'] and
+            tokens[i + 1] in ['==', '!=', '<', '<=', '>', '>='] and
+            tokens[i + 2] not in ['AND', 'OR', 'NOT', '(', ')']):
+            
+            # This is a comparison - evaluate it
+            col_name = token
+            operator = tokens[i + 1]
+            value_token = tokens[i + 2]
+            
+            # Parse value
+            if value_token.startswith('"') and value_token.endswith('"'):
+                value = value_token[1:-1]  # Remove quotes
+            elif value_token.startswith("'") and value_token.endswith("'"):
+                value = value_token[1:-1]  # Remove quotes
+            else:
+                try:
+                    # Try to convert to number
+                    if '.' in value_token:
+                        value = float(value_token)
+                    else:
+                        value = int(value_token)
+                except ValueError:
+                    value = value_token  # Keep as string
+            
+            # Evaluate comparison
+            comparison_result = evaluate_comparison(df, col_name, operator, value)
+            processed_tokens.append(comparison_result)
+            i += 3  # Skip the next two tokens
+        else:
+            processed_tokens.append(token)
+            i += 1
+    
+    # Now evaluate logical operators using shunting yard algorithm
+    output_queue = []
+    operator_stack = []
+    
+    for token in processed_tokens:
+        if isinstance(token, pd.Series):
+            # Operand (boolean Series)
+            output_queue.append(token)
+        elif token == '(':
+            operator_stack.append(token)
+        elif token == ')':
+            while operator_stack and operator_stack[-1] != '(':
+                output_queue.append(operator_stack.pop())
+            if operator_stack and operator_stack[-1] == '(':
+                operator_stack.pop()  # Remove the '('
+        elif is_operator(token):
+            while (operator_stack and 
+                   operator_stack[-1] != '(' and 
+                   is_operator(operator_stack[-1]) and
+                   get_precedence(operator_stack[-1]) >= get_precedence(token)):
+                output_queue.append(operator_stack.pop())
+            operator_stack.append(token)
+        else:
+            raise ValueError(f"Unexpected token: {token}")
+    
+    while operator_stack:
+        output_queue.append(operator_stack.pop())
+    
+    # Evaluate postfix expression
+    stack = []
+    for token in output_queue:
+        if isinstance(token, pd.Series):
+            stack.append(token)
+        elif is_operator(token):
+            result = apply_operator(token, stack)
+            # Remove operands and push result
+            if token == 'NOT':
+                stack.pop()
+            else:
+                stack.pop()
+                stack.pop()
+            stack.append(result)
+        else:
+            raise ValueError(f"Unexpected token in evaluation: {token}")
+    
+    if len(stack) != 1:
+        raise ValueError("Invalid expression - evaluation stack should have exactly one result")
+    
+    return stack[0]
+
+def evaluate_comparison(df: pd.DataFrame, col_name: str, operator: str, value: Any) -> pd.Series:
+    """Evaluate a single comparison operation"""
+    if col_name not in df.columns:
+        raise ValueError(f"Column '{col_name}' not found in table")
+    
+    # Get column values and convert them appropriately
+    col_series = df[col_name].apply(safe_convert_value)
+    
+    # Perform comparison
+    if operator == '==':
+        return col_series == value
+    elif operator == '!=':
+        return col_series != value
+    elif operator == '<':
+        return col_series < value
+    elif operator == '<=':
+        return col_series <= value
+    elif operator == '>':
+        return col_series > value
+    elif operator == '>=':
+        return col_series >= value
+    else:
+        raise ValueError(f"Unknown operator: {operator}")
+
+def filter_table(df: pd.DataFrame, condition: str) -> pd.DataFrame:
+    """Filter DataFrame rows based on condition string"""
+    if df.empty:
+        return df
+    
+    try:
+        # Parse and evaluate condition
+        mask = parse_condition(condition, df)
+        
+        # Apply filter 
+        filtered_df = df[mask].copy()
+        
+        # Reset index to have consecutive row numbers
+        filtered_df = filtered_df.reset_index(drop=True)
+        
+        return filtered_df
+        
+    except Exception as e:
+        raise ValueError(f"Error filtering table: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Filter markdown table rows by conditions',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Numeric comparisons
+  md_table_filter --where "score > 80"
+  md_table_filter --where "price <= 100.50"
+  md_table_filter --where "age >= 18"
+
+  # Text comparisons
+  md_table_filter --where "status == 'active'"
+  md_table_filter --where "name != 'admin'"
+  
+  # Complex conditions
+  md_table_filter --where "score > 80 AND grade == 'A'"
+  md_table_filter --where "status == 'active' OR priority == 'high'"
+  md_table_filter --where "age >= 18 AND (score > 85 OR grade == 'A')"
+  md_table_filter --where "NOT (status == 'inactive')"
+  
+  # Pipeline usage
+  cat data.md | md_table_filter --where "score > 85" | md_table_calc "AVG(score)"
+  md_table_filter --where "department == 'sales'" < employees.md > sales_team.md
+        """
+    )
+    
+    parser.add_argument('--where', '-w', required=True,
+                       help='Condition to filter rows (e.g., "score > 80", "status == \'active\'")')
+    parser.add_argument('--input', '-i', help='Input markdown file. Default: stdin')
+    parser.add_argument('--output', '-o', help='Output markdown file. Default: stdout')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        
+        if df is None:
+            print("Error: No valid markdown table found in input", file=sys.stderr)
+            sys.exit(1)
+        
+        if df.empty:
+            print("Warning: Empty table found", file=sys.stderr)
+        
+        # Filter the table
+        filtered_df = filter_table(df, args.where)
+        
+        # Convert back to markdown
+        markdown_output = dataframe_to_markdown(filtered_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(markdown_output)
+            orig_rows = len(df)
+            filtered_rows = len(filtered_df)
+            print(f"Filtered {orig_rows} rows → {filtered_rows} rows (condition: {args.where}): {args.output}", file=sys.stderr)
+        else:
+            print(markdown_output, end='')
+            
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

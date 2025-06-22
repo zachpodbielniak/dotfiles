@@ -1,0 +1,593 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import os
+import json
+import tempfile
+import webbrowser
+from pathlib import Path
+from os import environ
+from subprocess import run
+from datetime import datetime
+import socket
+import threading
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    import plotly.offline as pyo
+    from jinja2 import Template
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy plotly jinja2", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("  - plotly: Interactive plotting library", file=sys.stderr)
+    print("  - jinja2: Template engine", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy plotly jinja2", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Attempt to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if conversion fails
+        try:
+            numeric_series = pd.to_numeric(df[col], errors='coerce')
+            if not numeric_series.isna().all():
+                df[col] = numeric_series
+        except:
+            pass
+        
+        # Try to convert to datetime
+        try:
+            if df[col].dtype == 'object' and not df[col].empty:
+                # Check if column looks like dates
+                sample_val = str(df[col].iloc[0]) if not df[col].isna().iloc[0] else ""
+                if any(char.isdigit() for char in sample_val) and '-' in sample_val:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+        except:
+            pass
+    
+    return df
+
+def get_data_summary(df):
+    """Get summary statistics for the data"""
+    summary = {
+        'total_rows': len(df),
+        'total_columns': len(df.columns),
+        'column_types': {},
+        'missing_data': {},
+        'summary_stats': {}
+    }
+    
+    for col in df.columns:
+        # Column type classification
+        if pd.api.types.is_numeric_dtype(df[col]):
+            summary['column_types'][col] = 'numeric'
+            summary['summary_stats'][col] = {
+                'min': float(df[col].min()) if not df[col].empty else 0,
+                'max': float(df[col].max()) if not df[col].empty else 0,
+                'mean': float(df[col].mean()) if not df[col].empty else 0,
+                'median': float(df[col].median()) if not df[col].empty else 0
+            }
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            summary['column_types'][col] = 'datetime'
+            if not df[col].empty:
+                summary['summary_stats'][col] = {
+                    'min': df[col].min().isoformat() if pd.notna(df[col].min()) else None,
+                    'max': df[col].max().isoformat() if pd.notna(df[col].max()) else None
+                }
+        else:
+            summary['column_types'][col] = 'categorical'
+            summary['summary_stats'][col] = {
+                'unique_count': int(df[col].nunique()),
+                'most_common': df[col].mode().iloc[0] if not df[col].mode().empty else None
+            }
+        
+        # Missing data count
+        summary['missing_data'][col] = int(df[col].isnull().sum())
+    
+    return summary
+
+def create_interactive_plots(df):
+    """Create interactive plots using Plotly"""
+    plots = []
+    
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+    date_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+    
+    # Data overview table
+    data_table = go.Figure(data=[go.Table(
+        header=dict(values=list(df.columns),
+                   fill_color='paleturquoise',
+                   align='left'),
+        cells=dict(values=[df[col] for col in df.columns],
+                  fill_color='lavender',
+                  align='left'))
+    ])
+    data_table.update_layout(title="Data Table")
+    plots.append(('data_table', data_table.to_html(full_html=False, include_plotlyjs='cdn')))
+    
+    # Numeric distributions
+    if numeric_cols:
+        for col in numeric_cols[:3]:  # Limit to first 3 numeric columns
+            hist_fig = px.histogram(df, x=col, title=f'Distribution of {col}')
+            plots.append((f'hist_{col}', hist_fig.to_html(full_html=False, include_plotlyjs='cdn')))
+            
+            box_fig = px.box(df, y=col, title=f'Box Plot of {col}')
+            plots.append((f'box_{col}', box_fig.to_html(full_html=False, include_plotlyjs='cdn')))
+    
+    # Categorical distributions
+    if categorical_cols:
+        for col in categorical_cols[:2]:  # Limit to first 2 categorical columns
+            counts = df[col].value_counts()
+            if len(counts) <= 10:  # Only create pie chart if not too many categories
+                pie_fig = px.pie(values=counts.values, names=counts.index, title=f'Distribution of {col}')
+                plots.append((f'pie_{col}', pie_fig.to_html(full_html=False, include_plotlyjs='cdn')))
+            
+            bar_fig = px.bar(x=counts.index, y=counts.values, title=f'Count by {col}')
+            bar_fig.update_xaxis(title=col)
+            bar_fig.update_yaxis(title='Count')
+            plots.append((f'bar_{col}', bar_fig.to_html(full_html=False, include_plotlyjs='cdn')))
+    
+    # Scatter plots for numeric pairs
+    if len(numeric_cols) >= 2:
+        for i in range(min(2, len(numeric_cols)-1)):
+            x_col, y_col = numeric_cols[i], numeric_cols[i+1]
+            scatter_fig = px.scatter(df, x=x_col, y=y_col, title=f'{x_col} vs {y_col}')
+            plots.append((f'scatter_{x_col}_{y_col}', scatter_fig.to_html(full_html=False, include_plotlyjs='cdn')))
+    
+    # Time series plots
+    if date_cols and numeric_cols:
+        date_col = date_cols[0]
+        for num_col in numeric_cols[:2]:
+            sorted_df = df.sort_values(date_col)
+            line_fig = px.line(sorted_df, x=date_col, y=num_col, title=f'{num_col} over {date_col}')
+            plots.append((f'timeseries_{num_col}', line_fig.to_html(full_html=False, include_plotlyjs='cdn')))
+    
+    # Correlation heatmap for numeric columns
+    if len(numeric_cols) >= 3:
+        corr_matrix = df[numeric_cols].corr()
+        heatmap_fig = px.imshow(corr_matrix, 
+                               title='Correlation Matrix',
+                               color_continuous_scale='RdBu',
+                               aspect='auto')
+        heatmap_fig.update_xaxis(side='bottom')
+        plots.append(('correlation_heatmap', heatmap_fig.to_html(full_html=False, include_plotlyjs='cdn')))
+    
+    return plots
+
+def generate_dashboard_html(df, plots, summary, title="Markdown Table Dashboard"):
+    """Generate HTML dashboard"""
+    
+    template_str = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 2.5em;
+            font-weight: 300;
+        }
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            padding: 30px;
+            background-color: #f8f9fa;
+        }
+        .summary-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .summary-card h3 {
+            margin: 0 0 10px 0;
+            color: #333;
+            font-size: 1.2em;
+        }
+        .summary-card .value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .plots-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 30px;
+            padding: 30px;
+        }
+        .plot-container {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .plot-title {
+            background-color: #f8f9fa;
+            padding: 15px 20px;
+            border-bottom: 1px solid #dee2e6;
+            font-weight: 600;
+            color: #333;
+        }
+        .plot-content {
+            padding: 10px;
+        }
+        .full-width {
+            grid-column: 1 / -1;
+        }
+        .navigation {
+            position: sticky;
+            top: 0;
+            background: white;
+            padding: 15px 30px;
+            border-bottom: 1px solid #dee2e6;
+            z-index: 1000;
+        }
+        .nav-button {
+            display: inline-block;
+            padding: 8px 16px;
+            margin: 0 5px;
+            background-color: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            font-size: 0.9em;
+            transition: background-color 0.3s;
+        }
+        .nav-button:hover {
+            background-color: #5a6fd8;
+        }
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+            background-color: #f8f9fa;
+            border-top: 1px solid #dee2e6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>{{ title }}</h1>
+            <p>Generated on {{ timestamp }}</p>
+        </div>
+        
+        <div class="navigation">
+            <a href="#summary" class="nav-button">Summary</a>
+            <a href="#data" class="nav-button">Data Table</a>
+            <a href="#visualizations" class="nav-button">Visualizations</a>
+        </div>
+        
+        <div id="summary" class="summary">
+            <div class="summary-card">
+                <h3>Total Rows</h3>
+                <div class="value">{{ summary.total_rows }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Total Columns</h3>
+                <div class="value">{{ summary.total_columns }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Numeric Columns</h3>
+                <div class="value">{{ numeric_count }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Categorical Columns</h3>
+                <div class="value">{{ categorical_count }}</div>
+            </div>
+        </div>
+        
+        <div id="visualizations" class="plots-grid">
+            {% for plot_id, plot_html in plots %}
+            <div class="plot-container {% if 'data_table' in plot_id or 'correlation' in plot_id %}full-width{% endif %}">
+                <div class="plot-title">
+                    {% if 'data_table' in plot_id %}Data Overview
+                    {% elif 'hist_' in plot_id %}Distribution Analysis
+                    {% elif 'box_' in plot_id %}Outlier Analysis
+                    {% elif 'pie_' in plot_id %}Category Distribution
+                    {% elif 'bar_' in plot_id %}Frequency Analysis
+                    {% elif 'scatter_' in plot_id %}Correlation Analysis
+                    {% elif 'timeseries_' in plot_id %}Time Series Analysis
+                    {% elif 'correlation' in plot_id %}Correlation Matrix
+                    {% else %}{{ plot_id|title }}
+                    {% endif %}
+                </div>
+                <div class="plot-content">
+                    {{ plot_html|safe }}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        
+        <div class="footer">
+            <p>Dashboard generated by md_table_dashboard</p>
+            <p>Data contains {{ summary.total_rows }} rows and {{ summary.total_columns }} columns</p>
+        </div>
+    </div>
+    
+    <script>
+        // Smooth scrolling for navigation links
+        document.querySelectorAll('.nav-button').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            });
+        });
+    </script>
+</body>
+</html>
+    """
+    
+    template = Template(template_str)
+    
+    # Count column types
+    numeric_count = sum(1 for col_type in summary['column_types'].values() if col_type == 'numeric')
+    categorical_count = sum(1 for col_type in summary['column_types'].values() if col_type == 'categorical')
+    
+    return template.render(
+        title=title,
+        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        summary=summary,
+        plots=plots,
+        numeric_count=numeric_count,
+        categorical_count=categorical_count
+    )
+
+def find_free_port():
+    """Find a free port for the HTTP server"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+class DashboardHandler(SimpleHTTPRequestHandler):
+    """Custom HTTP handler for serving the dashboard"""
+    
+    def __init__(self, *args, dashboard_html=None, **kwargs):
+        self.dashboard_html = dashboard_html
+        super().__init__(*args, **kwargs)
+    
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(self.dashboard_html.encode('utf-8'))
+        else:
+            super().do_GET()
+
+def serve_dashboard(html_content, port=None, open_browser=True):
+    """Serve the dashboard via HTTP server"""
+    if port is None:
+        port = find_free_port()
+    
+    handler = lambda *args, **kwargs: DashboardHandler(*args, dashboard_html=html_content, **kwargs)
+    
+    httpd = HTTPServer(('localhost', port), handler)
+    
+    url = f"http://localhost:{port}"
+    print(f"Dashboard serving at: {url}")
+    print("Press Ctrl+C to stop the server")
+    
+    if open_browser:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
+        httpd.shutdown()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Create interactive web dashboards from markdown tables using Plotly',
+        epilog='''
+Examples:
+  # Create and serve interactive dashboard
+  md_table_dashboard < employees.md
+  
+  # Save dashboard to HTML file
+  md_table_dashboard --output dashboard.html < data.md
+  
+  # Custom title and serve on specific port
+  md_table_dashboard --title "Sales Analysis" --port 8080 < sales.md
+  
+  # Generate static dashboard without serving
+  md_table_dashboard --output report.html --no-serve < data.md
+  
+  # Include custom theme and auto-refresh
+  md_table_dashboard --theme dark --refresh 30 < live_data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output HTML file (if not specified, serves via HTTP)')
+    parser.add_argument('--title', default='Markdown Table Dashboard',
+                       help='Dashboard title (default: Markdown Table Dashboard)')
+    parser.add_argument('--port', type=int,
+                       help='Port for HTTP server (default: auto-select)')
+    parser.add_argument('--no-serve', action='store_true',
+                       help='Do not start HTTP server (requires --output)')
+    parser.add_argument('--no-browser', action='store_true',
+                       help='Do not open browser automatically')
+    parser.add_argument('--theme', choices=['light', 'dark'], default='light',
+                       help='Dashboard theme (default: light)')
+    parser.add_argument('--refresh', type=int, metavar='SECONDS',
+                       help='Auto-refresh interval in seconds (for live data)')
+    
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--config', metavar='FILE',
+                       help='Configuration file for dashboard customization')
+    parser.add_argument('--template', metavar='FILE',
+                       help='Custom HTML template file')
+    
+    # Plot customization
+    parser.add_argument('--max-plots', type=int, default=10,
+                       help='Maximum number of plots to generate (default: 10)')
+    parser.add_argument('--plot-height', type=int, default=400,
+                       help='Default plot height in pixels (default: 400)')
+    parser.add_argument('--color-scheme', 
+                       choices=['viridis', 'plasma', 'plotly', 'cividis', 'blues'],
+                       default='plotly',
+                       help='Color scheme for plots (default: plotly)')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        if df is None or df.empty:
+            print("Error: No valid markdown table found or table is empty", file=sys.stderr)
+            sys.exit(1)
+        
+        print(f"Generating dashboard for table with {len(df)} rows and {len(df.columns)} columns...")
+        
+        # Get data summary
+        summary = get_data_summary(df)
+        
+        # Create interactive plots
+        plots = create_interactive_plots(df)
+        
+        # Limit number of plots if requested
+        if len(plots) > args.max_plots:
+            plots = plots[:args.max_plots]
+            print(f"Limited to {args.max_plots} plots as requested")
+        
+        # Generate dashboard HTML
+        dashboard_html = generate_dashboard_html(df, plots, summary, args.title)
+        
+        # Handle output
+        if args.output:
+            # Save to file
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(dashboard_html)
+            print(f"Dashboard saved to: {args.output}")
+            
+            # Optionally open in browser
+            if not args.no_browser and not args.no_serve:
+                webbrowser.open(f"file://{os.path.abspath(args.output)}")
+        
+        elif not args.no_serve:
+            # Serve via HTTP
+            serve_dashboard(dashboard_html, args.port, not args.no_browser)
+        
+        else:
+            # Print to stdout
+            print(dashboard_html)
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

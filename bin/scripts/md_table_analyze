@@ -1,0 +1,555 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import re
+from io import StringIO
+from os import environ
+from subprocess import run
+import math
+import json
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+    from scipy import stats
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import DBSCAN
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy scipy scikit-learn", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("  - scipy: Statistical functions", file=sys.stderr)
+    print("  - scikit-learn: Machine learning algorithms", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy scipy scikit-learn", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Attempt to convert numeric columns
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='ignore')
+    
+    return df
+
+def detect_numeric_columns(df):
+    """Detect which columns are numeric"""
+    numeric_cols = []
+    for col in df.columns:
+        if df[col].dtype in ['int64', 'float64'] or pd.api.types.is_numeric_dtype(df[col]):
+            numeric_cols.append(col)
+    return numeric_cols
+
+def correlation_analysis(df):
+    """Perform correlation analysis between numeric columns"""
+    numeric_cols = detect_numeric_columns(df)
+    
+    if len(numeric_cols) < 2:
+        return "## Correlation Analysis\n\nInsufficient numeric columns for correlation analysis.\n"
+    
+    try:
+        corr_matrix = df[numeric_cols].corr()
+        
+        analysis = "## Correlation Analysis\n\n"
+        analysis += "### Correlation Matrix\n\n"
+        
+        # Format correlation matrix as markdown table
+        analysis += "| Column | " + " | ".join(numeric_cols) + " |\n"
+        analysis += "|" + "---|" * (len(numeric_cols) + 1) + "\n"
+        
+        for idx, row in corr_matrix.iterrows():
+            analysis += f"| {idx} |"
+            for col in numeric_cols:
+                corr_val = row[col]
+                if pd.isna(corr_val):
+                    analysis += " N/A |"
+                else:
+                    analysis += f" {corr_val:.3f} |"
+            analysis += "\n"
+        
+        # Find strong correlations
+        analysis += "\n### Strong Correlations (|r| > 0.7)\n\n"
+        strong_corrs = []
+        for i, col1 in enumerate(numeric_cols):
+            for j, col2 in enumerate(numeric_cols[i+1:], i+1):
+                corr_val = corr_matrix.loc[col1, col2]
+                if not pd.isna(corr_val) and abs(corr_val) > 0.7:
+                    direction = "positive" if corr_val > 0 else "negative"
+                    strong_corrs.append(f"- **{col1}** vs **{col2}**: {corr_val:.3f} (strong {direction})")
+        
+        if strong_corrs:
+            analysis += "\n".join(strong_corrs) + "\n"
+        else:
+            analysis += "No strong correlations found.\n"
+        
+        return analysis
+        
+    except Exception as e:
+        return f"## Correlation Analysis\n\nError performing correlation analysis: {str(e)}\n"
+
+def outlier_detection(df):
+    """Detect outliers using IQR and Z-score methods"""
+    numeric_cols = detect_numeric_columns(df)
+    
+    if not numeric_cols:
+        return "## Outlier Detection\n\nNo numeric columns found for outlier analysis.\n"
+    
+    analysis = "## Outlier Detection\n\n"
+    
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if len(series) < 4:  # Need at least 4 values for IQR
+            continue
+            
+        analysis += f"### Column: {col}\n\n"
+        
+        # IQR method
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        iqr_outliers = series[(series < lower_bound) | (series > upper_bound)]
+        
+        # Z-score method (using modified Z-score with median)
+        median = series.median()
+        mad = np.median(np.abs(series - median))
+        modified_z_scores = 0.6745 * (series - median) / mad if mad != 0 else pd.Series([0] * len(series))
+        z_outliers = series[np.abs(modified_z_scores) > 3.5]
+        
+        analysis += f"- **IQR Method**: {len(iqr_outliers)} outliers (< {lower_bound:.2f} or > {upper_bound:.2f})\n"
+        analysis += f"- **Modified Z-Score**: {len(z_outliers)} outliers (|z| > 3.5)\n"
+        
+        if len(iqr_outliers) > 0:
+            outlier_values = iqr_outliers.head(5).tolist()
+            analysis += f"- **Sample outliers**: {outlier_values}\n"
+        
+        analysis += "\n"
+    
+    return analysis
+
+def distribution_analysis(df):
+    """Analyze data distributions"""
+    numeric_cols = detect_numeric_columns(df)
+    
+    if not numeric_cols:
+        return "## Distribution Analysis\n\nNo numeric columns found for distribution analysis.\n"
+    
+    analysis = "## Distribution Analysis\n\n"
+    
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if len(series) < 3:
+            continue
+            
+        analysis += f"### Column: {col}\n\n"
+        
+        # Basic statistics
+        analysis += f"- **Count**: {len(series)}\n"
+        analysis += f"- **Mean**: {series.mean():.3f}\n"
+        analysis += f"- **Median**: {series.median():.3f}\n"
+        analysis += f"- **Std Dev**: {series.std():.3f}\n"
+        analysis += f"- **Min**: {series.min():.3f}\n"
+        analysis += f"- **Max**: {series.max():.3f}\n"
+        
+        # Distribution shape
+        skewness = stats.skew(series)
+        kurtosis = stats.kurtosis(series)
+        
+        analysis += f"- **Skewness**: {skewness:.3f}"
+        if skewness > 1:
+            analysis += " (highly right-skewed)"
+        elif skewness > 0.5:
+            analysis += " (moderately right-skewed)"
+        elif skewness < -1:
+            analysis += " (highly left-skewed)"
+        elif skewness < -0.5:
+            analysis += " (moderately left-skewed)"
+        else:
+            analysis += " (approximately symmetric)"
+        analysis += "\n"
+        
+        analysis += f"- **Kurtosis**: {kurtosis:.3f}"
+        if kurtosis > 3:
+            analysis += " (heavy-tailed)"
+        elif kurtosis < -1:
+            analysis += " (light-tailed)"
+        else:
+            analysis += " (normal-like tails)"
+        analysis += "\n"
+        
+        # Normality test (if sample size is appropriate)
+        if 3 <= len(series) <= 5000:
+            try:
+                shapiro_stat, shapiro_p = stats.shapiro(series)
+                analysis += f"- **Normality Test (Shapiro-Wilk)**: p-value = {shapiro_p:.4f}"
+                if shapiro_p < 0.05:
+                    analysis += " (likely not normal)"
+                else:
+                    analysis += " (possibly normal)"
+                analysis += "\n"
+            except:
+                pass
+        
+        analysis += "\n"
+    
+    return analysis
+
+def trend_analysis(df):
+    """Analyze trends in time-series or sequential data"""
+    analysis = "## Trend Analysis\n\n"
+    
+    # Look for date columns
+    date_cols = []
+    for col in df.columns:
+        sample_vals = df[col].dropna().head(10)
+        if any(bool(re.match(r'\d{4}-\d{2}-\d{2}', str(val))) for val in sample_vals):
+            date_cols.append(col)
+    
+    numeric_cols = detect_numeric_columns(df)
+    
+    if not date_cols and not numeric_cols:
+        return analysis + "No suitable columns found for trend analysis.\n"
+    
+    if date_cols:
+        analysis += "### Time-based Trends\n\n"
+        for date_col in date_cols:
+            try:
+                # Try to parse dates
+                df_temp = df.copy()
+                df_temp[date_col] = pd.to_datetime(df_temp[date_col], errors='coerce')
+                df_temp = df_temp.dropna(subset=[date_col]).sort_values(date_col)
+                
+                if len(df_temp) < 3:
+                    continue
+                
+                analysis += f"**Date Column: {date_col}**\n"
+                analysis += f"- Date range: {df_temp[date_col].min().strftime('%Y-%m-%d')} to {df_temp[date_col].max().strftime('%Y-%m-%d')}\n"
+                analysis += f"- Total period: {(df_temp[date_col].max() - df_temp[date_col].min()).days} days\n"
+                
+                # Analyze trends in numeric columns over time
+                for num_col in numeric_cols:
+                    if num_col != date_col and num_col in df_temp.columns:
+                        valid_data = df_temp[[date_col, num_col]].dropna()
+                        if len(valid_data) >= 3:
+                            # Simple linear trend
+                            x = np.arange(len(valid_data))
+                            y = valid_data[num_col].values
+                            slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+                            
+                            analysis += f"  - **{num_col}**: "
+                            if p_value < 0.05:
+                                direction = "increasing" if slope > 0 else "decreasing"
+                                analysis += f"significant {direction} trend (slope={slope:.4f}, p={p_value:.4f})"
+                            else:
+                                analysis += f"no significant trend (p={p_value:.4f})"
+                            analysis += "\n"
+                
+                analysis += "\n"
+            except Exception as e:
+                analysis += f"Error analyzing {date_col}: {str(e)}\n"
+    
+    # Sequential analysis (without dates)
+    if numeric_cols and len(df) >= 5:
+        analysis += "### Sequential Patterns\n\n"
+        for col in numeric_cols[:3]:  # Limit to first 3 numeric columns
+            series = df[col].dropna()
+            if len(series) >= 5:
+                # Look for monotonic trends
+                diff_series = series.diff().dropna()
+                if len(diff_series) > 0:
+                    positive_changes = (diff_series > 0).sum()
+                    negative_changes = (diff_series < 0).sum()
+                    zero_changes = (diff_series == 0).sum()
+                    
+                    analysis += f"**{col}**:\n"
+                    analysis += f"- Increases: {positive_changes}, Decreases: {negative_changes}, No change: {zero_changes}\n"
+                    
+                    if positive_changes > negative_changes * 2:
+                        analysis += "- Pattern: Generally increasing\n"
+                    elif negative_changes > positive_changes * 2:
+                        analysis += "- Pattern: Generally decreasing\n"
+                    else:
+                        analysis += "- Pattern: Mixed/volatile\n"
+                    analysis += "\n"
+    
+    return analysis
+
+def generate_insights(df):
+    """Generate AI-powered insights (simplified heuristic version)"""
+    analysis = "## Key Insights\n\n"
+    
+    numeric_cols = detect_numeric_columns(df)
+    total_rows = len(df)
+    total_cols = len(df.columns)
+    
+    insights = []
+    
+    # Dataset overview insights
+    insights.append(f"📊 **Dataset Overview**: {total_rows} rows × {total_cols} columns with {len(numeric_cols)} numeric columns")
+    
+    # Missing data insights
+    missing_data = df.isnull().sum()
+    high_missing = missing_data[missing_data > total_rows * 0.1]
+    if len(high_missing) > 0:
+        insights.append(f"⚠️ **Data Quality**: {len(high_missing)} columns have >10% missing data")
+    
+    # Numeric range insights
+    if numeric_cols:
+        for col in numeric_cols[:3]:  # Limit to first 3
+            series = df[col].dropna()
+            if len(series) > 0:
+                range_val = series.max() - series.min()
+                cv = series.std() / series.mean() if series.mean() != 0 else float('inf')
+                
+                if cv > 1:
+                    insights.append(f"📈 **High Variability**: {col} shows high coefficient of variation ({cv:.2f})")
+                
+                # Check for potential outliers
+                Q1, Q3 = series.quantile([0.25, 0.75])
+                IQR = Q3 - Q1
+                outliers = series[(series < Q1 - 1.5*IQR) | (series > Q3 + 1.5*IQR)]
+                if len(outliers) > len(series) * 0.05:
+                    insights.append(f"🔍 **Outliers Detected**: {col} has {len(outliers)} potential outliers ({len(outliers)/len(series)*100:.1f}%)")
+    
+    # Correlation insights
+    if len(numeric_cols) >= 2:
+        try:
+            corr_matrix = df[numeric_cols].corr()
+            # Find strongest correlation (excluding diagonal)
+            mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+            strong_corrs = corr_matrix.where(mask).abs().max().max()
+            if strong_corrs > 0.8:
+                insights.append(f"🔗 **Strong Correlation**: Found correlation coefficient of {strong_corrs:.3f}")
+        except:
+            pass
+    
+    # Pattern insights
+    if total_rows >= 10:
+        # Check for potential groupings in categorical data
+        categorical_cols = [col for col in df.columns if col not in numeric_cols]
+        for col in categorical_cols[:2]:  # Limit to first 2
+            unique_vals = df[col].nunique()
+            if 2 <= unique_vals <= total_rows * 0.3:
+                insights.append(f"🏷️ **Categorical Pattern**: {col} has {unique_vals} distinct values (good for grouping)")
+    
+    # Recommendations
+    recommendations = []
+    
+    if len(numeric_cols) >= 2:
+        recommendations.append("Consider correlation analysis between numeric variables")
+    
+    if any(df[col].isnull().sum() > 0 for col in df.columns):
+        recommendations.append("Review missing data patterns and consider imputation strategies")
+    
+    if len(numeric_cols) > 0:
+        recommendations.append("Perform outlier analysis to identify anomalous values")
+    
+    if total_rows >= 20:
+        recommendations.append("Consider time-series analysis if data has temporal ordering")
+    
+    # Format output
+    if insights:
+        analysis += "\n".join(f"{i+1}. {insight}" for i, insight in enumerate(insights))
+        analysis += "\n\n"
+    
+    if recommendations:
+        analysis += "### Recommended Next Steps\n\n"
+        analysis += "\n".join(f"- {rec}" for rec in recommendations)
+        analysis += "\n"
+    
+    return analysis
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Deep statistical analysis and pattern detection for markdown tables',
+        epilog='''
+Examples:
+  # Basic analysis
+  md_table_analyze < data.md
+  
+  # Full analysis with insights
+  md_table_analyze --generate-insights < data.md
+  
+  # Specific analysis types
+  md_table_analyze --correlation --outliers < data.md
+  
+  # Output to file
+  md_table_analyze --generate-insights --output analysis_report.md < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--correlation', action='store_true',
+                       help='Perform correlation analysis between columns')
+    parser.add_argument('--outliers', action='store_true',
+                       help='Detect and flag outliers')
+    parser.add_argument('--distribution', action='store_true',
+                       help='Analyze data distributions')
+    parser.add_argument('--trends', action='store_true',
+                       help='Analyze trends in time-series data')
+    parser.add_argument('--generate-insights', action='store_true',
+                       help='Generate AI-powered observations and insights')
+    parser.add_argument('--all', action='store_true',
+                       help='Run all analysis types')
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--format', choices=['markdown', 'json'],
+                       default='markdown', help='Output format')
+    
+    args = parser.parse_args()
+    
+    # If no specific analysis requested, run basic set
+    if not any([args.correlation, args.outliers, args.distribution, args.trends, args.generate_insights, args.all]):
+        args.correlation = True
+        args.distribution = True
+        args.outliers = True
+    
+    if args.all:
+        args.correlation = True
+        args.outliers = True
+        args.distribution = True
+        args.trends = True
+        args.generate_insights = True
+    
+    # Read input
+    try:
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+    except Exception as e:
+        print(f"Error reading input: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not content.strip():
+        print("Error: No input data provided", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse table
+    df = parse_markdown_table(content)
+    if df is None:
+        print("Error: No valid markdown table found in input", file=sys.stderr)
+        sys.exit(1)
+    
+    if df.empty:
+        print("Error: Table is empty", file=sys.stderr)
+        sys.exit(1)
+    
+    # Generate analysis
+    results = []
+    
+    if args.format == 'json':
+        analysis_data = {
+            'dataset_info': {
+                'rows': len(df),
+                'columns': len(df.columns),
+                'numeric_columns': detect_numeric_columns(df)
+            }
+        }
+        
+        if args.correlation:
+            # Simple correlation for JSON
+            numeric_cols = detect_numeric_columns(df)
+            if len(numeric_cols) >= 2:
+                corr_matrix = df[numeric_cols].corr()
+                analysis_data['correlation'] = corr_matrix.to_dict()
+        
+        print(json.dumps(analysis_data, indent=2))
+    else:
+        # Markdown format
+        title = "# Statistical Analysis Report\n\n"
+        title += f"**Generated**: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        title += f"**Dataset**: {len(df)} rows × {len(df.columns)} columns\n\n"
+        results.append(title)
+        
+        if args.correlation:
+            results.append(correlation_analysis(df))
+        
+        if args.distribution:
+            results.append(distribution_analysis(df))
+        
+        if args.outliers:
+            results.append(outlier_detection(df))
+        
+        if args.trends:
+            results.append(trend_analysis(df))
+        
+        if args.generate_insights:
+            results.append(generate_insights(df))
+        
+        # Write output
+        output_text = "\n".join(results)
+        
+        try:
+            if args.output:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.write(output_text)
+            else:
+                print(output_text)
+        except Exception as e:
+            print(f"Error writing output: {e}", file=sys.stderr)
+            sys.exit(1)
+
+if __name__ == '__main__':
+    main()

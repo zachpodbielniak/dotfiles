@@ -1,0 +1,292 @@
+#!/usr/bin/python3
+"""
+md_table_join - Join two markdown tables based on common columns
+
+Usage:
+  md_table_join --left file1.md --right file2.md --on column_name
+  md_table_join --left file1.md --right file2.md --on column_name --inner
+  md_table_join --left file1.md --right file2.md --on column_name --outer
+  cat file1.md | md_table_join --right file2.md --on column_name --left-suffix _l --right-suffix _r
+
+Join types:
+  --left-join    Left join (default) - keep all rows from left table
+  --right-join   Right join - keep all rows from right table  
+  --inner        Inner join - keep only matching rows
+  --outer        Outer join - keep all rows from both tables
+
+Options:
+  --on COLUMN          Column name to join on (required)
+  --left-suffix SUF    Suffix for duplicate column names from left table (default: _left)
+  --right-suffix SUF   Suffix for duplicate column names from right table (default: _right)
+  --left FILE          Left table file (default: stdin)
+  --right FILE         Right table file (required)
+
+Examples:
+  # Basic left join
+  md_table_join --left students.md --right grades.md --on student_id
+  
+  # Inner join with custom suffixes
+  md_table_join --left sales.md --right products.md --on product_id --inner --left-suffix _sale --right-suffix _prod
+  
+  # Outer join from stdin
+  cat employees.md | md_table_join --right departments.md --on dept_id --outer
+  
+  # Right join
+  md_table_join --left inventory.md --right orders.md --on item_id --right-join-join
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import argparse
+import sys
+import re
+from typing import List, Optional, Dict, Any
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat first row as data
+        data_lines = table_lines
+        headers = [f"Column{i+1}" for i in range(len(headers))]
+        data_start = 0
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=headers)
+    
+    # Try to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if it fails
+        try:
+            df[col] = pd.to_numeric(df[col])
+        except (ValueError, TypeError):
+            # Keep as string if conversion fails
+            pass
+    
+    return df
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """Convert pandas DataFrame to markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Add header row
+    headers = [str(col) for col in df.columns]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["-" * (len(str(h)) + 2) for h in headers]) + "|")
+    
+    # Add data rows
+    for _, row in df.iterrows():
+        row_data = []
+        for val in row:
+            # Handle different data types
+            if pd.isna(val):
+                row_data.append("")
+            elif isinstance(val, (int, float)):
+                if pd.isna(val):
+                    row_data.append("")
+                elif isinstance(val, float) and val.is_integer():
+                    row_data.append(str(int(val)))
+                else:
+                    row_data.append(str(val))
+            else:
+                # Escape pipes in cell content
+                cell_content = str(val).replace("|", "\\|")
+                row_data.append(cell_content)
+        
+        lines.append("| " + " | ".join(row_data) + " |")
+    
+    return "\n".join(lines) + "\n"
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Join two markdown tables based on common columns',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_table_join --left students.md --right grades.md --on student_id
+  md_table_join --left sales.md --right products.md --on product_id --inner
+  cat employees.md | md_table_join --right departments.md --on dept_id --outer
+  md_table_join --left inventory.md --right orders.md --on item_id --right-join
+        """
+    )
+    
+    # Required arguments
+    parser.add_argument('--on', required=True, help='Column name to join on')
+    parser.add_argument('--right', required=True, help='Right table file')
+    
+    # Optional arguments
+    parser.add_argument('--left', help='Left table file (default: stdin)')
+    parser.add_argument('--left-suffix', default='_left', help='Suffix for duplicate left columns')
+    parser.add_argument('--right-suffix', default='_right', help='Suffix for duplicate right columns')
+    
+    # Join type (mutually exclusive)
+    join_group = parser.add_mutually_exclusive_group()
+    join_group.add_argument('--left-join', dest='join_type', action='store_const', const='left',
+                           help='Left join (default) - keep all rows from left table')
+    join_group.add_argument('--right-join', dest='join_type', action='store_const', const='right',
+                           help='Right join - keep all rows from right table')
+    join_group.add_argument('--inner', dest='join_type', action='store_const', const='inner',
+                           help='Inner join - keep only matching rows')
+    join_group.add_argument('--outer', dest='join_type', action='store_const', const='outer',
+                           help='Outer join - keep all rows from both tables')
+    
+    # Set default join type
+    parser.set_defaults(join_type='left')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read left table
+        if args.left:
+            with open(args.left, 'r', encoding='utf-8') as f:
+                left_content = f.read()
+        else:
+            left_content = sys.stdin.read()
+        
+        if not left_content.strip():
+            print("Error: No left table data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Read right table
+        with open(args.right, 'r', encoding='utf-8') as f:
+            right_content = f.read()
+        
+        if not right_content.strip():
+            print("Error: No right table data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse both tables
+        left_df = parse_markdown_table(left_content)
+        right_df = parse_markdown_table(right_content)
+        
+        if left_df is None:
+            print("Error: No valid markdown table found in left input", file=sys.stderr)
+            sys.exit(1)
+        
+        if right_df is None:
+            print("Error: No valid markdown table found in right input", file=sys.stderr)
+            sys.exit(1)
+        
+        # Check if join column exists in both tables
+        if args.on not in left_df.columns:
+            print(f"Error: Column '{args.on}' not found in left table", file=sys.stderr)
+            print(f"Available columns: {list(left_df.columns)}", file=sys.stderr)
+            sys.exit(1)
+        
+        if args.on not in right_df.columns:
+            print(f"Error: Column '{args.on}' not found in right table", file=sys.stderr)
+            print(f"Available columns: {list(right_df.columns)}", file=sys.stderr)
+            sys.exit(1)
+        
+        # Perform the join
+        try:
+            joined_df = left_df.merge(
+                right_df, 
+                on=args.on, 
+                how=args.join_type,
+                suffixes=(args.left_suffix, args.right_suffix)
+            )
+        except Exception as e:
+            print(f"Error performing join: {e}", file=sys.stderr)
+            sys.exit(1)
+        
+        # Convert to markdown and output
+        markdown_output = dataframe_to_markdown(joined_df)
+        print(markdown_output, end='')
+        
+        # Print stats to stderr
+        left_rows, left_cols = left_df.shape
+        right_rows, right_cols = right_df.shape
+        joined_rows, joined_cols = joined_df.shape
+        
+        print(f"Join completed: {left_rows}x{left_cols} {args.join_type} join {right_rows}x{right_cols} → {joined_rows}x{joined_cols}", file=sys.stderr)
+        
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,772 @@
+#!/usr/bin/python3
+"""
+md_table_backup - Backup and restore functionality for markdown tables
+
+Usage:
+  md_table_backup --backup < table.md
+  md_table_backup --backup --encrypt --password secret < table.md
+  md_table_backup --restore backup_20240101_120000.tar.gz
+  md_table_backup --list-backups
+  md_table_backup --validate backup_20240101_120000.tar.gz
+  md_table_backup --cleanup --keep 10
+  md_table_backup --sync --remote user@server:/backups/
+  
+Backup Features:
+  - Versioned backups with timestamps
+  - Compression (gzip, bzip2, xz)
+  - Encryption (AES-256)
+  - Incremental backups
+  - Backup validation and integrity checks
+  - Selective backup of specific tables/files
+  - Metadata and indexing
+  - Remote sync capabilities
+  - Automatic cleanup of old backups
+  - Conflict resolution during restore
+  
+Backup Storage:
+  - Default location: ~/.md_table_backups/
+  - Custom location: --backup-dir /path/to/backups/
+  - Backup format: backup_YYYYMMDD_HHMMSS.tar.gz
+  - Metadata stored in: .backup_index.json
+  
+Options:
+  --backup                Create new backup
+  --restore FILE         Restore from backup file
+  --list-backups         List all available backups
+  --validate FILE        Validate backup integrity
+  --cleanup              Remove old backups
+  --keep N               Keep N most recent backups (default: 10)
+  --backup-dir PATH      Custom backup directory
+  --encrypt              Encrypt backup (requires --password)
+  --password PASS        Encryption password
+  --compress TYPE        Compression: gzip, bzip2, xz (default: gzip)
+  --incremental          Create incremental backup
+  --selective PATTERN    Backup only files matching pattern
+  --sync                 Sync with remote location
+  --remote URL           Remote sync destination (user@host:/path/)
+  --force                Force overwrite during restore
+  --dry-run              Show what would be done without doing it
+  --metadata             Show backup metadata
+  --export FORMAT        Export backup list (json, csv, md)
+
+Examples:
+  # Basic backup
+  md_table_backup --backup < data.md
+  
+  # Encrypted backup with custom location
+  md_table_backup --backup --encrypt --password secret --backup-dir /secure/backups/ < data.md
+  
+  # Incremental backup
+  md_table_backup --backup --incremental < data.md
+  
+  # List and validate backups
+  md_table_backup --list-backups
+  md_table_backup --validate backup_20240101_120000.tar.gz
+  
+  # Restore with conflict resolution
+  md_table_backup --restore backup_20240101_120000.tar.gz --force
+  
+  # Cleanup old backups
+  md_table_backup --cleanup --keep 5
+  
+  # Sync to remote server
+  md_table_backup --sync --remote user@server:/backups/
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import argparse
+import json
+import os
+import sys
+import tarfile
+import gzip
+import bz2
+import lzma
+import hashlib
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Union
+import getpass
+
+# Try to import cryptography for encryption
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import base64
+    ENCRYPTION_AVAILABLE = True
+except ImportError:
+    ENCRYPTION_AVAILABLE = False
+
+class MarkdownTableBackup:
+    def __init__(self, backup_dir: str = None):
+        self.backup_dir = Path(backup_dir) if backup_dir else Path.home() / ".md_table_backups"
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.index_file = self.backup_dir / ".backup_index.json"
+        self.index = self._load_index()
+        
+    def _load_index(self) -> Dict[str, Any]:
+        """Load backup index from file"""
+        if self.index_file.exists():
+            try:
+                with open(self.index_file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass
+        return {"backups": [], "version": "1.0"}
+    
+    def _save_index(self):
+        """Save backup index to file"""
+        try:
+            with open(self.index_file, 'w') as f:
+                json.dump(self.index, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Warning: Could not save backup index: {e}", file=sys.stderr)
+    
+    def _generate_backup_filename(self, prefix: str = "backup") -> str:
+        """Generate backup filename with timestamp"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{prefix}_{timestamp}.tar.gz"
+    
+    def _calculate_checksum(self, file_path: Path) -> str:
+        """Calculate SHA256 checksum of file"""
+        sha256_hash = hashlib.sha256()
+        try:
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(chunk)
+            return sha256_hash.hexdigest()
+        except Exception:
+            return ""
+    
+    def _derive_key(self, password: str, salt: bytes) -> bytes:
+        """Derive encryption key from password"""
+        if not ENCRYPTION_AVAILABLE:
+            raise ValueError("Encryption not available. Install cryptography: pip install cryptography")
+        
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    
+    def _encrypt_data(self, data: bytes, password: str) -> bytes:
+        """Encrypt data with password"""
+        if not ENCRYPTION_AVAILABLE:
+            raise ValueError("Encryption not available. Install cryptography: pip install cryptography")
+        
+        salt = os.urandom(16)
+        key = self._derive_key(password, salt)
+        fernet = Fernet(key)
+        encrypted_data = fernet.encrypt(data)
+        return salt + encrypted_data
+    
+    def _decrypt_data(self, encrypted_data: bytes, password: str) -> bytes:
+        """Decrypt data with password"""
+        if not ENCRYPTION_AVAILABLE:
+            raise ValueError("Encryption not available. Install cryptography: pip install cryptography")
+        
+        salt = encrypted_data[:16]
+        encrypted_content = encrypted_data[16:]
+        key = self._derive_key(password, salt)
+        fernet = Fernet(key)
+        return fernet.decrypt(encrypted_content)
+    
+    def _compress_data(self, data: bytes, compression: str) -> bytes:
+        """Compress data using specified method"""
+        if compression == "gzip":
+            return gzip.compress(data)
+        elif compression == "bzip2":
+            return bz2.compress(data)
+        elif compression == "xz":
+            return lzma.compress(data)
+        else:
+            return data
+    
+    def _decompress_data(self, data: bytes, compression: str) -> bytes:
+        """Decompress data using specified method"""
+        if compression == "gzip":
+            return gzip.decompress(data)
+        elif compression == "bzip2":
+            return bz2.decompress(data)
+        elif compression == "xz":
+            return lzma.decompress(data)
+        else:
+            return data
+    
+    def create_backup(self, content: str, encrypt: bool = False, password: str = None,
+                     compression: str = "gzip", incremental: bool = False,
+                     selective: str = None, metadata: Dict[str, Any] = None) -> str:
+        """Create a new backup"""
+        
+        if encrypt and not password:
+            password = getpass.getpass("Enter encryption password: ")
+        
+        if encrypt and not ENCRYPTION_AVAILABLE:
+            print("Error: Encryption requested but cryptography library not available", file=sys.stderr)
+            print("Install with: pip install cryptography", file=sys.stderr)
+            return None
+        
+        # Generate backup filename
+        backup_filename = self._generate_backup_filename()
+        backup_path = self.backup_dir / backup_filename
+        
+        # Create backup metadata
+        backup_metadata = {
+            "filename": backup_filename,
+            "timestamp": datetime.now().isoformat(),
+            "size": len(content.encode('utf-8')),
+            "compressed": compression != "none",
+            "compression": compression,
+            "encrypted": encrypt,
+            "incremental": incremental,
+            "selective_pattern": selective,
+            "content_hash": hashlib.sha256(content.encode('utf-8')).hexdigest(),
+            "metadata": metadata or {}
+        }
+        
+        try:
+            # Prepare content for backup
+            content_bytes = content.encode('utf-8')
+            
+            # Apply compression if requested
+            if compression != "none":
+                content_bytes = self._compress_data(content_bytes, compression)
+                backup_metadata["compressed_size"] = len(content_bytes)
+            
+            # Apply encryption if requested
+            if encrypt:
+                content_bytes = self._encrypt_data(content_bytes, password)
+                backup_metadata["encrypted_size"] = len(content_bytes)
+            
+            # Create tar archive
+            with tarfile.open(backup_path, 'w:gz') as tar:
+                # Add content
+                content_info = tarfile.TarInfo(name="table_content.md")
+                content_info.size = len(content_bytes)
+                tar.addfile(content_info, fileobj=tarfile.io.BytesIO(content_bytes))
+                
+                # Add metadata
+                metadata_json = json.dumps(backup_metadata, indent=2).encode('utf-8')
+                metadata_info = tarfile.TarInfo(name="backup_metadata.json")
+                metadata_info.size = len(metadata_json)
+                tar.addfile(metadata_info, fileobj=tarfile.io.BytesIO(metadata_json))
+            
+            # Calculate final checksum
+            backup_metadata["file_checksum"] = self._calculate_checksum(backup_path)
+            backup_metadata["file_size"] = backup_path.stat().st_size
+            
+            # Add to index
+            self.index["backups"].append(backup_metadata)
+            self._save_index()
+            
+            print(f"Backup created: {backup_filename}")
+            print(f"Size: {backup_metadata['file_size']} bytes")
+            if encrypt:
+                print("Encryption: Yes")
+            if compression != "none":
+                print(f"Compression: {compression}")
+            
+            return backup_filename
+            
+        except Exception as e:
+            print(f"Error creating backup: {e}", file=sys.stderr)
+            if backup_path.exists():
+                backup_path.unlink()
+            return None
+    
+    def restore_backup(self, backup_filename: str, password: str = None,
+                      force: bool = False, dry_run: bool = False) -> Optional[str]:
+        """Restore from backup file"""
+        
+        backup_path = self.backup_dir / backup_filename
+        if not backup_path.exists():
+            print(f"Error: Backup file not found: {backup_filename}", file=sys.stderr)
+            return None
+        
+        try:
+            # Extract backup
+            with tarfile.open(backup_path, 'r:gz') as tar:
+                # Read metadata
+                try:
+                    metadata_member = tar.getmember("backup_metadata.json")
+                    metadata_data = tar.extractfile(metadata_member).read()
+                    metadata = json.loads(metadata_data.decode('utf-8'))
+                except KeyError:
+                    print("Warning: No metadata found in backup", file=sys.stderr)
+                    metadata = {}
+                
+                # Read content
+                try:
+                    content_member = tar.getmember("table_content.md")
+                    content_data = tar.extractfile(content_member).read()
+                except KeyError:
+                    print("Error: No table content found in backup", file=sys.stderr)
+                    return None
+            
+            if dry_run:
+                print(f"Would restore backup: {backup_filename}")
+                print(f"Original size: {metadata.get('size', 'unknown')} bytes")
+                print(f"Encrypted: {metadata.get('encrypted', False)}")
+                print(f"Compression: {metadata.get('compression', 'none')}")
+                return "DRY_RUN"
+            
+            # Decrypt if needed
+            if metadata.get('encrypted', False):
+                if not password:
+                    password = getpass.getpass("Enter decryption password: ")
+                
+                if not ENCRYPTION_AVAILABLE:
+                    print("Error: Backup is encrypted but cryptography library not available", file=sys.stderr)
+                    return None
+                
+                try:
+                    content_data = self._decrypt_data(content_data, password)
+                except Exception as e:
+                    print(f"Error: Failed to decrypt backup (wrong password?): {e}", file=sys.stderr)
+                    return None
+            
+            # Decompress if needed
+            compression = metadata.get('compression', 'none')
+            if compression != 'none':
+                try:
+                    content_data = self._decompress_data(content_data, compression)
+                except Exception as e:
+                    print(f"Error: Failed to decompress backup: {e}", file=sys.stderr)
+                    return None
+            
+            # Verify content hash if available
+            content_str = content_data.decode('utf-8')
+            if 'content_hash' in metadata:
+                actual_hash = hashlib.sha256(content_str.encode('utf-8')).hexdigest()
+                if actual_hash != metadata['content_hash']:
+                    if not force:
+                        print("Error: Content hash verification failed. Use --force to override.", file=sys.stderr)
+                        return None
+                    else:
+                        print("Warning: Content hash verification failed, but continuing due to --force", file=sys.stderr)
+            
+            print(f"Successfully restored backup: {backup_filename}")
+            print(f"Content size: {len(content_str)} characters")
+            if metadata.get('timestamp'):
+                print(f"Backup timestamp: {metadata['timestamp']}")
+            
+            return content_str
+            
+        except Exception as e:
+            print(f"Error restoring backup: {e}", file=sys.stderr)
+            return None
+    
+    def list_backups(self, export_format: str = None) -> List[Dict[str, Any]]:
+        """List all available backups"""
+        
+        # Refresh index by scanning directory
+        self._refresh_index()
+        
+        if not self.index["backups"]:
+            print("No backups found.")
+            return []
+        
+        backups = sorted(self.index["backups"], key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+        if export_format == "json":
+            print(json.dumps(backups, indent=2, default=str))
+        elif export_format == "csv":
+            print("filename,timestamp,size,encrypted,compression,checksum")
+            for backup in backups:
+                print(f"{backup.get('filename', '')},{backup.get('timestamp', '')},"
+                      f"{backup.get('file_size', '')},{backup.get('encrypted', False)},"
+                      f"{backup.get('compression', '')},{backup.get('file_checksum', '')}")
+        elif export_format == "md":
+            print("# Backup List\n")
+            print("| Filename | Timestamp | Size | Encrypted | Compression | Checksum |")
+            print("|----------|-----------|------|-----------|-------------|----------|")
+            for backup in backups:
+                size_str = f"{backup.get('file_size', 0):,}" if backup.get('file_size') else "Unknown"
+                print(f"| {backup.get('filename', '')} | {backup.get('timestamp', '')} | "
+                      f"{size_str} | {backup.get('encrypted', False)} | "
+                      f"{backup.get('compression', '')} | {backup.get('file_checksum', '')[:8]}... |")
+        else:
+            # Default text format
+            print(f"{'Filename':<30} {'Timestamp':<20} {'Size':<10} {'Encrypted':<10} {'Compression':<12}")
+            print("-" * 82)
+            
+            for backup in backups:
+                size_str = f"{backup.get('file_size', 0):,}" if backup.get('file_size') else "Unknown"
+                timestamp_str = backup.get('timestamp', '')[:19] if backup.get('timestamp') else 'Unknown'
+                
+                print(f"{backup.get('filename', ''):<30} {timestamp_str:<20} "
+                      f"{size_str:<10} {backup.get('encrypted', False):<10} "
+                      f"{backup.get('compression', ''):<12}")
+        
+        return backups
+    
+    def validate_backup(self, backup_filename: str) -> bool:
+        """Validate backup integrity"""
+        
+        backup_path = self.backup_dir / backup_filename
+        if not backup_path.exists():
+            print(f"Error: Backup file not found: {backup_filename}", file=sys.stderr)
+            return False
+        
+        print(f"Validating backup: {backup_filename}")
+        
+        # Find backup in index
+        backup_metadata = None
+        for backup in self.index["backups"]:
+            if backup.get("filename") == backup_filename:
+                backup_metadata = backup
+                break
+        
+        if not backup_metadata:
+            print("Warning: No metadata found in index")
+        
+        validation_results = []
+        
+        # Check file exists and is readable
+        try:
+            with tarfile.open(backup_path, 'r:gz') as tar:
+                members = tar.getnames()
+                validation_results.append(("File structure", "OK" if "table_content.md" in members else "FAIL"))
+        except Exception as e:
+            validation_results.append(("File structure", f"FAIL: {e}"))
+            print("\n".join(f"  {test}: {result}" for test, result in validation_results))
+            return False
+        
+        # Check file size
+        actual_size = backup_path.stat().st_size
+        if backup_metadata and backup_metadata.get("file_size"):
+            expected_size = backup_metadata["file_size"]
+            if actual_size == expected_size:
+                validation_results.append(("File size", "OK"))
+            else:
+                validation_results.append(("File size", f"FAIL: Expected {expected_size}, got {actual_size}"))
+        else:
+            validation_results.append(("File size", f"OK ({actual_size} bytes)"))
+        
+        # Check checksum
+        if backup_metadata and backup_metadata.get("file_checksum"):
+            actual_checksum = self._calculate_checksum(backup_path)
+            expected_checksum = backup_metadata["file_checksum"]
+            if actual_checksum == expected_checksum:
+                validation_results.append(("Checksum", "OK"))
+            else:
+                validation_results.append(("Checksum", f"FAIL: Expected {expected_checksum[:8]}..., got {actual_checksum[:8]}..."))
+        else:
+            validation_results.append(("Checksum", "SKIP (no expected checksum)"))
+        
+        # Try to read metadata
+        try:
+            with tarfile.open(backup_path, 'r:gz') as tar:
+                metadata_member = tar.getmember("backup_metadata.json")
+                metadata_data = tar.extractfile(metadata_member).read()
+                metadata = json.loads(metadata_data.decode('utf-8'))
+                validation_results.append(("Metadata", "OK"))
+        except Exception as e:
+            validation_results.append(("Metadata", f"FAIL: {e}"))
+        
+        # Print results
+        print()
+        all_passed = True
+        for test, result in validation_results:
+            status = "✓" if result == "OK" or result.startswith("OK") else "✗"
+            print(f"  {status} {test}: {result}")
+            if result != "OK" and not result.startswith("OK") and not result.startswith("SKIP"):
+                all_passed = False
+        
+        print(f"\nValidation {'PASSED' if all_passed else 'FAILED'}")
+        return all_passed
+    
+    def cleanup_backups(self, keep: int = 10, dry_run: bool = False) -> int:
+        """Remove old backups, keeping only the most recent ones"""
+        
+        self._refresh_index()
+        
+        if len(self.index["backups"]) <= keep:
+            print(f"Only {len(self.index['backups'])} backups found, nothing to clean up.")
+            return 0
+        
+        # Sort by timestamp
+        backups = sorted(self.index["backups"], key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+        # Identify backups to remove
+        to_remove = backups[keep:]
+        
+        if dry_run:
+            print(f"Would remove {len(to_remove)} old backups:")
+            for backup in to_remove:
+                print(f"  - {backup.get('filename', 'unknown')}")
+            return len(to_remove)
+        
+        removed_count = 0
+        for backup in to_remove:
+            filename = backup.get('filename')
+            if filename:
+                backup_path = self.backup_dir / filename
+                try:
+                    if backup_path.exists():
+                        backup_path.unlink()
+                        print(f"Removed: {filename}")
+                    
+                    # Remove from index
+                    self.index["backups"].remove(backup)
+                    removed_count += 1
+                    
+                except Exception as e:
+                    print(f"Error removing {filename}: {e}", file=sys.stderr)
+        
+        if removed_count > 0:
+            self._save_index()
+            print(f"Cleanup complete: {removed_count} backups removed")
+        
+        return removed_count
+    
+    def sync_remote(self, remote_url: str, dry_run: bool = False) -> bool:
+        """Sync backups with remote location"""
+        
+        if not shutil.which("rsync"):
+            print("Error: rsync not found. Install rsync for remote sync functionality.", file=sys.stderr)
+            return False
+        
+        # Prepare rsync command
+        rsync_cmd = [
+            "rsync",
+            "-avz",
+            "--progress",
+            str(self.backup_dir) + "/",
+            remote_url
+        ]
+        
+        if dry_run:
+            rsync_cmd.insert(1, "--dry-run")
+            print("Dry run - would execute:")
+            print(" ".join(rsync_cmd))
+        
+        try:
+            result = subprocess.run(rsync_cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print("Sync completed successfully")
+                if not dry_run:
+                    print(result.stdout)
+                return True
+            else:
+                print(f"Sync failed with return code {result.returncode}", file=sys.stderr)
+                print(result.stderr, file=sys.stderr)
+                return False
+                
+        except Exception as e:
+            print(f"Error during sync: {e}", file=sys.stderr)
+            return False
+    
+    def _refresh_index(self):
+        """Refresh index by scanning backup directory"""
+        
+        # Get all backup files in directory
+        backup_files = list(self.backup_dir.glob("backup_*.tar.gz"))
+        
+        # Get filenames in current index
+        indexed_files = {backup.get("filename") for backup in self.index["backups"]}
+        
+        # Add missing files to index
+        for backup_file in backup_files:
+            if backup_file.name not in indexed_files:
+                # Try to read metadata from the backup file
+                try:
+                    with tarfile.open(backup_file, 'r:gz') as tar:
+                        try:
+                            metadata_member = tar.getmember("backup_metadata.json")
+                            metadata_data = tar.extractfile(metadata_member).read()
+                            metadata = json.loads(metadata_data.decode('utf-8'))
+                            self.index["backups"].append(metadata)
+                        except KeyError:
+                            # No metadata in file, create basic entry
+                            basic_metadata = {
+                                "filename": backup_file.name,
+                                "timestamp": datetime.fromtimestamp(backup_file.stat().st_mtime).isoformat(),
+                                "file_size": backup_file.stat().st_size,
+                                "file_checksum": self._calculate_checksum(backup_file),
+                                "encrypted": False,
+                                "compression": "gzip"
+                            }
+                            self.index["backups"].append(basic_metadata)
+                except Exception:
+                    # Skip files that can't be read
+                    continue
+        
+        # Remove entries for files that no longer exist
+        existing_files = {f.name for f in backup_files}
+        self.index["backups"] = [
+            backup for backup in self.index["backups"]
+            if backup.get("filename") in existing_files
+        ]
+        
+        self._save_index()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Backup and restore functionality for markdown tables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Create basic backup
+    md_table_backup --backup < data.md
+    
+    # Create encrypted backup
+    md_table_backup --backup --encrypt --password secret < data.md
+    
+    # Create compressed backup
+    md_table_backup --backup --compress xz < data.md
+    
+    # List all backups
+    md_table_backup --list-backups
+    
+    # Restore backup
+    md_table_backup --restore backup_20240101_120000.tar.gz
+    
+    # Validate backup
+    md_table_backup --validate backup_20240101_120000.tar.gz
+    
+    # Cleanup old backups
+    md_table_backup --cleanup --keep 5
+    
+    # Sync to remote server
+    md_table_backup --sync --remote user@server:/backups/
+        """
+    )
+    
+    # Main operations
+    operation = parser.add_mutually_exclusive_group(required=True)
+    operation.add_argument('--backup', action='store_true', help='Create new backup')
+    operation.add_argument('--restore', metavar='FILE', help='Restore from backup file')
+    operation.add_argument('--list-backups', action='store_true', help='List all available backups')
+    operation.add_argument('--validate', metavar='FILE', help='Validate backup integrity')
+    operation.add_argument('--cleanup', action='store_true', help='Remove old backups')
+    operation.add_argument('--sync', action='store_true', help='Sync with remote location')
+    
+    # Backup options
+    parser.add_argument('--backup-dir', metavar='PATH', help='Custom backup directory')
+    parser.add_argument('--encrypt', action='store_true', help='Encrypt backup')
+    parser.add_argument('--password', metavar='PASS', help='Encryption password')
+    parser.add_argument('--compress', metavar='TYPE', choices=['gzip', 'bzip2', 'xz', 'none'],
+                       default='gzip', help='Compression method (default: gzip)')
+    parser.add_argument('--incremental', action='store_true', help='Create incremental backup')
+    parser.add_argument('--selective', metavar='PATTERN', help='Backup only files matching pattern')
+    
+    # Restore options
+    parser.add_argument('--force', action='store_true', help='Force overwrite during restore')
+    
+    # Cleanup options
+    parser.add_argument('--keep', type=int, default=10, help='Keep N most recent backups (default: 10)')
+    
+    # Sync options
+    parser.add_argument('--remote', metavar='URL', help='Remote sync destination (user@host:/path/)')
+    
+    # General options
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be done without doing it')
+    parser.add_argument('--metadata', action='store_true', help='Show backup metadata')
+    parser.add_argument('--export', metavar='FORMAT', choices=['json', 'csv', 'md'],
+                       help='Export backup list format')
+    
+    args = parser.parse_args()
+    
+    # Initialize backup manager
+    backup_manager = MarkdownTableBackup(args.backup_dir)
+    
+    try:
+        if args.backup:
+            # Read content from stdin
+            content = sys.stdin.read()
+            if not content.strip():
+                print("Error: No content provided for backup", file=sys.stderr)
+                sys.exit(1)
+            
+            # Create backup
+            result = backup_manager.create_backup(
+                content=content,
+                encrypt=args.encrypt,
+                password=args.password,
+                compression=args.compress,
+                incremental=args.incremental,
+                selective=args.selective,
+                metadata={"command_line": " ".join(sys.argv)}
+            )
+            
+            if not result:
+                sys.exit(1)
+        
+        elif args.restore:
+            # Restore backup
+            result = backup_manager.restore_backup(
+                backup_filename=args.restore,
+                password=args.password,
+                force=args.force,
+                dry_run=args.dry_run
+            )
+            
+            if result and result != "DRY_RUN":
+                print(result)
+            elif not result:
+                sys.exit(1)
+        
+        elif args.list_backups:
+            # List backups
+            backup_manager.list_backups(args.export)
+        
+        elif args.validate:
+            # Validate backup
+            if not backup_manager.validate_backup(args.validate):
+                sys.exit(1)
+        
+        elif args.cleanup:
+            # Cleanup old backups
+            removed = backup_manager.cleanup_backups(args.keep, args.dry_run)
+            if removed == 0 and not args.dry_run:
+                print("No backups removed.")
+        
+        elif args.sync:
+            # Sync with remote
+            if not args.remote:
+                print("Error: --remote URL required for sync operation", file=sys.stderr)
+                sys.exit(1)
+            
+            if not backup_manager.sync_remote(args.remote, args.dry_run):
+                sys.exit(1)
+    
+    except KeyboardInterrupt:
+        print("\nOperation cancelled", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

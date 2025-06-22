@@ -1,0 +1,546 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import os
+import re
+from pathlib import Path
+from os import environ
+from subprocess import run
+import json
+from datetime import datetime
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+    from sqlalchemy import create_engine, text
+    import sqlite3
+    import tempfile
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy sqlalchemy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("  - sqlalchemy: SQL query engine", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy sqlalchemy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Attempt to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if conversion fails
+        try:
+            numeric_series = pd.to_numeric(df[col], errors='coerce')
+            if not numeric_series.isna().all():
+                df[col] = numeric_series
+        except:
+            pass
+        
+        # Try to convert to datetime
+        try:
+            if df[col].dtype == 'object' and not df[col].empty:
+                # Check if column looks like dates
+                sample_val = str(df[col].iloc[0]) if not df[col].isna().iloc[0] else ""
+                if re.match(r'\d{4}-\d{2}-\d{2}', sample_val):
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+        except:
+            pass
+    
+    return df
+
+def dataframe_to_markdown(df):
+    """Convert pandas DataFrame to markdown table format"""
+    if df.empty:
+        return ""
+    
+    # Build table
+    lines = []
+    
+    # Header line
+    header_line = "| " + " | ".join(str(col) for col in df.columns) + " |"
+    lines.append(header_line)
+    
+    # Separator line
+    separator_line = "|" + "|".join(["-" * (len(str(col)) + 2) for col in df.columns]) + "|"
+    lines.append(separator_line)
+    
+    # Data lines
+    for _, row in df.iterrows():
+        data_line = "| " + " | ".join([str(val) if pd.notna(val) else "" for val in row]) + " |"
+        lines.append(data_line)
+    
+    return '\n'.join(lines)
+
+def create_temp_database(df, table_name="data"):
+    """Create temporary SQLite database with DataFrame data"""
+    temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+    temp_db.close()
+    
+    # Create connection and load data
+    engine = create_engine(f'sqlite:///{temp_db.name}')
+    df.to_sql(table_name, engine, index=False, if_exists='replace')
+    
+    return temp_db.name, engine
+
+def validate_sql_query(query, allowed_operations=None):
+    """Basic SQL query validation for security"""
+    if allowed_operations is None:
+        allowed_operations = ['SELECT', 'WITH']
+    
+    # Convert to uppercase for checking
+    query_upper = query.upper().strip()
+    
+    # Check if query starts with allowed operations
+    starts_with_allowed = any(query_upper.startswith(op) for op in allowed_operations)
+    
+    if not starts_with_allowed:
+        raise ValueError(f"Query must start with one of: {', '.join(allowed_operations)}")
+    
+    # Check for dangerous operations
+    dangerous_keywords = [
+        'DROP', 'DELETE', 'INSERT', 'UPDATE', 'CREATE', 'ALTER', 
+        'TRUNCATE', 'EXEC', 'EXECUTE', 'ATTACH', 'DETACH'
+    ]
+    
+    for keyword in dangerous_keywords:
+        if keyword in query_upper:
+            raise ValueError(f"Dangerous operation '{keyword}' is not allowed")
+    
+    return True
+
+def execute_query(df, query, table_name="data"):
+    """Execute SQL query on DataFrame"""
+    # Validate query
+    validate_sql_query(query)
+    
+    # Create temporary database
+    temp_db_path, engine = create_temp_database(df, table_name)
+    
+    try:
+        # Execute query
+        result_df = pd.read_sql(query, engine)
+        return result_df
+    finally:
+        # Clean up
+        engine.dispose()
+        os.unlink(temp_db_path)
+
+def build_query_from_filters(base_table="data", **filters):
+    """Build SQL query from simple filter conditions"""
+    conditions = []
+    query_parts = [f"SELECT * FROM {base_table}"]
+    
+    for key, value in filters.items():
+        if key == 'columns':
+            # Select specific columns
+            if isinstance(value, str):
+                columns = [col.strip() for col in value.split(',')]
+            else:
+                columns = value
+            query_parts[0] = f"SELECT {', '.join(columns)} FROM {base_table}"
+        
+        elif key == 'where':
+            conditions.append(value)
+        
+        elif key == 'order_by':
+            query_parts.append(f"ORDER BY {value}")
+        
+        elif key == 'limit':
+            query_parts.append(f"LIMIT {value}")
+        
+        elif key == 'group_by':
+            query_parts.append(f"GROUP BY {value}")
+        
+        elif key == 'having':
+            query_parts.append(f"HAVING {value}")
+        
+        else:
+            # Simple equality condition
+            if isinstance(value, str):
+                conditions.append(f"{key} = '{value}'")
+            else:
+                conditions.append(f"{key} = {value}")
+    
+    if conditions:
+        query_parts.insert(1, f"WHERE {' AND '.join(conditions)}")
+    
+    return ' '.join(query_parts)
+
+def get_table_schema(df):
+    """Get schema information for the DataFrame"""
+    schema_info = {
+        'columns': [],
+        'row_count': len(df),
+        'column_count': len(df.columns)
+    }
+    
+    for col in df.columns:
+        col_info = {
+            'name': col,
+            'dtype': str(df[col].dtype),
+            'null_count': df[col].isnull().sum(),
+            'unique_count': df[col].nunique(),
+            'sample_values': df[col].dropna().head(3).tolist()
+        }
+        
+        if pd.api.types.is_numeric_dtype(df[col]):
+            col_info.update({
+                'min': df[col].min(),
+                'max': df[col].max(),
+                'mean': df[col].mean()
+            })
+        
+        schema_info['columns'].append(col_info)
+    
+    return schema_info
+
+def suggest_queries(df):
+    """Suggest useful queries based on data structure"""
+    suggestions = []
+    
+    # Basic queries
+    suggestions.append({
+        'name': 'Show all data',
+        'query': 'SELECT * FROM data',
+        'description': 'Display entire table'
+    })
+    
+    if len(df) > 10:
+        suggestions.append({
+            'name': 'Show first 10 rows',
+            'query': 'SELECT * FROM data LIMIT 10',
+            'description': 'Display first 10 rows'
+        })
+    
+    # Numeric column queries
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 0:
+        first_numeric = numeric_cols[0]
+        suggestions.extend([
+            {
+                'name': f'Summary of {first_numeric}',
+                'query': f'SELECT COUNT(*) as count, AVG({first_numeric}) as avg, MIN({first_numeric}) as min, MAX({first_numeric}) as max FROM data',
+                'description': f'Statistical summary of {first_numeric} column'
+            },
+            {
+                'name': f'High values in {first_numeric}',
+                'query': f'SELECT * FROM data ORDER BY {first_numeric} DESC LIMIT 5',
+                'description': f'Top 5 rows by {first_numeric} value'
+            }
+        ])
+    
+    # Categorical column queries
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    if len(categorical_cols) > 0:
+        first_categorical = categorical_cols[0]
+        suggestions.extend([
+            {
+                'name': f'Count by {first_categorical}',
+                'query': f'SELECT {first_categorical}, COUNT(*) as count FROM data GROUP BY {first_categorical} ORDER BY count DESC',
+                'description': f'Group and count by {first_categorical}'
+            },
+            {
+                'name': f'Unique {first_categorical} values',
+                'query': f'SELECT DISTINCT {first_categorical} FROM data ORDER BY {first_categorical}',
+                'description': f'List unique values in {first_categorical}'
+            }
+        ])
+    
+    # Date column queries
+    date_cols = df.select_dtypes(include=['datetime64']).columns
+    if len(date_cols) > 0:
+        first_date = date_cols[0]
+        suggestions.extend([
+            {
+                'name': f'Recent records by {first_date}',
+                'query': f'SELECT * FROM data ORDER BY {first_date} DESC LIMIT 10',
+                'description': f'Most recent records by {first_date}'
+            },
+            {
+                'name': f'Records by month',
+                'query': f'SELECT strftime("%Y-%m", {first_date}) as month, COUNT(*) as count FROM data GROUP BY month ORDER BY month',
+                'description': f'Count records by month using {first_date}'
+            }
+        ])
+    
+    return suggestions
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Execute SQL-like queries on markdown tables using pandas and SQLite',
+        epilog='''
+Examples:
+  # Basic query
+  md_table_query --query "SELECT * FROM data WHERE age > 30" < employees.md
+  
+  # Show schema information
+  md_table_query --schema < data.md
+  
+  # Quick filters
+  md_table_query --columns "name,age" --where "age > 25" --order-by "age DESC" < data.md
+  
+  # Get query suggestions
+  md_table_query --suggest-queries < data.md
+  
+  # Interactive mode with multiple queries
+  md_table_query --interactive < data.md
+  
+  # Complex aggregation
+  md_table_query --query "SELECT department, AVG(salary) as avg_salary FROM data GROUP BY department" < employees.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--query', '-q', metavar='SQL',
+                       help='SQL query to execute (SELECT statements only)')
+    parser.add_argument('--schema', action='store_true',
+                       help='Show table schema information')
+    parser.add_argument('--suggest-queries', action='store_true',
+                       help='Suggest useful queries based on data structure')
+    parser.add_argument('--interactive', action='store_true',
+                       help='Interactive query mode')
+    parser.add_argument('--table-name', default='data',
+                       help='Table name to use in queries (default: data)')
+    
+    # Quick filter options
+    parser.add_argument('--columns', metavar='COLS',
+                       help='Comma-separated list of columns to select')
+    parser.add_argument('--where', metavar='CONDITION',
+                       help='WHERE clause condition')
+    parser.add_argument('--order-by', metavar='COLUMN',
+                       help='ORDER BY clause')
+    parser.add_argument('--group-by', metavar='COLUMN',
+                       help='GROUP BY clause')
+    parser.add_argument('--having', metavar='CONDITION',
+                       help='HAVING clause condition')
+    parser.add_argument('--limit', type=int, metavar='N',
+                       help='LIMIT number of results')
+    
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--format', choices=['markdown', 'json', 'csv'],
+                       default='markdown',
+                       help='Output format (default: markdown)')
+    parser.add_argument('--validate-only', action='store_true',
+                       help='Only validate query without executing')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        if df is None or df.empty:
+            print("Error: No valid markdown table found or table is empty", file=sys.stderr)
+            sys.exit(1)
+        
+        if args.schema:
+            # Show schema information
+            schema = get_table_schema(df)
+            
+            if args.format == 'json':
+                output_text = json.dumps(schema, indent=2, default=str)
+            else:
+                output_text = f"# Table Schema\n\n"
+                output_text += f"**Rows**: {schema['row_count']}\n"
+                output_text += f"**Columns**: {schema['column_count']}\n\n"
+                output_text += "## Column Details\n\n"
+                
+                for col in schema['columns']:
+                    output_text += f"### {col['name']}\n"
+                    output_text += f"- **Type**: {col['dtype']}\n"
+                    output_text += f"- **Null Count**: {col['null_count']}\n"
+                    output_text += f"- **Unique Values**: {col['unique_count']}\n"
+                    
+                    if 'min' in col:
+                        output_text += f"- **Min**: {col['min']}\n"
+                        output_text += f"- **Max**: {col['max']}\n"
+                        output_text += f"- **Mean**: {col['mean']:.2f}\n"
+                    
+                    if col['sample_values']:
+                        output_text += f"- **Sample Values**: {', '.join(str(v) for v in col['sample_values'])}\n"
+                    
+                    output_text += "\n"
+        
+        elif args.suggest_queries:
+            # Show query suggestions
+            suggestions = suggest_queries(df)
+            
+            if args.format == 'json':
+                output_text = json.dumps(suggestions, indent=2, default=str)
+            else:
+                output_text = f"# Query Suggestions\n\n"
+                output_text += f"Based on analysis of your table with {len(df)} rows and {len(df.columns)} columns:\n\n"
+                
+                for i, suggestion in enumerate(suggestions, 1):
+                    output_text += f"## {i}. {suggestion['name']}\n"
+                    output_text += f"{suggestion['description']}\n\n"
+                    output_text += f"```sql\n{suggestion['query']}\n```\n\n"
+        
+        elif args.interactive:
+            # Interactive mode
+            print(f"Interactive query mode - Table loaded with {len(df)} rows and {len(df.columns)} columns")
+            print("Available columns:", ", ".join(df.columns))
+            print("Type 'help' for suggestions, 'schema' for structure, 'exit' to quit")
+            print()
+            
+            while True:
+                try:
+                    query = input("SQL> ").strip()
+                    
+                    if query.lower() in ['exit', 'quit']:
+                        break
+                    elif query.lower() == 'help':
+                        suggestions = suggest_queries(df)
+                        for i, suggestion in enumerate(suggestions[:5], 1):
+                            print(f"{i}. {suggestion['name']}: {suggestion['query']}")
+                        continue
+                    elif query.lower() == 'schema':
+                        print("Columns:", ", ".join(f"{col} ({df[col].dtype})" for col in df.columns))
+                        continue
+                    elif not query:
+                        continue
+                    
+                    # Execute query
+                    result_df = execute_query(df, query, args.table_name)
+                    
+                    if result_df.empty:
+                        print("No results returned")
+                    else:
+                        print(dataframe_to_markdown(result_df))
+                    print()
+                    
+                except KeyboardInterrupt:
+                    print("\nExiting...")
+                    break
+                except Exception as e:
+                    print(f"Error: {e}")
+            
+            return
+        
+        else:
+            # Execute query
+            if args.query:
+                query = args.query
+            else:
+                # Build query from filter options
+                filter_params = {}
+                if args.columns:
+                    filter_params['columns'] = args.columns
+                if args.where:
+                    filter_params['where'] = args.where
+                if args.order_by:
+                    filter_params['order_by'] = args.order_by
+                if args.group_by:
+                    filter_params['group_by'] = args.group_by
+                if args.having:
+                    filter_params['having'] = args.having
+                if args.limit:
+                    filter_params['limit'] = args.limit
+                
+                if not filter_params:
+                    # Default query if no filters provided
+                    query = f"SELECT * FROM {args.table_name}"
+                else:
+                    query = build_query_from_filters(args.table_name, **filter_params)
+            
+            if args.validate_only:
+                try:
+                    validate_sql_query(query)
+                    print("Query is valid")
+                except Exception as e:
+                    print(f"Query validation failed: {e}", file=sys.stderr)
+                    sys.exit(1)
+                return
+            
+            # Execute query
+            result_df = execute_query(df, query, args.table_name)
+            
+            # Format output
+            if args.format == 'json':
+                output_text = result_df.to_json(orient='records', indent=2, default_handler=str)
+            elif args.format == 'csv':
+                output_text = result_df.to_csv(index=False)
+            else:  # markdown
+                output_text = dataframe_to_markdown(result_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output_text)
+        else:
+            print(output_text)
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

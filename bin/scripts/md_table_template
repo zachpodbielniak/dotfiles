@@ -1,0 +1,414 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import os
+from pathlib import Path
+from os import environ
+from subprocess import run
+import json
+from datetime import datetime
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+# Template directory
+TEMPLATE_DIR = Path("/var/home/zach/Documents/notes/03_resources/templates/markdown_tables")
+
+def ensure_template_directory():
+    """Ensure the template directory exists"""
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+
+def list_templates():
+    """List all available templates"""
+    ensure_template_directory()
+    
+    templates = []
+    for file_path in TEMPLATE_DIR.glob("*.md"):
+        template_name = file_path.stem
+        templates.append({
+            'name': template_name,
+            'file': str(file_path),
+            'size': file_path.stat().st_size,
+            'modified': datetime.fromtimestamp(file_path.stat().st_mtime)
+        })
+    
+    return sorted(templates, key=lambda x: x['name'])
+
+def load_template(template_name):
+    """Load a template by name"""
+    template_path = TEMPLATE_DIR / f"{template_name}.md"
+    
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template '{template_name}' not found")
+    
+    with open(template_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def save_template(template_name, content, overwrite=False):
+    """Save content as a template"""
+    ensure_template_directory()
+    template_path = TEMPLATE_DIR / f"{template_name}.md"
+    
+    if template_path.exists() and not overwrite:
+        raise FileExistsError(f"Template '{template_name}' already exists. Use --overwrite to replace.")
+    
+    with open(template_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    return str(template_path)
+
+def parse_markdown_table(content):
+    """Parse markdown table and extract structure"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    return {
+        'headers': headers,
+        'data_rows': len(data_lines),
+        'sample_data': data_lines[:3] if data_lines else []
+    }
+
+def apply_template_parameters(content, params):
+    """Apply parameters to template content"""
+    if not params:
+        return content
+    
+    # Parse parameters
+    param_dict = {}
+    for param in params:
+        if '=' in param:
+            key, value = param.split('=', 1)
+            param_dict[key.strip()] = value.strip()
+    
+    # Apply common parameters
+    modified_content = content
+    
+    # Replace date placeholders
+    if 'date' not in param_dict:
+        param_dict['date'] = datetime.now().strftime('%Y-%m-%d')
+    
+    # Simple parameter substitution
+    for key, value in param_dict.items():
+        placeholder = f"{{{{{key}}}}}"
+        modified_content = modified_content.replace(placeholder, value)
+    
+    return modified_content
+
+def generate_empty_rows(headers, count):
+    """Generate empty rows for a table"""
+    empty_row = "| " + " | ".join([""] * len(headers)) + " |"
+    return [empty_row] * count
+
+def customize_template(content, rows=None, columns=None):
+    """Customize template structure"""
+    table_info = parse_markdown_table(content)
+    
+    if not table_info:
+        return content
+    
+    lines = content.strip().split('\n')
+    table_lines = []
+    other_lines = []
+    in_table = False
+    
+    # Separate table and non-table content
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(line)
+            in_table = True
+        else:
+            if in_table and stripped.startswith('|'):
+                table_lines.append(line)
+            else:
+                other_lines.append(line)
+                in_table = False
+    
+    if not table_lines:
+        return content
+    
+    # Rebuild table with modifications
+    headers = table_info['headers']
+    
+    # Modify columns if requested
+    if columns:
+        if isinstance(columns, int):
+            # Adjust number of columns
+            if columns > len(headers):
+                # Add columns
+                for i in range(len(headers), columns):
+                    headers.append(f"Column{i+1}")
+            elif columns < len(headers):
+                # Remove columns
+                headers = headers[:columns]
+    
+    # Build new table
+    new_table = []
+    
+    # Header row
+    header_row = "| " + " | ".join(headers) + " |"
+    new_table.append(header_row)
+    
+    # Separator row
+    separator_row = "|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|"
+    new_table.append(separator_row)
+    
+    # Data rows
+    if rows:
+        if isinstance(rows, int):
+            # Generate specified number of rows
+            if rows > 0:
+                # Use existing data rows as examples, then generate empty ones
+                existing_data_rows = [line for line in table_lines[2:] if line.strip()]
+                
+                for i in range(rows):
+                    if i < len(existing_data_rows):
+                        # Use existing row, adjust for column count
+                        row_data = [col.strip() for col in existing_data_rows[i].split('|')[1:-1]]
+                        # Adjust for new column count
+                        while len(row_data) < len(headers):
+                            row_data.append("")
+                        row_data = row_data[:len(headers)]
+                        new_row = "| " + " | ".join(row_data) + " |"
+                    else:
+                        # Generate empty row
+                        new_row = "| " + " | ".join([""] * len(headers)) + " |"
+                    new_table.append(new_row)
+    else:
+        # Keep existing data rows, adjust for column changes
+        existing_data_rows = [line for line in table_lines[2:] if line.strip()]
+        for row_line in existing_data_rows:
+            row_data = [col.strip() for col in row_line.split('|')[1:-1]]
+            # Adjust for new column count
+            while len(row_data) < len(headers):
+                row_data.append("")
+            row_data = row_data[:len(headers)]
+            new_row = "| " + " | ".join(row_data) + " |"
+            new_table.append(new_row)
+    
+    # Combine with other content
+    result = []
+    if other_lines:
+        result.extend(other_lines)
+        result.append("")  # Add blank line before table
+    result.extend(new_table)
+    
+    return '\n'.join(result)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Create and manage reusable markdown table templates',
+        epilog='''
+Examples:
+  # List available templates
+  md_table_template --list-templates
+  
+  # Apply a template
+  md_table_template --apply-template employee
+  
+  # Apply template with parameters
+  md_table_template --apply-template sales --params "date=2024-06-22,rows=10"
+  
+  # Save current table as template
+  md_table_template --save-template my_template --from data.md
+  
+  # Customize template structure
+  md_table_template --apply-template employee --customize-fields rows=5,columns=8
+  
+  # Create template from stdin
+  cat data.md | md_table_template --save-template new_template
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--list-templates', action='store_true',
+                       help='List all available templates')
+    parser.add_argument('--apply-template', metavar='NAME',
+                       help='Apply a template by name')
+    parser.add_argument('--save-template', metavar='NAME',
+                       help='Save input as a template')
+    parser.add_argument('--from', dest='from_file', metavar='FILE',
+                       help='Source file for saving template')
+    parser.add_argument('--params', metavar='PARAMS',
+                       help='Parameters for template (comma-separated key=value pairs)')
+    parser.add_argument('--customize-fields', metavar='FIELDS',
+                       help='Customize template structure (rows=N,columns=N)')
+    parser.add_argument('--overwrite', action='store_true',
+                       help='Overwrite existing template')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--format', choices=['markdown', 'json'],
+                       default='markdown', help='Output format for --list-templates')
+    parser.add_argument('--description', metavar='TEXT',
+                       help='Description for saved template')
+    
+    args = parser.parse_args()
+    
+    try:
+        if args.list_templates:
+            templates = list_templates()
+            
+            if args.format == 'json':
+                output_data = {
+                    'templates': templates,
+                    'template_directory': str(TEMPLATE_DIR),
+                    'count': len(templates)
+                }
+                output_text = json.dumps(output_data, indent=2, default=str)
+            else:
+                if not templates:
+                    output_text = "No templates found.\n"
+                    output_text += f"Template directory: {TEMPLATE_DIR}\n"
+                    output_text += "Create templates using --save-template option.\n"
+                else:
+                    output_text = f"# Available Templates ({len(templates)})\n\n"
+                    output_text += f"**Template Directory**: `{TEMPLATE_DIR}`\n\n"
+                    
+                    for template in templates:
+                        output_text += f"## {template['name']}\n\n"
+                        
+                        # Load and analyze template
+                        try:
+                            content = load_template(template['name'])
+                            table_info = parse_markdown_table(content)
+                            
+                            if table_info:
+                                output_text += f"- **Columns**: {len(table_info['headers'])}\n"
+                                output_text += f"- **Headers**: {', '.join(table_info['headers'])}\n"
+                                output_text += f"- **Sample Rows**: {table_info['data_rows']}\n"
+                            
+                            output_text += f"- **File Size**: {template['size']} bytes\n"
+                            output_text += f"- **Modified**: {template['modified'].strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            
+                            # Show usage example
+                            output_text += f"- **Usage**: `md_table_template --apply-template {template['name']}`\n"
+                            
+                        except Exception as e:
+                            output_text += f"- **Error**: Could not read template ({e})\n"
+                        
+                        output_text += "\n"
+            
+            # Write output
+            if args.output:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.write(output_text)
+            else:
+                print(output_text, end='')
+        
+        elif args.apply_template:
+            # Apply template
+            try:
+                content = load_template(args.apply_template)
+                
+                # Apply parameters if provided
+                if args.params:
+                    params = [p.strip() for p in args.params.split(',')]
+                    content = apply_template_parameters(content, params)
+                
+                # Apply customizations if provided
+                if args.customize_fields:
+                    custom_params = {}
+                    for param in args.customize_fields.split(','):
+                        if '=' in param:
+                            key, value = param.split('=', 1)
+                            try:
+                                custom_params[key.strip()] = int(value.strip())
+                            except ValueError:
+                                custom_params[key.strip()] = value.strip()
+                    
+                    content = customize_template(
+                        content,
+                        rows=custom_params.get('rows'),
+                        columns=custom_params.get('columns')
+                    )
+                
+                # Write output
+                if args.output:
+                    with open(args.output, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                else:
+                    print(content)
+                    
+            except FileNotFoundError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                print(f"Available templates: {', '.join([t['name'] for t in list_templates()])}", file=sys.stderr)
+                sys.exit(1)
+        
+        elif args.save_template:
+            # Save template
+            try:
+                # Read content
+                if args.from_file:
+                    with open(args.from_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                else:
+                    content = sys.stdin.read()
+                
+                if not content.strip():
+                    print("Error: No content provided for template", file=sys.stderr)
+                    sys.exit(1)
+                
+                # Validate that it contains a markdown table
+                table_info = parse_markdown_table(content)
+                if not table_info:
+                    print("Warning: Content does not appear to contain a valid markdown table", file=sys.stderr)
+                
+                # Save template
+                template_path = save_template(args.save_template, content, args.overwrite)
+                
+                print(f"Template '{args.save_template}' saved to: {template_path}")
+                
+                if table_info:
+                    print(f"Template structure: {len(table_info['headers'])} columns, {table_info['data_rows']} sample rows")
+                    print(f"Columns: {', '.join(table_info['headers'])}")
+                
+            except FileExistsError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error saving template: {e}", file=sys.stderr)
+                sys.exit(1)
+        
+        else:
+            parser.print_help()
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

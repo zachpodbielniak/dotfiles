@@ -1,0 +1,607 @@
+#!/usr/bin/python3
+"""
+md_table_diff - Compare two markdown tables and show differences
+
+Usage:
+  md_table_diff table1.md table2.md --key id
+  md_table_diff old_data.md new_data.md --key employee_id --output changes.md
+  cat table1.md | md_table_diff - table2.md --key name --ignore created_date
+  
+Comparison types:
+  --key COLUMN           Use specified column as unique identifier for row matching
+  --no-key              Compare tables row-by-row without key matching
+  --ignore COLUMNS      Ignore specified columns (comma-separated)
+  --only COLUMNS        Only compare specified columns (comma-separated)
+  
+Output options:
+  --output FILE         Write differences to file (default: stdout)
+  --format diff|table   Output format: diff (change summary) or table (full comparison table)
+  --show-unchanged      Include unchanged rows in output
+  --show-stats          Include summary statistics
+  --color               Use color coding for differences (terminal output)
+  
+Comparison modes:
+  --added               Show only added rows
+  --deleted             Show only deleted rows  
+  --modified            Show only modified rows
+  --unchanged           Show only unchanged rows
+
+Examples:
+  # Compare tables using ID as key
+  md_table_diff old.md new.md --key employee_id --output changes.md
+  
+  # Show only added and deleted rows
+  md_table_diff table1.md table2.md --key id --added --deleted
+  
+  # Ignore timestamp columns
+  md_table_diff before.md after.md --key name --ignore created_date,updated_date
+  
+  # Full comparison table with stats
+  md_table_diff old.md new.md --key id --format table --show-unchanged --show-stats
+  
+  # Compare without key matching (row-by-row)
+  md_table_diff list1.md list2.md --no-key --color
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Set
+from enum import Enum
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+class ChangeType(Enum):
+    ADDED = "added"
+    DELETED = "deleted"
+    MODIFIED = "modified"
+    UNCHANGED = "unchanged"
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat first row as data
+        data_lines = table_lines
+        headers = [f"Column{i+1}" for i in range(len(headers))]
+        data_start = 0
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=headers)
+    return df
+
+def dataframe_to_markdown(df: pd.DataFrame, include_header: bool = True) -> str:
+    """Convert pandas DataFrame to markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Add header row if requested
+    if include_header:
+        headers = [str(col) for col in df.columns]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+    
+    # Add data rows
+    for _, row in df.iterrows():
+        row_data = []
+        for val in row:
+            # Handle different data types
+            if pd.isna(val):
+                row_data.append("")
+            elif isinstance(val, (int, float)):
+                if pd.isna(val):
+                    row_data.append("")
+                elif isinstance(val, float) and val.is_integer():
+                    row_data.append(str(int(val)))
+                else:
+                    row_data.append(str(val))
+            else:
+                # Escape pipes in cell content
+                cell_content = str(val).replace("|", "\\|")
+                row_data.append(cell_content)
+        
+        lines.append("| " + " | ".join(row_data) + " |")
+    
+    return "\n".join(lines) + "\n"
+
+def prepare_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, ignore_cols: List[str] = None, 
+                      only_cols: List[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Prepare DataFrames for comparison by filtering columns"""
+    
+    # Get common columns
+    common_cols = list(set(df1.columns) & set(df2.columns))
+    
+    if not common_cols:
+        raise ValueError("No common columns found between the two tables")
+    
+    # Apply column filters
+    if only_cols:
+        # Only use specified columns (that exist in both tables)
+        filtered_cols = [col for col in only_cols if col in common_cols]
+        if not filtered_cols:
+            raise ValueError(f"None of the specified columns exist in both tables: {only_cols}")
+        common_cols = filtered_cols
+    
+    if ignore_cols:
+        # Remove ignored columns
+        common_cols = [col for col in common_cols if col not in ignore_cols]
+        if not common_cols:
+            raise ValueError("No columns left after ignoring specified columns")
+    
+    # Filter DataFrames to common columns
+    df1_filtered = df1[common_cols].copy()
+    df2_filtered = df2[common_cols].copy()
+    
+    return df1_filtered, df2_filtered
+
+def compare_with_key(df1: pd.DataFrame, df2: pd.DataFrame, key_col: str) -> Dict[str, pd.DataFrame]:
+    """Compare two DataFrames using a key column"""
+    
+    if key_col not in df1.columns:
+        raise ValueError(f"Key column '{key_col}' not found in first table")
+    if key_col not in df2.columns:
+        raise ValueError(f"Key column '{key_col}' not found in second table")
+    
+    # Set key column as index
+    df1_keyed = df1.set_index(key_col)
+    df2_keyed = df2.set_index(key_col)
+    
+    # Find added, deleted, and common keys
+    keys1 = set(df1_keyed.index)
+    keys2 = set(df2_keyed.index)
+    
+    added_keys = keys2 - keys1
+    deleted_keys = keys1 - keys2
+    common_keys = keys1 & keys2
+    
+    results = {
+        'added': pd.DataFrame(),
+        'deleted': pd.DataFrame(),
+        'modified': pd.DataFrame(),
+        'unchanged': pd.DataFrame()
+    }
+    
+    # Added rows
+    if added_keys:
+        results['added'] = df2_keyed.loc[list(added_keys)].reset_index()
+    
+    # Deleted rows  
+    if deleted_keys:
+        results['deleted'] = df1_keyed.loc[list(deleted_keys)].reset_index()
+    
+    # Compare common rows
+    modified_rows = []
+    unchanged_rows = []
+    
+    for key in common_keys:
+        row1 = df1_keyed.loc[key]
+        row2 = df2_keyed.loc[key]
+        
+        # Compare all values (excluding the key column since it's now the index)
+        if not row1.equals(row2):
+            # Row has been modified
+            # Create a combined row showing changes
+            modified_row = {key_col: key}
+            for col in row1.index:
+                old_val = row1[col]
+                new_val = row2[col]
+                if pd.isna(old_val) and pd.isna(new_val):
+                    modified_row[col] = new_val
+                elif old_val != new_val:
+                    modified_row[f"{col}_old"] = old_val
+                    modified_row[f"{col}_new"] = new_val
+                    modified_row[col] = f"{old_val} → {new_val}"
+                else:
+                    modified_row[col] = new_val
+            modified_rows.append(modified_row)
+        else:
+            # Row is unchanged
+            unchanged_row = {key_col: key}
+            for col in row1.index:
+                unchanged_row[col] = row1[col]
+            unchanged_rows.append(unchanged_row)
+    
+    if modified_rows:
+        results['modified'] = pd.DataFrame(modified_rows)
+    
+    if unchanged_rows:
+        results['unchanged'] = pd.DataFrame(unchanged_rows)
+    
+    return results
+
+def compare_without_key(df1: pd.DataFrame, df2: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Compare two DataFrames row by row without key matching"""
+    
+    results = {
+        'added': pd.DataFrame(),
+        'deleted': pd.DataFrame(), 
+        'modified': pd.DataFrame(),
+        'unchanged': pd.DataFrame()
+    }
+    
+    # Ensure both DataFrames have the same columns
+    common_cols = list(set(df1.columns) & set(df2.columns))
+    df1_common = df1[common_cols].copy()
+    df2_common = df2[common_cols].copy()
+    
+    # Add row numbers for tracking
+    df1_common['__row_num__'] = range(len(df1_common))
+    df2_common['__row_num__'] = range(len(df2_common))
+    
+    max_rows = max(len(df1_common), len(df2_common))
+    min_rows = min(len(df1_common), len(df2_common))
+    
+    modified_rows = []
+    unchanged_rows = []
+    
+    # Compare common rows
+    for i in range(min_rows):
+        row1 = df1_common.iloc[i][common_cols]  # Exclude row_num
+        row2 = df2_common.iloc[i][common_cols]
+        
+        if not row1.equals(row2):
+            # Row has been modified
+            modified_row = {'__row_num__': i}
+            for col in common_cols:
+                old_val = row1[col]
+                new_val = row2[col]
+                if pd.isna(old_val) and pd.isna(new_val):
+                    modified_row[col] = new_val
+                elif old_val != new_val:
+                    modified_row[col] = f"{old_val} → {new_val}"
+                else:
+                    modified_row[col] = new_val
+            modified_rows.append(modified_row)
+        else:
+            # Row is unchanged
+            unchanged_row = {'__row_num__': i}
+            for col in common_cols:
+                unchanged_row[col] = row1[col]
+            unchanged_rows.append(unchanged_row)
+    
+    # Handle extra rows
+    if len(df2_common) > len(df1_common):
+        # Added rows
+        added_data = df2_common.iloc[min_rows:].copy()
+        results['added'] = added_data
+    elif len(df1_common) > len(df2_common):
+        # Deleted rows
+        deleted_data = df1_common.iloc[min_rows:].copy()
+        results['deleted'] = deleted_data
+    
+    if modified_rows:
+        results['modified'] = pd.DataFrame(modified_rows)
+    
+    if unchanged_rows:
+        results['unchanged'] = pd.DataFrame(unchanged_rows)
+    
+    return results
+
+def filter_results(results: Dict[str, pd.DataFrame], show_added: bool, show_deleted: bool,
+                  show_modified: bool, show_unchanged: bool) -> Dict[str, pd.DataFrame]:
+    """Filter results based on what to show"""
+    filtered = {}
+    
+    if show_added and not results['added'].empty:
+        filtered['added'] = results['added']
+    if show_deleted and not results['deleted'].empty:
+        filtered['deleted'] = results['deleted']
+    if show_modified and not results['modified'].empty:
+        filtered['modified'] = results['modified']
+    if show_unchanged and not results['unchanged'].empty:
+        filtered['unchanged'] = results['unchanged']
+    
+    return filtered
+
+def generate_diff_summary(results: Dict[str, pd.DataFrame]) -> str:
+    """Generate a summary of differences"""
+    lines = []
+    
+    lines.append("TABLE COMPARISON SUMMARY")
+    lines.append("=" * 50)
+    lines.append("")
+    
+    # Statistics
+    total_added = len(results.get('added', pd.DataFrame()))
+    total_deleted = len(results.get('deleted', pd.DataFrame()))
+    total_modified = len(results.get('modified', pd.DataFrame()))
+    total_unchanged = len(results.get('unchanged', pd.DataFrame()))
+    total_rows = total_added + total_deleted + total_modified + total_unchanged
+    
+    lines.append("STATISTICS:")
+    lines.append(f"  Total rows processed: {total_rows}")
+    lines.append(f"  Added rows: {total_added}")
+    lines.append(f"  Deleted rows: {total_deleted}")
+    lines.append(f"  Modified rows: {total_modified}")
+    lines.append(f"  Unchanged rows: {total_unchanged}")
+    lines.append("")
+    
+    # Details for each type
+    for change_type, df in results.items():
+        if df.empty:
+            continue
+            
+        lines.append(f"{change_type.upper()} ROWS ({len(df)}):")
+        lines.append("")
+        
+        # Convert to markdown
+        markdown_table = dataframe_to_markdown(df)
+        lines.append(markdown_table)
+        lines.append("")
+    
+    return "\n".join(lines)
+
+def generate_comparison_table(results: Dict[str, pd.DataFrame], use_color: bool = False) -> str:
+    """Generate a unified comparison table"""
+    all_rows = []
+    
+    # Color codes for terminal output
+    colors = {
+        'added': '\033[92m',    # Green
+        'deleted': '\033[91m',  # Red  
+        'modified': '\033[93m', # Yellow
+        'unchanged': '\033[0m', # Normal
+        'reset': '\033[0m'      # Reset
+    } if use_color else {key: '' for key in ['added', 'deleted', 'modified', 'unchanged', 'reset']}
+    
+    # Combine all results with change type indicator
+    for change_type, df in results.items():
+        if df.empty:
+            continue
+        
+        df_copy = df.copy()
+        df_copy['__change_type__'] = change_type
+        all_rows.append(df_copy)
+    
+    if not all_rows:
+        return "No data to display\n"
+    
+    # Combine all DataFrames
+    combined_df = pd.concat(all_rows, ignore_index=True, sort=False)
+    
+    # Move change_type column to first position
+    cols = ['__change_type__'] + [col for col in combined_df.columns if col != '__change_type__']
+    combined_df = combined_df[cols]
+    
+    # Convert to markdown with color if requested
+    if use_color:
+        lines = []
+        
+        # Header
+        headers = [str(col).replace('__change_type__', 'Change') for col in combined_df.columns]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+        
+        # Data rows with color
+        for _, row in combined_df.iterrows():
+            change_type = row['__change_type__']
+            color = colors.get(change_type, colors['unchanged'])
+            
+            row_data = []
+            for i, val in enumerate(row):
+                if i == 0:  # Change type column
+                    row_data.append(change_type.upper())
+                else:
+                    if pd.isna(val):
+                        row_data.append("")
+                    else:
+                        cell_content = str(val).replace("|", "\\|")
+                        row_data.append(cell_content)
+            
+            line = "| " + " | ".join(row_data) + " |"
+            lines.append(f"{color}{line}{colors['reset']}")
+        
+        return "\n".join(lines) + "\n"
+    else:
+        # Regular markdown without color
+        combined_df = combined_df.rename(columns={'__change_type__': 'Change'})
+        return dataframe_to_markdown(combined_df)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Compare two markdown tables and show differences',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic comparison with key
+  md_table_diff old.md new.md --key employee_id
+  
+  # Show only specific types of changes
+  md_table_diff table1.md table2.md --key id --added --modified
+  
+  # Ignore certain columns
+  md_table_diff before.md after.md --key name --ignore created_date,updated_date
+  
+  # Row-by-row comparison without key
+  md_table_diff list1.md list2.md --no-key --color
+  
+  # Full comparison table with statistics
+  md_table_diff old.md new.md --key id --format table --show-unchanged --show-stats
+        """
+    )
+    
+    # Input files
+    parser.add_argument('file1', help='First markdown table file (use - for stdin)')
+    parser.add_argument('file2', help='Second markdown table file')
+    
+    # Comparison options
+    key_group = parser.add_mutually_exclusive_group()
+    key_group.add_argument('--key', '-k', help='Column to use as unique identifier for row matching')
+    key_group.add_argument('--no-key', action='store_true', help='Compare row-by-row without key matching')
+    
+    parser.add_argument('--ignore', help='Ignore specified columns (comma-separated)')
+    parser.add_argument('--only', help='Only compare specified columns (comma-separated)')
+    
+    # Output options
+    parser.add_argument('--output', '-o', help='Output file (default: stdout)')
+    parser.add_argument('--format', '-f', choices=['diff', 'table'], default='diff',
+                       help='Output format: diff (summary) or table (unified table)')
+    parser.add_argument('--show-unchanged', action='store_true', help='Include unchanged rows in output')
+    parser.add_argument('--show-stats', action='store_true', help='Include summary statistics')
+    parser.add_argument('--color', action='store_true', help='Use color coding (terminal output only)')
+    
+    # Filter specific change types
+    change_filter = parser.add_argument_group('change type filters')
+    change_filter.add_argument('--added', action='store_true', help='Show only added rows')
+    change_filter.add_argument('--deleted', action='store_true', help='Show only deleted rows')
+    change_filter.add_argument('--modified', action='store_true', help='Show only modified rows')
+    change_filter.add_argument('--unchanged', action='store_true', help='Show only unchanged rows')
+    
+    args = parser.parse_args()
+    
+    # Default behavior: show added, deleted, and modified (not unchanged)
+    if not any([args.added, args.deleted, args.modified, args.unchanged]):
+        args.added = args.deleted = args.modified = True
+        args.unchanged = args.show_unchanged
+    
+    try:
+        # Read input files
+        if args.file1 == '-':
+            content1 = sys.stdin.read()
+        else:
+            with open(args.file1, 'r', encoding='utf-8') as f:
+                content1 = f.read()
+        
+        with open(args.file2, 'r', encoding='utf-8') as f:
+            content2 = f.read()
+        
+        if not content1.strip() or not content2.strip():
+            print("Error: One or both input files are empty", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown tables
+        df1 = parse_markdown_table(content1)
+        df2 = parse_markdown_table(content2)
+        
+        if df1 is None or df2 is None:
+            print("Error: Could not parse one or both markdown tables", file=sys.stderr)
+            sys.exit(1)
+        
+        print(f"Table 1: {len(df1)} rows, {len(df1.columns)} columns", file=sys.stderr)
+        print(f"Table 2: {len(df2)} rows, {len(df2.columns)} columns", file=sys.stderr)
+        
+        # Parse column filters
+        ignore_cols = [col.strip() for col in args.ignore.split(',')] if args.ignore else None
+        only_cols = [col.strip() for col in args.only.split(',')] if args.only else None
+        
+        # Prepare DataFrames
+        df1_prep, df2_prep = prepare_dataframes(df1, df2, ignore_cols, only_cols)
+        
+        # Perform comparison
+        if args.key:
+            results = compare_with_key(df1_prep, df2_prep, args.key)
+        else:
+            results = compare_without_key(df1_prep, df2_prep)
+        
+        # Filter results based on what to show
+        filtered_results = filter_results(results, args.added, args.deleted, args.modified, args.unchanged)
+        
+        # Generate output
+        if args.format == 'table':
+            output = generate_comparison_table(filtered_results, args.color and not args.output)
+        else:
+            output = generate_diff_summary(filtered_results)
+        
+        # Add statistics if requested
+        if args.show_stats and args.format == 'table':
+            stats_summary = generate_diff_summary(results)
+            output = stats_summary + "\n" + output
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output)
+            print(f"Comparison written to: {args.output}", file=sys.stderr)
+        else:
+            print(output, end='')
+        
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

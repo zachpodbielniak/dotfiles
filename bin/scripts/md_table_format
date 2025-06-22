@@ -1,0 +1,392 @@
+#!/usr/bin/python3
+"""
+md_table_format - Standardize markdown table formatting
+
+Usage:
+  md_table_format [--align ALIGN] [--width WIDTH] [--padding PADDING] [--input FILE] [--output FILE]
+  cat table.md | md_table_format --align left,center,right
+  md_table_format --width 20,10,15 --padding 1 < messy_table.md
+
+Options:
+  --align ALIGN        Column alignment: left,center,right or l,c,r (default: left for all)
+  --width WIDTH        Fixed column widths: 10,20,15 (default: auto-fit content)
+  --padding PADDING    Cell padding spaces (default: 1)
+  --input FILE         Input markdown file (default: stdin)
+  --output FILE        Output markdown file (default: stdout)
+  --min-width MIN      Minimum column width (default: 3)
+  --max-width MAX      Maximum column width (default: 50)
+  --truncate           Truncate content that exceeds max width
+  --wrap               Wrap content that exceeds max width (TODO: future feature)
+
+Column alignment options:
+  left, l, <           Left align (default)
+  center, c, ^         Center align  
+  right, r, >          Right align
+
+Examples:
+  # Basic formatting with auto-sizing
+  md_table_format < messy_table.md
+  
+  # Custom alignment for 3 columns
+  md_table_format --align left,center,right < table.md
+  
+  # Fixed column widths
+  md_table_format --width 15,20,10 --padding 2 < table.md
+  
+  # Right-align all columns with minimal padding
+  md_table_format --align right --padding 0 < numbers.md
+  
+  # Truncate long content
+  md_table_format --max-width 20 --truncate < wide_table.md
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import argparse
+import sys
+import re
+import textwrap
+from typing import List, Optional, Dict, Any, Tuple
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat first row as data
+        data_lines = table_lines
+        headers = [f"Column{i+1}" for i in range(len(headers))]
+        data_start = 0
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame - keep everything as strings to preserve formatting
+    df = pd.DataFrame(data, columns=headers)
+    
+    return df
+
+def parse_alignment(align_spec: str, num_columns: int) -> List[str]:
+    """Parse alignment specification into list of alignments"""
+    if not align_spec:
+        return ['left'] * num_columns
+    
+    # Split by comma and normalize
+    aligns = [a.strip().lower() for a in align_spec.split(',')]
+    
+    # Normalize alignment names
+    normalized = []
+    for align in aligns:
+        if align in ['left', 'l', '<']:
+            normalized.append('left')
+        elif align in ['center', 'centre', 'c', '^']:
+            normalized.append('center')
+        elif align in ['right', 'r', '>']:
+            normalized.append('right')
+        else:
+            print(f"Warning: Unknown alignment '{align}', using 'left'", file=sys.stderr)
+            normalized.append('left')
+    
+    # If only one alignment specified, apply to all columns
+    if len(normalized) == 1:
+        return normalized * num_columns
+    
+    # If fewer alignments than columns, pad with 'left'
+    while len(normalized) < num_columns:
+        normalized.append('left')
+    
+    # If more alignments than columns, truncate
+    return normalized[:num_columns]
+
+def parse_widths(width_spec: str, num_columns: int) -> Optional[List[int]]:
+    """Parse width specification into list of widths"""
+    if not width_spec:
+        return None
+    
+    try:
+        widths = [int(w.strip()) for w in width_spec.split(',')]
+        
+        # If only one width specified, apply to all columns
+        if len(widths) == 1:
+            return widths * num_columns
+        
+        # If fewer widths than columns, pad with the last width
+        while len(widths) < num_columns:
+            widths.append(widths[-1])
+        
+        # If more widths than columns, truncate
+        return widths[:num_columns]
+        
+    except ValueError as e:
+        print(f"Error parsing widths: {e}", file=sys.stderr)
+        return None
+
+def calculate_column_widths(df: pd.DataFrame, 
+                          fixed_widths: Optional[List[int]] = None,
+                          min_width: int = 3,
+                          max_width: int = 50) -> List[int]:
+    """Calculate optimal column widths"""
+    if fixed_widths:
+        return fixed_widths
+    
+    widths = []
+    for col in df.columns:
+        # Consider header width
+        header_width = len(str(col))
+        
+        # Consider content width
+        if len(df) > 0:
+            content_width = df[col].astype(str).str.len().max()
+        else:
+            content_width = 0
+        
+        # Take the maximum, but apply constraints
+        width = max(header_width, content_width, min_width)
+        width = min(width, max_width)
+        
+        widths.append(width)
+    
+    return widths
+
+def format_cell(content: str, width: int, align: str, padding: int, truncate: bool = False) -> str:
+    """Format a single cell with specified width, alignment, and padding"""
+    # Convert to string and handle None/NaN
+    if pd.isna(content) or content is None:
+        content = ""
+    else:
+        content = str(content)
+    
+    # Handle truncation
+    if truncate and len(content) > width:
+        if width > 3:
+            content = content[:width-3] + "..."
+        else:
+            content = content[:width]
+    
+    # Apply alignment within the available width
+    if align == 'left':
+        formatted = content.ljust(width)
+    elif align == 'center':
+        formatted = content.center(width)
+    elif align == 'right':
+        formatted = content.rjust(width)
+    else:
+        formatted = content.ljust(width)  # Default to left
+    
+    # Add padding
+    if padding > 0:
+        formatted = ' ' * padding + formatted + ' ' * padding
+    
+    return formatted
+
+def create_separator_row(widths: List[int], alignments: List[str], padding: int) -> str:
+    """Create the separator row with proper alignment indicators"""
+    separators = []
+    
+    for width, align in zip(widths, alignments):
+        # Base separator length
+        sep_width = width + (2 * padding)
+        
+        # Create separator with alignment indicators
+        if align == 'left':
+            sep = '-' * sep_width
+        elif align == 'center':
+            sep = ':' + '-' * (sep_width - 2) + ':'
+        elif align == 'right':
+            sep = '-' * (sep_width - 1) + ':'
+        else:
+            sep = '-' * sep_width
+        
+        separators.append(sep)
+    
+    return '|' + '|'.join(separators) + '|'
+
+def format_markdown_table(df: pd.DataFrame, 
+                         alignments: List[str],
+                         widths: List[int],
+                         padding: int = 1,
+                         truncate: bool = False) -> str:
+    """Format DataFrame as a properly aligned markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Format header row
+    header_cells = []
+    for col, width, align in zip(df.columns, widths, alignments):
+        formatted_cell = format_cell(str(col), width, align, padding, truncate)
+        header_cells.append(formatted_cell)
+    
+    lines.append('|' + '|'.join(header_cells) + '|')
+    
+    # Add separator row
+    lines.append(create_separator_row(widths, alignments, padding))
+    
+    # Format data rows
+    for _, row in df.iterrows():
+        row_cells = []
+        for val, width, align in zip(row, widths, alignments):
+            formatted_cell = format_cell(val, width, align, padding, truncate)
+            row_cells.append(formatted_cell)
+        
+        lines.append('|' + '|'.join(row_cells) + '|')
+    
+    return '\n'.join(lines) + '\n'
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Standardize markdown table formatting',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_table_format < messy_table.md
+  md_table_format --align left,center,right < table.md
+  md_table_format --width 15,20,10 --padding 2 < table.md
+  md_table_format --align right --padding 0 < numbers.md
+  md_table_format --max-width 20 --truncate < wide_table.md
+        """
+    )
+    
+    parser.add_argument('--align', help='Column alignment: left,center,right or l,c,r')
+    parser.add_argument('--width', help='Fixed column widths: 10,20,15')
+    parser.add_argument('--padding', type=int, default=1, help='Cell padding spaces (default: 1)')
+    parser.add_argument('--input', '-i', help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', help='Output markdown file (default: stdout)')
+    parser.add_argument('--min-width', type=int, default=3, help='Minimum column width (default: 3)')
+    parser.add_argument('--max-width', type=int, default=50, help='Maximum column width (default: 50)')
+    parser.add_argument('--truncate', action='store_true', help='Truncate content that exceeds max width')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        
+        if df is None:
+            print("Error: No valid markdown table found in input", file=sys.stderr)
+            sys.exit(1)
+        
+        if df.empty:
+            print("Warning: Empty table found", file=sys.stderr)
+            formatted_output = "| (empty table) |\n|----------------|\n"
+        else:
+            # Parse formatting options
+            num_columns = len(df.columns)
+            alignments = parse_alignment(args.align, num_columns)
+            fixed_widths = parse_widths(args.width, num_columns)
+            
+            # Calculate column widths
+            widths = calculate_column_widths(df, fixed_widths, args.min_width, args.max_width)
+            
+            # Format the table
+            formatted_output = format_markdown_table(
+                df, alignments, widths, args.padding, args.truncate
+            )
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(formatted_output)
+            print(f"Formatted table written to: {args.output}", file=sys.stderr)
+        else:
+            print(formatted_output, end='')
+        
+        # Print stats to stderr if writing to file
+        if args.output and not df.empty:
+            rows, cols = df.shape
+            print(f"Formatted {rows} rows, {cols} columns", file=sys.stderr)
+        
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

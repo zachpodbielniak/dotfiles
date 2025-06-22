@@ -1,0 +1,398 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import re
+from io import StringIO
+from os import environ
+from subprocess import run
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    return pd.DataFrame(rows, columns=headers)
+
+def dataframe_to_markdown(df):
+    """Convert pandas DataFrame to markdown table format"""
+    if df.empty:
+        return ""
+    
+    # Build table
+    lines = []
+    
+    # Header line
+    header_line = "| " + " | ".join(df.columns) + " |"
+    lines.append(header_line)
+    
+    # Separator line
+    separator_line = "|" + "|".join(["-" * (len(col) + 2) for col in df.columns]) + "|"
+    lines.append(separator_line)
+    
+    # Data lines
+    for _, row in df.iterrows():
+        data_line = "| " + " | ".join([str(val) for val in row]) + " |"
+        lines.append(data_line)
+    
+    return '\n'.join(lines)
+
+def is_number(value):
+    """Check if a value can be converted to a number"""
+    try:
+        float(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+def convert_value(value):
+    """Convert string value to appropriate type for comparison"""
+    if pd.isna(value) or value == '':
+        return None
+    
+    # Try to convert to number
+    if is_number(value):
+        try:
+            # Try integer first
+            if '.' not in str(value):
+                return int(float(value))
+            else:
+                return float(value)
+        except (ValueError, TypeError):
+            pass
+    
+    return str(value)
+
+def evaluate_condition(row, condition):
+    """Evaluate a condition against a row"""
+    # Simple condition parser - supports basic operators
+    # Format: column operator value
+    # Operators: ==, !=, >, <, >=, <=, LIKE, NOT LIKE
+    
+    # Handle AND/OR logic
+    if ' AND ' in condition:
+        parts = condition.split(' AND ')
+        return all(evaluate_condition(row, part.strip()) for part in parts)
+    
+    if ' OR ' in condition:
+        parts = condition.split(' OR ')
+        return any(evaluate_condition(row, part.strip()) for part in parts)
+    
+    # Handle NOT
+    if condition.strip().startswith('NOT '):
+        return not evaluate_condition(row, condition[4:].strip())
+    
+    # Parse single condition
+    condition = condition.strip()
+    
+    # Find operator
+    operators = ['>=', '<=', '!=', '==', '>', '<', ' LIKE ', ' NOT LIKE ']
+    operator = None
+    column = None
+    value = None
+    
+    for op in operators:
+        if op in condition:
+            parts = condition.split(op, 1)
+            if len(parts) == 2:
+                column = parts[0].strip()
+                value = parts[1].strip()
+                operator = op.strip()
+                break
+    
+    if not operator:
+        # Default to equality if no operator found
+        parts = condition.split('=', 1)
+        if len(parts) == 2:
+            column = parts[0].strip()
+            value = parts[1].strip()
+            operator = '=='
+        else:
+            return False
+    
+    # Check if column exists
+    if column not in row.index:
+        return False
+    
+    # Get row value
+    row_value = row[column]
+    
+    # Remove quotes from value if present
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    elif value.startswith("'") and value.endswith("'"):
+        value = value[1:-1]
+    
+    # Convert values for comparison
+    row_val_converted = convert_value(row_value)
+    compare_val_converted = convert_value(value)
+    
+    # Handle None values
+    if row_val_converted is None:
+        row_val_converted = ''
+    if compare_val_converted is None:
+        compare_val_converted = ''
+    
+    # Perform comparison
+    try:
+        if operator == '==':
+            return str(row_val_converted) == str(compare_val_converted)
+        elif operator == '!=':
+            return str(row_val_converted) != str(compare_val_converted)
+        elif operator == '>':
+            if isinstance(row_val_converted, (int, float)) and isinstance(compare_val_converted, (int, float)):
+                return row_val_converted > compare_val_converted
+            return str(row_val_converted) > str(compare_val_converted)
+        elif operator == '<':
+            if isinstance(row_val_converted, (int, float)) and isinstance(compare_val_converted, (int, float)):
+                return row_val_converted < compare_val_converted
+            return str(row_val_converted) < str(compare_val_converted)
+        elif operator == '>=':
+            if isinstance(row_val_converted, (int, float)) and isinstance(compare_val_converted, (int, float)):
+                return row_val_converted >= compare_val_converted
+            return str(row_val_converted) >= str(compare_val_converted)
+        elif operator == '<=':
+            if isinstance(row_val_converted, (int, float)) and isinstance(compare_val_converted, (int, float)):
+                return row_val_converted <= compare_val_converted
+            return str(row_val_converted) <= str(compare_val_converted)
+        elif operator == 'LIKE':
+            # Simple pattern matching (convert to regex)
+            pattern = value.replace('%', '.*').replace('_', '.')
+            return bool(re.search(pattern, str(row_val_converted), re.IGNORECASE))
+        elif operator == 'NOT LIKE':
+            pattern = value.replace('%', '.*').replace('_', '.')
+            return not bool(re.search(pattern, str(row_val_converted), re.IGNORECASE))
+    except Exception:
+        return False
+    
+    return False
+
+def parse_updates(update_str):
+    """Parse update string into column=value pairs"""
+    updates = {}
+    
+    # Split by comma, but handle quoted values
+    parts = []
+    current = ""
+    in_quotes = False
+    quote_char = None
+    
+    for char in update_str:
+        if char in ['"', "'"] and not in_quotes:
+            in_quotes = True
+            quote_char = char
+            current += char
+        elif char == quote_char and in_quotes:
+            in_quotes = False
+            quote_char = None
+            current += char
+        elif char == ',' and not in_quotes:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += char
+    
+    if current.strip():
+        parts.append(current.strip())
+    
+    # Parse each part as column=value
+    for part in parts:
+        if '=' in part:
+            col, val = part.split('=', 1)
+            col = col.strip()
+            val = val.strip()
+            
+            # Remove quotes if present
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            
+            updates[col] = val
+    
+    return updates
+
+def apply_updates(df, condition, updates, limit=None):
+    """Apply updates to rows matching the condition"""
+    updated_count = 0
+    
+    for index, row in df.iterrows():
+        if evaluate_condition(row, condition):
+            # Apply updates to this row
+            for col, value in updates.items():
+                if col in df.columns:
+                    df.at[index, col] = value
+                else:
+                    print(f"Warning: Column '{col}' not found in table", file=sys.stderr)
+            
+            updated_count += 1
+            
+            # Check limit
+            if limit and updated_count >= limit:
+                break
+    
+    return updated_count
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Update values in markdown tables based on conditions',
+        epilog='''
+Examples:
+  # Update status for high scores
+  md_table_update --where "score > 90" --set "status=excellent" < data.md
+  
+  # Update multiple columns
+  md_table_update --where "name == 'John'" --set "age=26,city=Boston" < data.md
+  
+  # Update with limit
+  md_table_update --where "status == 'pending'" --set "status=processed" --limit 5 < data.md
+  
+  # Complex conditions
+  md_table_update --where "age >= 18 AND status == 'active'" --set "eligible=yes" < data.md
+  
+  # Pattern matching
+  md_table_update --where "email LIKE '%@gmail.com'" --set "provider=gmail" < data.md
+  
+  # Increment numeric values
+  md_table_update --where "active == 'true'" --set "visits=visits+1" < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--where', '-w', required=True, metavar='CONDITION',
+                       help='Condition to match rows (e.g., "score > 80")')
+    parser.add_argument('--set', '-s', required=True, metavar='UPDATES',
+                       help='Updates to apply (e.g., "column=value,column2=value2")')
+    parser.add_argument('--limit', '-l', type=int, metavar='N',
+                       help='Limit number of rows to update')
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Show number of rows updated')
+    
+    args = parser.parse_args()
+    
+    # Read input
+    try:
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+    except Exception as e:
+        print(f"Error reading input: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not content.strip():
+        print("Error: No input data provided", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse table
+    df = parse_markdown_table(content)
+    if df is None:
+        print("Error: No valid markdown table found in input", file=sys.stderr)
+        sys.exit(1)
+    
+    if df.empty:
+        print("Error: Table is empty", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse updates
+    try:
+        updates = parse_updates(args.set)
+        if not updates:
+            print("Error: No valid updates specified", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error parsing updates: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Apply updates
+    try:
+        updated_count = apply_updates(df, args.where, updates, args.limit)
+        
+        if args.verbose:
+            print(f"Updated {updated_count} rows", file=sys.stderr)
+        
+    except Exception as e:
+        print(f"Error applying updates: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Generate output
+    result_md = dataframe_to_markdown(df)
+    
+    # Write output
+    try:
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(result_md)
+        else:
+            print(result_md)
+    except Exception as e:
+        print(f"Error writing output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

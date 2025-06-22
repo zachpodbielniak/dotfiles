@@ -1,0 +1,242 @@
+#!/usr/bin/python3
+"""
+md_table_transpose - Transpose markdown table rows and columns
+
+Usage:
+  md_table_transpose [--input file] [--output file]
+  cat table.md | md_table_transpose
+  echo "table" | md_table_transpose > transposed.md
+
+This script flips the orientation of markdown tables, converting rows to columns
+and columns to rows. The first row becomes the first column, etc.
+
+Examples:
+  # Transpose from stdin
+  echo "| Name | Alice | Bob |
+|------|-------|-----|
+| Score | 85 | 92 |" | md_table_transpose
+
+  # Output:
+  # | Name | Score |
+  # |------|-------|
+  # | Alice | 85 |
+  # | Bob | 92 |
+
+  # Transpose from file
+  md_table_transpose --input data.md --output transposed.md
+  
+  # Pipeline usage
+  cat data.md | md_table_transpose | md_table_calc "AVG(B)"
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import re
+from typing import List, Optional
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 1:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat first row as headers, rest as data
+        if len(table_lines) > 1:
+            data_lines = table_lines[1:]
+        else:
+            data_lines = []
+        data_start = 1
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines and separator_idx is not None:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=headers)
+    
+    return df
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """Convert pandas DataFrame to markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Add header row
+    headers = [str(col) for col in df.columns]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+    
+    # Add data rows
+    for _, row in df.iterrows():
+        row_data = []
+        for val in row:
+            # Handle different data types
+            if pd.isna(val):
+                row_data.append("")
+            else:
+                # Escape pipes in cell content
+                cell_content = str(val).replace("|", "\\|")
+                row_data.append(cell_content)
+        
+        lines.append("| " + " | ".join(row_data) + " |")
+    
+    return "\n".join(lines) + "\n"
+
+def transpose_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Transpose the DataFrame (swap rows and columns)"""
+    if df.empty:
+        return df
+    
+    # Transpose the DataFrame
+    transposed = df.T
+    
+    # Reset index to turn row labels into a column
+    transposed = transposed.reset_index()
+    
+    # Rename columns - the first column is the old index (column names)
+    # and the rest are the transposed data
+    new_columns = ['Column'] + [f'Row{i+1}' for i in range(len(transposed.columns) - 1)]
+    transposed.columns = new_columns
+    
+    return transposed
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Transpose markdown table rows and columns',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_table_transpose --input data.md --output transposed.md
+  cat table.md | md_table_transpose > transposed.md
+  echo "| A | B | C |
+|---|---|---|
+| 1 | 2 | 3 |
+| 4 | 5 | 6 |" | md_table_transpose
+
+  Pipeline usage:
+  md_table_transpose < data.md | md_table_calc "SUM(B)"
+  cat data.md | md_table_transpose | md_table_sort --by Column
+        """
+    )
+    
+    parser.add_argument('--input', '-i', help='Input markdown file. Default: stdin')
+    parser.add_argument('--output', '-o', help='Output markdown file. Default: stdout')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        
+        if df is None:
+            print("Error: No valid markdown table found in input", file=sys.stderr)
+            sys.exit(1)
+        
+        # Transpose the table
+        transposed_df = transpose_table(df)
+        
+        # Convert back to markdown
+        markdown_output = dataframe_to_markdown(transposed_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(markdown_output)
+            orig_rows, orig_cols = df.shape
+            new_rows, new_cols = transposed_df.shape
+            print(f"Transposed table ({orig_rows}×{orig_cols} → {new_rows}×{new_cols}): {args.output}", file=sys.stderr)
+        else:
+            print(markdown_output, end='')
+            
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,503 @@
+#!/usr/bin/python3
+"""
+md_table_merge - Combine multiple markdown tables
+
+Usage:
+  md_table_merge file1.md file2.md [file3.md ...]
+  md_table_merge --vertical file1.md file2.md
+  md_table_merge --horizontal file1.md file2.md
+  cat file1.md | md_table_merge --stdin file2.md file3.md
+
+Merge modes:
+  default           Stack tables vertically, preserve all headers
+  --vertical        Stack tables vertically (same as default)
+  --horizontal      Join tables side by side
+  --append          Append rows, require identical headers
+
+Options:
+  --stdin           Include stdin as first input source
+  --headers         Header handling: keep, merge, first, none (default: keep)
+  --separator TEXT  Text to insert between merged sections (default: empty line)
+  --output FORMAT   Output format: markdown (default), csv, json
+  --fill VALUE      Fill value for missing columns (default: empty string)
+
+Header handling modes:
+  keep    Keep all headers from all tables (default)
+  merge   Merge headers, handle duplicates intelligently  
+  first   Use only headers from first table
+  none    No headers in output
+
+Examples:
+  md_table_merge table1.md table2.md
+  md_table_merge --horizontal left.md right.md
+  md_table_merge --append --headers first *.md
+  cat data.md | md_table_merge --stdin extra.md --headers merge
+  md_table_merge --vertical --separator "---" part1.md part2.md
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import sys
+import os
+import argparse
+import json
+import re
+from typing import List, Dict, Optional, Tuple, Union
+from pathlib import Path
+
+class MarkdownTableMerger:
+    def __init__(self):
+        self.tables: List[Dict] = []
+        self.sources: List[str] = []
+        
+    def parse_file(self, file_path: str) -> List[Dict]:
+        """Parse markdown file and extract all tables"""
+        try:
+            if file_path == '-':  # stdin
+                lines = sys.stdin.readlines()
+                source_name = '<stdin>'
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                source_name = file_path
+            
+            return self._extract_tables_from_lines(lines, source_name)
+            
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}", file=sys.stderr)
+            return []
+    
+    def _extract_tables_from_lines(self, lines: List[str], source_name: str) -> List[Dict]:
+        """Extract all tables from lines"""
+        lines = [line.rstrip() for line in lines]
+        tables = []
+        
+        in_table = False
+        table_start = -1
+        table_lines = []
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Check if this line looks like a table row
+            if line_stripped.startswith('|') and line_stripped.endswith('|'):
+                if not in_table:
+                    # Starting a new table
+                    in_table = True
+                    table_start = i
+                    table_lines = [line]
+                else:
+                    # Continue current table
+                    table_lines.append(line)
+            elif in_table:
+                # We were in a table but this line doesn't look like a table row
+                # Check if it's a separator line
+                if re.match(r'^\s*\|[-\s|:]+\|\s*$', line_stripped):
+                    # This is a separator line, continue the table
+                    table_lines.append(line)
+                else:
+                    # End of table
+                    table = self._process_table(table_lines, source_name, table_start)
+                    if table:
+                        tables.append(table)
+                    in_table = False
+                    table_lines = []
+        
+        # Handle table that ends at end of document
+        if in_table and table_lines:
+            table = self._process_table(table_lines, source_name, table_start)
+            if table:
+                tables.append(table)
+        
+        return tables
+    
+    def _process_table(self, raw_lines: List[str], source: str, start_line: int) -> Optional[Dict]:
+        """Process and validate a potential table"""
+        # Filter out empty lines and separator lines
+        table_lines = []
+        separator_found = False
+        
+        for line in raw_lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            if re.match(r'^\|[-\s|:]+\|$', line_stripped):
+                separator_found = True
+                continue
+            
+            if line_stripped.startswith('|') and line_stripped.endswith('|'):
+                table_lines.append(line)
+        
+        # A valid table needs at least a header row
+        if len(table_lines) >= 1:
+            # Parse the table
+            headers, data = self._parse_table_content(table_lines)
+            
+            return {
+                'source': source,
+                'start_line': start_line,
+                'headers': headers,
+                'data': data,
+                'has_separator': separator_found,
+                'raw_lines': table_lines
+            }
+        
+        return None
+    
+    def _parse_table_content(self, table_lines: List[str]) -> Tuple[List[str], List[List[str]]]:
+        """Parse table content into headers and data"""
+        if not table_lines:
+            return [], []
+        
+        # First line is headers
+        headers = self._parse_table_row(table_lines[0])
+        
+        # Remaining lines are data
+        data = []
+        for line in table_lines[1:]:
+            row = self._parse_table_row(line)
+            data.append(row)
+        
+        return headers, data
+    
+    def _parse_table_row(self, line: str) -> List[str]:
+        """Parse a single table row"""
+        # Remove leading/trailing |
+        line = line.strip().strip('|')
+        # Split by | and clean whitespace
+        return [cell.strip() for cell in line.split('|')]
+    
+    def load_tables(self, file_paths: List[str], include_stdin: bool = False) -> None:
+        """Load tables from multiple files"""
+        self.tables = []
+        self.sources = []
+        
+        # Handle stdin first if requested
+        if include_stdin:
+            stdin_tables = self.parse_file('-')
+            self.tables.extend(stdin_tables)
+            self.sources.extend(['<stdin>'] * len(stdin_tables))
+        
+        # Load from files
+        for file_path in file_paths:
+            if os.path.exists(file_path):
+                file_tables = self.parse_file(file_path)
+                self.tables.extend(file_tables)
+                self.sources.extend([file_path] * len(file_tables))
+            else:
+                print(f"Warning: File not found: {file_path}", file=sys.stderr)
+    
+    def merge_vertical(self, header_mode: str = 'keep', separator: str = '', fill_value: str = '') -> Dict:
+        """Merge tables vertically (stack rows)"""
+        if not self.tables:
+            return {'headers': [], 'data': []}
+        
+        # Determine final headers based on mode
+        if header_mode == 'first':
+            final_headers = self.tables[0]['headers'].copy()
+        elif header_mode == 'none':
+            final_headers = []
+        elif header_mode == 'merge':
+            # Merge all unique headers, preserving order
+            final_headers = []
+            seen = set()
+            for table in self.tables:
+                for header in table['headers']:
+                    if header not in seen:
+                        final_headers.append(header)
+                        seen.add(header)
+        else:  # 'keep' mode
+            # Use headers from first table as base, then add any new ones
+            final_headers = self.tables[0]['headers'].copy()
+            seen = set(final_headers)
+            for table in self.tables[1:]:
+                for header in table['headers']:
+                    if header not in seen:
+                        final_headers.append(header)
+                        seen.add(header)
+        
+        # Merge data
+        merged_data = []
+        
+        for i, table in enumerate(self.tables):
+            # Add separator if not first table
+            if i > 0 and separator:
+                # Add separator row
+                sep_row = [separator] + [fill_value] * (len(final_headers) - 1)
+                merged_data.append(sep_row)
+            
+            # Process each row in the table
+            for row in table['data']:
+                merged_row = []
+                table_headers = table['headers']
+                
+                # Map columns from this table to final headers
+                for final_header in final_headers:
+                    if final_header in table_headers:
+                        col_index = table_headers.index(final_header)
+                        if col_index < len(row):
+                            merged_row.append(row[col_index])
+                        else:
+                            merged_row.append(fill_value)
+                    else:
+                        merged_row.append(fill_value)
+                
+                merged_data.append(merged_row)
+        
+        return {
+            'headers': final_headers,
+            'data': merged_data
+        }
+    
+    def merge_horizontal(self, header_mode: str = 'keep', fill_value: str = '') -> Dict:
+        """Merge tables horizontally (join columns)"""
+        if not self.tables:
+            return {'headers': [], 'data': []}
+        
+        # Determine final headers
+        if header_mode == 'first':
+            final_headers = self.tables[0]['headers'].copy()
+        elif header_mode == 'none':
+            final_headers = []
+        else:  # 'keep' or 'merge'
+            final_headers = []
+            for table in self.tables:
+                if header_mode == 'merge':
+                    # Avoid duplicate headers by adding suffix
+                    for header in table['headers']:
+                        base_header = header
+                        counter = 1
+                        while header in final_headers:
+                            header = f"{base_header}_{counter}"
+                            counter += 1
+                        final_headers.append(header)
+                else:  # 'keep'
+                    final_headers.extend(table['headers'])
+        
+        # Find maximum number of rows across all tables
+        max_rows = max(len(table['data']) for table in self.tables) if self.tables else 0
+        
+        # Merge data horizontally
+        merged_data = []
+        for row_index in range(max_rows):
+            merged_row = []
+            
+            for table in self.tables:
+                if row_index < len(table['data']):
+                    # Use actual row data
+                    row_data = table['data'][row_index]
+                    # Pad row to match header count
+                    while len(row_data) < len(table['headers']):
+                        row_data.append(fill_value)
+                    merged_row.extend(row_data[:len(table['headers'])])
+                else:
+                    # Pad with fill values
+                    merged_row.extend([fill_value] * len(table['headers']))
+            
+            merged_data.append(merged_row)
+        
+        return {
+            'headers': final_headers,
+            'data': merged_data
+        }
+    
+    def merge_append(self, fill_value: str = '') -> Dict:
+        """Merge tables by appending rows (requires identical headers)"""
+        if not self.tables:
+            return {'headers': [], 'data': []}
+        
+        # Check that all tables have identical headers
+        first_headers = self.tables[0]['headers']
+        for i, table in enumerate(self.tables[1:], 1):
+            if table['headers'] != first_headers:
+                raise ValueError(f"Table {i+1} has different headers: {table['headers']} vs {first_headers}")
+        
+        # Merge data
+        merged_data = []
+        for table in self.tables:
+            merged_data.extend(table['data'])
+        
+        return {
+            'headers': first_headers,
+            'data': merged_data
+        }
+    
+    def format_as_markdown(self, merged_table: Dict) -> str:
+        """Format merged table as markdown"""
+        if not merged_table['headers'] and not merged_table['data']:
+            return ""
+        
+        lines = []
+        
+        # Add headers if present
+        if merged_table['headers']:
+            headers = merged_table['headers']
+            lines.append("| " + " | ".join(headers) + " |")
+            
+            # Add separator row
+            separator = "|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|"
+            lines.append(separator)
+        
+        # Add data rows
+        for row in merged_table['data']:
+            # Ensure row matches header length
+            if merged_table['headers']:
+                while len(row) < len(merged_table['headers']):
+                    row.append("")
+                row = row[:len(merged_table['headers'])]
+            
+            lines.append("| " + " | ".join(row) + " |")
+        
+        return "\n".join(lines)
+    
+    def format_as_csv(self, merged_table: Dict) -> str:
+        """Format merged table as CSV"""
+        import csv
+        import io
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write headers if present
+        if merged_table['headers']:
+            writer.writerow(merged_table['headers'])
+        
+        # Write data rows
+        for row in merged_table['data']:
+            # Ensure row matches header length
+            if merged_table['headers']:
+                while len(row) < len(merged_table['headers']):
+                    row.append("")
+                row = row[:len(merged_table['headers'])]
+            writer.writerow(row)
+        
+        return output.getvalue()
+    
+    def format_as_json(self, merged_table: Dict) -> str:
+        """Format merged table as JSON"""
+        if not merged_table['headers']:
+            # No headers, return array of arrays
+            return json.dumps(merged_table['data'], indent=2)
+        
+        # Convert to array of objects
+        json_data = []
+        headers = merged_table['headers']
+        
+        for row in merged_table['data']:
+            # Ensure row matches header length
+            while len(row) < len(headers):
+                row.append("")
+            
+            row_dict = {}
+            for i, header in enumerate(headers):
+                if i < len(row):
+                    row_dict[header] = row[i]
+                else:
+                    row_dict[header] = ""
+            json_data.append(row_dict)
+        
+        return json.dumps(json_data, indent=2)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Combine multiple markdown tables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_table_merge table1.md table2.md
+  md_table_merge --horizontal left.md right.md
+  md_table_merge --append --headers first *.md
+  cat data.md | md_table_merge --stdin extra.md --headers merge
+  md_table_merge --vertical --separator "---" part1.md part2.md
+        """
+    )
+    
+    # Merge modes (mutually exclusive)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--vertical', '-v', action='store_true',
+                      help='Stack tables vertically (default)')
+    group.add_argument('--horizontal', '-z', action='store_true',
+                      help='Join tables side by side')
+    group.add_argument('--append', '-a', action='store_true',
+                      help='Append rows, require identical headers')
+    
+    # Input files
+    parser.add_argument('files', nargs='*', help='Input markdown files')
+    parser.add_argument('--stdin', action='store_true',
+                       help='Include stdin as first input source')
+    
+    # Options
+    parser.add_argument('--headers', choices=['keep', 'merge', 'first', 'none'],
+                       default='keep', help='Header handling mode (default: keep)')
+    parser.add_argument('--separator', '-s', default='',
+                       help='Text to insert between merged sections')
+    parser.add_argument('--output', '-o', choices=['markdown', 'csv', 'json'],
+                       default='markdown', help='Output format (default: markdown)')
+    parser.add_argument('--fill', '-f', default='',
+                       help='Fill value for missing columns (default: empty string)')
+    
+    args = parser.parse_args()
+    
+    # Validate input
+    if not args.files and not args.stdin:
+        print("Error: No input files specified. Use files or --stdin", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        # Create merger and load tables
+        merger = MarkdownTableMerger()
+        merger.load_tables(args.files, args.stdin)
+        
+        if not merger.tables:
+            print("Error: No tables found in input files", file=sys.stderr)
+            sys.exit(1)
+        
+        # Determine merge mode
+        if args.horizontal:
+            merged_table = merger.merge_horizontal(args.headers, args.fill)
+        elif args.append:
+            merged_table = merger.merge_append(args.fill)
+        else:  # default or --vertical
+            merged_table = merger.merge_vertical(args.headers, args.separator, args.fill)
+        
+        # Format output
+        if args.output == 'markdown':
+            output = merger.format_as_markdown(merged_table)
+        elif args.output == 'csv':
+            output = merger.format_as_csv(merged_table)
+        elif args.output == 'json':
+            output = merger.format_as_json(merged_table)
+        
+        print(output)
+    
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

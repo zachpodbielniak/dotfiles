@@ -1,0 +1,571 @@
+#!/usr/bin/python3
+"""
+md_table_generate - Generate synthetic data and markdown tables
+
+Usage:
+  md_table_generate --template table.md --rows 100 > new_table.md
+  md_table_generate --columns "name:name,email:email,age:int(18-65)" --rows 50
+  md_table_generate --schema schema.json --seed 12345 --rows 200
+  echo "| Name | Score |" | md_table_generate --extend --rows 10
+
+Supported data types:
+  - name, first_name, last_name: Person names
+  - email: Email addresses  
+  - company: Company names
+  - address, street, city, state, country: Location data
+  - phone: Phone numbers
+  - date(YYYY-MM-DD), datetime: Date/time values
+  - int(min-max), float(min-max): Numeric ranges
+  - choice(opt1,opt2,opt3): Random selection
+  - uuid: UUID values
+  - text(min-max): Random text of specified length
+  - boolean: True/False values
+  - currency: Money amounts
+  - url: Web URLs
+  - ipv4: IP addresses
+
+Statistical distributions (for numeric types):
+  - normal(mean,std): Normal distribution
+  - uniform(min,max): Uniform distribution  
+  - exponential(rate): Exponential distribution
+  - poisson(lambda): Poisson distribution
+
+Column relationships:
+  - correlate(column_name,factor): Correlate with another numeric column
+  - depend(column_name,mapping): Create dependencies between categorical columns
+
+Examples:
+  # Basic generation
+  md_table_generate --columns "name:name,score:int(0-100)" --rows 50
+
+  # With statistical distributions
+  md_table_generate --columns "height:normal(170,10),weight:normal(70,15)" --rows 100
+
+  # With relationships
+  md_table_generate --columns "salary:int(30000-150000),bonus:correlate(salary,0.1)" --rows 25
+
+  # Extend existing table
+  cat existing.md | md_table_generate --extend --rows 20
+
+  # From template file
+  md_table_generate --template data.md --rows 100 --seed 42
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import json
+import re
+import random
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from collections import defaultdict
+import math
+
+# Try to import required packages with helpful error messages
+try:
+    import pandas as pd
+    from faker import Faker
+    import numpy as np
+except ImportError as e:
+    missing_pkg = str(e).split("'")[1] if "'" in str(e) else "unknown"
+    print(f"Error: Required dependency '{missing_pkg}' not installed.", file=sys.stderr)
+    print("Install with: pip install pandas faker numpy", file=sys.stderr)
+    print("  - pandas: Data processing and table generation", file=sys.stderr)
+    print("  - faker: Realistic fake data generation", file=sys.stderr)
+    print("  - numpy: Statistical distributions and math functions", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas faker numpy", file=sys.stderr)
+    sys.exit(1)
+
+class MarkdownTableGenerator:
+    def __init__(self, seed: Optional[int] = None):
+        self.fake = Faker()
+        if seed is not None:
+            Faker.seed(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        self.generated_data: Dict[str, List[Any]] = {}
+        self.column_specs: Dict[str, str] = {}
+        self.relationships: List[Tuple[str, str, Any]] = []
+        
+    def parse_table_from_lines(self, lines: List[str]) -> Optional[pd.DataFrame]:
+        """Parse existing markdown table to use as template"""
+        table_lines = []
+        
+        # Filter for table lines only
+        for line in lines:
+            line = line.strip()
+            if line.startswith('|') and line.endswith('|'):
+                # Skip separator lines (|---|---|)
+                if re.match(r'^\|[-\s|]+\|$', line):
+                    continue
+                table_lines.append(line)
+        
+        if not table_lines:
+            return None
+        
+        # Parse header
+        header_line = table_lines[0]
+        headers = self._parse_row(header_line)
+        
+        # Parse data rows
+        data_rows = []
+        for line in table_lines[1:]:
+            row_data = self._parse_row(line)
+            if len(row_data) == len(headers):
+                data_rows.append(row_data)
+        
+        if not data_rows:
+            # Return empty DataFrame with just headers
+            return pd.DataFrame(columns=headers)
+        
+        return pd.DataFrame(data_rows, columns=headers)
+    
+    def _parse_row(self, line: str) -> List[str]:
+        """Parse a single table row"""
+        # Remove leading/trailing |
+        line = line.strip('|')
+        # Split by | and clean whitespace
+        return [cell.strip() for cell in line.split('|')]
+    
+    def infer_column_types(self, df: pd.DataFrame) -> Dict[str, str]:
+        """Infer data types from existing table data"""
+        column_types = {}
+        
+        for col in df.columns:
+            values = df[col].dropna()
+            if len(values) == 0:
+                column_types[col] = "text(5-15)"
+                continue
+            
+            # Check if all values are numeric
+            numeric_values = []
+            for val in values:
+                try:
+                    numeric_values.append(float(val))
+                except (ValueError, TypeError):
+                    break
+            
+            if len(numeric_values) == len(values):
+                # Numeric column
+                min_val = int(min(numeric_values))
+                max_val = int(max(numeric_values))
+                if all(v == int(v) for v in numeric_values):
+                    column_types[col] = f"int({min_val}-{max_val})"
+                else:
+                    column_types[col] = f"float({min_val}-{max_val})"
+            else:
+                # Text column - check for patterns
+                sample_values = values.head(10).tolist()
+                
+                # Check for email pattern
+                if any('@' in str(v) for v in sample_values):
+                    column_types[col] = "email"
+                # Check for name patterns
+                elif col.lower() in ['name', 'first_name', 'last_name']:
+                    column_types[col] = "name"
+                # Check for company patterns  
+                elif col.lower() in ['company', 'organization']:
+                    column_types[col] = "company"
+                # Check for date patterns
+                elif any(re.match(r'\d{4}-\d{2}-\d{2}', str(v)) for v in sample_values):
+                    column_types[col] = "date"
+                # Check for boolean
+                elif all(str(v).lower() in ['true', 'false', 'yes', 'no', '1', '0'] for v in sample_values):
+                    column_types[col] = "boolean"
+                else:
+                    # Generic text
+                    lengths = [len(str(v)) for v in sample_values]
+                    min_len = max(3, min(lengths)) 
+                    max_len = min(50, max(lengths))
+                    column_types[col] = f"text({min_len}-{max_len})"
+        
+        return column_types
+    
+    def parse_column_spec(self, spec: str) -> Dict[str, str]:
+        """Parse column specification string"""
+        columns = {}
+        
+        # Split by comma and parse each column
+        for col_def in spec.split(','):
+            col_def = col_def.strip()
+            if ':' not in col_def:
+                raise ValueError(f"Invalid column specification: {col_def}")
+            
+            col_name, col_type = col_def.split(':', 1)
+            columns[col_name.strip()] = col_type.strip()
+        
+        return columns
+    
+    def generate_value(self, column_name: str, data_type: str, row_index: int) -> Any:
+        """Generate a single value based on data type specification"""
+        
+        # Handle relationships first
+        for rel_col, rel_type, rel_config in self.relationships:
+            if rel_col == column_name:
+                if rel_type == 'correlate':
+                    base_col, factor = rel_config
+                    if base_col in self.generated_data:
+                        base_values = self.generated_data[base_col]
+                        if row_index < len(base_values):
+                            base_val = base_values[row_index]
+                            if isinstance(base_val, (int, float)):
+                                # Add some correlation with noise
+                                correlated_val = base_val * factor + random.gauss(0, abs(base_val * factor * 0.1))
+                                if 'int' in data_type:
+                                    return int(correlated_val)
+                                return round(correlated_val, 2)
+                elif rel_type == 'depend':
+                    base_col, mapping = rel_config
+                    if base_col in self.generated_data:
+                        base_values = self.generated_data[base_col]
+                        if row_index < len(base_values):
+                            base_val = str(base_values[row_index])
+                            if base_val in mapping:
+                                return random.choice(mapping[base_val])
+        
+        # Handle statistical distributions
+        if data_type.startswith('normal('):
+            match = re.match(r'normal\(([^,]+),([^)]+)\)', data_type)
+            if match:
+                mean, std = float(match.group(1)), float(match.group(2))
+                return round(np.random.normal(mean, std), 2)
+        
+        elif data_type.startswith('uniform('):
+            match = re.match(r'uniform\(([^,]+),([^)]+)\)', data_type)
+            if match:
+                min_val, max_val = float(match.group(1)), float(match.group(2))
+                return round(np.random.uniform(min_val, max_val), 2)
+        
+        elif data_type.startswith('exponential('):
+            match = re.match(r'exponential\(([^)]+)\)', data_type)
+            if match:
+                rate = float(match.group(1))
+                return round(np.random.exponential(1/rate), 2)
+        
+        elif data_type.startswith('poisson('):
+            match = re.match(r'poisson\(([^)]+)\)', data_type)
+            if match:
+                lam = float(match.group(1))
+                return int(np.random.poisson(lam))
+        
+        # Handle basic data types
+        if data_type == 'name' or data_type == 'first_name':
+            return self.fake.first_name()
+        elif data_type == 'last_name':
+            return self.fake.last_name()
+        elif data_type == 'email':
+            return self.fake.email()
+        elif data_type == 'company':
+            return self.fake.company()
+        elif data_type == 'address':
+            return self.fake.address().replace('\n', ', ')
+        elif data_type == 'street':
+            return self.fake.street_address()
+        elif data_type == 'city':
+            return self.fake.city()
+        elif data_type == 'state':
+            return self.fake.state()
+        elif data_type == 'country':
+            return self.fake.country()
+        elif data_type == 'phone':
+            return self.fake.phone_number()
+        elif data_type == 'date':
+            return self.fake.date()
+        elif data_type == 'datetime':
+            return self.fake.date_time().strftime('%Y-%m-%d %H:%M:%S')
+        elif data_type == 'uuid':
+            return str(self.fake.uuid4())
+        elif data_type == 'boolean':
+            return random.choice([True, False])
+        elif data_type == 'currency':
+            return f"${self.fake.random_int(min=100, max=100000)}.{self.fake.random_int(min=0, max=99):02d}"
+        elif data_type == 'url':
+            return self.fake.url()
+        elif data_type == 'ipv4':
+            return self.fake.ipv4()
+        
+        # Handle parameterized types
+        elif data_type.startswith('int(') and data_type.endswith(')'):
+            # Extract range: int(min-max)
+            range_str = data_type[4:-1]
+            if '-' in range_str:
+                min_val, max_val = map(int, range_str.split('-', 1))
+                return random.randint(min_val, max_val)
+            else:
+                return random.randint(0, int(range_str))
+        
+        elif data_type.startswith('float(') and data_type.endswith(')'):
+            # Extract range: float(min-max)
+            range_str = data_type[6:-1]
+            if '-' in range_str:
+                min_val, max_val = map(float, range_str.split('-', 1))
+                return round(random.uniform(min_val, max_val), 2)
+            else:
+                return round(random.uniform(0, float(range_str)), 2)
+        
+        elif data_type.startswith('choice(') and data_type.endswith(')'):
+            # Extract choices: choice(opt1,opt2,opt3)
+            choices_str = data_type[7:-1]
+            choices = [choice.strip() for choice in choices_str.split(',')]
+            return random.choice(choices)
+        
+        elif data_type.startswith('text(') and data_type.endswith(')'):
+            # Extract length range: text(min-max)
+            range_str = data_type[5:-1]
+            if '-' in range_str:
+                min_len, max_len = map(int, range_str.split('-', 1))
+                length = random.randint(min_len, max_len)
+            else:
+                length = int(range_str)
+            return self.fake.text(max_nb_chars=length).replace('\n', ' ').strip()
+        
+        # Default fallback
+        return self.fake.word()
+    
+    def parse_relationships(self, columns: Dict[str, str]):
+        """Parse relationship specifications from column types"""
+        for col_name, col_type in columns.items():
+            if col_type.startswith('correlate('):
+                # Extract: correlate(column_name,factor)
+                match = re.match(r'correlate\(([^,]+),([^)]+)\)', col_type)
+                if match:
+                    base_col = match.group(1).strip()
+                    factor = float(match.group(2))
+                    self.relationships.append((col_name, 'correlate', (base_col, factor)))
+                    # Update column type to be numeric
+                    columns[col_name] = 'float(0-1000)'
+            
+            elif col_type.startswith('depend('):
+                # Extract: depend(column_name,mapping_json)
+                match = re.match(r'depend\(([^,]+),(.+)\)', col_type)
+                if match:
+                    base_col = match.group(1).strip()
+                    mapping_str = match.group(2).strip()
+                    try:
+                        mapping = json.loads(mapping_str)
+                        self.relationships.append((col_name, 'depend', (base_col, mapping)))
+                        # Update column type to be choice of all possible values
+                        all_choices = []
+                        for choices in mapping.values():
+                            all_choices.extend(choices)
+                        columns[col_name] = f'choice({",".join(set(all_choices))})'
+                    except json.JSONDecodeError:
+                        print(f"Warning: Invalid JSON mapping for {col_name}: {mapping_str}", file=sys.stderr)
+    
+    def generate_table(self, columns: Dict[str, str], num_rows: int) -> pd.DataFrame:
+        """Generate a complete table with specified columns and rows"""
+        
+        # Parse relationships first
+        self.parse_relationships(columns)
+        self.column_specs = columns.copy()
+        
+        # Generate data column by column
+        for col_name, col_type in columns.items():
+            self.generated_data[col_name] = []
+            
+            for row_idx in range(num_rows):
+                value = self.generate_value(col_name, col_type, row_idx)
+                self.generated_data[col_name].append(value)
+        
+        # Create DataFrame
+        df = pd.DataFrame(self.generated_data)
+        return df
+    
+    def extend_table(self, existing_df: pd.DataFrame, num_rows: int) -> pd.DataFrame:
+        """Extend an existing table with more rows using inferred patterns"""
+        
+        # Infer column types from existing data
+        column_types = self.infer_column_types(existing_df)
+        
+        # Generate new data
+        new_df = self.generate_table(column_types, num_rows)
+        
+        # Combine with existing data
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        return combined_df
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """Convert pandas DataFrame to markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Add header row
+    headers = [str(col) for col in df.columns]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+    
+    # Add data rows
+    for _, row in df.iterrows():
+        row_data = []
+        for val in row:
+            # Handle different data types
+            if pd.isna(val):
+                row_data.append("")
+            elif isinstance(val, bool):
+                row_data.append("true" if val else "false")
+            elif isinstance(val, (int, float)):
+                if pd.isna(val):
+                    row_data.append("")
+                elif isinstance(val, float) and val.is_integer():
+                    row_data.append(str(int(val)))
+                else:
+                    row_data.append(str(val))
+            else:
+                # Escape pipes in cell content
+                cell_content = str(val).replace("|", "\\|")
+                row_data.append(cell_content)
+        
+        lines.append("| " + " | ".join(row_data) + " |")
+    
+    return "\n".join(lines) + "\n"
+
+def load_schema_file(schema_path: str) -> Dict[str, Any]:
+    """Load column schema from JSON file"""
+    try:
+        with open(schema_path, 'r') as f:
+            schema = json.load(f)
+        
+        if 'columns' not in schema:
+            raise ValueError("Schema file must contain 'columns' key")
+        
+        return schema
+    except Exception as e:
+        print(f"Error loading schema file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate synthetic data and markdown tables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Data type examples:
+  Basic types: name, email, company, phone, date, boolean, uuid, url
+  Numeric: int(1-100), float(0.0-1.0)
+  Text: text(10-50), choice(red,green,blue)
+  Statistical: normal(100,15), uniform(0,1), exponential(0.5)
+  Relationships: correlate(salary,0.1), depend(dept,{"IT":["dev","admin"]})
+
+Examples:
+  # Generate basic table
+  md_table_generate --columns "name:name,email:email,age:int(18-65)" --rows 50
+
+  # With statistical distributions
+  md_table_generate --columns "height:normal(170,10),weight:correlate(height,0.4)" --rows 100
+
+  # Extend existing table
+  cat data.md | md_table_generate --extend --rows 25
+
+  # From template file
+  md_table_generate --template sample.md --rows 200 --seed 42
+        """
+    )
+    
+    parser.add_argument('--columns', '-c', help='Column specification: "name:type,name:type,..."')
+    parser.add_argument('--template', '-t', help='Template markdown file to extend')
+    parser.add_argument('--schema', '-s', help='JSON schema file defining columns and types')
+    parser.add_argument('--rows', '-r', type=int, default=10, help='Number of rows to generate (default: 10)')
+    parser.add_argument('--seed', type=int, help='Random seed for reproducible results')
+    parser.add_argument('--extend', action='store_true', help='Extend table from stdin with additional rows')
+    parser.add_argument('--output', '-o', help='Output file (default: stdout)')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    input_count = sum([bool(args.columns), bool(args.template), bool(args.schema), args.extend])
+    if input_count == 0:
+        print("Error: Must specify one of --columns, --template, --schema, or --extend", file=sys.stderr)
+        sys.exit(1)
+    elif input_count > 1:
+        print("Error: Can only specify one of --columns, --template, --schema, or --extend", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        generator = MarkdownTableGenerator(seed=args.seed)
+        
+        if args.extend:
+            # Read existing table from stdin
+            lines = sys.stdin.readlines()
+            existing_df = generator.parse_table_from_lines(lines)
+            if existing_df is None:
+                print("Error: No valid markdown table found in input", file=sys.stderr)
+                sys.exit(1)
+            
+            result_df = generator.extend_table(existing_df, args.rows)
+        
+        elif args.template:
+            # Load template file
+            if not Path(args.template).exists():
+                print(f"Error: Template file not found: {args.template}", file=sys.stderr)
+                sys.exit(1)
+            
+            with open(args.template, 'r') as f:
+                lines = f.readlines()
+            
+            existing_df = generator.parse_table_from_lines(lines)
+            if existing_df is None:
+                print(f"Error: No valid markdown table found in template: {args.template}", file=sys.stderr)
+                sys.exit(1)
+            
+            result_df = generator.extend_table(existing_df, args.rows)
+        
+        elif args.schema:
+            # Load schema file
+            schema = load_schema_file(args.schema)
+            columns = schema['columns']
+            
+            # Handle additional schema properties
+            if 'seed' in schema and not args.seed:
+                generator = MarkdownTableGenerator(seed=schema['seed'])
+            
+            if 'rows' in schema and args.rows == 10:  # Default wasn't overridden
+                args.rows = schema['rows']
+            
+            result_df = generator.generate_table(columns, args.rows)
+        
+        else:  # args.columns
+            columns = generator.parse_column_spec(args.columns)
+            result_df = generator.generate_table(columns, args.rows)
+        
+        # Convert to markdown
+        markdown_output = dataframe_to_markdown(result_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(markdown_output)
+            print(f"Generated table with {len(result_df)} rows: {args.output}", file=sys.stderr)
+        else:
+            print(markdown_output, end='')
+    
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

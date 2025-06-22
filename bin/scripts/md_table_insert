@@ -1,0 +1,258 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import re
+from io import StringIO
+from os import environ
+from subprocess import run
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    return pd.DataFrame(rows, columns=headers)
+
+def dataframe_to_markdown(df):
+    """Convert pandas DataFrame to markdown table format"""
+    if df.empty:
+        return ""
+    
+    # Build table
+    lines = []
+    
+    # Header line
+    header_line = "| " + " | ".join(df.columns) + " |"
+    lines.append(header_line)
+    
+    # Separator line
+    separator_line = "|" + "|".join(["-" * (len(col) + 2) for col in df.columns]) + "|"
+    lines.append(separator_line)
+    
+    # Data lines
+    for _, row in df.iterrows():
+        data_line = "| " + " | ".join([str(val) for val in row]) + " |"
+        lines.append(data_line)
+    
+    return '\n'.join(lines)
+
+def create_new_row(df, values):
+    """Create a new row from provided values"""
+    if not values:
+        # Empty row with all columns
+        return pd.Series([''] * len(df.columns), index=df.columns)
+    
+    # Parse values - can be column=value pairs or positional values
+    new_row = pd.Series([''] * len(df.columns), index=df.columns)
+    
+    # Check if values contain '=' (column=value format)
+    if any('=' in val for val in values):
+        # Parse as column=value pairs
+        for val in values:
+            if '=' in val:
+                col, value = val.split('=', 1)
+                col = col.strip()
+                if col in df.columns:
+                    new_row[col] = value.strip()
+                else:
+                    print(f"Warning: Column '{col}' not found in table", file=sys.stderr)
+    else:
+        # Parse as positional values
+        for i, val in enumerate(values[:len(df.columns)]):
+            new_row.iloc[i] = val.strip()
+    
+    return new_row
+
+def insert_row(df, new_row, position, mode):
+    """Insert a new row into the DataFrame at specified position"""
+    if df.empty:
+        return pd.DataFrame([new_row])
+    
+    if mode == 'append':
+        return pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    elif mode == 'prepend':
+        return pd.concat([pd.DataFrame([new_row]), df], ignore_index=True)
+    elif mode == 'at':
+        # Handle negative indices
+        if position < 0:
+            position = len(df) + position + 1
+        
+        # Ensure position is within bounds
+        position = max(0, min(position, len(df)))
+        
+        # Split DataFrame and insert
+        before = df.iloc[:position]
+        after = df.iloc[position:]
+        
+        return pd.concat([before, pd.DataFrame([new_row]), after], ignore_index=True)
+    
+    return df
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Insert rows into markdown tables',
+        epilog='''
+Examples:
+  # Append a new row
+  echo "| Name | Age |\\n|------|-----|\\n| John | 25 |" | md_table_insert --append "Jane,30"
+  
+  # Prepend a new row
+  md_table_insert --prepend "Name=Admin,Age=0" < data.md
+  
+  # Insert at specific position
+  md_table_insert --at 2 "Bob,35" < data.md
+  
+  # Insert at position from end (negative index)
+  md_table_insert --at -1 "Last,Person" < data.md
+  
+  # Insert empty row
+  md_table_insert --append "" < data.md
+  
+  # Insert with column=value syntax
+  md_table_insert --append "name=Alice,age=28,city=NYC" < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('values', nargs='*', 
+                       help='Values to insert (comma-separated or column=value pairs)')
+    parser.add_argument('--append', action='store_true',
+                       help='Append row at the end (default)')
+    parser.add_argument('--prepend', action='store_true',
+                       help='Prepend row at the beginning')
+    parser.add_argument('--at', type=int, metavar='POSITION',
+                       help='Insert at specific position (0-based, negative from end)')
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    
+    args = parser.parse_args()
+    
+    # Determine insertion mode
+    mode = 'append'  # default
+    position = 0
+    
+    if args.prepend:
+        mode = 'prepend'
+    elif args.at is not None:
+        mode = 'at'
+        position = args.at
+    elif args.append:
+        mode = 'append'
+    
+    # Read input
+    try:
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+    except Exception as e:
+        print(f"Error reading input: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not content.strip():
+        print("Error: No input data provided", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse table
+    df = parse_markdown_table(content)
+    if df is None:
+        print("Error: No valid markdown table found in input", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse values to insert
+    if args.values:
+        # Join all values and split by comma
+        values_str = ' '.join(args.values)
+        if ',' in values_str and not any('=' in val for val in values_str.split(',')):
+            # Comma-separated values
+            values = [val.strip() for val in values_str.split(',')]
+        else:
+            # Space-separated or column=value format
+            values = args.values
+    else:
+        values = []
+    
+    # Create new row
+    new_row = create_new_row(df, values)
+    
+    # Insert row
+    result_df = insert_row(df, new_row, position, mode)
+    
+    # Generate output
+    result_md = dataframe_to_markdown(result_df)
+    
+    # Write output
+    try:
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(result_md)
+        else:
+            print(result_md)
+    except Exception as e:
+        print(f"Error writing output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

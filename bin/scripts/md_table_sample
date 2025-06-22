@@ -1,0 +1,465 @@
+#!/usr/bin/python3
+"""
+md_table_sample - Sample rows from markdown tables
+
+Usage:
+  md_table_sample --rows N < table.md
+  md_table_sample --percent 0.1 < table.md
+  cat table.md | md_table_sample --rows 10 --seed 42
+
+Sampling methods:
+  --rows N          Sample N random rows
+  --percent P       Sample P percentage of rows (0.0-1.0)
+  --head N          Take first N rows
+  --tail N          Take last N rows
+
+Options:
+  --seed N          Random seed for reproducible results
+  --headers         Header handling: keep, skip (default: keep)
+  --output FORMAT   Output format: markdown (default), csv, json
+  --replace         Sample with replacement (default: without replacement)
+  --stratify COL    Stratified sampling by column name
+  --table N         Sample from Nth table if multiple tables (1-based, default: 1)
+
+Examples:
+  md_table_sample --rows 10 < large_table.md
+  md_table_sample --percent 0.1 --seed 42 < data.md
+  md_table_sample --head 5 < table.md
+  md_table_sample --rows 100 --replace --stratify category < data.md
+  md_table_sample --tail 20 --output csv < results.md
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import sys
+import re
+import argparse
+import json
+import random
+from typing import List, Dict, Optional, Tuple
+from collections import Counter
+
+class MarkdownTableSampler:
+    def __init__(self, seed: Optional[int] = None):
+        self.tables: List[Dict] = []
+        if seed is not None:
+            random.seed(seed)
+        
+    def parse_document(self, lines: List[str]) -> None:
+        """Parse markdown document to find tables"""
+        lines = [line.rstrip() for line in lines]
+        self.tables = []
+        
+        in_table = False
+        table_start = -1
+        table_lines = []
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Check if this line looks like a table row
+            if line_stripped.startswith('|') and line_stripped.endswith('|'):
+                if not in_table:
+                    # Starting a new table
+                    in_table = True
+                    table_start = i
+                    table_lines = [line]
+                else:
+                    # Continue current table
+                    table_lines.append(line)
+            elif in_table:
+                # We were in a table but this line doesn't look like a table row
+                # Check if it's a separator line
+                if re.match(r'^\s*\|[-\s|:]+\|\s*$', line_stripped):
+                    # This is a separator line, continue the table
+                    table_lines.append(line)
+                else:
+                    # End of table
+                    table = self._process_table(table_lines, table_start)
+                    if table:
+                        self.tables.append(table)
+                    in_table = False
+                    table_lines = []
+        
+        # Handle table that ends at end of document
+        if in_table and table_lines:
+            table = self._process_table(table_lines, table_start)
+            if table:
+                self.tables.append(table)
+    
+    def _process_table(self, raw_lines: List[str], start_line: int) -> Optional[Dict]:
+        """Process and validate a potential table"""
+        # Filter out empty lines and separator lines
+        table_lines = []
+        separator_found = False
+        
+        for line in raw_lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            if re.match(r'^\|[-\s|:]+\|$', line_stripped):
+                separator_found = True
+                continue
+            
+            if line_stripped.startswith('|') and line_stripped.endswith('|'):
+                table_lines.append(line)
+        
+        # A valid table needs at least a header row
+        if len(table_lines) >= 1:
+            # Parse the table
+            headers, data = self._parse_table_content(table_lines)
+            
+            return {
+                'start_line': start_line,
+                'headers': headers,
+                'data': data,
+                'has_separator': separator_found,
+                'raw_lines': table_lines
+            }
+        
+        return None
+    
+    def _parse_table_content(self, table_lines: List[str]) -> Tuple[List[str], List[List[str]]]:
+        """Parse table content into headers and data"""
+        if not table_lines:
+            return [], []
+        
+        # First line is headers
+        headers = self._parse_table_row(table_lines[0])
+        
+        # Remaining lines are data
+        data = []
+        for line in table_lines[1:]:
+            row = self._parse_table_row(line)
+            # Ensure row has same number of columns as headers
+            while len(row) < len(headers):
+                row.append("")
+            data.append(row[:len(headers)])
+        
+        return headers, data
+    
+    def _parse_table_row(self, line: str) -> List[str]:
+        """Parse a single table row"""
+        # Remove leading/trailing |
+        line = line.strip().strip('|')
+        # Split by | and clean whitespace
+        return [cell.strip() for cell in line.split('|')]
+    
+    def get_table(self, table_num: int = 1) -> Optional[Dict]:
+        """Get specific table by number (1-based)"""
+        if table_num < 1 or table_num > len(self.tables):
+            return None
+        return self.tables[table_num - 1]
+    
+    def sample_rows(self, table: Dict, n_rows: int, replace: bool = False) -> Dict:
+        """Sample N random rows from table"""
+        if not table or not table['data']:
+            return table
+        
+        data = table['data']
+        
+        if replace:
+            # Sample with replacement
+            sampled_indices = [random.randint(0, len(data) - 1) for _ in range(n_rows)]
+        else:
+            # Sample without replacement
+            n_rows = min(n_rows, len(data))
+            sampled_indices = random.sample(range(len(data)), n_rows)
+        
+        sampled_data = [data[i] for i in sampled_indices]
+        
+        return {
+            'headers': table['headers'],
+            'data': sampled_data
+        }
+    
+    def sample_percent(self, table: Dict, percent: float, replace: bool = False) -> Dict:
+        """Sample percentage of rows from table"""
+        if not table or not table['data']:
+            return table
+        
+        n_rows = max(1, int(len(table['data']) * percent))
+        return self.sample_rows(table, n_rows, replace)
+    
+    def sample_head(self, table: Dict, n_rows: int) -> Dict:
+        """Take first N rows from table"""
+        if not table or not table['data']:
+            return table
+        
+        sampled_data = table['data'][:n_rows]
+        
+        return {
+            'headers': table['headers'],
+            'data': sampled_data
+        }
+    
+    def sample_tail(self, table: Dict, n_rows: int) -> Dict:
+        """Take last N rows from table"""
+        if not table or not table['data']:
+            return table
+        
+        sampled_data = table['data'][-n_rows:] if n_rows <= len(table['data']) else table['data']
+        
+        return {
+            'headers': table['headers'],
+            'data': sampled_data
+        }
+    
+    def sample_stratified(self, table: Dict, n_rows: int, stratify_column: str, replace: bool = False) -> Dict:
+        """Stratified sampling by column values"""
+        if not table or not table['data'] or not table['headers']:
+            return table
+        
+        # Find column index
+        if stratify_column not in table['headers']:
+            raise ValueError(f"Column '{stratify_column}' not found in table headers: {table['headers']}")
+        
+        col_index = table['headers'].index(stratify_column)
+        
+        # Group rows by column value
+        groups = {}
+        for i, row in enumerate(table['data']):
+            if col_index < len(row):
+                key = row[col_index]
+            else:
+                key = ""  # Empty value for missing columns
+            
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(i)
+        
+        # Calculate sample size per group (proportional)
+        total_rows = len(table['data'])
+        sampled_indices = []
+        
+        for group_key, group_indices in groups.items():
+            group_size = len(group_indices)
+            group_sample_size = max(1, int((group_size / total_rows) * n_rows))
+            
+            if replace:
+                group_sampled = [random.choice(group_indices) for _ in range(group_sample_size)]
+            else:
+                group_sample_size = min(group_sample_size, len(group_indices))
+                group_sampled = random.sample(group_indices, group_sample_size)
+            
+            sampled_indices.extend(group_sampled)
+        
+        # If we don't have enough samples, add more randomly
+        while len(sampled_indices) < n_rows and len(sampled_indices) < total_rows:
+            remaining_indices = [i for i in range(total_rows) if i not in sampled_indices]
+            if not remaining_indices:
+                break
+            sampled_indices.append(random.choice(remaining_indices))
+        
+        # Trim to exact size if needed
+        sampled_indices = sampled_indices[:n_rows]
+        
+        sampled_data = [table['data'][i] for i in sampled_indices]
+        
+        return {
+            'headers': table['headers'],
+            'data': sampled_data
+        }
+    
+    def format_as_markdown(self, table: Dict, include_headers: bool = True) -> str:
+        """Format table as markdown"""
+        if not table or (not table['headers'] and not table['data']):
+            return ""
+        
+        lines = []
+        
+        # Add headers if present and requested
+        if include_headers and table['headers']:
+            headers = table['headers']
+            lines.append("| " + " | ".join(headers) + " |")
+            
+            # Add separator row
+            separator = "|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|"
+            lines.append(separator)
+        
+        # Add data rows
+        for row in table['data']:
+            # Ensure row matches header length if headers exist
+            if table['headers']:
+                while len(row) < len(table['headers']):
+                    row.append("")
+                row = row[:len(table['headers'])]
+            
+            lines.append("| " + " | ".join(row) + " |")
+        
+        return "\n".join(lines)
+    
+    def format_as_csv(self, table: Dict, include_headers: bool = True) -> str:
+        """Format table as CSV"""
+        import csv
+        import io
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write headers if present and requested
+        if include_headers and table['headers']:
+            writer.writerow(table['headers'])
+        
+        # Write data rows
+        for row in table['data']:
+            # Ensure row matches header length if headers exist
+            if table['headers']:
+                while len(row) < len(table['headers']):
+                    row.append("")
+                row = row[:len(table['headers'])]
+            writer.writerow(row)
+        
+        return output.getvalue()
+    
+    def format_as_json(self, table: Dict, include_headers: bool = True) -> str:
+        """Format table as JSON"""
+        if not include_headers or not table['headers']:
+            # No headers, return array of arrays
+            return json.dumps(table['data'], indent=2)
+        
+        # Convert to array of objects
+        json_data = []
+        headers = table['headers']
+        
+        for row in table['data']:
+            # Ensure row matches header length
+            while len(row) < len(headers):
+                row.append("")
+            
+            row_dict = {}
+            for i, header in enumerate(headers):
+                if i < len(row):
+                    row_dict[header] = row[i]
+                else:
+                    row_dict[header] = ""
+            json_data.append(row_dict)
+        
+        return json.dumps(json_data, indent=2)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Sample rows from markdown tables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_table_sample --rows 10 < large_table.md
+  md_table_sample --percent 0.1 --seed 42 < data.md
+  md_table_sample --head 5 < table.md
+  md_table_sample --rows 100 --replace --stratify category < data.md
+  md_table_sample --tail 20 --output csv < results.md
+        """
+    )
+    
+    # Sampling methods (mutually exclusive)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--rows', '-r', type=int, help='Sample N random rows')
+    group.add_argument('--percent', '-p', type=float, help='Sample P percentage of rows (0.0-1.0)')
+    group.add_argument('--head', type=int, help='Take first N rows')
+    group.add_argument('--tail', type=int, help='Take last N rows')
+    
+    # Options
+    parser.add_argument('--seed', '-s', type=int, help='Random seed for reproducible results')
+    parser.add_argument('--headers', choices=['keep', 'skip'], default='keep',
+                       help='Header handling (default: keep)')
+    parser.add_argument('--output', '-o', choices=['markdown', 'csv', 'json'],
+                       default='markdown', help='Output format (default: markdown)')
+    parser.add_argument('--replace', action='store_true',
+                       help='Sample with replacement (default: without replacement)')
+    parser.add_argument('--stratify', help='Stratified sampling by column name')
+    parser.add_argument('--table', '-t', type=int, default=1,
+                       help='Sample from Nth table if multiple tables (1-based, default: 1)')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.percent is not None and (args.percent < 0.0 or args.percent > 1.0):
+        print("Error: Percentage must be between 0.0 and 1.0", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.stratify and not (args.rows or args.percent):
+        print("Error: Stratified sampling requires --rows or --percent", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        # Read input from stdin
+        lines = sys.stdin.readlines()
+        
+        if not lines:
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Create sampler and parse document
+        sampler = MarkdownTableSampler(args.seed)
+        sampler.parse_document(lines)
+        
+        if not sampler.tables:
+            print("Error: No tables found in input", file=sys.stderr)
+            sys.exit(1)
+        
+        # Get specified table
+        table = sampler.get_table(args.table)
+        if not table:
+            print(f"Error: Table {args.table} not found. Document has {len(sampler.tables)} table(s)", file=sys.stderr)
+            sys.exit(1)
+        
+        # Perform sampling
+        if args.rows is not None:
+            if args.stratify:
+                sampled_table = sampler.sample_stratified(table, args.rows, args.stratify, args.replace)
+            else:
+                sampled_table = sampler.sample_rows(table, args.rows, args.replace)
+        elif args.percent is not None:
+            if args.stratify:
+                n_rows = max(1, int(len(table['data']) * args.percent))
+                sampled_table = sampler.sample_stratified(table, n_rows, args.stratify, args.replace)
+            else:
+                sampled_table = sampler.sample_percent(table, args.percent, args.replace)
+        elif args.head is not None:
+            sampled_table = sampler.sample_head(table, args.head)
+        elif args.tail is not None:
+            sampled_table = sampler.sample_tail(table, args.tail)
+        
+        # Format output
+        include_headers = (args.headers == 'keep')
+        
+        if args.output == 'markdown':
+            output = sampler.format_as_markdown(sampled_table, include_headers)
+        elif args.output == 'csv':
+            output = sampler.format_as_csv(sampled_table, include_headers)
+        elif args.output == 'json':
+            output = sampler.format_as_json(sampled_table, include_headers)
+        
+        print(output)
+    
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

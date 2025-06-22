@@ -1,0 +1,650 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import re
+from io import StringIO
+from os import environ
+from subprocess import run
+import json
+from datetime import datetime
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+    from scipy import stats
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy scipy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("  - scipy: Statistical functions", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy scipy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Attempt to convert numeric columns
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='ignore')
+    
+    return df
+
+def detect_numeric_columns(df):
+    """Detect which columns are numeric"""
+    numeric_cols = []
+    for col in df.columns:
+        if df[col].dtype in ['int64', 'float64'] or pd.api.types.is_numeric_dtype(df[col]):
+            numeric_cols.append(col)
+    return numeric_cols
+
+def generate_executive_summary(df):
+    """Generate high-level executive summary"""
+    summary = "## Executive Summary\n\n"
+    
+    numeric_cols = detect_numeric_columns(df)
+    categorical_cols = [col for col in df.columns if col not in numeric_cols]
+    
+    # Dataset overview
+    summary += f"**Dataset Overview**: This analysis covers {len(df):,} records across {len(df.columns)} dimensions"
+    if numeric_cols:
+        summary += f", including {len(numeric_cols)} quantitative measures"
+    if categorical_cols:
+        summary += f" and {len(categorical_cols)} categorical attributes"
+    summary += ".\n\n"
+    
+    # Key findings
+    findings = []
+    
+    # Completeness
+    missing_pct = (df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100
+    if missing_pct < 5:
+        findings.append("✅ **High Data Quality**: Excellent data completeness with minimal missing values")
+    elif missing_pct < 15:
+        findings.append("⚠️ **Moderate Data Quality**: Some missing data requiring attention")
+    else:
+        findings.append("❌ **Data Quality Concerns**: Significant missing data impacting analysis reliability")
+    
+    # Numeric insights
+    if numeric_cols:
+        total_variance = 0
+        high_variance_cols = []
+        
+        for col in numeric_cols:
+            series = df[col].dropna()
+            if len(series) > 1 and series.std() > 0:
+                cv = series.std() / abs(series.mean()) if series.mean() != 0 else 0
+                if cv > 1:
+                    high_variance_cols.append(col)
+        
+        if high_variance_cols:
+            findings.append(f"📊 **High Variability**: {len(high_variance_cols)} metrics show significant variation")
+        
+        # Value ranges
+        ranges_info = []
+        for col in numeric_cols[:3]:  # Top 3 numeric columns
+            series = df[col].dropna()
+            if len(series) > 0:
+                min_val, max_val = series.min(), series.max()
+                ranges_info.append(f"{col}: {min_val:,.1f} to {max_val:,.1f}")
+        
+        if ranges_info:
+            findings.append(f"📈 **Value Ranges**: " + ", ".join(ranges_info))
+    
+    # Categorical insights
+    if categorical_cols:
+        diversity_info = []
+        for col in categorical_cols[:2]:  # Top 2 categorical columns
+            unique_count = df[col].nunique()
+            total_count = len(df[col].dropna())
+            if total_count > 0:
+                diversity_pct = (unique_count / total_count) * 100
+                diversity_info.append(f"{col}: {unique_count} categories ({diversity_pct:.1f}% diversity)")
+        
+        if diversity_info:
+            findings.append(f"🏷️ **Category Distribution**: " + ", ".join(diversity_info))
+    
+    # Business relevance
+    if len(df) >= 100:
+        findings.append("📊 **Statistical Significance**: Dataset size supports robust statistical analysis")
+    elif len(df) >= 30:
+        findings.append("📊 **Moderate Sample**: Dataset provides meaningful insights with some limitations")
+    else:
+        findings.append("⚠️ **Small Sample**: Limited dataset may affect statistical reliability")
+    
+    if findings:
+        summary += "**Key Findings**:\n\n"
+        for i, finding in enumerate(findings, 1):
+            summary += f"{i}. {finding}\n"
+        summary += "\n"
+    
+    return summary
+
+def identify_key_metrics(df):
+    """Identify and highlight the most important numerical metrics"""
+    metrics = "## Key Metrics\n\n"
+    
+    numeric_cols = detect_numeric_columns(df)
+    
+    if not numeric_cols:
+        return metrics + "No numerical metrics found in the dataset.\n"
+    
+    metric_importance = []
+    
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if len(series) == 0:
+            continue
+        
+        # Calculate importance score based on various factors
+        importance_score = 0
+        
+        # Non-zero variance (higher is more important)
+        if series.std() > 0:
+            cv = series.std() / abs(series.mean()) if series.mean() != 0 else 0
+            importance_score += min(cv * 10, 50)  # Cap at 50
+        
+        # Range significance
+        range_val = series.max() - series.min()
+        if range_val > 0:
+            importance_score += min(range_val / 1000, 25)  # Normalize and cap
+        
+        # Non-missing data completeness
+        completeness = len(series) / len(df)
+        importance_score += completeness * 25
+        
+        metric_importance.append((col, importance_score, series))
+    
+    # Sort by importance
+    metric_importance.sort(key=lambda x: x[1], reverse=True)
+    
+    metrics += "### Top Metrics by Significance\n\n"
+    
+    for i, (col, score, series) in enumerate(metric_importance[:5], 1):
+        metrics += f"**{i}. {col}**\n"
+        metrics += f"- **Average**: {series.mean():.2f}\n"
+        metrics += f"- **Range**: {series.min():.2f} to {series.max():.2f}\n"
+        metrics += f"- **Standard Deviation**: {series.std():.2f}\n"
+        
+        # Performance indicators
+        median_val = series.median()
+        if series.mean() > median_val * 1.2:
+            metrics += "- **Distribution**: Right-skewed (few high values)\n"
+        elif series.mean() < median_val * 0.8:
+            metrics += "- **Distribution**: Left-skewed (few low values)\n"
+        else:
+            metrics += "- **Distribution**: Relatively balanced\n"
+        
+        # Outlier indication
+        Q1, Q3 = series.quantile([0.25, 0.75])
+        IQR = Q3 - Q1
+        outliers = series[(series < Q1 - 1.5*IQR) | (series > Q3 + 1.5*IQR)]
+        if len(outliers) > 0:
+            metrics += f"- **Outliers**: {len(outliers)} values ({len(outliers)/len(series)*100:.1f}%)\n"
+        
+        metrics += "\n"
+    
+    return metrics
+
+def analyze_trends(df):
+    """Identify patterns and trends in the data"""
+    trends = "## Trend Analysis\n\n"
+    
+    numeric_cols = detect_numeric_columns(df)
+    
+    if not numeric_cols:
+        return trends + "No numerical data available for trend analysis.\n"
+    
+    # Look for date columns
+    date_cols = []
+    for col in df.columns:
+        sample_vals = df[col].dropna().head(10)
+        date_patterns = [
+            r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+            r'\d{2}/\d{2}/\d{4}',  # MM/DD/YYYY
+            r'\d{4}/\d{2}/\d{2}'   # YYYY/MM/DD
+        ]
+        if any(any(re.match(pattern, str(val)) for pattern in date_patterns) for val in sample_vals):
+            date_cols.append(col)
+    
+    trends_found = []
+    
+    # Time-based trends
+    if date_cols:
+        trends += "### Temporal Trends\n\n"
+        for date_col in date_cols:
+            try:
+                df_temp = df.copy()
+                df_temp[date_col] = pd.to_datetime(df_temp[date_col], errors='coerce')
+                df_temp = df_temp.dropna(subset=[date_col]).sort_values(date_col)
+                
+                if len(df_temp) < 3:
+                    continue
+                
+                trends += f"**Time Period**: {df_temp[date_col].min().strftime('%Y-%m-%d')} to {df_temp[date_col].max().strftime('%Y-%m-%d')}\n\n"
+                
+                for num_col in numeric_cols:
+                    if num_col in df_temp.columns:
+                        valid_data = df_temp[[date_col, num_col]].dropna()
+                        if len(valid_data) >= 3:
+                            # Calculate trend
+                            x = np.arange(len(valid_data))
+                            y = valid_data[num_col].values
+                            slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+                            
+                            trend_direction = "📈 Increasing" if slope > 0 else "📉 Decreasing"
+                            trend_strength = "strong" if abs(r_value) > 0.7 else "moderate" if abs(r_value) > 0.4 else "weak"
+                            
+                            if p_value < 0.05:
+                                trends += f"- **{num_col}**: {trend_direction} trend ({trend_strength}, p<0.05)\n"
+                                
+                                # Calculate trend magnitude
+                                start_val = valid_data[num_col].iloc[0]
+                                end_val = valid_data[num_col].iloc[-1]
+                                if start_val != 0:
+                                    change_pct = ((end_val - start_val) / abs(start_val)) * 100
+                                    trends += f"  - Change: {change_pct:+.1f}% over period\n"
+                                
+                                trends_found.append(f"{num_col}: {trend_direction.lower()}")
+                            else:
+                                trends += f"- **{num_col}**: No significant trend (p={p_value:.3f})\n"
+                
+                trends += "\n"
+            except Exception as e:
+                trends += f"Error analyzing temporal trends: {str(e)}\n"
+    
+    # Sequential patterns (without explicit dates)
+    if not date_cols and len(df) >= 5:
+        trends += "### Sequential Patterns\n\n"
+        for col in numeric_cols[:3]:  # Analyze top 3 numeric columns
+            series = df[col].dropna()
+            if len(series) >= 5:
+                # Simple momentum analysis
+                changes = series.diff().dropna()
+                positive_momentum = (changes > 0).sum()
+                negative_momentum = (changes < 0).sum()
+                
+                if positive_momentum > negative_momentum * 1.5:
+                    trends += f"- **{col}**: Generally increasing pattern\n"
+                    trends_found.append(f"{col}: increasing")
+                elif negative_momentum > positive_momentum * 1.5:
+                    trends += f"- **{col}**: Generally decreasing pattern\n"
+                    trends_found.append(f"{col}: decreasing")
+                else:
+                    trends += f"- **{col}**: Volatile/mixed pattern\n"
+                
+                # Volatility assessment
+                if len(changes) > 0:
+                    volatility = changes.std()
+                    mean_change = abs(changes.mean())
+                    if volatility > mean_change * 3:
+                        trends += f"  - High volatility detected\n"
+        
+        trends += "\n"
+    
+    # Correlation-based patterns
+    if len(numeric_cols) >= 2:
+        trends += "### Relationship Patterns\n\n"
+        try:
+            corr_matrix = df[numeric_cols].corr()
+            strong_relationships = []
+            
+            for i, col1 in enumerate(numeric_cols):
+                for j, col2 in enumerate(numeric_cols[i+1:], i+1):
+                    corr_val = corr_matrix.loc[col1, col2]
+                    if not pd.isna(corr_val) and abs(corr_val) > 0.6:
+                        relationship_type = "positive" if corr_val > 0 else "negative"
+                        strength = "strong" if abs(corr_val) > 0.8 else "moderate"
+                        strong_relationships.append(f"- **{col1}** and **{col2}**: {strength} {relationship_type} relationship (r={corr_val:.3f})")
+            
+            if strong_relationships:
+                trends += "\n".join(strong_relationships)
+                trends += "\n\n"
+            else:
+                trends += "No strong relationships found between variables.\n\n"
+        except:
+            trends += "Unable to analyze variable relationships.\n\n"
+    
+    # Summary
+    if trends_found:
+        trends += "### Trend Summary\n\n"
+        trends += "Key patterns identified:\n"
+        for trend in trends_found[:5]:  # Limit to top 5
+            trends += f"- {trend}\n"
+        trends += "\n"
+    
+    return trends
+
+def generate_recommendations(df):
+    """Generate actionable recommendations based on data analysis"""
+    recommendations = "## Recommendations\n\n"
+    
+    numeric_cols = detect_numeric_columns(df)
+    categorical_cols = [col for col in df.columns if col not in numeric_cols]
+    
+    recs = []
+    
+    # Data quality recommendations
+    missing_data = df.isnull().sum()
+    high_missing = missing_data[missing_data > len(df) * 0.1]
+    
+    if len(high_missing) > 0:
+        recs.append({
+            'priority': 'High',
+            'category': 'Data Quality',
+            'action': f'Address missing data in {len(high_missing)} columns',
+            'details': f'Columns with >10% missing data: {", ".join(high_missing.index.tolist())}',
+            'impact': 'Improves analysis reliability and statistical power'
+        })
+    
+    # Outlier recommendations
+    if numeric_cols:
+        outlier_cols = []
+        for col in numeric_cols:
+            series = df[col].dropna()
+            if len(series) >= 4:
+                Q1, Q3 = series.quantile([0.25, 0.75])
+                IQR = Q3 - Q1
+                outliers = series[(series < Q1 - 1.5*IQR) | (series > Q3 + 1.5*IQR)]
+                if len(outliers) > len(series) * 0.05:  # More than 5% outliers
+                    outlier_cols.append(col)
+        
+        if outlier_cols:
+            recs.append({
+                'priority': 'Medium',
+                'category': 'Data Analysis',
+                'action': 'Investigate outliers in key metrics',
+                'details': f'Columns with potential outliers: {", ".join(outlier_cols)}',
+                'impact': 'Ensures data integrity and prevents skewed analysis'
+            })
+    
+    # Statistical analysis recommendations
+    if len(numeric_cols) >= 2:
+        recs.append({
+            'priority': 'Medium',
+            'category': 'Statistical Analysis',
+            'action': 'Perform correlation analysis',
+            'details': f'Analyze relationships between {len(numeric_cols)} numeric variables',
+            'impact': 'Identifies hidden patterns and variable dependencies'
+        })
+    
+    # Time series recommendations
+    date_cols = []
+    for col in df.columns:
+        sample_vals = df[col].dropna().head(5)
+        if any(bool(re.match(r'\d{4}-\d{2}-\d{2}', str(val))) for val in sample_vals):
+            date_cols.append(col)
+    
+    if date_cols and numeric_cols:
+        recs.append({
+            'priority': 'Medium',
+            'category': 'Trend Analysis',
+            'action': 'Conduct time-series analysis',
+            'details': f'Analyze trends over time using date column(s): {", ".join(date_cols)}',
+            'impact': 'Reveals temporal patterns and forecasting opportunities'
+        })
+    
+    # Segmentation recommendations
+    if categorical_cols and numeric_cols:
+        good_segment_cols = []
+        for col in categorical_cols:
+            unique_count = df[col].nunique()
+            if 2 <= unique_count <= min(10, len(df) // 5):
+                good_segment_cols.append(col)
+        
+        if good_segment_cols:
+            recs.append({
+                'priority': 'Low',
+                'category': 'Segmentation',
+                'action': 'Perform segmented analysis',
+                'details': f'Segment data by: {", ".join(good_segment_cols)}',
+                'impact': 'Uncovers group-specific patterns and insights'
+            })
+    
+    # Visualization recommendations
+    if len(df) >= 20:
+        if numeric_cols:
+            recs.append({
+                'priority': 'Low',
+                'category': 'Visualization',
+                'action': 'Create distribution plots',
+                'details': f'Visualize distributions for: {", ".join(numeric_cols[:3])}',
+                'impact': 'Improves data understanding and communication'
+            })
+    
+    # Data collection recommendations
+    if len(df) < 30:
+        recs.append({
+            'priority': 'High',
+            'category': 'Data Collection',
+            'action': 'Increase sample size',
+            'details': f'Current dataset has only {len(df)} records',
+            'impact': 'Improves statistical reliability and analysis confidence'
+        })
+    
+    # Format recommendations
+    if recs:
+        # Sort by priority
+        priority_order = {'High': 0, 'Medium': 1, 'Low': 2}
+        recs.sort(key=lambda x: priority_order.get(x['priority'], 3))
+        
+        recommendations += "### Immediate Actions\n\n"
+        for i, rec in enumerate([r for r in recs if r['priority'] == 'High'], 1):
+            recommendations += f"**{i}. {rec['action']}** (🔴 High Priority)\n"
+            recommendations += f"- **Details**: {rec['details']}\n"
+            recommendations += f"- **Impact**: {rec['impact']}\n\n"
+        
+        medium_recs = [r for r in recs if r['priority'] == 'Medium']
+        if medium_recs:
+            recommendations += "### Next Steps\n\n"
+            for i, rec in enumerate(medium_recs, 1):
+                recommendations += f"**{i}. {rec['action']}** (🟡 Medium Priority)\n"
+                recommendations += f"- **Details**: {rec['details']}\n"
+                recommendations += f"- **Impact**: {rec['impact']}\n\n"
+        
+        low_recs = [r for r in recs if r['priority'] == 'Low']
+        if low_recs:
+            recommendations += "### Future Considerations\n\n"
+            for i, rec in enumerate(low_recs, 1):
+                recommendations += f"**{i}. {rec['action']}** (🟢 Low Priority)\n"
+                recommendations += f"- **Details**: {rec['details']}\n"
+                recommendations += f"- **Impact**: {rec['impact']}\n\n"
+    else:
+        recommendations += "No specific recommendations identified. The dataset appears to be in good condition for analysis.\n"
+    
+    return recommendations
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate executive summaries and insights for markdown tables',
+        epilog='''
+Examples:
+  # Executive summary
+  md_table_summarize --executive-summary < data.md
+  
+  # Key metrics identification
+  md_table_summarize --key-metrics < sales_data.md
+  
+  # Trend analysis
+  md_table_summarize --trends < time_series.md
+  
+  # Full summary with recommendations
+  md_table_summarize --all < dataset.md
+  
+  # Output to file
+  md_table_summarize --all --output summary_report.md < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--executive-summary', action='store_true',
+                       help='Generate high-level executive overview')
+    parser.add_argument('--key-metrics', action='store_true',
+                       help='Identify most important numerical metrics')
+    parser.add_argument('--trends', action='store_true',
+                       help='Analyze patterns and trends in data')
+    parser.add_argument('--recommendations', action='store_true',
+                       help='Generate actionable recommendations')
+    parser.add_argument('--all', action='store_true',
+                       help='Generate complete summary report')
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--format', choices=['markdown', 'json'],
+                       default='markdown', help='Output format')
+    
+    args = parser.parse_args()
+    
+    # If no specific analysis requested, generate executive summary
+    if not any([args.executive_summary, args.key_metrics, args.trends, args.recommendations, args.all]):
+        args.executive_summary = True
+    
+    if args.all:
+        args.executive_summary = True
+        args.key_metrics = True
+        args.trends = True
+        args.recommendations = True
+    
+    # Read input
+    try:
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+    except Exception as e:
+        print(f"Error reading input: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not content.strip():
+        print("Error: No input data provided", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse table
+    df = parse_markdown_table(content)
+    if df is None:
+        print("Error: No valid markdown table found in input", file=sys.stderr)
+        sys.exit(1)
+    
+    if df.empty:
+        print("Error: Table is empty", file=sys.stderr)
+        sys.exit(1)
+    
+    # Generate summary
+    results = []
+    
+    if args.format == 'json':
+        summary_data = {
+            'timestamp': datetime.now().isoformat(),
+            'dataset_info': {
+                'rows': len(df),
+                'columns': len(df.columns),
+                'numeric_columns': detect_numeric_columns(df)
+            }
+        }
+        
+        if args.key_metrics:
+            numeric_cols = detect_numeric_columns(df)
+            metrics = {}
+            for col in numeric_cols:
+                series = df[col].dropna()
+                if len(series) > 0:
+                    metrics[col] = {
+                        'mean': float(series.mean()),
+                        'median': float(series.median()),
+                        'std': float(series.std()),
+                        'min': float(series.min()),
+                        'max': float(series.max())
+                    }
+            summary_data['key_metrics'] = metrics
+        
+        print(json.dumps(summary_data, indent=2))
+    else:
+        # Markdown format
+        title = "# Data Summary Report\n\n"
+        title += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        title += f"**Dataset**: {len(df):,} rows × {len(df.columns)} columns\n\n"
+        results.append(title)
+        
+        if args.executive_summary:
+            results.append(generate_executive_summary(df))
+        
+        if args.key_metrics:
+            results.append(identify_key_metrics(df))
+        
+        if args.trends:
+            results.append(analyze_trends(df))
+        
+        if args.recommendations:
+            results.append(generate_recommendations(df))
+        
+        # Write output
+        output_text = "\n".join(results)
+        
+        try:
+            if args.output:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.write(output_text)
+            else:
+                print(output_text)
+        except Exception as e:
+            print(f"Error writing output: {e}", file=sys.stderr)
+            sys.exit(1)
+
+if __name__ == '__main__':
+    main()

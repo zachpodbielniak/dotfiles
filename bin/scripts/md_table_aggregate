@@ -1,0 +1,642 @@
+#!/usr/bin/python3
+"""
+md_table_aggregate - Advanced aggregation operations for markdown tables
+
+Usage:
+  echo "table" | md_table_aggregate --groupby column --agg sum,mean,count
+  md_table_aggregate --groupby category,region --agg sales:sum,price:mean < table.md
+  md_table_aggregate --window column --func rolling:mean:3 < table.md
+  md_table_aggregate --summary < table.md
+  md_table_aggregate --pivot-agg index=cat columns=month values=sales agg=sum < table.md
+
+Operations:
+  --groupby: Group by columns and apply aggregations
+  --window: Apply window functions (rolling, expanding, ewm)
+  --summary: Generate statistical summary for all numeric columns
+  --pivot-agg: Pivot table with aggregations (shorthand for reshape+aggregate)
+  --crosstab: Cross-tabulation with optional aggregation
+
+Aggregation functions:
+  - Basic: sum, mean, count, min, max, std, var, median
+  - Advanced: first, last, nunique, sem, skew, kurt
+  - Quantiles: q25, q50, q75, q90, q95, q99
+  - Custom: Custom expressions using pandas syntax
+
+Window functions:
+  - rolling: Rolling windows (e.g., rolling:mean:5)
+  - expanding: Expanding windows (e.g., expanding:sum)
+  - ewm: Exponentially weighted (e.g., ewm:mean:0.3)
+
+Examples:
+  # Group by category, get sum and mean of sales
+  md_table_aggregate --groupby category --agg sales:sum,sales:mean
+  
+  # Multiple grouping columns
+  md_table_aggregate --groupby region,category --agg sales:sum,count:count
+  
+  # Rolling average
+  md_table_aggregate --window date --func rolling:mean:7 --columns sales
+  
+  # Statistical summary
+  md_table_aggregate --summary
+  
+  # Pivot with aggregation
+  md_table_aggregate --pivot-agg index=product columns=quarter values=revenue agg=sum
+  
+  # Cross-tabulation
+  md_table_aggregate --crosstab rows=category columns=region values=sales agg=mean
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import io
+import re
+from typing import List, Dict, Any, Optional, Union
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+class MarkdownTableParser:
+    """Parse markdown tables into pandas DataFrames"""
+    
+    def parse_table(self, lines: List[str]) -> pd.DataFrame:
+        """Parse markdown table from input lines"""
+        table_lines = []
+        
+        # Filter for table lines only
+        for line in lines:
+            line = line.strip()
+            if line.startswith('|') and line.endswith('|'):
+                # Skip separator lines (|---|---|)
+                if re.match(r'^\|[-\s|]+\|$', line):
+                    continue
+                table_lines.append(line)
+        
+        if not table_lines:
+            raise ValueError("No valid markdown table found")
+        
+        # Parse header
+        header_line = table_lines[0]
+        headers = self._parse_row(header_line)
+        
+        # Parse data rows
+        data = []
+        for line in table_lines[1:]:
+            row_data = self._parse_row(line)
+            if len(row_data) == len(headers):
+                data.append(row_data)
+        
+        # Create DataFrame
+        df = pd.DataFrame(data, columns=headers)
+        
+        # Attempt to convert numeric columns
+        for col in df.columns:
+            df[col] = self._convert_column(df[col])
+        
+        return df
+    
+    def _parse_row(self, line: str) -> List[str]:
+        """Parse a single table row"""
+        # Remove leading/trailing |
+        line = line.strip('|')
+        # Split by | and clean whitespace
+        return [cell.strip() for cell in line.split('|')]
+    
+    def _convert_column(self, series: pd.Series) -> pd.Series:
+        """Attempt to convert column to numeric type"""
+        # Try to convert to numeric, keeping original if it fails
+        try:
+            # Clean numeric values (remove $, commas, etc.)
+            cleaned = series.astype(str).str.replace(r'[$,]', '', regex=True)
+            numeric = pd.to_numeric(cleaned, errors='coerce')
+            
+            # If more than half the values converted successfully, use numeric
+            if numeric.notna().sum() > len(series) * 0.5:
+                return numeric
+            else:
+                return series
+        except:
+            return series
+
+class MarkdownTableFormatter:
+    """Format pandas DataFrames as markdown tables"""
+    
+    def format_table(self, df: pd.DataFrame) -> str:
+        """Convert DataFrame to markdown table"""
+        if df.empty:
+            return "| (empty table) |\n|----------------|\n"
+        
+        lines = []
+        
+        # Add header row
+        headers = [str(col) for col in df.columns]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+        
+        # Add data rows
+        for _, row in df.iterrows():
+            row_data = []
+            for val in row:
+                # Handle different data types
+                if pd.isna(val):
+                    row_data.append("")
+                elif isinstance(val, (int, float)):
+                    if pd.isna(val):
+                        row_data.append("")
+                    elif isinstance(val, float) and val.is_integer():
+                        row_data.append(str(int(val)))
+                    else:
+                        # Format floats to reasonable precision
+                        row_data.append(f"{val:.3g}")
+                else:
+                    # Escape pipes in cell content
+                    cell_content = str(val).replace("|", "\\|")
+                    row_data.append(cell_content)
+            
+            lines.append("| " + " | ".join(row_data) + " |")
+        
+        return "\n".join(lines) + "\n"
+
+class TableAggregator:
+    """Perform aggregation operations on pandas DataFrames"""
+    
+    def __init__(self):
+        self.parser = MarkdownTableParser()
+        self.formatter = MarkdownTableFormatter()
+        
+        # Define available aggregation functions
+        self.agg_functions = {
+            'sum': 'sum',
+            'mean': 'mean',
+            'count': 'count',
+            'min': 'min',
+            'max': 'max',
+            'std': 'std',
+            'var': 'var',
+            'median': 'median',
+            'first': 'first',
+            'last': 'last',
+            'nunique': 'nunique',
+            'sem': 'sem',
+            'skew': 'skew',
+            'kurt': 'kurt',
+            'q25': lambda x: x.quantile(0.25),
+            'q50': lambda x: x.quantile(0.50),
+            'q75': lambda x: x.quantile(0.75),
+            'q90': lambda x: x.quantile(0.90),
+            'q95': lambda x: x.quantile(0.95),
+            'q99': lambda x: x.quantile(0.99),
+        }
+    
+    def group_and_aggregate(self, df: pd.DataFrame, groupby_cols: List[str], 
+                           agg_spec: Dict[str, List[str]]) -> pd.DataFrame:
+        """Group by columns and apply aggregations"""
+        
+        # Validate groupby columns exist
+        missing_cols = [col for col in groupby_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Groupby columns not found: {missing_cols}")
+        
+        # Validate aggregation columns and functions
+        for col, funcs in agg_spec.items():
+            if col not in df.columns:
+                raise ValueError(f"Aggregation column not found: {col}")
+            
+            for func in funcs:
+                if func not in self.agg_functions:
+                    raise ValueError(f"Unknown aggregation function: {func}")
+        
+        try:
+            # Perform groupby and aggregation
+            grouped = df.groupby(groupby_cols)
+            
+            # Build aggregation dictionary
+            agg_dict = {}
+            for col, funcs in agg_spec.items():
+                if len(funcs) == 1:
+                    agg_dict[col] = self.agg_functions[funcs[0]]
+                else:
+                    agg_dict[col] = [self.agg_functions[func] for func in funcs]
+            
+            result = grouped.agg(agg_dict)
+            
+            # Flatten column names if MultiIndex
+            if isinstance(result.columns, pd.MultiIndex):
+                result.columns = ['_'.join(col).strip() for col in result.columns.values]
+            
+            # Reset index to make groupby columns regular columns
+            result = result.reset_index()
+            
+            return result
+            
+        except Exception as e:
+            raise ValueError(f"Groupby aggregation failed: {e}")
+    
+    def window_functions(self, df: pd.DataFrame, order_col: str, 
+                        window_func: str, target_cols: List[str]) -> pd.DataFrame:
+        """Apply window functions to DataFrame"""
+        
+        # Validate order column exists
+        if order_col not in df.columns:
+            raise ValueError(f"Order column not found: {order_col}")
+        
+        # Validate target columns exist
+        missing_cols = [col for col in target_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Target columns not found: {missing_cols}")
+        
+        # Parse window function (e.g., "rolling:mean:5", "expanding:sum", "ewm:mean:0.3")
+        parts = window_func.split(':')
+        if len(parts) < 2:
+            raise ValueError(f"Invalid window function format: {window_func}")
+        
+        window_type = parts[0]
+        func_name = parts[1]
+        
+        if func_name not in ['mean', 'sum', 'min', 'max', 'std', 'var', 'count']:
+            raise ValueError(f"Unsupported window function: {func_name}")
+        
+        try:
+            # Sort by order column
+            result_df = df.sort_values(order_col).copy()
+            
+            for col in target_cols:
+                # Skip non-numeric columns
+                if not pd.api.types.is_numeric_dtype(result_df[col]):
+                    continue
+                
+                if window_type == 'rolling':
+                    if len(parts) < 3:
+                        raise ValueError("Rolling window requires window size (e.g., rolling:mean:5)")
+                    window_size = int(parts[2])
+                    window_obj = result_df[col].rolling(window=window_size)
+                    
+                elif window_type == 'expanding':
+                    window_obj = result_df[col].expanding()
+                    
+                elif window_type == 'ewm':
+                    if len(parts) < 3:
+                        raise ValueError("EWM requires alpha parameter (e.g., ewm:mean:0.3)")
+                    alpha = float(parts[2])
+                    window_obj = result_df[col].ewm(alpha=alpha)
+                    
+                else:
+                    raise ValueError(f"Unsupported window type: {window_type}")
+                
+                # Apply function
+                new_col_name = f"{col}_{window_type}_{func_name}"
+                if window_type == 'rolling':
+                    new_col_name += f"_{window_size}"
+                elif window_type == 'ewm':
+                    new_col_name += f"_{alpha}"
+                
+                result_df[new_col_name] = getattr(window_obj, func_name)()
+            
+            return result_df
+            
+        except Exception as e:
+            raise ValueError(f"Window function failed: {e}")
+    
+    def statistical_summary(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Generate comprehensive statistical summary"""
+        
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        
+        if len(numeric_cols) == 0:
+            raise ValueError("No numeric columns found for summary")
+        
+        try:
+            # Get basic statistics
+            summary = df[numeric_cols].describe()
+            
+            # Add additional statistics
+            additional_stats = {}
+            for col in numeric_cols:
+                col_data = df[col].dropna()
+                if len(col_data) > 0:
+                    additional_stats[col] = {
+                        'variance': col_data.var(),
+                        'skewness': col_data.skew(),
+                        'kurtosis': col_data.kurt(),
+                        'q25': col_data.quantile(0.25),
+                        'q75': col_data.quantile(0.75),
+                        'iqr': col_data.quantile(0.75) - col_data.quantile(0.25),
+                        'missing': df[col].isna().sum(),
+                        'zeros': (df[col] == 0).sum(),
+                    }
+            
+            # Convert additional stats to DataFrame
+            additional_df = pd.DataFrame(additional_stats).T
+            
+            # Combine with basic summary
+            summary = summary.T
+            summary = pd.concat([summary, additional_df], axis=1)
+            
+            # Reset index to make column names a regular column
+            summary = summary.reset_index()
+            summary.rename(columns={'index': 'column'}, inplace=True)
+            
+            return summary
+            
+        except Exception as e:
+            raise ValueError(f"Statistical summary failed: {e}")
+    
+    def pivot_aggregate(self, df: pd.DataFrame, index: str, columns: str, 
+                       values: str, agg_func: str) -> pd.DataFrame:
+        """Create pivot table with aggregation"""
+        
+        # Validate columns exist
+        missing_cols = []
+        for col in [index, columns, values]:
+            if col not in df.columns:
+                missing_cols.append(col)
+        
+        if missing_cols:
+            raise ValueError(f"Columns not found: {missing_cols}")
+        
+        if agg_func not in self.agg_functions:
+            raise ValueError(f"Unknown aggregation function: {agg_func}")
+        
+        try:
+            # Create pivot table
+            pivot_df = pd.pivot_table(
+                df,
+                index=index,
+                columns=columns,
+                values=values,
+                aggfunc=self.agg_functions[agg_func]
+            )
+            
+            # Flatten column names and reset index
+            pivot_df.columns.name = None
+            pivot_df = pivot_df.reset_index()
+            
+            return pivot_df
+            
+        except Exception as e:
+            raise ValueError(f"Pivot aggregation failed: {e}")
+    
+    def cross_tabulation(self, df: pd.DataFrame, row_cols: List[str], 
+                        col_cols: List[str], values_col: Optional[str] = None,
+                        agg_func: str = 'count') -> pd.DataFrame:
+        """Create cross-tabulation with optional aggregation"""
+        
+        # Validate columns exist
+        all_cols = row_cols + col_cols
+        if values_col:
+            all_cols.append(values_col)
+        
+        missing_cols = [col for col in all_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Columns not found: {missing_cols}")
+        
+        if agg_func not in self.agg_functions:
+            raise ValueError(f"Unknown aggregation function: {agg_func}")
+        
+        try:
+            if values_col:
+                # Cross-tabulation with values
+                crosstab = pd.crosstab(
+                    [df[col] for col in row_cols],
+                    [df[col] for col in col_cols],
+                    values=df[values_col],
+                    aggfunc=self.agg_functions[agg_func]
+                )
+            else:
+                # Simple frequency cross-tabulation
+                crosstab = pd.crosstab(
+                    [df[col] for col in row_cols],
+                    [df[col] for col in col_cols]
+                )
+            
+            # Reset index to make row variables regular columns
+            crosstab = crosstab.reset_index()
+            
+            return crosstab
+            
+        except Exception as e:
+            raise ValueError(f"Cross-tabulation failed: {e}")
+
+def parse_aggregation_spec(agg_str: str) -> Dict[str, List[str]]:
+    """Parse aggregation specification string"""
+    agg_spec = {}
+    
+    for item in agg_str.split(','):
+        item = item.strip()
+        if ':' in item:
+            # Column-specific aggregation (e.g., "sales:sum")
+            col, funcs = item.split(':', 1)
+            col = col.strip()
+            func_list = [f.strip() for f in funcs.split('+')]
+            agg_spec[col] = func_list
+        else:
+            # Apply to all numeric columns
+            raise ValueError(f"Aggregation specification must include column name: {item}")
+    
+    return agg_spec
+
+def parse_column_list(column_str: str) -> List[str]:
+    """Parse comma-separated column list"""
+    if not column_str:
+        return []
+    return [col.strip() for col in column_str.split(',')]
+
+def parse_key_value_pairs(kv_str: str) -> Dict[str, str]:
+    """Parse key=value pairs"""
+    result = {}
+    for pair in kv_str.split(' '):
+        if '=' in pair:
+            key, value = pair.split('=', 1)
+            result[key.strip()] = value.strip()
+    return result
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Advanced aggregation operations for markdown tables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Group by category, sum sales
+  md_table_aggregate --groupby category --agg sales:sum
+  
+  # Multiple grouping and aggregations
+  md_table_aggregate --groupby region,category --agg sales:sum,price:mean+std
+  
+  # Rolling average
+  md_table_aggregate --window date --func rolling:mean:7 --columns price,volume
+  
+  # Statistical summary
+  md_table_aggregate --summary
+  
+  # Pivot with aggregation
+  md_table_aggregate --pivot-agg index=product columns=quarter values=revenue agg=sum
+  
+  # Cross-tabulation
+  md_table_aggregate --crosstab rows=category columns=region values=sales agg=mean
+        """
+    )
+    
+    # Operation type (mutually exclusive)
+    op_group = parser.add_mutually_exclusive_group(required=True)
+    op_group.add_argument('--groupby', help='Group by columns (comma-separated)')
+    op_group.add_argument('--window', help='Order column for window functions')
+    op_group.add_argument('--summary', action='store_true', help='Statistical summary of numeric columns')
+    op_group.add_argument('--pivot-agg', help='Pivot aggregation (format: index=col columns=col values=col agg=func)')
+    op_group.add_argument('--crosstab', help='Cross-tabulation (format: rows=col1,col2 columns=col3)')
+    
+    # Aggregation options
+    parser.add_argument('--agg', help='Aggregation specification (e.g., sales:sum,price:mean+std)')
+    parser.add_argument('--func', help='Window function (e.g., rolling:mean:5, expanding:sum, ewm:mean:0.3)')
+    parser.add_argument('--columns', help='Target columns for window functions (comma-separated)')
+    
+    # Cross-tabulation options
+    parser.add_argument('--values', help='Values column for cross-tabulation')
+    parser.add_argument('--agg-func', default='count', help='Aggregation function for cross-tabulation')
+    
+    # I/O options
+    parser.add_argument('--input', '-i', help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', help='Output markdown file (default: stdout)')
+    parser.add_argument('--filter', help='Filter rows before aggregation (pandas query syntax)')
+    
+    # Debug options
+    parser.add_argument('--debug', action='store_true', help='Show debug information')
+    
+    args = parser.parse_args()
+    
+    try:
+        aggregator = TableAggregator()
+        
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        else:
+            lines = sys.stdin.readlines()
+        
+        if not lines:
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse table
+        df = aggregator.parser.parse_table(lines)
+        
+        if args.debug:
+            print(f"Debug: Input table shape: {df.shape}", file=sys.stderr)
+            print(f"Debug: Columns: {list(df.columns)}", file=sys.stderr)
+            print(f"Debug: Numeric columns: {list(df.select_dtypes(include=[np.number]).columns)}", file=sys.stderr)
+        
+        # Apply filter if specified
+        if args.filter:
+            original_shape = df.shape
+            df = df.query(args.filter)
+            if args.debug:
+                print(f"Debug: After filter shape: {df.shape} (filtered {original_shape[0] - df.shape[0]} rows)", file=sys.stderr)
+        
+        # Perform aggregation operation
+        if args.groupby:
+            if not args.agg:
+                print("Error: --agg required with --groupby", file=sys.stderr)
+                sys.exit(1)
+            
+            groupby_cols = parse_column_list(args.groupby)
+            agg_spec = parse_aggregation_spec(args.agg)
+            
+            result_df = aggregator.group_and_aggregate(df, groupby_cols, agg_spec)
+            
+        elif args.window:
+            if not args.func:
+                print("Error: --func required with --window", file=sys.stderr)
+                sys.exit(1)
+            
+            if not args.columns:
+                # Use all numeric columns
+                target_cols = list(df.select_dtypes(include=[np.number]).columns)
+            else:
+                target_cols = parse_column_list(args.columns)
+            
+            result_df = aggregator.window_functions(df, args.window, args.func, target_cols)
+            
+        elif args.summary:
+            result_df = aggregator.statistical_summary(df)
+            
+        elif args.pivot_agg:
+            params = parse_key_value_pairs(args.pivot_agg)
+            required_params = ['index', 'columns', 'values', 'agg']
+            missing_params = [p for p in required_params if p not in params]
+            if missing_params:
+                print(f"Error: Missing required pivot-agg parameters: {missing_params}", file=sys.stderr)
+                print("Format: index=col columns=col values=col agg=func", file=sys.stderr)
+                sys.exit(1)
+            
+            result_df = aggregator.pivot_aggregate(
+                df, params['index'], params['columns'], params['values'], params['agg']
+            )
+            
+        elif args.crosstab:
+            params = parse_key_value_pairs(args.crosstab)
+            if 'rows' not in params or 'columns' not in params:
+                print("Error: Missing required crosstab parameters: rows, columns", file=sys.stderr)
+                print("Format: rows=col1,col2 columns=col3", file=sys.stderr)
+                sys.exit(1)
+            
+            row_cols = parse_column_list(params['rows'])
+            col_cols = parse_column_list(params['columns'])
+            values_col = args.values
+            
+            result_df = aggregator.cross_tabulation(
+                df, row_cols, col_cols, values_col, args.agg_func
+            )
+        
+        if args.debug:
+            print(f"Debug: Output table shape: {result_df.shape}", file=sys.stderr)
+            print(f"Debug: Output columns: {list(result_df.columns)}", file=sys.stderr)
+        
+        # Format output
+        output = aggregator.formatter.format_table(result_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output)
+            print(f"Aggregated table written to: {args.output}", file=sys.stderr)
+        else:
+            print(output, end='')
+            
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

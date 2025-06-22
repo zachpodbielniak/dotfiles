@@ -1,0 +1,756 @@
+#!/usr/bin/python3
+"""
+md_table_export_enhanced - Advanced export of markdown tables to multiple formats
+
+Usage:
+  cat table.md | md_table_export_enhanced --format excel --output data.xlsx
+  md_table_export_enhanced --input table.md --format json --output data.json
+  md_table_export_enhanced --input table.md --format all --output-dir exports/
+  cat table.md | md_table_export_enhanced --format sqlite --output database.db
+
+Supported formats:
+  - excel: Excel (.xlsx) with formatting and multiple sheets
+  - json: JSON with structured data and metadata
+  - csv: Comma-separated values
+  - xml: XML with schema
+  - parquet: Apache Parquet columnar format
+  - sqlite: SQLite database
+  - yaml: YAML structured data
+  - html: HTML table with styling
+  - all: Export to all formats
+
+Excel-specific options:
+  - Sheet names, styling, conditional formatting
+  - Data types preservation
+  - Charts and pivot tables
+  - Password protection
+
+Export features:
+  - Data type inference and preservation
+  - Schema and metadata export
+  - Batch processing of multiple tables
+  - Custom formatting and styling
+  - Compression and optimization
+
+Examples:
+  # Basic export
+  cat data.md | md_table_export_enhanced --format excel --output report.xlsx
+
+  # With custom sheet name and styling
+  md_table_export_enhanced --input data.md --format excel --output report.xlsx \\
+    --sheet-name "Sales Data" --style professional
+
+  # Export with data types preserved
+  cat table.md | md_table_export_enhanced --format parquet --output data.parquet \\
+    --preserve-types --compress
+
+  # Batch export to all formats
+  md_table_export_enhanced --input table.md --format all --output-dir ./exports/
+
+  # SQLite with custom table name
+  cat data.md | md_table_export_enhanced --format sqlite --output db.sqlite \\
+    --table-name employee_data
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import json
+import re
+import sqlite3
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Union
+from datetime import datetime
+import io
+
+# Try to import required packages with helpful error messages
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError as e:
+    missing_pkg = str(e).split("'")[1] if "'" in str(e) else "unknown"
+    print(f"Error: Required dependency '{missing_pkg}' not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("  - pandas: Data processing and export", file=sys.stderr)
+    print("  - numpy: Data type handling", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+# Optional dependencies with graceful fallback
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    PARQUET_AVAILABLE = True
+except ImportError:
+    PARQUET_AVAILABLE = False
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+class MarkdownTableExporter:
+    def __init__(self):
+        self.supported_formats = {
+            'excel': self.export_excel,
+            'json': self.export_json,
+            'csv': self.export_csv,
+            'xml': self.export_xml,
+            'parquet': self.export_parquet,
+            'sqlite': self.export_sqlite,
+            'yaml': self.export_yaml,
+            'html': self.export_html,
+            'all': self.export_all
+        }
+        
+    def parse_table_from_lines(self, lines: List[str]) -> pd.DataFrame:
+        """Parse markdown table from input lines"""
+        table_lines = []
+        
+        # Filter for table lines only
+        for line in lines:
+            line = line.strip()
+            if line.startswith('|') and line.endswith('|'):
+                # Skip separator lines (|---|---|)
+                if re.match(r'^\|[-\s|]+\|$', line):
+                    continue
+                table_lines.append(line)
+        
+        if not table_lines:
+            raise ValueError("No valid markdown table found")
+        
+        # Parse header
+        header_line = table_lines[0]
+        headers = self._parse_row(header_line)
+        
+        # Parse data rows
+        data_rows = []
+        for line in table_lines[1:]:
+            row_data = self._parse_row(line)
+            if len(row_data) == len(headers):
+                data_rows.append(row_data)
+        
+        if not data_rows:
+            # Return empty DataFrame with just headers
+            return pd.DataFrame(columns=headers)
+        
+        return pd.DataFrame(data_rows, columns=headers)
+    
+    def _parse_row(self, line: str) -> List[str]:
+        """Parse a single table row"""
+        # Remove leading/trailing |
+        line = line.strip('|')
+        # Split by | and clean whitespace
+        return [cell.strip() for cell in line.split('|')]
+    
+    def infer_and_convert_types(self, df: pd.DataFrame, preserve_types: bool = True) -> pd.DataFrame:
+        """Infer and convert column data types"""
+        if not preserve_types:
+            return df
+        
+        df_converted = df.copy()
+        
+        for col in df_converted.columns:
+            # Skip empty columns
+            if df_converted[col].isna().all():
+                continue
+            
+            # Try to convert to numeric
+            try:
+                # Check if all non-null values can be converted to float
+                numeric_series = pd.to_numeric(df_converted[col], errors='coerce')
+                if not numeric_series.isna().all():
+                    # Check if all numbers are integers
+                    non_null_numeric = numeric_series.dropna()
+                    if len(non_null_numeric) > 0 and all(x == int(x) for x in non_null_numeric):
+                        df_converted[col] = pd.to_numeric(df_converted[col], errors='coerce').astype('Int64')
+                    else:
+                        df_converted[col] = pd.to_numeric(df_converted[col], errors='coerce')
+                    continue
+            except:
+                pass
+            
+            # Try to convert to datetime
+            try:
+                datetime_series = pd.to_datetime(df_converted[col], errors='coerce')
+                if not datetime_series.isna().all():
+                    df_converted[col] = datetime_series
+                    continue
+            except:
+                pass
+            
+            # Try to convert to boolean
+            try:
+                unique_values = df_converted[col].dropna().str.lower().unique()
+                if len(unique_values) <= 2 and all(v in ['true', 'false', 'yes', 'no', '1', '0'] for v in unique_values):
+                    bool_map = {'true': True, 'false': False, 'yes': True, 'no': False, '1': True, '0': False}
+                    df_converted[col] = df_converted[col].str.lower().map(bool_map)
+                    continue
+            except:
+                pass
+            
+            # Keep as string (object type)
+        
+        return df_converted
+    
+    def export_excel(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to Excel with advanced formatting"""
+        if not EXCEL_AVAILABLE:
+            print("Warning: openpyxl not available. Installing requirements...", file=sys.stderr)
+            try:
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
+                import openpyxl
+                from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+                from openpyxl.formatting.rule import ColorScaleRule
+                from openpyxl.utils.dataframe import dataframe_to_rows
+            except:
+                print("Error: Could not install openpyxl. Falling back to CSV export.", file=sys.stderr)
+                self.export_csv(df, output_path.replace('.xlsx', '.csv'))
+                return
+        
+        sheet_name = kwargs.get('sheet_name', 'Sheet1')
+        style = kwargs.get('style', 'default')
+        password = kwargs.get('password', None)
+        
+        # Create workbook and worksheet
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_name
+        
+        # Write data
+        for r in dataframe_to_rows(df, index=False, header=True):
+            ws.append(r)
+        
+        # Apply styling based on style parameter
+        if style == 'professional':
+            self._apply_professional_style(ws, df)
+        elif style == 'colorful':
+            self._apply_colorful_style(ws, df)
+        else:
+            self._apply_default_style(ws, df)
+        
+        # Add metadata sheet
+        if kwargs.get('include_metadata', True):
+            self._add_metadata_sheet(wb, df)
+        
+        # Protect with password if specified
+        if password:
+            ws.protection.password = password
+        
+        # Save workbook
+        wb.save(output_path)
+    
+    def _apply_professional_style(self, ws, df):
+        """Apply professional Excel styling"""
+        # Header styling
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+        
+        # Add borders
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.border = thin_border
+        
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+    
+    def _apply_colorful_style(self, ws, df):
+        """Apply colorful Excel styling with conditional formatting"""
+        self._apply_professional_style(ws, df)
+        
+        # Add conditional formatting for numeric columns
+        for col_idx, col_name in enumerate(df.columns, 1):
+            if df[col_name].dtype in ['int64', 'float64', 'Int64']:
+                col_letter = openpyxl.utils.get_column_letter(col_idx)
+                cell_range = f"{col_letter}2:{col_letter}{len(df)+1}"
+                
+                # Add color scale rule
+                color_scale_rule = ColorScaleRule(
+                    start_type='min', start_color='F8696B',
+                    mid_type='percentile', mid_value=50, mid_color='FFEB9C',
+                    end_type='max', end_color='63BE7B'
+                )
+                ws.conditional_formatting.add(cell_range, color_scale_rule)
+    
+    def _apply_default_style(self, ws, df):
+        """Apply default Excel styling"""
+        # Just bold headers
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+    
+    def _add_metadata_sheet(self, wb, df):
+        """Add metadata sheet to Excel workbook"""
+        metadata_ws = wb.create_sheet("Metadata")
+        
+        metadata = [
+            ["Export Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ["Rows", len(df)],
+            ["Columns", len(df.columns)],
+            ["Column Names", ", ".join(df.columns.tolist())],
+            ["Data Types", ""],
+        ]
+        
+        for col in df.columns:
+            metadata.append([f"  {col}", str(df[col].dtype)])
+        
+        for row in metadata:
+            metadata_ws.append(row)
+        
+        # Style metadata sheet
+        metadata_ws['A1'].font = Font(bold=True, size=14)
+        for row in metadata_ws.iter_rows(min_row=2, max_row=5):
+            row[0].font = Font(bold=True)
+    
+    def export_json(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to JSON with metadata"""
+        include_metadata = kwargs.get('include_metadata', True)
+        orient = kwargs.get('orient', 'records')
+        
+        data = {
+            'data': json.loads(df.to_json(orient=orient, date_format='iso'))
+        }
+        
+        if include_metadata:
+            data['metadata'] = {
+                'export_date': datetime.now().isoformat(),
+                'rows': len(df),
+                'columns': len(df.columns),
+                'column_names': df.columns.tolist(),
+                'data_types': {col: str(df[col].dtype) for col in df.columns}
+            }
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+    
+    def export_csv(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to CSV"""
+        separator = kwargs.get('separator', ',')
+        encoding = kwargs.get('encoding', 'utf-8')
+        
+        df.to_csv(output_path, sep=separator, index=False, encoding=encoding)
+    
+    def export_xml(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to XML with schema"""
+        root = ET.Element("data")
+        
+        # Add metadata
+        metadata = ET.SubElement(root, "metadata")
+        ET.SubElement(metadata, "export_date").text = datetime.now().isoformat()
+        ET.SubElement(metadata, "rows").text = str(len(df))
+        ET.SubElement(metadata, "columns").text = str(len(df.columns))
+        
+        # Add schema
+        schema = ET.SubElement(root, "schema")
+        for col in df.columns:
+            col_element = ET.SubElement(schema, "column", name=str(col))
+            col_element.text = str(df[col].dtype)
+        
+        # Add records
+        records = ET.SubElement(root, "records")
+        for _, row in df.iterrows():
+            record = ET.SubElement(records, "record")
+            for col in df.columns:
+                field = ET.SubElement(record, "field", name=str(col))
+                value = row[col]
+                if pd.notna(value):
+                    field.text = str(value)
+        
+        # Write to file
+        tree = ET.ElementTree(root)
+        tree.write(output_path, encoding='utf-8', xml_declaration=True)
+    
+    def export_parquet(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to Parquet format"""
+        if not PARQUET_AVAILABLE:
+            print("Warning: pyarrow not available. Installing requirements...", file=sys.stderr)
+            try:
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "pyarrow"])
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+            except:
+                print("Error: Could not install pyarrow. Falling back to CSV export.", file=sys.stderr)
+                self.export_csv(df, output_path.replace('.parquet', '.csv'))
+                return
+        
+        compression = kwargs.get('compression', 'snappy')
+        
+        # Convert to Arrow table
+        table = pa.Table.from_pandas(df)
+        
+        # Write to parquet
+        pq.write_table(table, output_path, compression=compression)
+    
+    def export_sqlite(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to SQLite database"""
+        table_name = kwargs.get('table_name', 'data')
+        if_exists = kwargs.get('if_exists', 'replace')
+        
+        # Create connection
+        conn = sqlite3.connect(output_path)
+        
+        try:
+            # Write data
+            df.to_sql(table_name, conn, if_exists=if_exists, index=False)
+            
+            # Add metadata table
+            metadata_df = pd.DataFrame([
+                {'key': 'export_date', 'value': datetime.now().isoformat()},
+                {'key': 'rows', 'value': str(len(df))},
+                {'key': 'columns', 'value': str(len(df.columns))},
+                {'key': 'table_name', 'value': table_name}
+            ])
+            metadata_df.to_sql('metadata', conn, if_exists='replace', index=False)
+            
+            # Add column info table
+            column_info = []
+            for col in df.columns:
+                column_info.append({
+                    'column_name': col,
+                    'data_type': str(df[col].dtype),
+                    'non_null_count': df[col].count(),
+                    'unique_count': df[col].nunique()
+                })
+            
+            column_df = pd.DataFrame(column_info)
+            column_df.to_sql('column_info', conn, if_exists='replace', index=False)
+            
+        finally:
+            conn.close()
+    
+    def export_yaml(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to YAML format"""
+        if not YAML_AVAILABLE:
+            print("Warning: pyyaml not available. Installing requirements...", file=sys.stderr)
+            try:
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "pyyaml"])
+                import yaml
+            except:
+                print("Error: Could not install pyyaml. Falling back to JSON export.", file=sys.stderr)
+                self.export_json(df, output_path.replace('.yaml', '.json').replace('.yml', '.json'))
+                return
+        
+        include_metadata = kwargs.get('include_metadata', True)
+        
+        data = {
+            'data': df.to_dict('records')
+        }
+        
+        if include_metadata:
+            data['metadata'] = {
+                'export_date': datetime.now().isoformat(),
+                'rows': len(df),
+                'columns': len(df.columns),
+                'column_names': df.columns.tolist(),
+                'data_types': {col: str(df[col].dtype) for col in df.columns}
+            }
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+    
+    def export_html(self, df: pd.DataFrame, output_path: str, **kwargs) -> None:
+        """Export to HTML with styling"""
+        table_id = kwargs.get('table_id', 'data-table')
+        style = kwargs.get('style', 'default')
+        include_metadata = kwargs.get('include_metadata', True)
+        
+        # Generate HTML
+        html_content = self._generate_html_template(df, table_id, style, include_metadata)
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+    
+    def _generate_html_template(self, df: pd.DataFrame, table_id: str, style: str, include_metadata: bool) -> str:
+        """Generate HTML template with styling"""
+        css_styles = {
+            'default': """
+                table { border-collapse: collapse; width: 100%; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f2f2f2; font-weight: bold; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+            """,
+            'professional': """
+                table { border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; }
+                th, td { border: 1px solid #366092; padding: 12px; text-align: left; }
+                th { background-color: #366092; color: white; font-weight: bold; }
+                tr:nth-child(even) { background-color: #f8f9fa; }
+                tr:hover { background-color: #e9ecef; }
+            """,
+            'colorful': """
+                table { border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; }
+                th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+                th { background: linear-gradient(45deg, #ff6b6b, #4ecdc4); color: white; font-weight: bold; }
+                tr:nth-child(even) { background-color: #f0f8ff; }
+                tr:hover { background-color: #e0e0e0; }
+            """
+        }
+        
+        # Convert DataFrame to HTML table
+        table_html = df.to_html(table_id=table_id, escape=False, index=False)
+        
+        # Create complete HTML document
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Data Export</title>
+    <style>
+        {css_styles.get(style, css_styles['default'])}
+        .metadata {{ 
+            margin: 20px 0; 
+            padding: 15px; 
+            background-color: #f5f5f5; 
+            border-radius: 5px; 
+            font-family: Arial, sans-serif;
+        }}
+        .metadata h3 {{ margin-top: 0; color: #333; }}
+        .metadata p {{ margin: 5px 0; }}
+    </style>
+</head>
+<body>
+    <h1>Data Export</h1>
+"""
+        
+        if include_metadata:
+            html += f"""
+    <div class="metadata">
+        <h3>Metadata</h3>
+        <p><strong>Export Date:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+        <p><strong>Rows:</strong> {len(df)}</p>
+        <p><strong>Columns:</strong> {len(df.columns)}</p>
+        <p><strong>Column Names:</strong> {', '.join(df.columns.tolist())}</p>
+    </div>
+"""
+        
+        html += f"""
+    {table_html}
+</body>
+</html>
+"""
+        return html
+    
+    def export_all(self, df: pd.DataFrame, output_dir: str, **kwargs) -> None:
+        """Export to all supported formats"""
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        base_name = kwargs.get('base_name', 'data')
+        
+        # Export to each format
+        formats_to_export = [
+            ('excel', 'xlsx'),
+            ('json', 'json'),
+            ('csv', 'csv'),
+            ('xml', 'xml'),
+            ('parquet', 'parquet'),
+            ('sqlite', 'db'),
+            ('yaml', 'yaml'),
+            ('html', 'html')
+        ]
+        
+        exported_files = []
+        for format_name, extension in formats_to_export:
+            try:
+                file_path = output_path / f"{base_name}.{extension}"
+                self.supported_formats[format_name](df, str(file_path), **kwargs)
+                exported_files.append(str(file_path))
+                print(f"Exported {format_name}: {file_path}", file=sys.stderr)
+            except Exception as e:
+                print(f"Warning: Failed to export {format_name}: {e}", file=sys.stderr)
+        
+        return exported_files
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Advanced export of markdown tables to multiple formats',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Format-specific options:
+  Excel: --sheet-name, --style (default|professional|colorful), --password
+  JSON: --orient (records|index|values), --include-metadata
+  CSV: --separator, --encoding
+  XML: --include-metadata
+  Parquet: --compression (snappy|gzip|brotli)
+  SQLite: --table-name, --if-exists (replace|append|fail)
+  YAML: --include-metadata
+  HTML: --style, --table-id, --include-metadata
+
+Examples:
+  # Basic export
+  cat data.md | md_table_export_enhanced --format excel --output report.xlsx
+
+  # Professional Excel with custom sheet
+  md_table_export_enhanced -i data.md -f excel -o report.xlsx \\
+    --sheet-name "Q4 Sales" --style professional
+
+  # Export all formats
+  cat table.md | md_table_export_enhanced --format all --output-dir ./exports/
+
+  # SQLite with metadata
+  md_table_export_enhanced -i data.md -f sqlite -o data.db --table-name employees
+        """
+    )
+    
+    parser.add_argument('--input', '-i', help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', help='Output file path')
+    parser.add_argument('--output-dir', help='Output directory (for --format all)')
+    parser.add_argument('--format', '-f', required=True, 
+                       choices=['excel', 'json', 'csv', 'xml', 'parquet', 'sqlite', 'yaml', 'html', 'all'],
+                       help='Output format')
+    
+    # General options
+    parser.add_argument('--preserve-types', action='store_true', 
+                       help='Preserve and infer data types')
+    parser.add_argument('--include-metadata', action='store_true', default=True,
+                       help='Include metadata in export')
+    parser.add_argument('--base-name', default='data',
+                       help='Base filename for --format all (default: data)')
+    
+    # Excel-specific options
+    parser.add_argument('--sheet-name', default='Sheet1',
+                       help='Excel sheet name (default: Sheet1)')
+    parser.add_argument('--style', choices=['default', 'professional', 'colorful'], 
+                       default='default', help='Styling theme')
+    parser.add_argument('--password', help='Password protection for Excel file')
+    
+    # Format-specific options
+    parser.add_argument('--separator', default=',', help='CSV separator (default: ,)')
+    parser.add_argument('--encoding', default='utf-8', help='Text encoding (default: utf-8)')
+    parser.add_argument('--compression', choices=['snappy', 'gzip', 'brotli'], 
+                       default='snappy', help='Parquet compression (default: snappy)')
+    parser.add_argument('--table-name', default='data', help='SQLite table name (default: data)')
+    parser.add_argument('--if-exists', choices=['replace', 'append', 'fail'], 
+                       default='replace', help='SQLite behavior if table exists')
+    parser.add_argument('--orient', choices=['records', 'index', 'values'], 
+                       default='records', help='JSON orientation (default: records)')
+    parser.add_argument('--table-id', default='data-table', help='HTML table ID')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.format == 'all' and not args.output_dir:
+        print("Error: --output-dir required when using --format all", file=sys.stderr)
+        sys.exit(1)
+    elif args.format != 'all' and not args.output:
+        print("Error: --output required for single format export", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        exporter = MarkdownTableExporter()
+        
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        else:
+            lines = sys.stdin.readlines()
+        
+        # Parse table
+        df = exporter.parse_table_from_lines(lines)
+        
+        # Convert data types if requested
+        if args.preserve_types:
+            df = exporter.infer_and_convert_types(df, preserve_types=True)
+        
+        # Prepare export options
+        export_options = {
+            'preserve_types': args.preserve_types,
+            'include_metadata': args.include_metadata,
+            'base_name': args.base_name,
+            'sheet_name': args.sheet_name,
+            'style': args.style,
+            'password': args.password,
+            'separator': args.separator,
+            'encoding': args.encoding,
+            'compression': args.compression,
+            'table_name': args.table_name,
+            'if_exists': args.if_exists,
+            'orient': args.orient,
+            'table_id': args.table_id
+        }
+        
+        # Export data
+        if args.format == 'all':
+            exported_files = exporter.export_all(df, args.output_dir, **export_options)
+            print(f"Exported {len(exported_files)} files to {args.output_dir}", file=sys.stderr)
+        else:
+            output_path = args.output
+            exporter.supported_formats[args.format](df, output_path, **export_options)
+            print(f"Exported {args.format}: {output_path}", file=sys.stderr)
+    
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

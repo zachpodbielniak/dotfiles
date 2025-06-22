@@ -1,0 +1,498 @@
+#!/usr/bin/python3
+"""
+md_table_reshape - Transform markdown table structure with pivot, melt, transpose operations
+
+Usage:
+  echo "table" | md_table_reshape --pivot index=A values=B columns=C
+  md_table_reshape --melt id-vars=A,B var-name=Variable value-name=Value < table.md
+  md_table_reshape --transpose < table.md
+  md_table_reshape --reorder A,C,B < table.md
+  md_table_reshape --filter "A > 10" --pivot index=category values=amount columns=month < table.md
+
+Operations:
+  --pivot: Transform long to wide format (requires index, values, columns)
+  --melt: Transform wide to long format (requires id-vars, var-name, value-name)  
+  --transpose: Swap rows and columns
+  --reorder: Reorder columns by name
+  --filter: Filter rows before reshaping (pandas query syntax)
+
+Pivot options:
+  --aggfunc: Aggregation function for duplicates (sum, mean, count, min, max, std)
+  --fill-value: Value to fill missing cells (default: empty)
+  --margins: Add row/column totals (requires --aggfunc)
+
+Melt options:
+  --value-vars: Columns to melt (default: all non-id columns)
+  --var-name: Name for variable column (default: 'variable')
+  --value-name: Name for value column (default: 'value')
+
+Examples:
+  # Pivot sales data
+  md_table_reshape --pivot index=product values=sales columns=month --aggfunc=sum
+  
+  # Melt wide format to long
+  md_table_reshape --melt id-vars=product,category var-name=metric value-name=score
+  
+  # Transpose matrix
+  md_table_reshape --transpose
+  
+  # Reorder columns
+  md_table_reshape --reorder name,age,salary,department
+  
+  # Filter and pivot
+  md_table_reshape --filter "sales > 1000" --pivot index=region values=sales columns=quarter
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import io
+import re
+from typing import List, Dict, Any, Optional
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+class MarkdownTableParser:
+    """Parse markdown tables into pandas DataFrames"""
+    
+    def parse_table(self, lines: List[str]) -> pd.DataFrame:
+        """Parse markdown table from input lines"""
+        table_lines = []
+        
+        # Filter for table lines only
+        for line in lines:
+            line = line.strip()
+            if line.startswith('|') and line.endswith('|'):
+                # Skip separator lines (|---|---|)
+                if re.match(r'^\|[-\s|]+\|$', line):
+                    continue
+                table_lines.append(line)
+        
+        if not table_lines:
+            raise ValueError("No valid markdown table found")
+        
+        # Parse header
+        header_line = table_lines[0]
+        headers = self._parse_row(header_line)
+        
+        # Parse data rows
+        data = []
+        for line in table_lines[1:]:
+            row_data = self._parse_row(line)
+            if len(row_data) == len(headers):
+                data.append(row_data)
+        
+        # Create DataFrame
+        df = pd.DataFrame(data, columns=headers)
+        
+        # Attempt to convert numeric columns
+        for col in df.columns:
+            df[col] = self._convert_column(df[col])
+        
+        return df
+    
+    def _parse_row(self, line: str) -> List[str]:
+        """Parse a single table row"""
+        # Remove leading/trailing |
+        line = line.strip('|')
+        # Split by | and clean whitespace
+        return [cell.strip() for cell in line.split('|')]
+    
+    def _convert_column(self, series: pd.Series) -> pd.Series:
+        """Attempt to convert column to numeric type"""
+        # Try to convert to numeric, keeping original if it fails
+        try:
+            # Clean numeric values (remove $, commas, etc.)
+            cleaned = series.astype(str).str.replace(r'[$,]', '', regex=True)
+            numeric = pd.to_numeric(cleaned, errors='coerce')
+            
+            # If more than half the values converted successfully, use numeric
+            if numeric.notna().sum() > len(series) * 0.5:
+                return numeric
+            else:
+                return series
+        except:
+            return series
+
+class MarkdownTableFormatter:
+    """Format pandas DataFrames as markdown tables"""
+    
+    def format_table(self, df: pd.DataFrame) -> str:
+        """Convert DataFrame to markdown table"""
+        if df.empty:
+            return "| (empty table) |\n|----------------|\n"
+        
+        lines = []
+        
+        # Add header row
+        headers = [str(col) for col in df.columns]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+        
+        # Add data rows
+        for _, row in df.iterrows():
+            row_data = []
+            for val in row:
+                # Handle different data types
+                if pd.isna(val):
+                    row_data.append("")
+                elif isinstance(val, (int, float)):
+                    if pd.isna(val):
+                        row_data.append("")
+                    elif isinstance(val, float) and val.is_integer():
+                        row_data.append(str(int(val)))
+                    else:
+                        row_data.append(str(val))
+                else:
+                    # Escape pipes in cell content
+                    cell_content = str(val).replace("|", "\\|")
+                    row_data.append(cell_content)
+            
+            lines.append("| " + " | ".join(row_data) + " |")
+        
+        return "\n".join(lines) + "\n"
+
+class TableReshaper:
+    """Perform reshape operations on pandas DataFrames"""
+    
+    def __init__(self):
+        self.parser = MarkdownTableParser()
+        self.formatter = MarkdownTableFormatter()
+    
+    def pivot_table(self, df: pd.DataFrame, index: str, values: str, columns: str, 
+                   aggfunc: str = 'mean', fill_value: Any = None, margins: bool = False) -> pd.DataFrame:
+        """Create pivot table from DataFrame"""
+        
+        # Validate columns exist
+        missing_cols = []
+        for col in [index, values, columns]:
+            if col not in df.columns:
+                missing_cols.append(col)
+        
+        if missing_cols:
+            raise ValueError(f"Columns not found: {missing_cols}")
+        
+        # Map aggfunc string to function
+        agg_funcs = {
+            'sum': 'sum',
+            'mean': 'mean', 
+            'count': 'count',
+            'min': 'min',
+            'max': 'max',
+            'std': 'std',
+            'median': 'median',
+            'first': 'first',
+            'last': 'last'
+        }
+        
+        if aggfunc not in agg_funcs:
+            raise ValueError(f"Unsupported aggfunc: {aggfunc}. Choose from: {list(agg_funcs.keys())}")
+        
+        try:
+            # Create pivot table
+            pivot_df = pd.pivot_table(
+                df,
+                index=index,
+                values=values,
+                columns=columns,
+                aggfunc=agg_funcs[aggfunc],
+                fill_value=fill_value,
+                margins=margins
+            )
+            
+            # Flatten column names if MultiIndex
+            if isinstance(pivot_df.columns, pd.MultiIndex):
+                pivot_df.columns = [str(col) for col in pivot_df.columns]
+            
+            # Reset index to make it a regular column
+            pivot_df = pivot_df.reset_index()
+            
+            return pivot_df
+            
+        except Exception as e:
+            raise ValueError(f"Pivot operation failed: {e}")
+    
+    def melt_table(self, df: pd.DataFrame, id_vars: List[str], 
+                  value_vars: Optional[List[str]] = None,
+                  var_name: str = 'variable', value_name: str = 'value') -> pd.DataFrame:
+        """Melt DataFrame from wide to long format"""
+        
+        # Validate id_vars exist
+        missing_cols = [col for col in id_vars if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"ID columns not found: {missing_cols}")
+        
+        # If value_vars not specified, use all columns except id_vars
+        if value_vars is None:
+            value_vars = [col for col in df.columns if col not in id_vars]
+        else:
+            # Validate value_vars exist
+            missing_cols = [col for col in value_vars if col not in df.columns]
+            if missing_cols:
+                raise ValueError(f"Value columns not found: {missing_cols}")
+        
+        try:
+            melted_df = pd.melt(
+                df,
+                id_vars=id_vars,
+                value_vars=value_vars,
+                var_name=var_name,
+                value_name=value_name
+            )
+            
+            return melted_df
+            
+        except Exception as e:
+            raise ValueError(f"Melt operation failed: {e}")
+    
+    def transpose_table(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Transpose DataFrame (swap rows and columns)"""
+        try:
+            # Transpose and reset index
+            transposed = df.T
+            
+            # Use first row as column names
+            if len(transposed) > 0:
+                # Make first row the column names
+                new_columns = transposed.iloc[0].astype(str)
+                transposed_df = transposed[1:].copy()
+                transposed_df.columns = new_columns
+                
+                # Reset index to make it a regular column
+                transposed_df = transposed_df.reset_index()
+                transposed_df.rename(columns={'index': 'original_column'}, inplace=True)
+            else:
+                transposed_df = transposed.reset_index()
+            
+            return transposed_df
+            
+        except Exception as e:
+            raise ValueError(f"Transpose operation failed: {e}")
+    
+    def reorder_columns(self, df: pd.DataFrame, column_order: List[str]) -> pd.DataFrame:
+        """Reorder DataFrame columns"""
+        
+        # Validate all columns exist
+        missing_cols = [col for col in column_order if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Columns not found: {missing_cols}")
+        
+        # Check for extra columns not in order
+        extra_cols = [col for col in df.columns if col not in column_order]
+        if extra_cols:
+            print(f"Warning: Columns not in reorder list will be dropped: {extra_cols}", file=sys.stderr)
+        
+        try:
+            return df[column_order]
+        except Exception as e:
+            raise ValueError(f"Column reordering failed: {e}")
+    
+    def filter_table(self, df: pd.DataFrame, filter_expr: str) -> pd.DataFrame:
+        """Filter DataFrame using pandas query syntax"""
+        try:
+            return df.query(filter_expr)
+        except Exception as e:
+            raise ValueError(f"Filter operation failed: {e}. Check query syntax.")
+
+def parse_column_list(column_str: str) -> List[str]:
+    """Parse comma-separated column list"""
+    if not column_str:
+        return []
+    return [col.strip() for col in column_str.split(',')]
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Transform markdown table structure with reshape operations',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Pivot table
+  md_table_reshape --pivot index=product,values=sales,columns=month --aggfunc=sum
+  
+  # Melt table
+  md_table_reshape --melt id-vars=id,name var-name=metric value-name=score
+  
+  # Transpose table
+  md_table_reshape --transpose
+  
+  # Reorder columns
+  md_table_reshape --reorder name,age,salary
+  
+  # Filter and reshape
+  md_table_reshape --filter "sales > 100" --pivot index=category,values=sales,columns=quarter
+        """
+    )
+    
+    # Operation type (mutually exclusive)
+    op_group = parser.add_mutually_exclusive_group(required=True)
+    op_group.add_argument('--pivot', help='Pivot table (format: index=col,values=col,columns=col)')
+    op_group.add_argument('--melt', help='Melt table (format: id-vars=col1,col2)')
+    op_group.add_argument('--transpose', action='store_true', help='Transpose table')
+    op_group.add_argument('--reorder', help='Reorder columns (comma-separated list)')
+    
+    # Common options
+    parser.add_argument('--filter', help='Filter rows before operation (pandas query syntax)')
+    parser.add_argument('--input', '-i', help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', help='Output markdown file (default: stdout)')
+    
+    # Pivot-specific options
+    parser.add_argument('--aggfunc', default='mean', 
+                       choices=['sum', 'mean', 'count', 'min', 'max', 'std', 'median', 'first', 'last'],
+                       help='Aggregation function for pivot (default: mean)')
+    parser.add_argument('--fill-value', help='Fill value for missing data')
+    parser.add_argument('--margins', action='store_true', help='Add row/column totals to pivot')
+    
+    # Melt-specific options  
+    parser.add_argument('--value-vars', help='Columns to melt (comma-separated, default: all non-id columns)')
+    parser.add_argument('--var-name', default='variable', help='Name for variable column (default: variable)')
+    parser.add_argument('--value-name', default='value', help='Name for value column (default: value)')
+    
+    # Debug options
+    parser.add_argument('--debug', action='store_true', help='Show debug information')
+    
+    args = parser.parse_args()
+    
+    try:
+        reshaper = TableReshaper()
+        
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        else:
+            lines = sys.stdin.readlines()
+        
+        if not lines:
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse table
+        df = reshaper.parser.parse_table(lines)
+        
+        if args.debug:
+            print(f"Debug: Input table shape: {df.shape}", file=sys.stderr)
+            print(f"Debug: Columns: {list(df.columns)}", file=sys.stderr)
+        
+        # Apply filter if specified
+        if args.filter:
+            original_shape = df.shape
+            df = reshaper.filter_table(df, args.filter)
+            if args.debug:
+                print(f"Debug: After filter shape: {df.shape} (filtered {original_shape[0] - df.shape[0]} rows)", file=sys.stderr)
+        
+        # Perform reshape operation
+        if args.pivot:
+            # Parse pivot parameters
+            pivot_params = {}
+            for param in args.pivot.split(','):
+                key, value = param.split('=', 1)
+                pivot_params[key.strip()] = value.strip()
+            
+            required_params = ['index', 'values', 'columns']
+            missing_params = [p for p in required_params if p not in pivot_params]
+            if missing_params:
+                print(f"Error: Missing required pivot parameters: {missing_params}", file=sys.stderr)
+                print("Format: --pivot index=col,values=col,columns=col", file=sys.stderr)
+                sys.exit(1)
+            
+            # Convert fill_value if specified
+            fill_value = args.fill_value
+            if fill_value and fill_value.lower() == 'none':
+                fill_value = None
+            elif fill_value and fill_value.replace('.', '').replace('-', '').isdigit():
+                fill_value = float(fill_value) if '.' in fill_value else int(fill_value)
+            
+            result_df = reshaper.pivot_table(
+                df,
+                index=pivot_params['index'],
+                values=pivot_params['values'], 
+                columns=pivot_params['columns'],
+                aggfunc=args.aggfunc,
+                fill_value=fill_value,
+                margins=args.margins
+            )
+            
+        elif args.melt:
+            # Parse melt parameters
+            melt_params = {}
+            for param in args.melt.split(' '):
+                if '=' in param:
+                    key, value = param.split('=', 1)
+                    melt_params[key.strip()] = value.strip()
+            
+            if 'id-vars' not in melt_params:
+                print("Error: Missing required parameter 'id-vars' for melt", file=sys.stderr)
+                print("Format: --melt id-vars=col1,col2", file=sys.stderr)
+                sys.exit(1)
+            
+            id_vars = parse_column_list(melt_params['id-vars'])
+            value_vars = parse_column_list(args.value_vars) if args.value_vars else None
+            
+            result_df = reshaper.melt_table(
+                df,
+                id_vars=id_vars,
+                value_vars=value_vars,
+                var_name=args.var_name,
+                value_name=args.value_name
+            )
+            
+        elif args.transpose:
+            result_df = reshaper.transpose_table(df)
+            
+        elif args.reorder:
+            column_order = parse_column_list(args.reorder)
+            result_df = reshaper.reorder_columns(df, column_order)
+        
+        if args.debug:
+            print(f"Debug: Output table shape: {result_df.shape}", file=sys.stderr)
+            print(f"Debug: Output columns: {list(result_df.columns)}", file=sys.stderr)
+        
+        # Format output
+        output = reshaper.formatter.format_table(result_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output)
+            print(f"Reshaped table written to: {args.output}", file=sys.stderr)
+        else:
+            print(output, end='')
+            
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

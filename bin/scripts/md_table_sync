@@ -1,0 +1,591 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import os
+import json
+import subprocess
+from pathlib import Path
+from os import environ
+from subprocess import run
+from datetime import datetime
+import tempfile
+import hashlib
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    import urllib.parse
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas psycopg2-binary", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - psycopg2-binary: PostgreSQL adapter", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas psycopg2-binary", file=sys.stderr)
+    sys.exit(1)
+
+def parse_connection_string(connection_string):
+    """Parse PostgreSQL connection string"""
+    if connection_string.startswith('postgresql://') or connection_string.startswith('postgres://'):
+        parsed = urllib.parse.urlparse(connection_string)
+        return {
+            'host': parsed.hostname or 'localhost',
+            'port': parsed.port or 5432,
+            'database': parsed.path.lstrip('/') if parsed.path else 'postgres',
+            'user': parsed.username or 'postgres',
+            'password': parsed.password or ''
+        }
+    else:
+        # Parse key=value format
+        params = {}
+        for part in connection_string.split():
+            if '=' in part:
+                key, value = part.split('=', 1)
+                params[key] = value
+        
+        return {
+            'host': params.get('host', 'localhost'),
+            'port': int(params.get('port', 5432)),
+            'database': params.get('dbname', params.get('database', 'postgres')),
+            'user': params.get('user', 'postgres'),
+            'password': params.get('password', '')
+        }
+
+def get_postgres_connection(connection_params):
+    """Establish PostgreSQL connection"""
+    try:
+        conn = psycopg2.connect(**connection_params)
+        return conn
+    except psycopg2.Error as e:
+        raise Exception(f"Failed to connect to PostgreSQL: {e}")
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Attempt to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if conversion fails
+        try:
+            numeric_series = pd.to_numeric(df[col], errors='coerce')
+            if not numeric_series.isna().all():
+                df[col] = numeric_series
+        except:
+            pass
+    
+    return df
+
+def dataframe_to_markdown(df):
+    """Convert pandas DataFrame to markdown table format"""
+    if df.empty:
+        return ""
+    
+    # Build table
+    lines = []
+    
+    # Header line
+    header_line = "| " + " | ".join(df.columns) + " |"
+    lines.append(header_line)
+    
+    # Separator line
+    separator_line = "|" + "|".join(["-" * (len(col) + 2) for col in df.columns]) + "|"
+    lines.append(separator_line)
+    
+    # Data lines
+    for _, row in df.iterrows():
+        data_line = "| " + " | ".join([str(val) if pd.notna(val) else "" for val in row]) + " |"
+        lines.append(data_line)
+    
+    return '\n'.join(lines)
+
+def postgres_to_markdown(connection_params, table_name=None, query=None):
+    """Pull data from PostgreSQL and convert to markdown"""
+    conn = None
+    try:
+        conn = get_postgres_connection(connection_params)
+        
+        if query:
+            # Execute custom query
+            df = pd.read_sql(query, conn)
+        elif table_name:
+            # Query specific table
+            df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+        else:
+            raise ValueError("Either table_name or query must be provided")
+        
+        return dataframe_to_markdown(df)
+        
+    except Exception as e:
+        raise Exception(f"Error reading from PostgreSQL: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def markdown_to_postgres(content, connection_params, table_name, conflict_resolution='merge', create_table=False):
+    """Push markdown table data to PostgreSQL"""
+    conn = None
+    try:
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        if df is None or df.empty:
+            raise ValueError("No valid markdown table found or table is empty")
+        
+        # Connect to database
+        conn = get_postgres_connection(connection_params)
+        cursor = conn.cursor()
+        
+        # Check if table exists
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = %s
+            )
+        """, (table_name,))
+        table_exists = cursor.fetchone()[0]
+        
+        if not table_exists and not create_table:
+            raise ValueError(f"Table '{table_name}' does not exist. Use --create-table to create it.")
+        
+        if create_table or not table_exists:
+            # Create table based on DataFrame structure
+            create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n"
+            
+            column_defs = []
+            for col in df.columns:
+                # Infer PostgreSQL data type
+                sample_data = df[col].dropna()
+                if len(sample_data) > 0:
+                    if pd.api.types.is_numeric_dtype(sample_data):
+                        if sample_data.dtype == 'int64':
+                            col_type = "INTEGER"
+                        else:
+                            col_type = "NUMERIC"
+                    else:
+                        # Check for common patterns
+                        sample_str = str(sample_data.iloc[0])
+                        if '@' in sample_str and '.' in sample_str:
+                            col_type = "VARCHAR(255)"  # Likely email
+                        elif len(sample_str) > 100:
+                            col_type = "TEXT"
+                        else:
+                            col_type = "VARCHAR(255)"
+                else:
+                    col_type = "TEXT"
+                
+                # Clean column name for PostgreSQL
+                clean_col = col.lower().replace(' ', '_').replace('-', '_')
+                column_defs.append(f"    {clean_col} {col_type}")
+            
+            create_table_sql += ",\n".join(column_defs) + "\n);"
+            
+            cursor.execute(create_table_sql)
+            print(f"Created table '{table_name}' with {len(df.columns)} columns")
+        
+        # Prepare column names (clean for PostgreSQL)
+        clean_columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
+        
+        if conflict_resolution == 'overwrite':
+            # Clear existing data
+            cursor.execute(f"TRUNCATE TABLE {table_name}")
+            print(f"Cleared existing data from table '{table_name}'")
+        
+        # Insert data
+        inserted_count = 0
+        updated_count = 0
+        
+        for _, row in df.iterrows():
+            values = [None if pd.isna(val) else val for val in row]
+            
+            if conflict_resolution == 'merge':
+                # Try to update first, then insert if no rows affected
+                # This requires a primary key or unique constraint - simplified approach
+                placeholders = ', '.join(['%s'] * len(values))
+                insert_sql = f"INSERT INTO {table_name} ({', '.join(clean_columns)}) VALUES ({placeholders})"
+                
+                try:
+                    cursor.execute(insert_sql, values)
+                    inserted_count += 1
+                except psycopg2.IntegrityError:
+                    # Conflict occurred, try to update (simplified - assumes first column is key)
+                    conn.rollback()
+                    if len(clean_columns) > 1:
+                        update_sets = ', '.join([f"{col} = %s" for col in clean_columns[1:]])
+                        update_sql = f"UPDATE {table_name} SET {update_sets} WHERE {clean_columns[0]} = %s"
+                        update_values = values[1:] + [values[0]]
+                        cursor.execute(update_sql, update_values)
+                        if cursor.rowcount > 0:
+                            updated_count += 1
+                        else:
+                            # Still insert if no update occurred
+                            cursor.execute(insert_sql, values)
+                            inserted_count += 1
+                    else:
+                        # Single column, just insert
+                        cursor.execute(insert_sql, values)
+                        inserted_count += 1
+            
+            elif conflict_resolution == 'skip':
+                # Try to insert, skip on conflict
+                placeholders = ', '.join(['%s'] * len(values))
+                insert_sql = f"INSERT INTO {table_name} ({', '.join(clean_columns)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
+                
+                cursor.execute(insert_sql, values)
+                if cursor.rowcount > 0:
+                    inserted_count += 1
+            
+            else:  # overwrite or merge without conflict handling
+                placeholders = ', '.join(['%s'] * len(values))
+                insert_sql = f"INSERT INTO {table_name} ({', '.join(clean_columns)}) VALUES ({placeholders})"
+                
+                cursor.execute(insert_sql, values)
+                inserted_count += 1
+        
+        conn.commit()
+        
+        result = f"Successfully synced to table '{table_name}': "
+        if inserted_count > 0:
+            result += f"{inserted_count} inserted"
+        if updated_count > 0:
+            result += f", {updated_count} updated"
+        
+        return result
+        
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise Exception(f"Error writing to PostgreSQL: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def bidirectional_sync(markdown_file, connection_params, table_name, conflict_resolution='merge'):
+    """Perform bidirectional synchronization between markdown file and PostgreSQL table"""
+    
+    # Calculate hashes for conflict detection
+    md_hash = None
+    db_hash = None
+    
+    try:
+        # Read current markdown file
+        if os.path.exists(markdown_file):
+            with open(markdown_file, 'r', encoding='utf-8') as f:
+                md_content = f.read()
+            md_hash = hashlib.md5(md_content.encode()).hexdigest()
+        else:
+            md_content = ""
+            md_hash = hashlib.md5(b"").hexdigest()
+        
+        # Read current database table
+        try:
+            db_content = postgres_to_markdown(connection_params, table_name=table_name)
+            db_hash = hashlib.md5(db_content.encode()).hexdigest()
+        except:
+            db_content = ""
+            db_hash = hashlib.md5(b"").hexdigest()
+        
+        # Check for changes
+        if md_hash == db_hash:
+            return "No changes detected - data is already synchronized"
+        
+        # Determine sync direction and conflicts
+        md_newer = os.path.getmtime(markdown_file) if os.path.exists(markdown_file) else 0
+        
+        # Get database modification time (simplified - use current time if no way to determine)
+        # In practice, you'd want a timestamp column in your tables
+        db_newer = datetime.now().timestamp()  # Simplified
+        
+        result_messages = []
+        
+        if not md_content and db_content:
+            # Database has data, markdown is empty - sync DB to markdown
+            with open(markdown_file, 'w', encoding='utf-8') as f:
+                f.write(db_content)
+            result_messages.append(f"Synced database to markdown file: {len(db_content.split('\n'))} lines written")
+        
+        elif md_content and not db_content:
+            # Markdown has data, database is empty - sync markdown to DB
+            result = markdown_to_postgres(md_content, connection_params, table_name, 
+                                        conflict_resolution, create_table=True)
+            result_messages.append(f"Synced markdown to database: {result}")
+        
+        elif md_content and db_content:
+            # Both have data - handle based on conflict resolution
+            if conflict_resolution == 'merge':
+                # Try to merge both directions
+                # First, update database with markdown changes
+                result = markdown_to_postgres(md_content, connection_params, table_name, 'merge')
+                result_messages.append(f"Merged markdown to database: {result}")
+                
+                # Then, update markdown with any database changes
+                updated_db_content = postgres_to_markdown(connection_params, table_name=table_name)
+                if updated_db_content != md_content:
+                    with open(markdown_file, 'w', encoding='utf-8') as f:
+                        f.write(updated_db_content)
+                    result_messages.append("Updated markdown file with merged database content")
+            
+            elif conflict_resolution == 'overwrite':
+                # Markdown overwrites database
+                result = markdown_to_postgres(md_content, connection_params, table_name, 'overwrite')
+                result_messages.append(f"Overwrote database with markdown: {result}")
+            
+            else:  # skip or other
+                result_messages.append("Conflict detected - no action taken. Use --conflict-resolution to specify behavior")
+        
+        return "; ".join(result_messages)
+        
+    except Exception as e:
+        return f"Sync error: {e}"
+
+def get_local_postgres_params():
+    """Get local PostgreSQL connection parameters using local_postgres script logic"""
+    # Try to read from environment variables first (matching local_postgres script)
+    default_params = {
+        'host': os.environ.get('LOCAL_DB_HOST', os.environ.get('TRANSCRIPTION_DB_HOST', '127.0.0.1')),
+        'port': int(os.environ.get('LOCAL_DB_PORT', os.environ.get('TRANSCRIPTION_DB_PORT', '5432'))),
+        'database': os.environ.get('LOCAL_DB_NAME', os.environ.get('TRANSCRIPTION_DB_NAME', 'postgres')),
+        'user': os.environ.get('LOCAL_DB_USER', os.environ.get('TRANSCRIPTION_DB_USER', 'postgres')),
+        'password': os.environ.get('LOCAL_DB_PASSWORD', os.environ.get('TRANSCRIPTION_DB_PASSWORD', ''))
+    }
+    
+    # Try to read from config file (matching local_postgres script)
+    config_file = Path.home() / ".config/transcription_db/config.yaml"
+    if config_file.exists():
+        try:
+            # Try to use yq if available
+            import yaml
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            if 'database' in config:
+                db_config = config['database']
+                default_params.update({
+                    'host': db_config.get('host', default_params['host']),
+                    'port': db_config.get('port', default_params['port']),
+                    'database': db_config.get('name', default_params['database']),
+                    'user': db_config.get('user', default_params['user']),
+                    'password': db_config.get('password', default_params['password'])
+                })
+        except:
+            pass  # Fall back to environment/defaults
+    
+    return default_params
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Synchronize markdown tables with external data sources (PostgreSQL focus)',
+        epilog='''
+Examples:
+  # Pull PostgreSQL table to markdown
+  md_table_sync --source database --connection-string "postgresql://user:pass@localhost/db" \\
+                --table users > users.md
+  
+  # Push markdown table to PostgreSQL
+  md_table_sync --source database --connection-string "postgresql://user:pass@localhost/db" \\
+                --table users --input users.md --push
+  
+  # Bidirectional sync
+  md_table_sync --source database --connection-string "postgresql://user:pass@localhost/db" \\
+                --table users --file users.md --bidirectional
+  
+  # Use local PostgreSQL (from local_postgres script config)
+  md_table_sync --source database --table users --file users.md --bidirectional --local
+  
+  # Custom query
+  md_table_sync --source database --connection-string "postgresql://localhost/db" \\
+                --query "SELECT name, email FROM users WHERE active = true"
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--source', required=True, 
+                       choices=['database', 'api', 'csv', 'json'],
+                       help='Source type (currently only database/postgresql supported)')
+    parser.add_argument('--connection-string', metavar='CONNECTION',
+                       help='Database connection string (postgresql://...)')
+    parser.add_argument('--table', metavar='TABLE_NAME',
+                       help='Database table name')
+    parser.add_argument('--query', metavar='SQL',
+                       help='Custom SQL query (alternative to --table)')
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (for push operations)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--file', metavar='FILE',
+                       help='Markdown file for bidirectional sync')
+    parser.add_argument('--push', action='store_true',
+                       help='Push markdown data to database')
+    parser.add_argument('--pull', action='store_true',
+                       help='Pull database data to markdown (default)')
+    parser.add_argument('--bidirectional', action='store_true',
+                       help='Bidirectional synchronization')
+    parser.add_argument('--conflict-resolution', 
+                       choices=['merge', 'overwrite', 'skip'],
+                       default='merge',
+                       help='How to handle conflicts (default: merge)')
+    parser.add_argument('--create-table', action='store_true',
+                       help='Create table if it does not exist (for push operations)')
+    parser.add_argument('--local', action='store_true',
+                       help='Use local PostgreSQL configuration (from local_postgres script)')
+    parser.add_argument('--schedule', metavar='CRON',
+                       help='Schedule recurring sync (cron syntax) - shows command only')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Show what would be done without executing')
+    
+    args = parser.parse_args()
+    
+    if args.source != 'database':
+        print("Error: Currently only 'database' source (PostgreSQL) is supported", file=sys.stderr)
+        sys.exit(1)
+    
+    # Determine connection parameters
+    if args.local:
+        connection_params = get_local_postgres_params()
+    elif args.connection_string:
+        connection_params = parse_connection_string(args.connection_string)
+    else:
+        print("Error: Either --connection-string or --local must be specified", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.dry_run:
+        print("DRY RUN MODE - No actual changes will be made")
+        print(f"Connection: {connection_params['user']}@{connection_params['host']}:{connection_params['port']}/{connection_params['database']}")
+        
+        if args.bidirectional and args.file:
+            print(f"Would perform bidirectional sync between '{args.file}' and table '{args.table}'")
+        elif args.push:
+            print(f"Would push data from '{args.input}' to table '{args.table}'")
+        else:
+            if args.query:
+                print(f"Would execute query: {args.query}")
+            else:
+                print(f"Would pull data from table '{args.table}'")
+        return
+    
+    if args.schedule:
+        # Show cron command
+        script_path = os.path.abspath(__file__)
+        base_command = f"{script_path}"
+        
+        # Rebuild command without --schedule
+        cmd_parts = [base_command]
+        for arg, value in vars(args).items():
+            if arg == 'schedule' or value is False or value is None:
+                continue
+            if value is True:
+                cmd_parts.append(f"--{arg.replace('_', '-')}")
+            else:
+                cmd_parts.append(f"--{arg.replace('_', '-')} '{value}'")
+        
+        cron_command = ' '.join(cmd_parts)
+        print(f"Add this to your crontab (crontab -e):")
+        print(f"{args.schedule} {cron_command}")
+        return
+    
+    try:
+        if args.bidirectional:
+            # Bidirectional sync
+            if not args.file:
+                print("Error: --file is required for bidirectional sync", file=sys.stderr)
+                sys.exit(1)
+            if not args.table:
+                print("Error: --table is required for bidirectional sync", file=sys.stderr)
+                sys.exit(1)
+            
+            result = bidirectional_sync(args.file, connection_params, args.table, args.conflict_resolution)
+            print(result)
+        
+        elif args.push:
+            # Push markdown to database
+            if not args.table:
+                print("Error: --table is required for push operations", file=sys.stderr)
+                sys.exit(1)
+            
+            # Read input
+            if args.input:
+                with open(args.input, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            else:
+                content = sys.stdin.read()
+            
+            if not content.strip():
+                print("Error: No input data provided", file=sys.stderr)
+                sys.exit(1)
+            
+            result = markdown_to_postgres(content, connection_params, args.table, 
+                                        args.conflict_resolution, args.create_table)
+            print(result)
+        
+        else:
+            # Pull from database (default)
+            if not args.table and not args.query:
+                print("Error: Either --table or --query is required for pull operations", file=sys.stderr)
+                sys.exit(1)
+            
+            markdown_content = postgres_to_markdown(connection_params, args.table, args.query)
+            
+            if args.output:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.write(markdown_content)
+                print(f"Data written to {args.output}")
+            else:
+                print(markdown_content)
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,407 @@
+#!/usr/bin/python3
+"""
+md_table_extract - Extract specific tables from markdown documents
+
+Usage:
+  md_table_extract --table N < document.md
+  md_table_extract --after "heading" < document.md  
+  md_table_extract --before "heading" < document.md
+  cat document.md | md_table_extract --table 2
+
+Extract methods:
+  --table N         Extract the Nth table (1-based indexing)
+  --after "text"    Extract first table found after heading containing text
+  --before "text"   Extract first table found before heading containing text
+  --all             Extract all tables (output separated by blank lines)
+
+Options:
+  --level N         Heading level to match (1-6, default: any level)
+  --case-sensitive  Case-sensitive heading matching (default: case-insensitive)
+  --output FORMAT   Output format: markdown (default), csv, json
+
+Examples:
+  md_table_extract --table 2 < report.md
+  md_table_extract --after "Sales Data" < quarterly.md
+  md_table_extract --before "Summary" --level 2 < analysis.md
+  md_table_extract --all --output csv < data.md
+  md_table_extract --after "Results" --case-sensitive < results.md
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import sys
+import re
+import argparse
+import json
+from typing import List, Dict, Optional, Tuple
+
+class MarkdownTableExtractor:
+    def __init__(self):
+        self.lines: List[str] = []
+        self.tables: List[Dict] = []
+        self.headings: List[Dict] = []
+        
+    def parse_document(self, lines: List[str]) -> None:
+        """Parse markdown document to find tables and headings"""
+        self.lines = [line.rstrip() for line in lines]
+        self._extract_headings()
+        self._extract_tables()
+    
+    def _extract_headings(self) -> None:
+        """Extract all headings with their positions and levels"""
+        self.headings = []
+        for i, line in enumerate(self.lines):
+            line = line.strip()
+            # Match ATX headings (# ## ### etc.)
+            match = re.match(r'^(#+)\s+(.+)', line)
+            if match:
+                level = len(match.group(1))
+                text = match.group(2).strip()
+                self.headings.append({
+                    'line': i,
+                    'level': level,
+                    'text': text,
+                    'raw': line
+                })
+    
+    def _extract_tables(self) -> None:
+        """Extract all tables with their positions"""
+        self.tables = []
+        in_table = False
+        table_start = -1
+        table_lines = []
+        
+        for i, line in enumerate(self.lines):
+            line_stripped = line.strip()
+            
+            # Check if this line looks like a table row
+            if line_stripped.startswith('|') and line_stripped.endswith('|'):
+                if not in_table:
+                    # Starting a new table
+                    in_table = True
+                    table_start = i
+                    table_lines = [line]
+                else:
+                    # Continue current table
+                    table_lines.append(line)
+            elif in_table:
+                # We were in a table but this line doesn't look like a table row
+                # Check if it's a separator line
+                if re.match(r'^\s*\|[-\s|:]+\|\s*$', line_stripped):
+                    # This is a separator line, continue the table
+                    table_lines.append(line)
+                else:
+                    # End of table
+                    self._process_table(table_start, i - 1, table_lines)
+                    in_table = False
+                    table_lines = []
+        
+        # Handle table that ends at end of document
+        if in_table and table_lines:
+            self._process_table(table_start, len(self.lines) - 1, table_lines)
+    
+    def _process_table(self, start_line: int, end_line: int, raw_lines: List[str]) -> None:
+        """Process and validate a potential table"""
+        # Filter out empty lines and separator lines
+        table_lines = []
+        separator_found = False
+        
+        for line in raw_lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            if re.match(r'^\|[-\s|:]+\|$', line_stripped):
+                separator_found = True
+                continue
+            
+            if line_stripped.startswith('|') and line_stripped.endswith('|'):
+                table_lines.append(line)
+        
+        # A valid table needs at least a header row
+        if len(table_lines) >= 1:
+            # Parse the table
+            headers, data = self._parse_table_content(table_lines)
+            
+            self.tables.append({
+                'start_line': start_line,
+                'end_line': end_line,
+                'raw_lines': table_lines,
+                'headers': headers,
+                'data': data,
+                'has_separator': separator_found
+            })
+    
+    def _parse_table_content(self, table_lines: List[str]) -> Tuple[List[str], List[List[str]]]:
+        """Parse table content into headers and data"""
+        if not table_lines:
+            return [], []
+        
+        # First line is headers
+        headers = self._parse_table_row(table_lines[0])
+        
+        # Remaining lines are data
+        data = []
+        for line in table_lines[1:]:
+            row = self._parse_table_row(line)
+            # Only add rows that have the same number of columns as headers
+            if len(row) == len(headers):
+                data.append(row)
+        
+        return headers, data
+    
+    def _parse_table_row(self, line: str) -> List[str]:
+        """Parse a single table row"""
+        # Remove leading/trailing |
+        line = line.strip().strip('|')
+        # Split by | and clean whitespace
+        return [cell.strip() for cell in line.split('|')]
+    
+    def extract_table_by_number(self, table_num: int) -> Optional[Dict]:
+        """Extract table by its number (1-based)"""
+        if table_num < 1 or table_num > len(self.tables):
+            return None
+        return self.tables[table_num - 1]
+    
+    def extract_table_by_heading(self, heading_text: str, position: str, 
+                                level: Optional[int] = None, 
+                                case_sensitive: bool = False) -> Optional[Dict]:
+        """Extract table relative to a heading"""
+        # Find matching heading
+        target_heading = None
+        
+        for heading in self.headings:
+            # Check level if specified
+            if level is not None and heading['level'] != level:
+                continue
+            
+            # Check text match
+            heading_text_check = heading['text']
+            search_text = heading_text
+            
+            if not case_sensitive:
+                heading_text_check = heading_text_check.lower()
+                search_text = search_text.lower()
+            
+            if search_text in heading_text_check:
+                target_heading = heading
+                break
+        
+        if not target_heading:
+            return None
+        
+        # Find table relative to heading
+        heading_line = target_heading['line']
+        
+        if position == 'after':
+            # Find first table after this heading
+            for table in self.tables:
+                if table['start_line'] > heading_line:
+                    return table
+        elif position == 'before':
+            # Find last table before this heading
+            for table in reversed(self.tables):
+                if table['end_line'] < heading_line:
+                    return table
+        
+        return None
+    
+    def extract_all_tables(self) -> List[Dict]:
+        """Extract all tables"""
+        return self.tables
+    
+    def format_table_as_markdown(self, table: Dict) -> str:
+        """Format table as markdown"""
+        if not table or not table['headers']:
+            return ""
+        
+        lines = []
+        
+        # Add header row
+        headers = table['headers']
+        lines.append("| " + " | ".join(headers) + " |")
+        
+        # Add separator row
+        separator = "|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|"
+        lines.append(separator)
+        
+        # Add data rows
+        for row in table['data']:
+            # Pad row to match header length
+            padded_row = row + [""] * (len(headers) - len(row))
+            lines.append("| " + " | ".join(padded_row[:len(headers)]) + " |")
+        
+        return "\n".join(lines)
+    
+    def format_table_as_csv(self, table: Dict) -> str:
+        """Format table as CSV"""
+        if not table or not table['headers']:
+            return ""
+        
+        import csv
+        import io
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write headers
+        writer.writerow(table['headers'])
+        
+        # Write data rows
+        for row in table['data']:
+            # Pad row to match header length
+            padded_row = row + [""] * (len(table['headers']) - len(row))
+            writer.writerow(padded_row[:len(table['headers'])])
+        
+        return output.getvalue()
+    
+    def format_table_as_json(self, table: Dict) -> str:
+        """Format table as JSON"""
+        if not table or not table['headers']:
+            return "[]"
+        
+        headers = table['headers']
+        json_data = []
+        
+        for row in table['data']:
+            # Pad row to match header length
+            padded_row = row + [""] * (len(headers) - len(row))
+            row_dict = {}
+            for i, header in enumerate(headers):
+                if i < len(padded_row):
+                    row_dict[header] = padded_row[i]
+                else:
+                    row_dict[header] = ""
+            json_data.append(row_dict)
+        
+        return json.dumps(json_data, indent=2)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Extract specific tables from markdown documents',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_table_extract --table 2 < report.md
+  md_table_extract --after "Sales Data" < quarterly.md  
+  md_table_extract --before "Summary" --level 2 < analysis.md
+  md_table_extract --all --output csv < data.md
+  cat document.md | md_table_extract --table 1 --output json
+        """
+    )
+    
+    # Extraction method (mutually exclusive)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--table', '-t', type=int, help='Extract table by number (1-based)')
+    group.add_argument('--after', '-a', help='Extract first table after heading containing text')
+    group.add_argument('--before', '-b', help='Extract first table before heading containing text')
+    group.add_argument('--all', action='store_true', help='Extract all tables')
+    
+    # Options
+    parser.add_argument('--level', '-l', type=int, choices=range(1, 7), 
+                       help='Heading level to match (1-6, default: any level)')
+    parser.add_argument('--case-sensitive', '-c', action='store_true',
+                       help='Case-sensitive heading matching')
+    parser.add_argument('--output', '-o', choices=['markdown', 'csv', 'json'],
+                       default='markdown', help='Output format (default: markdown)')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input from stdin
+        lines = sys.stdin.readlines()
+        
+        if not lines:
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Create extractor and parse document
+        extractor = MarkdownTableExtractor()
+        extractor.parse_document(lines)
+        
+        # Extract table(s) based on arguments
+        tables_to_output = []
+        
+        if args.table:
+            table = extractor.extract_table_by_number(args.table)
+            if table:
+                tables_to_output = [table]
+            else:
+                print(f"Error: Table {args.table} not found. Document has {len(extractor.tables)} table(s)", file=sys.stderr)
+                sys.exit(1)
+        
+        elif args.after:
+            table = extractor.extract_table_by_heading(
+                args.after, 'after', args.level, args.case_sensitive
+            )
+            if table:
+                tables_to_output = [table]
+            else:
+                print(f"Error: No table found after heading containing '{args.after}'", file=sys.stderr)
+                sys.exit(1)
+        
+        elif args.before:
+            table = extractor.extract_table_by_heading(
+                args.before, 'before', args.level, args.case_sensitive
+            )
+            if table:
+                tables_to_output = [table]
+            else:
+                print(f"Error: No table found before heading containing '{args.before}'", file=sys.stderr)
+                sys.exit(1)
+        
+        elif args.all:
+            tables_to_output = extractor.extract_all_tables()
+            if not tables_to_output:
+                print("Error: No tables found in document", file=sys.stderr)
+                sys.exit(1)
+        
+        # Format and output tables
+        for i, table in enumerate(tables_to_output):
+            if args.output == 'markdown':
+                output = extractor.format_table_as_markdown(table)
+            elif args.output == 'csv':
+                output = extractor.format_table_as_csv(table)
+            elif args.output == 'json':
+                output = extractor.format_table_as_json(table)
+            
+            print(output)
+            
+            # Add separator between tables if outputting multiple tables
+            if args.all and i < len(tables_to_output) - 1:
+                if args.output == 'markdown':
+                    print()  # Blank line separator for markdown
+                elif args.output == 'csv':
+                    print()  # Blank line separator for CSV
+                # JSON doesn't need separators as each table is a complete JSON array
+    
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

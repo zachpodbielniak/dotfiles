@@ -1,0 +1,526 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import re
+from io import StringIO
+from os import environ
+from subprocess import run
+import json
+from datetime import datetime
+from collections import Counter
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    # Keep original data for type inference
+    df_original = pd.DataFrame(rows, columns=headers)
+    
+    # Create numeric version for analysis
+    df_numeric = df_original.copy()
+    for col in df_numeric.columns:
+        df_numeric[col] = pd.to_numeric(df_numeric[col], errors='ignore')
+    
+    return df_original, df_numeric
+
+def infer_data_type(series):
+    """Infer the most likely data type for a series"""
+    non_empty = series.dropna()
+    if len(non_empty) == 0:
+        return "empty"
+    
+    # Try numeric first
+    try:
+        numeric_series = pd.to_numeric(non_empty, errors='coerce')
+        if not numeric_series.isna().all():
+            # Check if all values are integers
+            if all(float(x).is_integer() for x in numeric_series.dropna()):
+                return "integer"
+            else:
+                return "float"
+    except:
+        pass
+    
+    # Check for date patterns
+    date_patterns = [
+        r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+        r'\d{2}/\d{2}/\d{4}',  # MM/DD/YYYY
+        r'\d{4}/\d{2}/\d{2}',  # YYYY/MM/DD
+        r'\d{2}-\d{2}-\d{4}',  # MM-DD-YYYY
+    ]
+    
+    sample_values = non_empty.head(10).astype(str)
+    for pattern in date_patterns:
+        if sum(bool(re.match(pattern, val)) for val in sample_values) > len(sample_values) * 0.5:
+            return "date"
+    
+    # Check for boolean
+    bool_values = {'true', 'false', 'yes', 'no', '1', '0', 't', 'f', 'y', 'n'}
+    unique_lower = set(str(v).lower() for v in non_empty.unique())
+    if unique_lower.issubset(bool_values) and len(unique_lower) <= 2:
+        return "boolean"
+    
+    # Check for email
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if sum(bool(re.match(email_pattern, str(val))) for val in sample_values) > len(sample_values) * 0.7:
+        return "email"
+    
+    # Check for URL
+    url_pattern = r'^https?://[^\s]+$'
+    if sum(bool(re.match(url_pattern, str(val))) for val in sample_values) > len(sample_values) * 0.7:
+        return "url"
+    
+    # Check for categorical (limited unique values)
+    unique_count = len(non_empty.unique())
+    if unique_count <= min(10, len(non_empty) * 0.5):
+        return "categorical"
+    
+    # Default to text
+    return "text"
+
+def calculate_completeness_score(series):
+    """Calculate completeness score (0-100)"""
+    total_count = len(series)
+    non_null_count = series.notna().sum()
+    non_empty_count = sum(1 for x in series if pd.notna(x) and str(x).strip() != '')
+    
+    if total_count == 0:
+        return 0
+    
+    return (non_empty_count / total_count) * 100
+
+def calculate_accuracy_score(series, data_type):
+    """Calculate accuracy score based on data type consistency"""
+    non_empty = series.dropna()
+    if len(non_empty) == 0:
+        return 100  # No data to be inaccurate
+    
+    accurate_count = 0
+    
+    if data_type == "integer":
+        try:
+            numeric_series = pd.to_numeric(non_empty, errors='coerce')
+            accurate_count = sum(1 for x in numeric_series.dropna() if float(x).is_integer())
+        except:
+            accurate_count = 0
+    
+    elif data_type == "float":
+        try:
+            numeric_series = pd.to_numeric(non_empty, errors='coerce')
+            accurate_count = len(numeric_series.dropna())
+        except:
+            accurate_count = 0
+    
+    elif data_type == "date":
+        date_patterns = [r'\d{4}-\d{2}-\d{2}', r'\d{2}/\d{2}/\d{4}', r'\d{4}/\d{2}/\d{2}']
+        for val in non_empty:
+            if any(re.match(pattern, str(val)) for pattern in date_patterns):
+                accurate_count += 1
+    
+    elif data_type == "email":
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        accurate_count = sum(1 for val in non_empty if re.match(email_pattern, str(val)))
+    
+    elif data_type == "boolean":
+        bool_values = {'true', 'false', 'yes', 'no', '1', '0', 't', 'f', 'y', 'n'}
+        accurate_count = sum(1 for val in non_empty if str(val).lower() in bool_values)
+    
+    else:
+        # For text and categorical, assume all non-empty values are accurate
+        accurate_count = len(non_empty)
+    
+    return (accurate_count / len(non_empty)) * 100
+
+def generate_column_profile(df_original, df_numeric, column_name):
+    """Generate detailed profile for a single column"""
+    series_original = df_original[column_name]
+    series_numeric = df_numeric[column_name]
+    
+    profile = {}
+    
+    # Basic information
+    profile['name'] = column_name
+    profile['total_count'] = len(series_original)
+    profile['non_null_count'] = series_original.notna().sum()
+    profile['null_count'] = series_original.isna().sum()
+    profile['null_percentage'] = (profile['null_count'] / profile['total_count']) * 100 if profile['total_count'] > 0 else 0
+    
+    # Data type inference
+    profile['inferred_type'] = infer_data_type(series_original)
+    profile['unique_count'] = series_original.nunique()
+    profile['unique_percentage'] = (profile['unique_count'] / profile['total_count']) * 100 if profile['total_count'] > 0 else 0
+    
+    # Quality scores
+    profile['completeness_score'] = calculate_completeness_score(series_original)
+    profile['accuracy_score'] = calculate_accuracy_score(series_original, profile['inferred_type'])
+    
+    # Type-specific analysis
+    if profile['inferred_type'] in ['integer', 'float']:
+        non_null_numeric = series_numeric.dropna()
+        if len(non_null_numeric) > 0:
+            profile['min_value'] = float(non_null_numeric.min())
+            profile['max_value'] = float(non_null_numeric.max())
+            profile['mean_value'] = float(non_null_numeric.mean())
+            profile['median_value'] = float(non_null_numeric.median())
+            profile['std_value'] = float(non_null_numeric.std()) if len(non_null_numeric) > 1 else 0
+            
+            # Check for outliers
+            if len(non_null_numeric) >= 4:
+                Q1 = non_null_numeric.quantile(0.25)
+                Q3 = non_null_numeric.quantile(0.75)
+                IQR = Q3 - Q1
+                outliers = non_null_numeric[(non_null_numeric < Q1 - 1.5*IQR) | (non_null_numeric > Q3 + 1.5*IQR)]
+                profile['outlier_count'] = len(outliers)
+                profile['outlier_percentage'] = (len(outliers) / len(non_null_numeric)) * 100
+    
+    elif profile['inferred_type'] == 'categorical':
+        value_counts = series_original.value_counts()
+        profile['most_frequent_value'] = value_counts.index[0] if len(value_counts) > 0 else None
+        profile['most_frequent_count'] = int(value_counts.iloc[0]) if len(value_counts) > 0 else 0
+        profile['most_frequent_percentage'] = (profile['most_frequent_count'] / profile['non_null_count']) * 100 if profile['non_null_count'] > 0 else 0
+        
+        # Category distribution
+        profile['category_distribution'] = dict(value_counts.head(10))
+    
+    elif profile['inferred_type'] == 'text':
+        non_empty = series_original.dropna()
+        if len(non_empty) > 0:
+            lengths = [len(str(val)) for val in non_empty]
+            profile['min_length'] = min(lengths)
+            profile['max_length'] = max(lengths)
+            profile['avg_length'] = sum(lengths) / len(lengths)
+    
+    # Sample values (first 5 non-null)
+    sample_values = series_original.dropna().head(5).tolist()
+    profile['sample_values'] = [str(val) for val in sample_values]
+    
+    return profile
+
+def generate_overall_quality_score(profiles):
+    """Calculate overall data quality score"""
+    if not profiles:
+        return 0
+    
+    total_completeness = sum(p['completeness_score'] for p in profiles)
+    total_accuracy = sum(p['accuracy_score'] for p in profiles)
+    
+    avg_completeness = total_completeness / len(profiles)
+    avg_accuracy = total_accuracy / len(profiles)
+    
+    # Weight completeness and accuracy equally
+    overall_score = (avg_completeness + avg_accuracy) / 2
+    
+    return overall_score
+
+def generate_schema_validation(profiles):
+    """Generate schema validation information"""
+    schema = {}
+    
+    for profile in profiles:
+        col_name = profile['name']
+        schema[col_name] = {
+            'type': profile['inferred_type'],
+            'nullable': profile['null_count'] > 0,
+            'unique': profile['unique_count'] == profile['total_count'],
+        }
+        
+        # Add constraints based on type
+        if profile['inferred_type'] in ['integer', 'float']:
+            if 'min_value' in profile and 'max_value' in profile:
+                schema[col_name]['min_value'] = profile['min_value']
+                schema[col_name]['max_value'] = profile['max_value']
+        
+        elif profile['inferred_type'] == 'text':
+            if 'min_length' in profile and 'max_length' in profile:
+                schema[col_name]['min_length'] = profile['min_length']
+                schema[col_name]['max_length'] = profile['max_length']
+        
+        elif profile['inferred_type'] == 'categorical':
+            if 'category_distribution' in profile:
+                schema[col_name]['allowed_values'] = list(profile['category_distribution'].keys())
+    
+    return schema
+
+def format_profile_markdown(profiles, overall_score, schema):
+    """Format the profile data as markdown"""
+    report = "# Data Profiling Report\n\n"
+    report += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    report += f"**Overall Quality Score**: {overall_score:.1f}/100\n\n"
+    
+    # Quality summary
+    high_quality_cols = sum(1 for p in profiles if (p['completeness_score'] + p['accuracy_score'])/2 >= 80)
+    medium_quality_cols = sum(1 for p in profiles if 60 <= (p['completeness_score'] + p['accuracy_score'])/2 < 80)
+    low_quality_cols = sum(1 for p in profiles if (p['completeness_score'] + p['accuracy_score'])/2 < 60)
+    
+    report += "## Quality Summary\n\n"
+    report += f"- **High Quality Columns** (≥80): {high_quality_cols}\n"
+    report += f"- **Medium Quality Columns** (60-79): {medium_quality_cols}\n"
+    report += f"- **Low Quality Columns** (<60): {low_quality_cols}\n\n"
+    
+    # Column profiles
+    report += "## Column-by-Column Analysis\n\n"
+    
+    for profile in profiles:
+        quality_score = (profile['completeness_score'] + profile['accuracy_score']) / 2
+        quality_indicator = "🟢" if quality_score >= 80 else "🟡" if quality_score >= 60 else "🔴"
+        
+        report += f"### {quality_indicator} {profile['name']}\n\n"
+        report += f"**Type**: {profile['inferred_type']}\n"
+        report += f"**Quality Score**: {quality_score:.1f}/100\n"
+        report += f"**Completeness**: {profile['completeness_score']:.1f}% ({profile['non_null_count']:,}/{profile['total_count']:,} non-null)\n"
+        report += f"**Accuracy**: {profile['accuracy_score']:.1f}%\n"
+        report += f"**Uniqueness**: {profile['unique_count']:,} unique values ({profile['unique_percentage']:.1f}%)\n"
+        
+        # Type-specific details
+        if profile['inferred_type'] in ['integer', 'float'] and 'min_value' in profile:
+            report += f"**Range**: {profile['min_value']:.2f} to {profile['max_value']:.2f}\n"
+            report += f"**Mean**: {profile['mean_value']:.2f}, **Median**: {profile['median_value']:.2f}\n"
+            if 'outlier_count' in profile:
+                report += f"**Outliers**: {profile['outlier_count']} ({profile['outlier_percentage']:.1f}%)\n"
+        
+        elif profile['inferred_type'] == 'categorical' and 'most_frequent_value' in profile:
+            report += f"**Most Frequent**: '{profile['most_frequent_value']}' ({profile['most_frequent_percentage']:.1f}%)\n"
+            if 'category_distribution' in profile:
+                report += f"**Top Categories**: {', '.join(list(profile['category_distribution'].keys())[:5])}\n"
+        
+        elif profile['inferred_type'] == 'text' and 'avg_length' in profile:
+            report += f"**Length Range**: {profile['min_length']} to {profile['max_length']} characters\n"
+            report += f"**Average Length**: {profile['avg_length']:.1f} characters\n"
+        
+        # Sample values
+        if profile['sample_values']:
+            sample_vals = ', '.join(f"'{v}'" for v in profile['sample_values'][:3])
+            report += f"**Sample Values**: {sample_vals}\n"
+        
+        # Issues and recommendations
+        issues = []
+        if profile['null_percentage'] > 10:
+            issues.append(f"High missing data rate ({profile['null_percentage']:.1f}%)")
+        if profile['accuracy_score'] < 90:
+            issues.append(f"Data quality issues detected")
+        if profile['inferred_type'] in ['integer', 'float'] and 'outlier_percentage' in profile and profile['outlier_percentage'] > 5:
+            issues.append(f"High outlier rate ({profile['outlier_percentage']:.1f}%)")
+        
+        if issues:
+            report += f"**⚠️ Issues**: {'; '.join(issues)}\n"
+        
+        report += "\n"
+    
+    # Schema information
+    report += "## Inferred Schema\n\n"
+    report += "```json\n"
+    report += json.dumps(schema, indent=2)
+    report += "\n```\n\n"
+    
+    # Data quality recommendations
+    report += "## Recommendations\n\n"
+    
+    recommendations = []
+    
+    # Missing data recommendations
+    high_missing_cols = [p['name'] for p in profiles if p['null_percentage'] > 10]
+    if high_missing_cols:
+        recommendations.append(f"**Address Missing Data**: Investigate and handle missing values in: {', '.join(high_missing_cols)}")
+    
+    # Accuracy recommendations
+    low_accuracy_cols = [p['name'] for p in profiles if p['accuracy_score'] < 80]
+    if low_accuracy_cols:
+        recommendations.append(f"**Improve Data Accuracy**: Review data entry processes for: {', '.join(low_accuracy_cols)}")
+    
+    # Outlier recommendations
+    outlier_cols = [p['name'] for p in profiles if p['inferred_type'] in ['integer', 'float'] and 'outlier_percentage' in p and p['outlier_percentage'] > 5]
+    if outlier_cols:
+        recommendations.append(f"**Investigate Outliers**: Review unusual values in: {', '.join(outlier_cols)}")
+    
+    # Type consistency recommendations
+    mixed_type_cols = [p['name'] for p in profiles if p['accuracy_score'] < 95 and p['inferred_type'] in ['integer', 'float', 'date', 'email']]
+    if mixed_type_cols:
+        recommendations.append(f"**Standardize Data Types**: Ensure consistent formatting in: {', '.join(mixed_type_cols)}")
+    
+    if recommendations:
+        for i, rec in enumerate(recommendations, 1):
+            report += f"{i}. {rec}\n"
+    else:
+        report += "No major data quality issues detected. Dataset appears to be in good condition.\n"
+    
+    return report
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate comprehensive data profiling reports for markdown tables',
+        epilog='''
+Examples:
+  # Basic profiling report
+  md_table_profile < data.md
+  
+  # Output to file
+  md_table_profile --output profile_report.md < data.md
+  
+  # JSON format for programmatic use
+  md_table_profile --format json < data.md
+  
+  # Quick column overview
+  md_table_profile --summary < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--format', choices=['markdown', 'json'],
+                       default='markdown', help='Output format')
+    parser.add_argument('--summary', action='store_true',
+                       help='Generate summary report only')
+    
+    args = parser.parse_args()
+    
+    # Read input
+    try:
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+    except Exception as e:
+        print(f"Error reading input: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not content.strip():
+        print("Error: No input data provided", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse table
+    try:
+        df_original, df_numeric = parse_markdown_table(content)
+    except Exception as e:
+        print(f"Error parsing table: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if df_original is None:
+        print("Error: No valid markdown table found in input", file=sys.stderr)
+        sys.exit(1)
+    
+    if df_original.empty:
+        print("Error: Table is empty", file=sys.stderr)
+        sys.exit(1)
+    
+    # Generate profiles for each column
+    profiles = []
+    for column in df_original.columns:
+        profile = generate_column_profile(df_original, df_numeric, column)
+        profiles.append(profile)
+    
+    # Calculate overall quality score
+    overall_score = generate_overall_quality_score(profiles)
+    
+    # Generate schema
+    schema = generate_schema_validation(profiles)
+    
+    # Generate output
+    if args.format == 'json':
+        output_data = {
+            'timestamp': datetime.now().isoformat(),
+            'overall_quality_score': overall_score,
+            'column_profiles': profiles,
+            'inferred_schema': schema,
+            'summary': {
+                'total_columns': len(profiles),
+                'high_quality_columns': sum(1 for p in profiles if (p['completeness_score'] + p['accuracy_score'])/2 >= 80),
+                'total_rows': profiles[0]['total_count'] if profiles else 0
+            }
+        }
+        output_text = json.dumps(output_data, indent=2)
+    else:
+        if args.summary:
+            # Generate summary only
+            output_text = f"# Data Profile Summary\n\n"
+            output_text += f"**Overall Quality Score**: {overall_score:.1f}/100\n"
+            output_text += f"**Total Columns**: {len(profiles)}\n"
+            output_text += f"**Total Rows**: {profiles[0]['total_count'] if profiles else 0}\n\n"
+            
+            output_text += "## Column Overview\n\n"
+            output_text += "| Column | Type | Quality | Completeness | Uniqueness |\n"
+            output_text += "|--------|------|---------|--------------|------------|\n"
+            for profile in profiles:
+                quality_score = (profile['completeness_score'] + profile['accuracy_score']) / 2
+                output_text += f"| {profile['name']} | {profile['inferred_type']} | {quality_score:.1f}% | {profile['completeness_score']:.1f}% | {profile['unique_percentage']:.1f}% |\n"
+        else:
+            output_text = format_profile_markdown(profiles, overall_score, schema)
+    
+    # Write output
+    try:
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output_text)
+        else:
+            print(output_text)
+    except Exception as e:
+        print(f"Error writing output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

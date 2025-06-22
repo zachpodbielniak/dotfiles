@@ -1,0 +1,657 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import os
+import re
+from pathlib import Path
+from os import environ
+from subprocess import run
+import json
+from datetime import datetime
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+    from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, LabelEncoder, OneHotEncoder
+    from sklearn.impute import SimpleImputer
+    import warnings
+    warnings.filterwarnings('ignore')
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy scikit-learn", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("  - scikit-learn: Machine learning preprocessing", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy scikit-learn", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Attempt to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if conversion fails
+        try:
+            numeric_series = pd.to_numeric(df[col], errors='coerce')
+            if not numeric_series.isna().all():
+                df[col] = numeric_series
+        except:
+            pass
+        
+        # Try to convert to datetime
+        try:
+            if df[col].dtype == 'object' and not df[col].empty:
+                # Check if column looks like dates
+                sample_val = str(df[col].iloc[0]) if not df[col].isna().iloc[0] else ""
+                if any(char.isdigit() for char in sample_val) and '-' in sample_val:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+        except:
+            pass
+    
+    return df
+
+def dataframe_to_markdown(df):
+    """Convert pandas DataFrame to markdown table format"""
+    if df.empty:
+        return ""
+    
+    # Build table
+    lines = []
+    
+    # Header line
+    header_line = "| " + " | ".join(str(col) for col in df.columns) + " |"
+    lines.append(header_line)
+    
+    # Separator line
+    separator_line = "|" + "|".join(["-" * (len(str(col)) + 2) for col in df.columns]) + "|"
+    lines.append(separator_line)
+    
+    # Data lines
+    for _, row in df.iterrows():
+        data_line = "| " + " | ".join([str(val) if pd.notna(val) else "" for val in row]) + " |"
+        lines.append(data_line)
+    
+    return '\n'.join(lines)
+
+def normalize_text_columns(df, columns=None, operations=None):
+    """Normalize text columns with various operations"""
+    if operations is None:
+        operations = ['lowercase', 'strip', 'spaces']
+    
+    if columns is None:
+        columns = df.select_dtypes(include=['object']).columns.tolist()
+    
+    normalized_df = df.copy()
+    normalization_log = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+            
+        original_unique = df[col].nunique()
+        col_log = {'column': col, 'operations': [], 'before_unique': original_unique}
+        
+        if 'lowercase' in operations:
+            normalized_df[col] = normalized_df[col].astype(str).str.lower()
+            col_log['operations'].append('lowercase')
+        
+        if 'strip' in operations:
+            normalized_df[col] = normalized_df[col].astype(str).str.strip()
+            col_log['operations'].append('strip')
+        
+        if 'spaces' in operations:
+            # Normalize whitespace (multiple spaces to single space)
+            normalized_df[col] = normalized_df[col].astype(str).str.replace(r'\s+', ' ', regex=True)
+            col_log['operations'].append('normalize_spaces')
+        
+        if 'remove_special' in operations:
+            # Remove special characters except alphanumeric and spaces
+            normalized_df[col] = normalized_df[col].astype(str).str.replace(r'[^a-zA-Z0-9\s]', '', regex=True)
+            col_log['operations'].append('remove_special')
+        
+        if 'remove_numbers' in operations:
+            # Remove all numbers
+            normalized_df[col] = normalized_df[col].astype(str).str.replace(r'\d+', '', regex=True)
+            col_log['operations'].append('remove_numbers')
+        
+        if 'title_case' in operations:
+            normalized_df[col] = normalized_df[col].astype(str).str.title()
+            col_log['operations'].append('title_case')
+        
+        col_log['after_unique'] = normalized_df[col].nunique()
+        normalization_log.append(col_log)
+    
+    return normalized_df, normalization_log
+
+def normalize_numeric_columns(df, columns=None, method='standard'):
+    """Normalize numeric columns using various scaling methods"""
+    if columns is None:
+        columns = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    normalized_df = df.copy()
+    normalization_log = []
+    scalers = {}
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        # Skip columns with all NaN values
+        if df[col].isna().all():
+            continue
+        
+        col_log = {'column': col, 'method': method}
+        
+        # Handle missing values first
+        values = df[col].values.reshape(-1, 1)
+        
+        if method == 'standard':
+            scaler = StandardScaler()
+            col_log['description'] = 'Z-score normalization (mean=0, std=1)'
+        elif method == 'minmax':
+            scaler = MinMaxScaler()
+            col_log['description'] = 'Min-Max scaling (range 0-1)'
+        elif method == 'robust':
+            scaler = RobustScaler()
+            col_log['description'] = 'Robust scaling using median and IQR'
+        else:
+            raise ValueError(f"Unsupported normalization method: {method}")
+        
+        # Fit and transform
+        normalized_values = scaler.fit_transform(values)
+        normalized_df[col] = normalized_values.flatten()
+        
+        # Store scaler for potential reverse transformation
+        scalers[col] = scaler
+        
+        # Log statistics
+        col_log.update({
+            'original_mean': float(df[col].mean()) if not df[col].empty else 0,
+            'original_std': float(df[col].std()) if not df[col].empty else 0,
+            'normalized_mean': float(normalized_df[col].mean()) if not normalized_df[col].empty else 0,
+            'normalized_std': float(normalized_df[col].std()) if not normalized_df[col].empty else 0
+        })
+        
+        normalization_log.append(col_log)
+    
+    return normalized_df, normalization_log, scalers
+
+def handle_missing_values(df, strategy='mean', columns=None):
+    """Handle missing values using various imputation strategies"""
+    if columns is None:
+        columns = df.columns.tolist()
+    
+    imputed_df = df.copy()
+    imputation_log = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        missing_count = df[col].isna().sum()
+        if missing_count == 0:
+            continue
+        
+        col_log = {'column': col, 'missing_count': int(missing_count), 'strategy': strategy}
+        
+        if pd.api.types.is_numeric_dtype(df[col]):
+            if strategy == 'mean':
+                imputed_df[col] = imputed_df[col].fillna(df[col].mean())
+            elif strategy == 'median':
+                imputed_df[col] = imputed_df[col].fillna(df[col].median())
+            elif strategy == 'mode':
+                mode_val = df[col].mode().iloc[0] if not df[col].mode().empty else 0
+                imputed_df[col] = imputed_df[col].fillna(mode_val)
+            elif strategy == 'zero':
+                imputed_df[col] = imputed_df[col].fillna(0)
+            else:
+                # Forward fill or backward fill
+                if strategy == 'ffill':
+                    imputed_df[col] = imputed_df[col].fillna(method='ffill')
+                elif strategy == 'bfill':
+                    imputed_df[col] = imputed_df[col].fillna(method='bfill')
+        else:
+            # Categorical columns
+            if strategy == 'mode':
+                mode_val = df[col].mode().iloc[0] if not df[col].mode().empty else 'Unknown'
+                imputed_df[col] = imputed_df[col].fillna(mode_val)
+            elif strategy == 'unknown':
+                imputed_df[col] = imputed_df[col].fillna('Unknown')
+            elif strategy == 'ffill':
+                imputed_df[col] = imputed_df[col].fillna(method='ffill')
+            elif strategy == 'bfill':
+                imputed_df[col] = imputed_df[col].fillna(method='bfill')
+        
+        col_log['after_missing'] = int(imputed_df[col].isna().sum())
+        imputation_log.append(col_log)
+    
+    return imputed_df, imputation_log
+
+def encode_categorical_columns(df, columns=None, method='label'):
+    """Encode categorical columns using various encoding methods"""
+    if columns is None:
+        columns = df.select_dtypes(include=['object']).columns.tolist()
+    
+    encoded_df = df.copy()
+    encoding_log = []
+    encoders = {}
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        unique_count = df[col].nunique()
+        col_log = {'column': col, 'method': method, 'unique_values': int(unique_count)}
+        
+        if method == 'label':
+            # Label encoding (ordinal)
+            le = LabelEncoder()
+            encoded_df[col] = le.fit_transform(df[col].astype(str))
+            encoders[col] = le
+            col_log['description'] = 'Label encoding (0, 1, 2, ...)'
+            col_log['mapping'] = {str(label): int(code) for code, label in enumerate(le.classes_)}
+        
+        elif method == 'onehot':
+            # One-hot encoding
+            if unique_count > 10:
+                print(f"Warning: Column '{col}' has {unique_count} unique values. One-hot encoding may create many columns.", file=sys.stderr)
+            
+            # Create dummy variables
+            dummies = pd.get_dummies(df[col], prefix=col)
+            encoded_df = pd.concat([encoded_df.drop(col, axis=1), dummies], axis=1)
+            
+            col_log['description'] = f'One-hot encoding (created {len(dummies.columns)} columns)'
+            col_log['new_columns'] = list(dummies.columns)
+        
+        elif method == 'ordinal':
+            # Custom ordinal encoding (user can specify order)
+            # For now, just use label encoding as default
+            le = LabelEncoder()
+            encoded_df[col] = le.fit_transform(df[col].astype(str))
+            encoders[col] = le
+            col_log['description'] = 'Ordinal encoding (preserves order if specified)'
+        
+        encoding_log.append(col_log)
+    
+    return encoded_df, encoding_log, encoders
+
+def detect_outliers(df, columns=None, method='iqr'):
+    """Detect outliers in numeric columns"""
+    if columns is None:
+        columns = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    outlier_info = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        col_info = {'column': col, 'method': method}
+        
+        if method == 'iqr':
+            Q1 = df[col].quantile(0.25)
+            Q3 = df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            
+            outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
+            col_info.update({
+                'lower_bound': float(lower_bound),
+                'upper_bound': float(upper_bound),
+                'outlier_count': len(outliers),
+                'outlier_percentage': (len(outliers) / len(df)) * 100
+            })
+        
+        elif method == 'zscore':
+            z_scores = np.abs((df[col] - df[col].mean()) / df[col].std())
+            outliers = df[z_scores > 3]
+            col_info.update({
+                'threshold': 3.0,
+                'outlier_count': len(outliers),
+                'outlier_percentage': (len(outliers) / len(df)) * 100
+            })
+        
+        outlier_info.append(col_info)
+    
+    return outlier_info
+
+def remove_outliers(df, columns=None, method='iqr'):
+    """Remove outliers from the dataset"""
+    if columns is None:
+        columns = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    cleaned_df = df.copy()
+    removal_log = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        original_count = len(cleaned_df)
+        
+        if method == 'iqr':
+            Q1 = cleaned_df[col].quantile(0.25)
+            Q3 = cleaned_df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            
+            cleaned_df = cleaned_df[(cleaned_df[col] >= lower_bound) & (cleaned_df[col] <= upper_bound)]
+        
+        elif method == 'zscore':
+            z_scores = np.abs((cleaned_df[col] - cleaned_df[col].mean()) / cleaned_df[col].std())
+            cleaned_df = cleaned_df[z_scores <= 3]
+        
+        removed_count = original_count - len(cleaned_df)
+        removal_log.append({
+            'column': col,
+            'method': method,
+            'removed_count': removed_count,
+            'remaining_count': len(cleaned_df)
+        })
+    
+    return cleaned_df, removal_log
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Normalize and clean markdown table data using various techniques',
+        epilog='''
+Examples:
+  # Basic text normalization
+  md_table_normalize --text-normalize --operations "lowercase,strip,spaces" < data.md
+  
+  # Numeric standardization
+  md_table_normalize --numeric-normalize --method standard < data.md
+  
+  # Handle missing values
+  md_table_normalize --handle-missing --strategy mean < data.md
+  
+  # Encode categorical data
+  md_table_normalize --encode-categorical --encoding-method label < data.md
+  
+  # Complete normalization pipeline
+  md_table_normalize --full-pipeline --columns "Name,Age,Salary" < employees.md
+  
+  # Detect and remove outliers
+  md_table_normalize --remove-outliers --outlier-method iqr < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Normalization options
+    parser.add_argument('--text-normalize', action='store_true',
+                       help='Normalize text columns')
+    parser.add_argument('--numeric-normalize', action='store_true',
+                       help='Normalize numeric columns')
+    parser.add_argument('--handle-missing', action='store_true',
+                       help='Handle missing values')
+    parser.add_argument('--encode-categorical', action='store_true',
+                       help='Encode categorical columns')
+    parser.add_argument('--remove-outliers', action='store_true',
+                       help='Remove outliers from numeric columns')
+    parser.add_argument('--full-pipeline', action='store_true',
+                       help='Apply complete normalization pipeline')
+    
+    # Method-specific options
+    parser.add_argument('--operations', metavar='OPS',
+                       default='lowercase,strip,spaces',
+                       help='Text operations (comma-separated): lowercase,strip,spaces,remove_special,remove_numbers,title_case')
+    parser.add_argument('--method', choices=['standard', 'minmax', 'robust'],
+                       default='standard',
+                       help='Numeric normalization method (default: standard)')
+    parser.add_argument('--strategy', choices=['mean', 'median', 'mode', 'zero', 'unknown', 'ffill', 'bfill'],
+                       default='mean',
+                       help='Missing value imputation strategy (default: mean)')
+    parser.add_argument('--encoding-method', choices=['label', 'onehot', 'ordinal'],
+                       default='label',
+                       help='Categorical encoding method (default: label)')
+    parser.add_argument('--outlier-method', choices=['iqr', 'zscore'],
+                       default='iqr',
+                       help='Outlier detection method (default: iqr)')
+    
+    # Column selection
+    parser.add_argument('--columns', metavar='COLS',
+                       help='Comma-separated list of columns to process (default: all applicable)')
+    parser.add_argument('--exclude-columns', metavar='COLS',
+                       help='Comma-separated list of columns to exclude')
+    
+    # Output options
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--report', metavar='FILE',
+                       help='Save normalization report to file')
+    parser.add_argument('--format', choices=['markdown', 'json'],
+                       default='markdown',
+                       help='Output format (default: markdown)')
+    
+    # Analysis options
+    parser.add_argument('--detect-outliers-only', action='store_true',
+                       help='Only detect outliers without removing them')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Show what would be done without executing')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Show detailed processing information')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        if df is None or df.empty:
+            print("Error: No valid markdown table found or table is empty", file=sys.stderr)
+            sys.exit(1)
+        
+        if args.verbose:
+            print(f"Loaded table with {len(df)} rows and {len(df.columns)} columns", file=sys.stderr)
+        
+        # Parse column specifications
+        target_columns = None
+        if args.columns:
+            target_columns = [col.strip() for col in args.columns.split(',')]
+        
+        exclude_columns = []
+        if args.exclude_columns:
+            exclude_columns = [col.strip() for col in args.exclude_columns.split(',')]
+        
+        # Initialize processing log
+        processing_log = {
+            'original_shape': (len(df), len(df.columns)),
+            'operations': [],
+            'final_shape': None
+        }
+        
+        processed_df = df.copy()
+        
+        if args.detect_outliers_only:
+            # Only detect outliers
+            outlier_info = detect_outliers(processed_df, target_columns, args.outlier_method)
+            
+            if args.format == 'json':
+                print(json.dumps(outlier_info, indent=2))
+            else:
+                print("# Outlier Detection Report\n")
+                for info in outlier_info:
+                    print(f"## {info['column']}")
+                    print(f"- **Method**: {info['method']}")
+                    print(f"- **Outliers Found**: {info['outlier_count']}")
+                    print(f"- **Percentage**: {info['outlier_percentage']:.2f}%")
+                    if 'lower_bound' in info:
+                        print(f"- **Lower Bound**: {info['lower_bound']:.2f}")
+                        print(f"- **Upper Bound**: {info['upper_bound']:.2f}")
+                    print()
+            return
+        
+        # Apply normalization operations
+        if args.full_pipeline or args.handle_missing:
+            # Handle missing values
+            operations = [op.strip() for op in args.operations.split(',')]
+            processed_df, missing_log = handle_missing_values(processed_df, args.strategy, target_columns)
+            processing_log['operations'].append({
+                'type': 'missing_values',
+                'details': missing_log
+            })
+            if args.verbose:
+                print(f"Handled missing values using {args.strategy} strategy", file=sys.stderr)
+        
+        if args.full_pipeline or args.text_normalize:
+            # Text normalization
+            operations = [op.strip() for op in args.operations.split(',')]
+            text_columns = target_columns if target_columns else None
+            if text_columns:
+                text_columns = [col for col in text_columns if col in processed_df.select_dtypes(include=['object']).columns]
+            
+            processed_df, text_log = normalize_text_columns(processed_df, text_columns, operations)
+            processing_log['operations'].append({
+                'type': 'text_normalization',
+                'details': text_log
+            })
+            if args.verbose:
+                print(f"Normalized text columns with operations: {', '.join(operations)}", file=sys.stderr)
+        
+        if args.full_pipeline or args.numeric_normalize:
+            # Numeric normalization
+            numeric_columns = target_columns if target_columns else None
+            if numeric_columns:
+                numeric_columns = [col for col in numeric_columns if col in processed_df.select_dtypes(include=[np.number]).columns]
+            
+            processed_df, numeric_log, scalers = normalize_numeric_columns(processed_df, numeric_columns, args.method)
+            processing_log['operations'].append({
+                'type': 'numeric_normalization',
+                'details': numeric_log
+            })
+            if args.verbose:
+                print(f"Normalized numeric columns using {args.method} method", file=sys.stderr)
+        
+        if args.full_pipeline or args.encode_categorical:
+            # Categorical encoding
+            categorical_columns = target_columns if target_columns else None
+            if categorical_columns:
+                categorical_columns = [col for col in categorical_columns if col in processed_df.select_dtypes(include=['object']).columns]
+            
+            processed_df, encoding_log, encoders = encode_categorical_columns(processed_df, categorical_columns, args.encoding_method)
+            processing_log['operations'].append({
+                'type': 'categorical_encoding',
+                'details': encoding_log
+            })
+            if args.verbose:
+                print(f"Encoded categorical columns using {args.encoding_method} method", file=sys.stderr)
+        
+        if args.full_pipeline or args.remove_outliers:
+            # Remove outliers
+            numeric_columns = target_columns if target_columns else None
+            if numeric_columns:
+                numeric_columns = [col for col in numeric_columns if col in processed_df.select_dtypes(include=[np.number]).columns]
+            
+            processed_df, removal_log = remove_outliers(processed_df, numeric_columns, args.outlier_method)
+            processing_log['operations'].append({
+                'type': 'outlier_removal',
+                'details': removal_log
+            })
+            if args.verbose:
+                print(f"Removed outliers using {args.outlier_method} method", file=sys.stderr)
+        
+        # Exclude specified columns from output
+        if exclude_columns:
+            processed_df = processed_df.drop(columns=[col for col in exclude_columns if col in processed_df.columns])
+        
+        processing_log['final_shape'] = (len(processed_df), len(processed_df.columns))
+        
+        # Generate output
+        if args.format == 'json':
+            output_text = processed_df.to_json(orient='records', indent=2)
+        else:
+            output_text = dataframe_to_markdown(processed_df)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output_text)
+        else:
+            print(output_text)
+        
+        # Save processing report
+        if args.report:
+            with open(args.report, 'w', encoding='utf-8') as f:
+                json.dump(processing_log, f, indent=2, default=str)
+            if args.verbose:
+                print(f"Processing report saved to: {args.report}", file=sys.stderr)
+        
+        if args.verbose:
+            original_rows, original_cols = processing_log['original_shape']
+            final_rows, final_cols = processing_log['final_shape']
+            print(f"Processing complete: {original_rows}x{original_cols} → {final_rows}x{final_cols}", file=sys.stderr)
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

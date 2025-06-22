@@ -1,0 +1,639 @@
+#!/usr/bin/python3
+"""
+md_table_validate - Check markdown table structure and consistency
+
+Usage:
+  md_table_validate [--input FILE] [--strict] [--report] [--json] [--fix]
+  cat table.md | md_table_validate --strict --report
+  md_table_validate --input document.md --json > validation.json
+
+Validation checks:
+  - Table structure (proper headers, separators, rows)
+  - Column consistency (same number of columns across rows)
+  - Alignment syntax (valid :--: patterns in separators)
+  - Cell content (escaped characters, balanced quotes)
+  - Header uniqueness (duplicate column names)
+  - Empty rows/columns detection
+  - Formatting consistency (spacing, alignment)
+
+Options:
+  --input FILE      Input markdown file (default: stdin)
+  --strict          Enable strict validation mode (fail on warnings)
+  --report          Generate detailed validation report
+  --json            Output results in JSON format
+  --fix             Attempt to fix common issues (TODO: future feature)
+  --quiet           Only output errors and critical issues
+  --line-numbers    Include line numbers in error messages
+
+Exit codes:
+  0  - All tables valid
+  1  - Validation errors found (or warnings in strict mode)
+  2  - No tables found
+  3  - File/parsing errors
+
+Examples:
+  # Basic validation
+  md_table_validate < table.md
+  
+  # Strict mode with detailed report
+  md_table_validate --strict --report < complex_document.md
+  
+  # JSON output for integration
+  md_table_validate --json --input tables.md > results.json
+  
+  # Quiet mode (errors only)
+  md_table_validate --quiet --input messy_tables.md
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import argparse
+import sys
+import re
+import json
+from typing import List, Optional, Dict, Any, Tuple, NamedTuple
+from enum import Enum
+from dataclasses import dataclass
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas", file=sys.stderr)
+    sys.exit(1)
+
+class ValidationLevel(Enum):
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+
+@dataclass
+class ValidationIssue:
+    level: ValidationLevel
+    message: str
+    line_number: int = 0
+    column_number: int = 0
+    table_index: int = 0
+    fix_suggestion: str = ""
+
+@dataclass
+class TableInfo:
+    start_line: int
+    end_line: int
+    headers: List[str]
+    num_columns: int
+    num_rows: int
+    has_separator: bool
+    alignment_spec: List[str]
+
+class MarkdownTableValidator:
+    def __init__(self, strict_mode: bool = False, include_line_numbers: bool = False):
+        self.strict_mode = strict_mode
+        self.include_line_numbers = include_line_numbers
+        self.issues: List[ValidationIssue] = []
+        self.tables: List[TableInfo] = []
+    
+    def find_tables(self, content: str) -> List[Tuple[int, int, List[str]]]:
+        """Find all markdown tables in content and return (start_line, end_line, lines)"""
+        lines = content.split('\n')
+        tables = []
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Look for table start (line starting with |)
+            if line.startswith('|') and line.endswith('|'):
+                start_line = i
+                table_lines = [line]
+                
+                # Collect consecutive table lines
+                i += 1
+                while i < len(lines):
+                    line = lines[i].strip()
+                    if line.startswith('|') and line.endswith('|'):
+                        table_lines.append(line)
+                        i += 1
+                    elif line == '':
+                        # Skip empty lines within table
+                        i += 1
+                    else:
+                        break
+                
+                # Only consider it a table if we have at least 2 lines
+                if len(table_lines) >= 2:
+                    tables.append((start_line, i - 1, table_lines))
+                else:
+                    i += 1
+            else:
+                i += 1
+        
+        return tables
+    
+    def parse_alignment_from_separator(self, separator_line: str) -> List[str]:
+        """Parse column alignment from separator line"""
+        cells = [cell.strip() for cell in separator_line.split('|')[1:-1]]
+        alignments = []
+        
+        for cell in cells:
+            if cell.startswith(':') and cell.endswith(':'):
+                alignments.append('center')
+            elif cell.endswith(':'):
+                alignments.append('right')
+            elif cell.startswith(':'):
+                alignments.append('left')
+            else:
+                # Check if it's just dashes (default left)
+                if re.match(r'^-+$', cell):
+                    alignments.append('left')
+                else:
+                    alignments.append('invalid')
+        
+        return alignments
+    
+    def validate_table_structure(self, table_lines: List[str], table_index: int, start_line: int) -> TableInfo:
+        """Validate basic table structure"""
+        if len(table_lines) < 2:
+            self.add_issue(
+                ValidationLevel.ERROR,
+                f"Table {table_index + 1}: Must have at least 2 lines (header + separator)",
+                start_line + 1
+            )
+            return TableInfo(start_line, start_line + len(table_lines), [], 0, 0, False, [])
+        
+        # Parse header
+        header_line = table_lines[0]
+        headers = [cell.strip() for cell in header_line.split('|')[1:-1]]
+        
+        if not headers:
+            self.add_issue(
+                ValidationLevel.ERROR,
+                f"Table {table_index + 1}: No columns found in header",
+                start_line + 1
+            )
+            return TableInfo(start_line, start_line + len(table_lines), [], 0, 0, False, [])
+        
+        # Look for separator line
+        separator_idx = None
+        separator_line = None
+        alignments = []
+        
+        for i, line in enumerate(table_lines[1:], 1):
+            if re.match(r'^\|[\s\-:|]+\|$', line):
+                separator_idx = i
+                separator_line = line
+                alignments = self.parse_alignment_from_separator(line)
+                break
+        
+        has_separator = separator_idx is not None
+        
+        if not has_separator:
+            if self.strict_mode:
+                self.add_issue(
+                    ValidationLevel.ERROR,
+                    f"Table {table_index + 1}: Missing separator line",
+                    start_line + 2
+                )
+            else:
+                self.add_issue(
+                    ValidationLevel.WARNING,
+                    f"Table {table_index + 1}: Missing separator line",
+                    start_line + 2
+                )
+        
+        # Count data rows
+        data_lines = table_lines[separator_idx + 1:] if has_separator else table_lines[1:]
+        num_rows = len(data_lines)
+        
+        return TableInfo(
+            start_line,
+            start_line + len(table_lines),
+            headers,
+            len(headers),
+            num_rows,
+            has_separator,
+            alignments
+        )
+    
+    def validate_column_consistency(self, table_lines: List[str], table_info: TableInfo, table_index: int):
+        """Validate that all rows have consistent column counts"""
+        expected_cols = table_info.num_columns
+        
+        for i, line in enumerate(table_lines):
+            cells = line.split('|')[1:-1]  # Remove first/last empty
+            actual_cols = len(cells)
+            
+            if actual_cols != expected_cols:
+                line_num = table_info.start_line + i + 1
+                self.add_issue(
+                    ValidationLevel.ERROR,
+                    f"Table {table_index + 1}: Row {i + 1} has {actual_cols} columns, expected {expected_cols}",
+                    line_num,
+                    fix_suggestion=f"Add/remove columns to match header count of {expected_cols}"
+                )
+    
+    def validate_separator_syntax(self, table_info: TableInfo, separator_line: str, table_index: int):
+        """Validate separator line syntax"""
+        if not table_info.has_separator:
+            return
+        
+        cells = [cell.strip() for cell in separator_line.split('|')[1:-1]]
+        
+        for i, cell in enumerate(cells):
+            # Check for valid separator patterns
+            if not re.match(r'^:?-+:?$', cell):
+                line_num = table_info.start_line + 2  # Separator is typically line 2
+                self.add_issue(
+                    ValidationLevel.ERROR,
+                    f"Table {table_index + 1}: Invalid separator syntax in column {i + 1}: '{cell}'",
+                    line_num,
+                    fix_suggestion="Use format: '---', ':---', '---:', or ':---:'"
+                )
+        
+        # Check alignment consistency
+        if len(table_info.alignment_spec) != table_info.num_columns:
+            line_num = table_info.start_line + 2
+            self.add_issue(
+                ValidationLevel.ERROR,
+                f"Table {table_index + 1}: Separator has {len(table_info.alignment_spec)} columns, header has {table_info.num_columns}",
+                line_num
+            )
+    
+    def validate_header_uniqueness(self, table_info: TableInfo, table_index: int):
+        """Check for duplicate column headers"""
+        headers = table_info.headers
+        seen = set()
+        duplicates = set()
+        
+        for header in headers:
+            if header.lower() in seen:
+                duplicates.add(header)
+            else:
+                seen.add(header.lower())
+        
+        if duplicates:
+            self.add_issue(
+                ValidationLevel.WARNING,
+                f"Table {table_index + 1}: Duplicate column headers: {', '.join(duplicates)}",
+                table_info.start_line + 1,
+                fix_suggestion="Rename duplicate columns to be unique"
+            )
+    
+    def validate_cell_content(self, table_lines: List[str], table_info: TableInfo, table_index: int):
+        """Validate cell content for common issues"""
+        for i, line in enumerate(table_lines):
+            cells = [cell.strip() for cell in line.split('|')[1:-1]]
+            line_num = table_info.start_line + i + 1
+            
+            for j, cell in enumerate(cells):
+                # Check for unescaped pipes
+                if '|' in cell and '\\|' not in cell:
+                    self.add_issue(
+                        ValidationLevel.WARNING,
+                        f"Table {table_index + 1}: Unescaped pipe character in row {i + 1}, column {j + 1}",
+                        line_num,
+                        fix_suggestion="Escape pipes as '\\|' within cell content"
+                    )
+                
+                # Check for unbalanced quotes (simple check)
+                quote_count = cell.count('"')
+                if quote_count % 2 != 0:
+                    self.add_issue(
+                        ValidationLevel.INFO,
+                        f"Table {table_index + 1}: Possible unbalanced quotes in row {i + 1}, column {j + 1}",
+                        line_num
+                    )
+    
+    def validate_empty_content(self, table_info: TableInfo, table_lines: List[str], table_index: int):
+        """Check for empty rows or columns"""
+        if table_info.num_rows == 0:
+            self.add_issue(
+                ValidationLevel.WARNING,
+                f"Table {table_index + 1}: Table has no data rows",
+                table_info.start_line + 1
+            )
+        
+        # Check for empty columns
+        if len(table_lines) > 1:
+            all_cells = []
+            for line in table_lines:
+                cells = [cell.strip() for cell in line.split('|')[1:-1]]
+                all_cells.append(cells)
+            
+            # Transpose to check columns
+            if all_cells:
+                max_cols = max(len(row) for row in all_cells)
+                for col_idx in range(max_cols):
+                    column_data = []
+                    for row in all_cells:
+                        if col_idx < len(row):
+                            column_data.append(row[col_idx])
+                        else:
+                            column_data.append('')
+                    
+                    # Skip header row for empty check
+                    if len(column_data) > 1:
+                        data_cells = column_data[1:]  # Skip header
+                        if all(not cell.strip() for cell in data_cells):
+                            self.add_issue(
+                                ValidationLevel.INFO,
+                                f"Table {table_index + 1}: Column {col_idx + 1} appears to be empty",
+                                table_info.start_line + 1
+                            )
+    
+    def validate_formatting_consistency(self, table_lines: List[str], table_info: TableInfo, table_index: int):
+        """Check for formatting consistency issues"""
+        # Check spacing around pipes
+        for i, line in enumerate(table_lines):
+            line_num = table_info.start_line + i + 1
+            
+            # Check for inconsistent spacing
+            if '||' in line:
+                self.add_issue(
+                    ValidationLevel.INFO,
+                    f"Table {table_index + 1}: Double pipes found in row {i + 1} (possible formatting issue)",
+                    line_num,
+                    fix_suggestion="Check for missing cell content between pipes"
+                )
+            
+            # Check for leading/trailing whitespace inconsistency
+            if line.startswith('| ') and line.endswith(' |'):
+                # Good - consistent spacing
+                pass
+            elif line.startswith('|') and line.endswith('|'):
+                if not (line.startswith('| ') or line.endswith(' |')):
+                    self.add_issue(
+                        ValidationLevel.INFO,
+                        f"Table {table_index + 1}: Inconsistent spacing in row {i + 1}",
+                        line_num,
+                        fix_suggestion="Use consistent spacing: '| content |'"
+                    )
+    
+    def add_issue(self, level: ValidationLevel, message: str, line_number: int = 0, 
+                  column_number: int = 0, table_index: int = 0, fix_suggestion: str = ""):
+        """Add a validation issue"""
+        issue = ValidationIssue(
+            level=level,
+            message=message,
+            line_number=line_number if self.include_line_numbers else 0,
+            column_number=column_number,
+            table_index=table_index,
+            fix_suggestion=fix_suggestion
+        )
+        self.issues.append(issue)
+    
+    def validate(self, content: str) -> bool:
+        """Validate all tables in content. Returns True if valid."""
+        self.issues = []
+        self.tables = []
+        
+        # Find all tables
+        table_data = self.find_tables(content)
+        
+        if not table_data:
+            self.add_issue(
+                ValidationLevel.INFO,
+                "No markdown tables found in input"
+            )
+            return True  # Not an error to have no tables
+        
+        # Validate each table
+        for table_index, (start_line, end_line, table_lines) in enumerate(table_data):
+            # Basic structure validation
+            table_info = self.validate_table_structure(table_lines, table_index, start_line)
+            self.tables.append(table_info)
+            
+            if table_info.num_columns == 0:
+                continue  # Skip further validation if no columns
+            
+            # Column consistency
+            self.validate_column_consistency(table_lines, table_info, table_index)
+            
+            # Separator syntax
+            if table_info.has_separator and len(table_lines) > 1:
+                separator_line = table_lines[1] if len(table_lines) > 1 else ""
+                self.validate_separator_syntax(table_info, separator_line, table_index)
+            
+            # Header uniqueness
+            self.validate_header_uniqueness(table_info, table_index)
+            
+            # Cell content
+            self.validate_cell_content(table_lines, table_info, table_index)
+            
+            # Empty content
+            self.validate_empty_content(table_info, table_lines, table_index)
+            
+            # Formatting consistency
+            self.validate_formatting_consistency(table_lines, table_info, table_index)
+        
+        # Determine if validation passed
+        has_errors = any(issue.level == ValidationLevel.ERROR for issue in self.issues)
+        has_warnings = any(issue.level == ValidationLevel.WARNING for issue in self.issues)
+        
+        if self.strict_mode:
+            return not (has_errors or has_warnings)
+        else:
+            return not has_errors
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """Get validation summary"""
+        errors = [i for i in self.issues if i.level == ValidationLevel.ERROR]
+        warnings = [i for i in self.issues if i.level == ValidationLevel.WARNING]
+        info = [i for i in self.issues if i.level == ValidationLevel.INFO]
+        
+        return {
+            "tables_found": len(self.tables),
+            "total_issues": len(self.issues),
+            "errors": len(errors),
+            "warnings": len(warnings),
+            "info": len(info),
+            "validation_passed": len(errors) == 0 and (not self.strict_mode or len(warnings) == 0)
+        }
+
+def format_report(validator: MarkdownTableValidator, include_summary: bool = True) -> str:
+    """Format validation report"""
+    lines = []
+    
+    if include_summary:
+        summary = validator.get_summary()
+        lines.append("MARKDOWN TABLE VALIDATION REPORT")
+        lines.append("=" * 35)
+        lines.append(f"Tables found: {summary['tables_found']}")
+        lines.append(f"Total issues: {summary['total_issues']}")
+        lines.append(f"  Errors: {summary['errors']}")
+        lines.append(f"  Warnings: {summary['warnings']}")
+        lines.append(f"  Info: {summary['info']}")
+        lines.append(f"Validation {'PASSED' if summary['validation_passed'] else 'FAILED'}")
+        lines.append("")
+    
+    if validator.issues:
+        lines.append("ISSUES FOUND:")
+        lines.append("-" * 13)
+        
+        for issue in validator.issues:
+            level_str = issue.level.value.upper()
+            
+            if validator.include_line_numbers and issue.line_number > 0:
+                location = f" (line {issue.line_number})"
+            else:
+                location = ""
+            
+            lines.append(f"[{level_str}]{location} {issue.message}")
+            
+            if issue.fix_suggestion:
+                lines.append(f"  → {issue.fix_suggestion}")
+            
+            lines.append("")
+    
+    return "\n".join(lines)
+
+def format_json_report(validator: MarkdownTableValidator) -> str:
+    """Format validation report as JSON"""
+    summary = validator.get_summary()
+    
+    issues_data = []
+    for issue in validator.issues:
+        issue_data = {
+            "level": issue.level.value,
+            "message": issue.message,
+            "table_index": issue.table_index,
+            "fix_suggestion": issue.fix_suggestion
+        }
+        
+        if validator.include_line_numbers:
+            issue_data["line_number"] = issue.line_number
+            issue_data["column_number"] = issue.column_number
+        
+        issues_data.append(issue_data)
+    
+    tables_data = []
+    for i, table in enumerate(validator.tables):
+        table_data = {
+            "index": i,
+            "start_line": table.start_line,
+            "end_line": table.end_line,
+            "num_columns": table.num_columns,
+            "num_rows": table.num_rows,
+            "has_separator": table.has_separator,
+            "headers": table.headers,
+            "alignment_spec": table.alignment_spec
+        }
+        tables_data.append(table_data)
+    
+    report = {
+        "summary": summary,
+        "tables": tables_data,
+        "issues": issues_data
+    }
+    
+    return json.dumps(report, indent=2)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Check markdown table structure and consistency',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_table_validate < table.md
+  md_table_validate --strict --report < complex_document.md
+  md_table_validate --json --input tables.md > results.json
+  md_table_validate --quiet --input messy_tables.md
+        """
+    )
+    
+    parser.add_argument('--input', '-i', help='Input markdown file (default: stdin)')
+    parser.add_argument('--strict', action='store_true', help='Enable strict validation mode')
+    parser.add_argument('--report', action='store_true', help='Generate detailed validation report')
+    parser.add_argument('--json', action='store_true', help='Output results in JSON format')
+    parser.add_argument('--quiet', action='store_true', help='Only output errors and critical issues')
+    parser.add_argument('--line-numbers', action='store_true', help='Include line numbers in error messages')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(3)
+        
+        # Create validator
+        validator = MarkdownTableValidator(
+            strict_mode=args.strict,
+            include_line_numbers=args.line_numbers
+        )
+        
+        # Validate content
+        is_valid = validator.validate(content)
+        summary = validator.get_summary()
+        
+        # Generate output
+        if args.json:
+            print(format_json_report(validator))
+        elif args.report or not args.quiet:
+            print(format_report(validator, include_summary=not args.quiet))
+        elif not args.quiet:
+            # Default output
+            if summary['tables_found'] == 0:
+                print("No markdown tables found")
+            elif is_valid:
+                print(f"✓ All {summary['tables_found']} table(s) valid")
+            else:
+                print(f"✗ Validation failed: {summary['errors']} error(s), {summary['warnings']} warning(s)")
+        
+        # Handle quiet mode
+        if args.quiet and not is_valid:
+            # Only show errors and critical issues
+            for issue in validator.issues:
+                if issue.level == ValidationLevel.ERROR:
+                    location = f" (line {issue.line_number})" if args.line_numbers and issue.line_number > 0 else ""
+                    print(f"ERROR{location}: {issue.message}", file=sys.stderr)
+        
+        # Set exit code
+        if summary['tables_found'] == 0:
+            sys.exit(2)  # No tables found
+        elif not is_valid:
+            sys.exit(1)  # Validation failed
+        else:
+            sys.exit(0)  # Success
+        
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(3)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(3)
+
+if __name__ == "__main__":
+    main()

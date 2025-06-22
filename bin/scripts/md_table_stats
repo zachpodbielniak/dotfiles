@@ -1,0 +1,590 @@
+#!/usr/bin/python3
+"""
+md_table_stats - Generate statistics for markdown tables
+
+Usage:
+  md_table_stats < data.md
+  md_table_stats --input data.md --output stats.md
+  md_table_stats --column score --histogram
+  cat table.md | md_table_stats --column price --percentiles 25,50,75,90,95
+  
+Statistics generated:
+  - Basic table info (rows, columns, data types)
+  - Column statistics (count, mean, std, min, max, percentiles)
+  - Missing data analysis
+  - Data type distribution
+  - Histograms and value distributions (with --histogram)
+  
+Options:
+  --column NAME         Focus on specific column
+  --histogram          Generate histogram for numeric columns
+  --percentiles LIST   Custom percentiles (comma-separated, e.g., 25,50,75,95)
+  --bins N             Number of histogram bins (default: 10)
+  --format text|md     Output format: plain text or markdown (default: text)
+  --output FILE        Write output to file instead of stdout
+
+Examples:
+  md_table_stats < data.md
+  md_table_stats --column score --histogram --bins 20
+  md_table_stats --format md --output report.md < sales_data.md
+  md_table_stats --column price --percentiles 10,25,50,75,90,95
+"""
+
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+    run(cmd)
+    exit(0)
+
+import argparse
+import re
+import sys
+import math
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Union
+from collections import Counter
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat first row as data
+        data_lines = table_lines
+        headers = [f"Column{i+1}" for i in range(len(headers))]
+        data_start = 0
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=headers)
+    
+    # Try to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if it fails  
+        numeric_series = pd.to_numeric(df[col], errors='coerce')
+        # If more than 50% of values are numeric, convert the column
+        if numeric_series.notna().sum() / len(df) > 0.5:
+            df[col] = numeric_series
+    
+    return df
+
+def infer_column_type(series: pd.Series) -> str:
+    """Infer the primary data type of a column"""
+    if series.dtype in ['int64', 'float64']:
+        return 'numeric'
+    elif series.dtype == 'bool':
+        return 'boolean'
+    else:
+        # Check if it's mostly numeric
+        numeric_count = pd.to_numeric(series, errors='coerce').notna().sum()
+        if numeric_count / len(series) > 0.8:
+            return 'numeric (mixed)'
+        
+        # Check if it's date-like
+        try:
+            pd.to_datetime(series.dropna().head(10), errors='raise')
+            return 'datetime'
+        except:
+            pass
+        
+        return 'text'
+
+def generate_basic_stats(df: pd.DataFrame) -> Dict[str, Any]:
+    """Generate basic table statistics"""
+    stats = {
+        'rows': len(df),
+        'columns': len(df.columns),
+        'total_cells': len(df) * len(df.columns),
+        'missing_cells': df.isnull().sum().sum(),
+        'column_info': {}
+    }
+    
+    # Calculate missing percentage
+    if stats['total_cells'] > 0:
+        stats['missing_percentage'] = (stats['missing_cells'] / stats['total_cells']) * 100
+    else:
+        stats['missing_percentage'] = 0
+    
+    # Column-specific info
+    for col in df.columns:
+        col_info = {
+            'type': infer_column_type(df[col]),
+            'missing': df[col].isnull().sum(),
+            'unique': df[col].nunique(),
+            'most_common': None
+        }
+        
+        # Missing percentage for this column
+        col_info['missing_percentage'] = (col_info['missing'] / len(df)) * 100 if len(df) > 0 else 0
+        
+        # Most common value
+        if col_info['unique'] > 0:
+            value_counts = df[col].value_counts()
+            if len(value_counts) > 0:
+                col_info['most_common'] = {
+                    'value': value_counts.index[0],
+                    'count': value_counts.iloc[0],
+                    'percentage': (value_counts.iloc[0] / len(df)) * 100
+                }
+        
+        stats['column_info'][col] = col_info
+    
+    return stats
+
+def generate_numeric_stats(df: pd.DataFrame, column: str = None, percentiles: List[float] = None) -> Dict[str, Any]:
+    """Generate detailed statistics for numeric columns"""
+    if percentiles is None:
+        percentiles = [25, 50, 75]
+    
+    numeric_stats = {}
+    
+    # Get numeric columns
+    if column:
+        if column not in df.columns:
+            raise ValueError(f"Column '{column}' not found in table")
+        numeric_cols = [column] if pd.api.types.is_numeric_dtype(df[column]) else []
+        if not numeric_cols:
+            # Try to convert to numeric
+            numeric_series = pd.to_numeric(df[column], errors='coerce')
+            if numeric_series.notna().sum() > 0:
+                numeric_cols = [column]
+                df = df.copy()
+                df[column] = numeric_series
+    else:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        
+        # Also include columns that can be converted to numeric
+        for col in df.columns:
+            if col not in numeric_cols:
+                numeric_series = pd.to_numeric(df[col], errors='coerce')
+                if numeric_series.notna().sum() / len(df) > 0.5:
+                    numeric_cols.append(col)
+                    df = df.copy()
+                    df[col] = numeric_series
+    
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if len(series) == 0:
+            continue
+            
+        stats = {
+            'count': len(series),
+            'mean': series.mean(),
+            'std': series.std(),
+            'min': series.min(),
+            'max': series.max(),
+            'percentiles': {}
+        }
+        
+        # Calculate percentiles
+        for p in percentiles:
+            stats['percentiles'][f'p{int(p)}'] = series.quantile(p / 100)
+        
+        # Additional stats
+        stats['range'] = stats['max'] - stats['min']
+        stats['median'] = series.median()
+        stats['mode'] = series.mode().iloc[0] if len(series.mode()) > 0 else None
+        stats['skewness'] = series.skew()
+        stats['kurtosis'] = series.kurtosis()
+        
+        # Outlier detection (IQR method)
+        q1 = series.quantile(0.25)
+        q3 = series.quantile(0.75)
+        iqr = q3 - q1
+        outlier_bounds = {
+            'lower': q1 - 1.5 * iqr,
+            'upper': q3 + 1.5 * iqr
+        }
+        outliers = series[(series < outlier_bounds['lower']) | (series > outlier_bounds['upper'])]
+        stats['outliers'] = {
+            'count': len(outliers),
+            'percentage': (len(outliers) / len(series)) * 100,
+            'values': outliers.tolist() if len(outliers) <= 10 else outliers.head(10).tolist()
+        }
+        
+        numeric_stats[col] = stats
+    
+    return numeric_stats
+
+def generate_histogram(series: pd.Series, bins: int = 10) -> Dict[str, Any]:
+    """Generate histogram data for a numeric series"""
+    series = series.dropna()
+    if len(series) == 0:
+        return {'error': 'No numeric data available'}
+    
+    # Create histogram
+    counts, bin_edges = np.histogram(series, bins=bins)
+    
+    # Create histogram visualization
+    max_count = max(counts) if len(counts) > 0 else 0
+    hist_data = {
+        'bins': bins,
+        'total_values': len(series),
+        'bin_data': []
+    }
+    
+    for i in range(len(counts)):
+        bin_start = bin_edges[i]
+        bin_end = bin_edges[i + 1]
+        count = counts[i]
+        percentage = (count / len(series)) * 100
+        
+        # Create simple text histogram bar
+        if max_count > 0:
+            bar_length = int((count / max_count) * 40)  # Scale to 40 chars max
+            bar = '█' * bar_length
+        else:
+            bar = ''
+        
+        hist_data['bin_data'].append({
+            'range': f"[{bin_start:.2f}, {bin_end:.2f})",
+            'count': count,
+            'percentage': percentage,
+            'bar': bar
+        })
+    
+    return hist_data
+
+def format_text_output(basic_stats: Dict, numeric_stats: Dict, histogram_data: Dict = None, 
+                      column_focus: str = None) -> str:
+    """Format statistics as plain text"""
+    lines = []
+    
+    # Header
+    lines.append("MARKDOWN TABLE STATISTICS")
+    lines.append("=" * 50)
+    lines.append("")
+    
+    # Basic stats
+    lines.append("BASIC INFORMATION:")
+    lines.append(f"  Rows: {basic_stats['rows']:,}")
+    lines.append(f"  Columns: {basic_stats['columns']:,}")
+    lines.append(f"  Total cells: {basic_stats['total_cells']:,}")
+    lines.append(f"  Missing cells: {basic_stats['missing_cells']:,} ({basic_stats['missing_percentage']:.1f}%)")
+    lines.append("")
+    
+    # Column information
+    if not column_focus:
+        lines.append("COLUMN INFORMATION:")
+        for col, info in basic_stats['column_info'].items():
+            lines.append(f"  {col}:")
+            lines.append(f"    Type: {info['type']}")
+            lines.append(f"    Missing: {info['missing']} ({info['missing_percentage']:.1f}%)")
+            lines.append(f"    Unique values: {info['unique']}")
+            if info['most_common']:
+                lines.append(f"    Most common: '{info['most_common']['value']}' ({info['most_common']['count']} times, {info['most_common']['percentage']:.1f}%)")
+        lines.append("")
+    
+    # Numeric statistics
+    if numeric_stats:
+        if column_focus:
+            lines.append(f"DETAILED STATISTICS FOR '{column_focus}':")
+        else:
+            lines.append("NUMERIC COLUMN STATISTICS:")
+        
+        for col, stats in numeric_stats.items():
+            if not column_focus or col == column_focus:
+                lines.append(f"  {col}:")
+                lines.append(f"    Count: {stats['count']:,}")
+                lines.append(f"    Mean: {stats['mean']:.3f}")
+                lines.append(f"    Std Dev: {stats['std']:.3f}")
+                lines.append(f"    Min: {stats['min']:.3f}")
+                lines.append(f"    Max: {stats['max']:.3f}")
+                lines.append(f"    Range: {stats['range']:.3f}")
+                lines.append(f"    Median: {stats['median']:.3f}")
+                if stats['mode'] is not None:
+                    lines.append(f"    Mode: {stats['mode']:.3f}")
+                lines.append(f"    Skewness: {stats['skewness']:.3f}")
+                lines.append(f"    Kurtosis: {stats['kurtosis']:.3f}")
+                
+                # Percentiles
+                lines.append("    Percentiles:")
+                for p_name, p_value in stats['percentiles'].items():
+                    lines.append(f"      {p_name.upper()}: {p_value:.3f}")
+                
+                # Outliers
+                lines.append(f"    Outliers: {stats['outliers']['count']} ({stats['outliers']['percentage']:.1f}%)")
+                if stats['outliers']['values']:
+                    values_str = ', '.join(f"{v:.2f}" for v in stats['outliers']['values'])
+                    if stats['outliers']['count'] > 10:
+                        values_str += "..."
+                    lines.append(f"      Values: {values_str}")
+        lines.append("")
+    
+    # Histogram
+    if histogram_data:
+        for col, hist_info in histogram_data.items():
+            if 'error' in hist_info:
+                lines.append(f"HISTOGRAM FOR '{col}': {hist_info['error']}")
+            else:
+                lines.append(f"HISTOGRAM FOR '{col}' ({hist_info['total_values']} values, {hist_info['bins']} bins):")
+                lines.append("")
+                for bin_info in hist_info['bin_data']:
+                    lines.append(f"  {bin_info['range']:<20} {bin_info['count']:>6} ({bin_info['percentage']:>5.1f}%) {bin_info['bar']}")
+        lines.append("")
+    
+    return "\n".join(lines)
+
+def format_markdown_output(basic_stats: Dict, numeric_stats: Dict, histogram_data: Dict = None,
+                         column_focus: str = None) -> str:
+    """Format statistics as markdown"""
+    lines = []
+    
+    # Header
+    lines.append("# Markdown Table Statistics")
+    lines.append("")
+    
+    # Basic stats
+    lines.append("## Basic Information")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    lines.append(f"| Rows | {basic_stats['rows']:,} |")
+    lines.append(f"| Columns | {basic_stats['columns']:,} |")
+    lines.append(f"| Total cells | {basic_stats['total_cells']:,} |")
+    lines.append(f"| Missing cells | {basic_stats['missing_cells']:,} ({basic_stats['missing_percentage']:.1f}%) |")
+    lines.append("")
+    
+    # Column information
+    if not column_focus:
+        lines.append("## Column Information")
+        lines.append("")
+        lines.append("| Column | Type | Missing | Missing % | Unique | Most Common |")
+        lines.append("|--------|------|---------|-----------|--------|-------------|")
+        
+        for col, info in basic_stats['column_info'].items():
+            most_common = f"'{info['most_common']['value']}' ({info['most_common']['count']})" if info['most_common'] else "N/A"
+            lines.append(f"| {col} | {info['type']} | {info['missing']} | {info['missing_percentage']:.1f}% | {info['unique']} | {most_common} |")
+        lines.append("")
+    
+    # Numeric statistics
+    if numeric_stats:
+        if column_focus:
+            lines.append(f"## Detailed Statistics for '{column_focus}'")
+        else:
+            lines.append("## Numeric Column Statistics")
+        lines.append("")
+        
+        for col, stats in numeric_stats.items():
+            if not column_focus or col == column_focus:
+                lines.append(f"### {col}")
+                lines.append("")
+                lines.append("| Statistic | Value |")
+                lines.append("|-----------|-------|")
+                lines.append(f"| Count | {stats['count']:,} |")
+                lines.append(f"| Mean | {stats['mean']:.3f} |")
+                lines.append(f"| Std Dev | {stats['std']:.3f} |")
+                lines.append(f"| Min | {stats['min']:.3f} |")
+                lines.append(f"| Max | {stats['max']:.3f} |")
+                lines.append(f"| Range | {stats['range']:.3f} |")
+                lines.append(f"| Median | {stats['median']:.3f} |")
+                if stats['mode'] is not None:
+                    lines.append(f"| Mode | {stats['mode']:.3f} |")
+                lines.append(f"| Skewness | {stats['skewness']:.3f} |")
+                lines.append(f"| Kurtosis | {stats['kurtosis']:.3f} |")
+                
+                # Percentiles
+                for p_name, p_value in stats['percentiles'].items():
+                    lines.append(f"| {p_name.upper()} | {p_value:.3f} |")
+                
+                lines.append(f"| Outliers | {stats['outliers']['count']} ({stats['outliers']['percentage']:.1f}%) |")
+                lines.append("")
+    
+    # Histogram
+    if histogram_data:
+        for col, hist_info in histogram_data.items():
+            lines.append(f"## Histogram: {col}")
+            lines.append("")
+            
+            if 'error' in hist_info:
+                lines.append(f"*{hist_info['error']}*")
+            else:
+                lines.append(f"Distribution of {hist_info['total_values']} values across {hist_info['bins']} bins:")
+                lines.append("")
+                lines.append("```")
+                for bin_info in hist_info['bin_data']:
+                    lines.append(f"{bin_info['range']:<20} {bin_info['count']:>6} ({bin_info['percentage']:>5.1f}%) {bin_info['bar']}")
+                lines.append("```")
+            lines.append("")
+    
+    return "\n".join(lines)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate statistics for markdown tables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic statistics for entire table
+  md_table_stats < data.md
+  
+  # Focus on specific column with histogram
+  md_table_stats --column score --histogram < grades.md
+  
+  # Custom percentiles and output format
+  md_table_stats --percentiles 10,25,50,75,90,95 --format md > report.md
+  
+  # Detailed analysis with custom bins
+  md_table_stats --column price --histogram --bins 20 --output analysis.txt
+        """
+    )
+    
+    # Input/output options
+    parser.add_argument('--input', '-i', help='Input markdown file (default: stdin)')
+    parser.add_argument('--output', '-o', help='Output file (default: stdout)')
+    parser.add_argument('--format', '-f', choices=['text', 'md'], default='text',
+                       help='Output format: text or markdown (default: text)')
+    
+    # Analysis options
+    parser.add_argument('--column', '-c', help='Focus analysis on specific column')
+    parser.add_argument('--histogram', action='store_true', help='Generate histogram for numeric columns')
+    parser.add_argument('--percentiles', '-p', help='Custom percentiles (comma-separated, e.g., 25,50,75,95)')
+    parser.add_argument('--bins', '-b', type=int, default=10, help='Number of histogram bins (default: 10)')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        
+        if df is None or df.empty:
+            print("Error: No valid markdown table found in input", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse percentiles
+        percentiles = [25, 50, 75]  # default
+        if args.percentiles:
+            try:
+                percentiles = [float(p.strip()) for p in args.percentiles.split(',')]
+                percentiles = [p for p in percentiles if 0 <= p <= 100]  # Validate range
+            except ValueError:
+                print("Error: Invalid percentiles format. Use comma-separated numbers (e.g., 25,50,75)", file=sys.stderr)
+                sys.exit(1)
+        
+        # Generate statistics
+        basic_stats = generate_basic_stats(df)
+        numeric_stats = generate_numeric_stats(df, args.column, percentiles)
+        
+        # Generate histogram if requested
+        histogram_data = None
+        if args.histogram:
+            histogram_data = {}
+            
+            if args.column:
+                if args.column in df.columns:
+                    series = pd.to_numeric(df[args.column], errors='coerce')
+                    histogram_data[args.column] = generate_histogram(series, args.bins)
+                else:
+                    print(f"Warning: Column '{args.column}' not found", file=sys.stderr)
+            else:
+                # Generate histograms for all numeric columns
+                for col in numeric_stats.keys():
+                    series = pd.to_numeric(df[col], errors='coerce')
+                    histogram_data[col] = generate_histogram(series, args.bins)
+        
+        # Format output
+        if args.format == 'md':
+            output = format_markdown_output(basic_stats, numeric_stats, histogram_data, args.column)
+        else:
+            output = format_text_output(basic_stats, numeric_stats, histogram_data, args.column)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output)
+            print(f"Statistics written to: {args.output}", file=sys.stderr)
+        else:
+            print(output, end='')
+        
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

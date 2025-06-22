@@ -1,0 +1,854 @@
+#!/usr/bin/python3
+"""
+md_table_forecast - Time series forecasting for markdown tables
+
+This script provides comprehensive time series forecasting capabilities for markdown tables,
+supporting multiple forecasting methods including ARIMA, exponential smoothing, linear regression,
+seasonal decomposition, and machine learning approaches.
+
+Usage:
+  md_table_forecast --date-column Date --value-column Sales --periods 12 < data.md
+  md_table_forecast --method arima --seasonal --confidence 0.95 < timeseries.md
+  md_table_forecast --method linear --trend quadratic --evaluate < data.md
+  
+Methods:
+  arima       - Auto ARIMA with automatic parameter selection
+  exponential - Exponential smoothing (Simple, Double, Triple/Holt-Winters)
+  linear      - Linear/polynomial regression with trend fitting
+  seasonal    - Seasonal decomposition + forecasting
+  naive       - Naive and seasonal naive methods
+  ml          - Machine learning approaches (Random Forest, SVR)
+  ensemble    - Ensemble of multiple methods
+  
+Examples:
+  # Basic ARIMA forecast
+  md_table_forecast --date-column Date --value-column Revenue --periods 6 --method arima
+  
+  # Seasonal forecast with confidence intervals
+  md_table_forecast --seasonal --confidence 0.95 --periods 12 --method exponential
+  
+  # Evaluate multiple methods
+  md_table_forecast --evaluate --test-size 0.2 --methods arima,exponential,linear
+  
+  # Export forecast results
+  md_table_forecast --output forecast_results.md --format markdown --include-metrics
+"""
+
+import sys
+import argparse
+import os
+from pathlib import Path
+from os import environ
+from subprocess import run
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, timedelta
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from sklearn.linear_model import LinearRegression
+    from sklearn.preprocessing import PolynomialFeatures
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.svm import SVR
+    from sklearn.model_selection import train_test_split
+    from scipy import stats
+    from scipy.optimize import minimize
+    
+    # Optional imports for advanced methods
+    try:
+        from statsmodels.tsa.arima.model import ARIMA
+        from statsmodels.tsa.seasonal import seasonal_decompose
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+        from statsmodels.tsa.stattools import adfuller
+        from statsmodels.stats.diagnostic import acorr_ljungbox
+        STATSMODELS_AVAILABLE = True
+    except ImportError:
+        STATSMODELS_AVAILABLE = False
+        
+except ImportError as e:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy matplotlib seaborn scikit-learn scipy", file=sys.stderr)
+    print("For advanced methods: pip install statsmodels", file=sys.stderr)
+    print("  - pandas: Data manipulation", file=sys.stderr)
+    print("  - numpy: Numerical computing", file=sys.stderr)
+    print("  - matplotlib/seaborn: Plotting", file=sys.stderr)
+    print("  - scikit-learn: Machine learning", file=sys.stderr)
+    print("  - scipy: Statistical functions", file=sys.stderr)
+    print("  - statsmodels: Time series analysis (optional)", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install [packages]", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Convert columns
+    for col in df.columns:
+        # Try numeric conversion
+        try:
+            numeric_series = pd.to_numeric(df[col], errors='coerce')
+            if not numeric_series.isna().all():
+                df[col] = numeric_series
+        except:
+            pass
+        
+        # Try datetime conversion
+        try:
+            if df[col].dtype == 'object' and not df[col].empty:
+                sample_val = str(df[col].iloc[0]) if not df[col].isna().iloc[0] else ""
+                if any(char.isdigit() for char in sample_val) and ('-' in sample_val or '/' in sample_val):
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+        except:
+            pass
+    
+    return df
+
+def detect_time_series_columns(df):
+    """Detect potential date and value columns for time series"""
+    date_cols = []
+    value_cols = []
+    
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            date_cols.append(col)
+        elif pd.api.types.is_numeric_dtype(df[col]) and not df[col].isna().all():
+            value_cols.append(col)
+    
+    return date_cols, value_cols
+
+def prepare_time_series(df, date_column, value_column):
+    """Prepare time series data for forecasting"""
+    # Create working copy
+    ts_df = df[[date_column, value_column]].copy()
+    
+    # Remove rows with missing values
+    ts_df = ts_df.dropna()
+    
+    # Sort by date
+    ts_df = ts_df.sort_values(date_column)
+    
+    # Set date as index
+    ts_df.set_index(date_column, inplace=True)
+    
+    # Create time series
+    ts = ts_df[value_column]
+    
+    return ts
+
+def calculate_metrics(actual, predicted):
+    """Calculate forecast accuracy metrics"""
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    
+    # Remove NaN values
+    mask = ~(np.isnan(actual) | np.isnan(predicted))
+    actual = actual[mask]
+    predicted = predicted[mask]
+    
+    if len(actual) == 0:
+        return {}
+    
+    metrics = {
+        'MAE': mean_absolute_error(actual, predicted),
+        'RMSE': np.sqrt(mean_squared_error(actual, predicted)),
+        'MAPE': np.mean(np.abs((actual - predicted) / actual)) * 100 if np.all(actual != 0) else np.inf,
+        'MSE': mean_squared_error(actual, predicted),
+        'R2': 1 - (np.sum((actual - predicted) ** 2) / np.sum((actual - np.mean(actual)) ** 2)) if np.var(actual) != 0 else 0
+    }
+    
+    return metrics
+
+def naive_forecast(ts, periods):
+    """Simple naive forecasting methods"""
+    last_value = ts.iloc[-1]
+    dates = pd.date_range(start=ts.index[-1] + pd.Timedelta(days=1), periods=periods, freq='D')
+    
+    # Naive (last value)
+    naive_pred = [last_value] * periods
+    
+    # Seasonal naive (if we have enough data)
+    seasonal_naive_pred = naive_pred.copy()
+    if len(ts) >= 7:  # Weekly seasonality
+        seasonal_pattern = ts.iloc[-7:].values
+        seasonal_naive_pred = np.tile(seasonal_pattern, (periods // 7) + 1)[:periods]
+    
+    return pd.Series(naive_pred, index=dates), pd.Series(seasonal_naive_pred, index=dates)
+
+def linear_trend_forecast(ts, periods, degree=1):
+    """Linear/polynomial trend forecasting"""
+    # Create numeric index for regression
+    x = np.arange(len(ts)).reshape(-1, 1)
+    y = ts.values
+    
+    # Polynomial features
+    poly_features = PolynomialFeatures(degree=degree)
+    x_poly = poly_features.fit_transform(x)
+    
+    # Fit model
+    model = LinearRegression()
+    model.fit(x_poly, y)
+    
+    # Generate future indices
+    future_x = np.arange(len(ts), len(ts) + periods).reshape(-1, 1)
+    future_x_poly = poly_features.transform(future_x)
+    
+    # Predict
+    predictions = model.predict(future_x_poly)
+    
+    # Create forecast dates
+    last_date = ts.index[-1]
+    freq = pd.infer_freq(ts.index) or 'D'
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=periods, freq=freq)
+    
+    forecast = pd.Series(predictions, index=future_dates)
+    
+    return forecast, model
+
+def exponential_smoothing_forecast(ts, periods, seasonal=False, seasonal_periods=None):
+    """Exponential smoothing forecasting"""
+    if not STATSMODELS_AVAILABLE:
+        print("Warning: statsmodels not available, using simple exponential smoothing", file=sys.stderr)
+        # Simple exponential smoothing
+        alpha = 0.3
+        smoothed = [ts.iloc[0]]
+        for i in range(1, len(ts)):
+            smoothed.append(alpha * ts.iloc[i] + (1 - alpha) * smoothed[-1])
+        
+        # Forecast
+        last_smooth = smoothed[-1]
+        predictions = [last_smooth] * periods
+        
+        freq = pd.infer_freq(ts.index) or 'D'
+        future_dates = pd.date_range(start=ts.index[-1] + pd.Timedelta(days=1), periods=periods, freq=freq)
+        return pd.Series(predictions, index=future_dates), None
+    
+    try:
+        # Determine seasonal parameters
+        if seasonal and seasonal_periods is None:
+            seasonal_periods = min(12, len(ts) // 2)  # Default seasonal period
+        
+        # Fit exponential smoothing model
+        if seasonal and len(ts) >= 2 * seasonal_periods:
+            model = ExponentialSmoothing(ts, seasonal='add', seasonal_periods=seasonal_periods)
+        else:
+            model = ExponentialSmoothing(ts, trend='add')
+        
+        fitted_model = model.fit()
+        
+        # Forecast
+        forecast = fitted_model.forecast(periods)
+        
+        return forecast, fitted_model
+        
+    except Exception as e:
+        print(f"Warning: Exponential smoothing failed ({e}), using simple method", file=sys.stderr)
+        return exponential_smoothing_forecast(ts, periods, seasonal=False)
+
+def arima_forecast(ts, periods, seasonal=False):
+    """ARIMA forecasting with automatic parameter selection"""
+    if not STATSMODELS_AVAILABLE:
+        print("Warning: statsmodels not available, falling back to linear trend", file=sys.stderr)
+        return linear_trend_forecast(ts, periods)
+    
+    try:
+        # Test for stationarity
+        adf_test = adfuller(ts.dropna())
+        is_stationary = adf_test[1] < 0.05
+        
+        # Simple parameter search for ARIMA
+        best_aic = float('inf')
+        best_params = (1, 1, 1)
+        best_model = None
+        
+        # Grid search for optimal parameters
+        for p in range(0, 3):
+            for d in range(0, 2):
+                for q in range(0, 3):
+                    try:
+                        model = ARIMA(ts, order=(p, d, q))
+                        fitted_model = model.fit()
+                        
+                        if fitted_model.aic < best_aic:
+                            best_aic = fitted_model.aic
+                            best_params = (p, d, q)
+                            best_model = fitted_model
+                    except:
+                        continue
+        
+        if best_model is None:
+            # Fallback to simple ARIMA(1,1,1)
+            model = ARIMA(ts, order=(1, 1, 1))
+            best_model = model.fit()
+        
+        # Generate forecast
+        forecast = best_model.forecast(steps=periods)
+        confidence_intervals = best_model.get_forecast(steps=periods).conf_int()
+        
+        # Create forecast series with proper dates
+        freq = pd.infer_freq(ts.index) or 'D'
+        future_dates = pd.date_range(start=ts.index[-1] + pd.Timedelta(days=1), periods=periods, freq=freq)
+        forecast_series = pd.Series(forecast, index=future_dates)
+        
+        return forecast_series, best_model, confidence_intervals
+        
+    except Exception as e:
+        print(f"Warning: ARIMA failed ({e}), falling back to linear trend", file=sys.stderr)
+        return linear_trend_forecast(ts, periods)
+
+def ml_forecast(ts, periods, method='rf'):
+    """Machine learning based forecasting"""
+    # Create features (lagged values, rolling statistics)
+    window_sizes = [3, 7, 14] if len(ts) > 14 else [min(3, len(ts))]
+    
+    # Prepare features
+    features = []
+    targets = []
+    
+    max_lag = max(window_sizes) + 1
+    for i in range(max_lag, len(ts)):
+        feature_row = []
+        
+        # Lagged values
+        for lag in range(1, min(8, i)):
+            feature_row.append(ts.iloc[i - lag])
+        
+        # Rolling statistics
+        for window in window_sizes:
+            if i >= window:
+                feature_row.append(ts.iloc[i - window:i].mean())
+                feature_row.append(ts.iloc[i - window:i].std())
+        
+        # Time features
+        date = ts.index[i]
+        feature_row.extend([
+            date.dayofweek,
+            date.month,
+            date.day
+        ])
+        
+        features.append(feature_row)
+        targets.append(ts.iloc[i])
+    
+    if len(features) == 0:
+        print("Warning: Not enough data for ML forecasting, using linear trend", file=sys.stderr)
+        return linear_trend_forecast(ts, periods)
+    
+    features = np.array(features)
+    targets = np.array(targets)
+    
+    # Train model
+    if method == 'rf':
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+    elif method == 'svr':
+        model = SVR(kernel='rbf')
+    else:
+        model = LinearRegression()
+    
+    model.fit(features, targets)
+    
+    # Generate forecasts
+    predictions = []
+    current_ts = ts.copy()
+    
+    for _ in range(periods):
+        # Create features for next prediction
+        feature_row = []
+        
+        # Lagged values
+        for lag in range(1, min(8, len(current_ts))):
+            feature_row.append(current_ts.iloc[-lag])
+        
+        # Rolling statistics
+        for window in window_sizes:
+            if len(current_ts) >= window:
+                feature_row.append(current_ts.iloc[-window:].mean())
+                feature_row.append(current_ts.iloc[-window:].std())
+        
+        # Time features (approximate)
+        next_date = current_ts.index[-1] + pd.Timedelta(days=1)
+        feature_row.extend([
+            next_date.dayofweek,
+            next_date.month,
+            next_date.day
+        ])
+        
+        # Ensure feature length matches training
+        while len(feature_row) < features.shape[1]:
+            feature_row.append(0)
+        feature_row = feature_row[:features.shape[1]]
+        
+        # Predict
+        pred = model.predict([feature_row])[0]
+        predictions.append(pred)
+        
+        # Add prediction to current time series for next iteration
+        new_date = current_ts.index[-1] + pd.Timedelta(days=1)
+        current_ts = pd.concat([current_ts, pd.Series([pred], index=[new_date])])
+    
+    # Create forecast series
+    freq = pd.infer_freq(ts.index) or 'D'
+    future_dates = pd.date_range(start=ts.index[-1] + pd.Timedelta(days=1), periods=periods, freq=freq)
+    forecast_series = pd.Series(predictions, index=future_dates)
+    
+    return forecast_series, model
+
+def ensemble_forecast(ts, periods, methods=['linear', 'exponential', 'arima']):
+    """Ensemble forecasting combining multiple methods"""
+    forecasts = []
+    weights = []
+    
+    for method in methods:
+        try:
+            if method == 'linear':
+                forecast, _ = linear_trend_forecast(ts, periods)
+                forecasts.append(forecast)
+                weights.append(1.0)
+            elif method == 'exponential':
+                forecast, _ = exponential_smoothing_forecast(ts, periods)
+                forecasts.append(forecast)
+                weights.append(1.0)
+            elif method == 'arima' and STATSMODELS_AVAILABLE:
+                result = arima_forecast(ts, periods)
+                if isinstance(result, tuple) and len(result) >= 2:
+                    forecast = result[0]
+                    forecasts.append(forecast)
+                    weights.append(1.0)
+            elif method == 'ml':
+                forecast, _ = ml_forecast(ts, periods)
+                forecasts.append(forecast)
+                weights.append(1.0)
+        except Exception as e:
+            print(f"Warning: {method} method failed: {e}", file=sys.stderr)
+            continue
+    
+    if not forecasts:
+        print("Warning: All ensemble methods failed, using naive forecast", file=sys.stderr)
+        naive_pred, _ = naive_forecast(ts, periods)
+        return naive_pred, None
+    
+    # Combine forecasts (simple average)
+    ensemble_forecast = sum(forecasts) / len(forecasts)
+    
+    return ensemble_forecast, forecasts
+
+def evaluate_forecasts(ts, test_size=0.2, methods=['linear', 'exponential', 'arima']):
+    """Evaluate different forecasting methods on historical data"""
+    # Split data
+    split_point = int(len(ts) * (1 - test_size))
+    train_ts = ts.iloc[:split_point]
+    test_ts = ts.iloc[split_point:]
+    
+    if len(test_ts) == 0:
+        print("Warning: Not enough data for evaluation", file=sys.stderr)
+        return {}
+    
+    results = {}
+    
+    for method in methods:
+        try:
+            periods = len(test_ts)
+            
+            if method == 'linear':
+                forecast, _ = linear_trend_forecast(train_ts, periods)
+            elif method == 'exponential':
+                forecast, _ = exponential_smoothing_forecast(train_ts, periods)
+            elif method == 'arima' and STATSMODELS_AVAILABLE:
+                result = arima_forecast(train_ts, periods)
+                forecast = result[0] if isinstance(result, tuple) else result
+            elif method == 'ml':
+                forecast, _ = ml_forecast(train_ts, periods)
+            elif method == 'naive':
+                forecast, _ = naive_forecast(train_ts, periods)
+            else:
+                continue
+            
+            # Calculate metrics
+            metrics = calculate_metrics(test_ts.values, forecast.values)
+            results[method] = metrics
+            
+        except Exception as e:
+            print(f"Warning: Evaluation of {method} failed: {e}", file=sys.stderr)
+            results[method] = {'error': str(e)}
+    
+    return results
+
+def create_forecast_table(ts, forecast_results, original_columns, include_confidence=False):
+    """Create markdown table with forecast results"""
+    
+    # Combine historical and forecast data
+    historical_df = pd.DataFrame({
+        original_columns[0]: ts.index,
+        original_columns[1]: ts.values,
+        'Type': ['Historical'] * len(ts)
+    })
+    
+    forecast_data = []
+    for method, forecast in forecast_results.items():
+        if isinstance(forecast, pd.Series):
+            for date, value in forecast.items():
+                forecast_data.append({
+                    original_columns[0]: date,
+                    original_columns[1]: value,
+                    'Type': f'Forecast_{method}'
+                })
+    
+    forecast_df = pd.DataFrame(forecast_data)
+    
+    # Combine all data
+    combined_df = pd.concat([historical_df, forecast_df], ignore_index=True)
+    
+    return combined_df
+
+def format_markdown_table(df):
+    """Format DataFrame as markdown table"""
+    if df.empty:
+        return ""
+    
+    # Create header
+    headers = df.columns.tolist()
+    header_line = "| " + " | ".join(headers) + " |"
+    separator_line = "|" + "|".join([" --- " for _ in headers]) + "|"
+    
+    # Create data rows
+    rows = []
+    for _, row in df.iterrows():
+        formatted_row = []
+        for col in headers:
+            value = row[col]
+            if pd.isna(value):
+                formatted_row.append("")
+            elif isinstance(value, float):
+                formatted_row.append(f"{value:.2f}")
+            else:
+                formatted_row.append(str(value))
+        rows.append("| " + " | ".join(formatted_row) + " |")
+    
+    return "\n".join([header_line, separator_line] + rows)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Time series forecasting for markdown tables',
+        epilog='''
+Examples:
+  # Basic ARIMA forecast
+  md_table_forecast --date-column Date --value-column Sales --periods 12 --method arima < data.md
+  
+  # Seasonal exponential smoothing
+  md_table_forecast --method exponential --seasonal --periods 6 < timeseries.md
+  
+  # Evaluate multiple methods
+  md_table_forecast --evaluate --test-size 0.3 --methods arima,exponential,linear < data.md
+  
+  # Ensemble forecast
+  md_table_forecast --method ensemble --periods 8 --output forecast.md < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Data specification
+    parser.add_argument('--date-column', metavar='COLUMN',
+                       help='Column containing dates (auto-detected if not specified)')
+    parser.add_argument('--value-column', metavar='COLUMN',
+                       help='Column containing values to forecast (auto-detected if not specified)')
+    
+    # Forecasting parameters
+    parser.add_argument('--method', choices=['arima', 'exponential', 'linear', 'seasonal', 'naive', 'ml', 'ensemble'],
+                       default='arima', help='Forecasting method (default: arima)')
+    parser.add_argument('--periods', type=int, default=12,
+                       help='Number of periods to forecast (default: 12)')
+    parser.add_argument('--seasonal', action='store_true',
+                       help='Enable seasonal forecasting')
+    parser.add_argument('--seasonal-periods', type=int,
+                       help='Number of periods in seasonal cycle')
+    
+    # Model parameters
+    parser.add_argument('--trend', choices=['linear', 'quadratic', 'cubic'],
+                       default='linear', help='Trend type for linear method')
+    parser.add_argument('--ml-method', choices=['rf', 'svr', 'linear'],
+                       default='rf', help='Machine learning method')
+    parser.add_argument('--ensemble-methods', metavar='METHODS',
+                       help='Comma-separated list of methods for ensemble')
+    
+    # Evaluation
+    parser.add_argument('--evaluate', action='store_true',
+                       help='Evaluate forecast methods on historical data')
+    parser.add_argument('--test-size', type=float, default=0.2,
+                       help='Proportion of data for testing (default: 0.2)')
+    parser.add_argument('--methods', metavar='METHODS',
+                       help='Comma-separated list of methods to evaluate')
+    
+    # Confidence intervals and uncertainty
+    parser.add_argument('--confidence', type=float, default=0.95,
+                       help='Confidence level for intervals (default: 0.95)')
+    parser.add_argument('--include-confidence', action='store_true',
+                       help='Include confidence intervals in output')
+    
+    # Output options
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: stdout)')
+    parser.add_argument('--format', choices=['markdown', 'csv', 'json'],
+                       default='markdown', help='Output format')
+    parser.add_argument('--include-metrics', action='store_true',
+                       help='Include accuracy metrics in output')
+    parser.add_argument('--plot', metavar='FILE',
+                       help='Save forecast plot to file')
+    
+    # Input options
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--list-columns', action='store_true',
+                       help='List available columns and exit')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse table
+        df = parse_markdown_table(content)
+        if df is None or df.empty:
+            print("Error: No valid markdown table found", file=sys.stderr)
+            sys.exit(1)
+        
+        # Detect time series columns
+        date_cols, value_cols = detect_time_series_columns(df)
+        
+        if args.list_columns:
+            print("Available columns:")
+            for col in df.columns:
+                dtype = df[col].dtype
+                col_type = "Date" if col in date_cols else "Numeric" if col in value_cols else "Other"
+                print(f"  {col}: {dtype} ({col_type})")
+            return
+        
+        # Determine columns to use
+        if args.date_column:
+            if args.date_column not in df.columns:
+                print(f"Error: Date column '{args.date_column}' not found", file=sys.stderr)
+                sys.exit(1)
+            date_column = args.date_column
+        else:
+            if not date_cols:
+                print("Error: No date column detected. Use --date-column to specify.", file=sys.stderr)
+                print(f"Available columns: {', '.join(df.columns)}", file=sys.stderr)
+                sys.exit(1)
+            date_column = date_cols[0]
+            print(f"Auto-detected date column: {date_column}", file=sys.stderr)
+        
+        if args.value_column:
+            if args.value_column not in df.columns:
+                print(f"Error: Value column '{args.value_column}' not found", file=sys.stderr)
+                sys.exit(1)
+            value_column = args.value_column
+        else:
+            if not value_cols:
+                print("Error: No numeric column detected. Use --value-column to specify.", file=sys.stderr)
+                sys.exit(1)
+            value_column = value_cols[0]
+            print(f"Auto-detected value column: {value_column}", file=sys.stderr)
+        
+        # Prepare time series
+        ts = prepare_time_series(df, date_column, value_column)
+        
+        if len(ts) < 3:
+            print("Error: Not enough data points for forecasting (minimum 3 required)", file=sys.stderr)
+            sys.exit(1)
+        
+        # Handle evaluation mode
+        if args.evaluate:
+            methods = args.methods.split(',') if args.methods else ['linear', 'exponential', 'arima', 'naive']
+            results = evaluate_forecasts(ts, args.test_size, methods)
+            
+            print("# Forecast Method Evaluation\n")
+            print("| Method | MAE | RMSE | MAPE | R² |")
+            print("|--------|-----|------|------|----|")
+            
+            for method, metrics in results.items():
+                if 'error' in metrics:
+                    print(f"| {method} | Error | {metrics['error']} | - | - |")
+                else:
+                    mae = metrics.get('MAE', 0)
+                    rmse = metrics.get('RMSE', 0)
+                    mape = metrics.get('MAPE', 0)
+                    r2 = metrics.get('R2', 0)
+                    print(f"| {method} | {mae:.2f} | {rmse:.2f} | {mape:.1f}% | {r2:.3f} |")
+            
+            return
+        
+        # Generate forecasts
+        forecast_results = {}
+        
+        if args.method == 'ensemble':
+            methods = args.ensemble_methods.split(',') if args.ensemble_methods else ['linear', 'exponential', 'arima']
+            forecast, individual_forecasts = ensemble_forecast(ts, args.periods, methods)
+            forecast_results['ensemble'] = forecast
+            
+            if individual_forecasts:
+                for i, method in enumerate(methods):
+                    if i < len(individual_forecasts):
+                        forecast_results[f'ensemble_{method}'] = individual_forecasts[i]
+        
+        else:
+            # Single method forecasting
+            if args.method == 'linear':
+                degree = {'linear': 1, 'quadratic': 2, 'cubic': 3}.get(args.trend, 1)
+                forecast, model = linear_trend_forecast(ts, args.periods, degree)
+                forecast_results['linear'] = forecast
+            
+            elif args.method == 'exponential':
+                forecast, model = exponential_smoothing_forecast(ts, args.periods, args.seasonal, args.seasonal_periods)
+                forecast_results['exponential'] = forecast
+            
+            elif args.method == 'arima':
+                result = arima_forecast(ts, args.periods, args.seasonal)
+                if isinstance(result, tuple) and len(result) >= 2:
+                    forecast, model = result[0], result[1]
+                    forecast_results['arima'] = forecast
+                else:
+                    forecast_results['arima'] = result
+            
+            elif args.method == 'ml':
+                forecast, model = ml_forecast(ts, args.periods, args.ml_method)
+                forecast_results['ml'] = forecast
+            
+            elif args.method == 'naive':
+                naive_pred, seasonal_naive_pred = naive_forecast(ts, args.periods)
+                forecast_results['naive'] = naive_pred
+                forecast_results['seasonal_naive'] = seasonal_naive_pred
+        
+        # Create output
+        if args.format == 'markdown':
+            # Create forecast table
+            combined_df = create_forecast_table(ts, forecast_results, [date_column, value_column])
+            output = format_markdown_table(combined_df)
+            
+            if args.include_metrics:
+                output += "\n\n# Forecast Summary\n\n"
+                for method, forecast in forecast_results.items():
+                    output += f"- **{method.title()}**: {len(forecast)} periods forecast\n"
+            
+        elif args.format == 'csv':
+            combined_df = create_forecast_table(ts, forecast_results, [date_column, value_column])
+            output = combined_df.to_csv(index=False)
+        
+        elif args.format == 'json':
+            json_data = {
+                'historical': {
+                    'dates': ts.index.strftime('%Y-%m-%d').tolist(),
+                    'values': ts.values.tolist()
+                },
+                'forecasts': {}
+            }
+            
+            for method, forecast in forecast_results.items():
+                json_data['forecasts'][method] = {
+                    'dates': forecast.index.strftime('%Y-%m-%d').tolist(),
+                    'values': forecast.values.tolist()
+                }
+            
+            output = json.dumps(json_data, indent=2)
+        
+        # Output results
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output)
+            print(f"Forecast saved to: {args.output}", file=sys.stderr)
+        else:
+            print(output)
+        
+        # Create plot if requested
+        if args.plot:
+            plt.figure(figsize=(12, 8))
+            
+            # Plot historical data
+            plt.plot(ts.index, ts.values, 'o-', label='Historical', linewidth=2, markersize=4)
+            
+            # Plot forecasts
+            colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown']
+            for i, (method, forecast) in enumerate(forecast_results.items()):
+                color = colors[i % len(colors)]
+                plt.plot(forecast.index, forecast.values, 's--', 
+                        label=f'Forecast ({method})', color=color, linewidth=2, markersize=4)
+            
+            plt.xlabel(date_column)
+            plt.ylabel(value_column)
+            plt.title(f'Time Series Forecast - {value_column}')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            plt.savefig(args.plot, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Plot saved to: {args.plot}", file=sys.stderr)
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

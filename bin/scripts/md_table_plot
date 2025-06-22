@@ -1,0 +1,580 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import os
+from pathlib import Path
+from os import environ
+from subprocess import run
+import json
+from datetime import datetime
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    run(cmd)
+    sys.exit(0)
+
+try:
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.dates import DateFormatter
+    import warnings
+    warnings.filterwarnings('ignore')
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas numpy matplotlib seaborn", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - numpy: Numerical operations", file=sys.stderr)
+    print("  - matplotlib: Plotting library", file=sys.stderr)
+    print("  - seaborn: Statistical visualization", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas numpy matplotlib seaborn", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content):
+    """Parse markdown table content into a pandas DataFrame"""
+    lines = content.strip().split('\n')
+    
+    # Find table lines (start and end with |)
+    table_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines.append(stripped)
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header
+    header_line = table_lines[0]
+    headers = [col.strip() for col in header_line.split('|')[1:-1]]
+    
+    # Skip separator line (assumed to be line 1)
+    data_lines = table_lines[2:] if len(table_lines) > 2 else []
+    
+    # Parse data rows
+    rows = []
+    for line in data_lines:
+        row = [col.strip() for col in line.split('|')[1:-1]]
+        # Ensure row has same number of columns as headers
+        while len(row) < len(headers):
+            row.append('')
+        rows.append(row[:len(headers)])
+    
+    if not rows:
+        # Create empty DataFrame with headers
+        return pd.DataFrame(columns=headers)
+    
+    df = pd.DataFrame(rows, columns=headers)
+    
+    # Attempt to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if conversion fails
+        try:
+            numeric_series = pd.to_numeric(df[col], errors='coerce')
+            if not numeric_series.isna().all():
+                df[col] = numeric_series
+        except:
+            pass
+        
+        # Try to convert to datetime
+        try:
+            if df[col].dtype == 'object' and not df[col].empty:
+                # Check if column looks like dates
+                sample_val = str(df[col].iloc[0]) if not df[col].isna().iloc[0] else ""
+                if any(char.isdigit() for char in sample_val) and '-' in sample_val:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+        except:
+            pass
+    
+    return df
+
+def get_plot_suggestions(df):
+    """Suggest appropriate plot types based on data structure"""
+    suggestions = []
+    
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+    date_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+    
+    # Single numeric column plots
+    if len(numeric_cols) >= 1:
+        suggestions.extend([
+            {
+                'type': 'histogram',
+                'columns': [numeric_cols[0]],
+                'description': f'Distribution of {numeric_cols[0]}'
+            },
+            {
+                'type': 'box',
+                'columns': [numeric_cols[0]],
+                'description': f'Box plot of {numeric_cols[0]} (outliers and quartiles)'
+            }
+        ])
+    
+    # Two numeric columns
+    if len(numeric_cols) >= 2:
+        suggestions.append({
+            'type': 'scatter',
+            'columns': [numeric_cols[0], numeric_cols[1]],
+            'description': f'Scatter plot: {numeric_cols[0]} vs {numeric_cols[1]}'
+        })
+    
+    # Categorical analysis
+    if len(categorical_cols) >= 1:
+        suggestions.extend([
+            {
+                'type': 'bar',
+                'columns': [categorical_cols[0]],
+                'description': f'Count by {categorical_cols[0]}'
+            },
+            {
+                'type': 'pie',
+                'columns': [categorical_cols[0]],
+                'description': f'Pie chart of {categorical_cols[0]} distribution'
+            }
+        ])
+    
+    # Mixed categorical + numeric
+    if len(categorical_cols) >= 1 and len(numeric_cols) >= 1:
+        suggestions.extend([
+            {
+                'type': 'bar',
+                'columns': [categorical_cols[0], numeric_cols[0]],
+                'description': f'{numeric_cols[0]} by {categorical_cols[0]}'
+            },
+            {
+                'type': 'box',
+                'columns': [categorical_cols[0], numeric_cols[0]],
+                'description': f'Box plot of {numeric_cols[0]} grouped by {categorical_cols[0]}'
+            }
+        ])
+    
+    # Time series
+    if len(date_cols) >= 1 and len(numeric_cols) >= 1:
+        suggestions.append({
+            'type': 'line',
+            'columns': [date_cols[0], numeric_cols[0]],
+            'description': f'Time series: {numeric_cols[0]} over {date_cols[0]}'
+        })
+    
+    # Correlation matrix for multiple numeric columns
+    if len(numeric_cols) >= 3:
+        suggestions.append({
+            'type': 'heatmap',
+            'columns': numeric_cols,
+            'description': 'Correlation matrix of numeric columns'
+        })
+    
+    return suggestions
+
+def create_plot(df, plot_type, columns, **kwargs):
+    """Create plot based on type and columns"""
+    plt.figure(figsize=kwargs.get('figsize', (10, 6)))
+    
+    if plot_type == 'histogram':
+        col = columns[0]
+        plt.hist(df[col].dropna(), bins=kwargs.get('bins', 20), alpha=0.7, edgecolor='black')
+        plt.xlabel(col)
+        plt.ylabel('Frequency')
+        plt.title(f'Distribution of {col}')
+        plt.grid(True, alpha=0.3)
+    
+    elif plot_type == 'box':
+        if len(columns) == 1:
+            # Single box plot
+            col = columns[0]
+            plt.boxplot(df[col].dropna(), labels=[col])
+            plt.ylabel(col)
+            plt.title(f'Box Plot of {col}')
+        else:
+            # Grouped box plot
+            x_col, y_col = columns[0], columns[1]
+            df.boxplot(column=y_col, by=x_col, ax=plt.gca())
+            plt.title(f'{y_col} by {x_col}')
+            plt.suptitle('')  # Remove automatic title
+        plt.grid(True, alpha=0.3)
+    
+    elif plot_type == 'scatter':
+        x_col, y_col = columns[0], columns[1]
+        plt.scatter(df[x_col], df[y_col], alpha=0.6)
+        plt.xlabel(x_col)
+        plt.ylabel(y_col)
+        plt.title(f'{x_col} vs {y_col}')
+        plt.grid(True, alpha=0.3)
+        
+        # Add trend line if both columns are numeric
+        if pd.api.types.is_numeric_dtype(df[x_col]) and pd.api.types.is_numeric_dtype(df[y_col]):
+            z = np.polyfit(df[x_col].dropna(), df[y_col].dropna(), 1)
+            p = np.poly1d(z)
+            plt.plot(df[x_col], p(df[x_col]), "r--", alpha=0.8, linewidth=2)
+    
+    elif plot_type == 'bar':
+        if len(columns) == 1:
+            # Count plot
+            col = columns[0]
+            counts = df[col].value_counts()
+            plt.bar(range(len(counts)), counts.values)
+            plt.xticks(range(len(counts)), counts.index, rotation=45)
+            plt.ylabel('Count')
+            plt.title(f'Count by {col}')
+        else:
+            # Grouped bar plot
+            x_col, y_col = columns[0], columns[1]
+            grouped = df.groupby(x_col)[y_col].mean()
+            plt.bar(range(len(grouped)), grouped.values)
+            plt.xticks(range(len(grouped)), grouped.index, rotation=45)
+            plt.ylabel(f'Average {y_col}')
+            plt.title(f'Average {y_col} by {x_col}')
+        plt.grid(True, alpha=0.3)
+    
+    elif plot_type == 'pie':
+        col = columns[0]
+        counts = df[col].value_counts()
+        plt.pie(counts.values, labels=counts.index, autopct='%1.1f%%')
+        plt.title(f'Distribution of {col}')
+    
+    elif plot_type == 'line':
+        if len(columns) == 2:
+            x_col, y_col = columns[0], columns[1]
+            # Sort by x column for proper line plot
+            sorted_df = df.sort_values(x_col)
+            plt.plot(sorted_df[x_col], sorted_df[y_col], marker='o', linewidth=2, markersize=4)
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+            plt.title(f'{y_col} over {x_col}')
+            
+            # Format x-axis if it's a date
+            if pd.api.types.is_datetime64_any_dtype(sorted_df[x_col]):
+                plt.gca().xaxis.set_major_formatter(DateFormatter('%Y-%m-%d'))
+                plt.xticks(rotation=45)
+        else:
+            # Multiple lines
+            for col in columns[1:]:
+                plt.plot(df[columns[0]], df[col], marker='o', label=col, linewidth=2, markersize=4)
+            plt.xlabel(columns[0])
+            plt.ylabel('Value')
+            plt.title('Multi-line Plot')
+            plt.legend()
+        plt.grid(True, alpha=0.3)
+    
+    elif plot_type == 'heatmap':
+        # Correlation heatmap
+        numeric_df = df[columns].select_dtypes(include=[np.number])
+        corr_matrix = numeric_df.corr()
+        
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0,
+                   square=True, fmt='.2f')
+        plt.title('Correlation Matrix')
+    
+    elif plot_type == 'violin':
+        if len(columns) == 1:
+            col = columns[0]
+            plt.violinplot(df[col].dropna(), positions=[1])
+            plt.xticks([1], [col])
+            plt.ylabel(col)
+            plt.title(f'Violin Plot of {col}')
+        else:
+            x_col, y_col = columns[0], columns[1]
+            # Group data for violin plot
+            groups = df.groupby(x_col)[y_col].apply(list)
+            plt.violinplot(groups.values, positions=range(len(groups)))
+            plt.xticks(range(len(groups)), groups.index, rotation=45)
+            plt.ylabel(y_col)
+            plt.title(f'{y_col} by {x_col}')
+    
+    else:
+        raise ValueError(f"Unsupported plot type: {plot_type}")
+    
+    plt.tight_layout()
+    return plt.gcf()
+
+def save_plot(fig, output_path, dpi=150, format='png'):
+    """Save plot to file"""
+    fig.savefig(output_path, dpi=dpi, format=format, bbox_inches='tight')
+    plt.close(fig)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate visualizations from markdown tables using matplotlib and seaborn',
+        epilog='''
+Examples:
+  # Create histogram of first numeric column
+  md_table_plot --type histogram --column Age < employees.md
+  
+  # Scatter plot of two columns
+  md_table_plot --type scatter --columns "Height,Weight" --output scatter.png < data.md
+  
+  # Bar chart with grouping
+  md_table_plot --type bar --columns "Department,Salary" < employees.md
+  
+  # Show plot suggestions based on data
+  md_table_plot --suggest < data.md
+  
+  # Time series plot
+  md_table_plot --type line --columns "Date,Sales" --output sales_trend.png < sales.md
+  
+  # Multiple plots in one figure
+  md_table_plot --type multi --plots "histogram:Age,scatter:Height:Weight" < data.md
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--type', '-t', 
+                       choices=['histogram', 'box', 'scatter', 'bar', 'pie', 'line', 'heatmap', 'violin', 'multi'],
+                       help='Type of plot to create')
+    parser.add_argument('--column', metavar='COLUMN',
+                       help='Single column for plotting')
+    parser.add_argument('--columns', metavar='COLS',
+                       help='Comma-separated list of columns for plotting')
+    parser.add_argument('--suggest', action='store_true',
+                       help='Suggest appropriate plot types based on data')
+    parser.add_argument('--plots', metavar='PLOT_SPECS',
+                       help='Multiple plot specifications (type:col1:col2,type:col3)')
+    
+    # Output options
+    parser.add_argument('--output', '-o', metavar='FILE',
+                       help='Output file (default: display plot)')
+    parser.add_argument('--format', choices=['png', 'pdf', 'svg', 'jpg'],
+                       default='png', help='Output format (default: png)')
+    parser.add_argument('--dpi', type=int, default=150,
+                       help='Output resolution in DPI (default: 150)')
+    parser.add_argument('--figsize', metavar='WIDTHxHEIGHT',
+                       help='Figure size in inches (e.g., 12x8)')
+    
+    # Plot customization
+    parser.add_argument('--title', metavar='TITLE',
+                       help='Custom plot title')
+    parser.add_argument('--xlabel', metavar='LABEL',
+                       help='Custom X-axis label')
+    parser.add_argument('--ylabel', metavar='LABEL',
+                       help='Custom Y-axis label')
+    parser.add_argument('--style', choices=['default', 'seaborn', 'ggplot', 'dark_background'],
+                       default='default', help='Plot style')
+    parser.add_argument('--color-palette', choices=['viridis', 'plasma', 'coolwarm', 'Set1', 'tab10'],
+                       default='viridis', help='Color palette')
+    parser.add_argument('--bins', type=int, default=20,
+                       help='Number of bins for histogram (default: 20)')
+    
+    parser.add_argument('--input', '-i', metavar='FILE',
+                       help='Input markdown file (default: stdin)')
+    parser.add_argument('--list-columns', action='store_true',
+                       help='List available columns and their types')
+    parser.add_argument('--interactive', action='store_true',
+                       help='Interactive mode for plot creation')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        if df is None or df.empty:
+            print("Error: No valid markdown table found or table is empty", file=sys.stderr)
+            sys.exit(1)
+        
+        # Set plot style
+        if args.style != 'default':
+            plt.style.use(args.style)
+        
+        # Set color palette
+        if hasattr(plt.cm, args.color_palette):
+            plt.cm.get_cmap(args.color_palette)
+        
+        # Parse figure size
+        figsize = (10, 6)  # default
+        if args.figsize:
+            try:
+                width, height = map(float, args.figsize.split('x'))
+                figsize = (width, height)
+            except:
+                print("Warning: Invalid figsize format, using default", file=sys.stderr)
+        
+        if args.list_columns:
+            # List columns and their types
+            print("Available columns:")
+            for col in df.columns:
+                dtype = df[col].dtype
+                unique_count = df[col].nunique()
+                null_count = df[col].isnull().sum()
+                print(f"  {col}: {dtype} ({unique_count} unique, {null_count} nulls)")
+            return
+        
+        if args.suggest:
+            # Show plot suggestions
+            suggestions = get_plot_suggestions(df)
+            
+            print("# Plot Suggestions\n")
+            print(f"Based on analysis of your table with {len(df)} rows and {len(df.columns)} columns:\n")
+            
+            for i, suggestion in enumerate(suggestions, 1):
+                print(f"## {i}. {suggestion['description']}")
+                print(f"**Type**: {suggestion['type']}")
+                print(f"**Columns**: {', '.join(suggestion['columns'])}")
+                print(f"**Command**: `md_table_plot --type {suggestion['type']} --columns \"{','.join(suggestion['columns'])}\"`")
+                print()
+            return
+        
+        if args.interactive:
+            # Interactive mode
+            print(f"Interactive plotting mode - Table loaded with {len(df)} rows and {len(df.columns)} columns")
+            print("Available columns:", ", ".join(df.columns))
+            print("Available plot types: histogram, box, scatter, bar, pie, line, heatmap, violin")
+            print("Type 'suggest' for recommendations, 'columns' to list columns, 'exit' to quit")
+            print()
+            
+            while True:
+                try:
+                    command = input("Plot> ").strip()
+                    
+                    if command.lower() in ['exit', 'quit']:
+                        break
+                    elif command.lower() == 'suggest':
+                        suggestions = get_plot_suggestions(df)
+                        for i, suggestion in enumerate(suggestions[:5], 1):
+                            print(f"{i}. {suggestion['description']} ({suggestion['type']})")
+                        continue
+                    elif command.lower() == 'columns':
+                        for col in df.columns:
+                            print(f"  {col}: {df[col].dtype}")
+                        continue
+                    elif not command:
+                        continue
+                    
+                    # Parse command (simplified)
+                    parts = command.split()
+                    if len(parts) < 3:
+                        print("Usage: <plot_type> <column1> [column2] [...]")
+                        continue
+                    
+                    plot_type = parts[0]
+                    columns = parts[1:]
+                    
+                    # Create and display plot
+                    fig = create_plot(df, plot_type, columns, figsize=figsize)
+                    plt.show()
+                    
+                except KeyboardInterrupt:
+                    print("\nExiting...")
+                    break
+                except Exception as e:
+                    print(f"Error: {e}")
+            
+            return
+        
+        # Determine columns to plot
+        columns = []
+        if args.column:
+            columns = [args.column]
+        elif args.columns:
+            columns = [col.strip() for col in args.columns.split(',')]
+        elif not args.plots:
+            print("Error: Must specify --column, --columns, --plots, or use --suggest", file=sys.stderr)
+            sys.exit(1)
+        
+        # Validate columns exist
+        if columns:
+            missing_cols = [col for col in columns if col not in df.columns]
+            if missing_cols:
+                print(f"Error: Columns not found: {', '.join(missing_cols)}", file=sys.stderr)
+                print(f"Available columns: {', '.join(df.columns)}", file=sys.stderr)
+                sys.exit(1)
+        
+        if args.plots:
+            # Multiple plots
+            plot_specs = args.plots.split(',')
+            num_plots = len(plot_specs)
+            
+            # Calculate subplot layout
+            cols = min(2, num_plots)
+            rows = (num_plots + cols - 1) // cols
+            
+            fig, axes = plt.subplots(rows, cols, figsize=(figsize[0] * cols, figsize[1] * rows))
+            if num_plots == 1:
+                axes = [axes]
+            elif rows == 1:
+                axes = axes if isinstance(axes, list) else [axes]
+            else:
+                axes = axes.flatten()
+            
+            for i, spec in enumerate(plot_specs):
+                parts = spec.split(':')
+                plot_type = parts[0]
+                plot_columns = parts[1:] if len(parts) > 1 else []
+                
+                plt.sca(axes[i])
+                create_plot(df, plot_type, plot_columns, figsize=figsize)
+            
+            # Hide unused subplots
+            for i in range(num_plots, len(axes)):
+                axes[i].set_visible(False)
+            
+            plt.tight_layout()
+            fig = plt.gcf()
+            
+        else:
+            # Single plot
+            if not args.type:
+                # Auto-suggest plot type
+                suggestions = get_plot_suggestions(df)
+                if suggestions:
+                    # Use first suggestion that matches our columns
+                    for suggestion in suggestions:
+                        if set(columns).issubset(set(suggestion['columns'])):
+                            args.type = suggestion['type']
+                            break
+                    
+                    if not args.type:
+                        args.type = suggestions[0]['type']  # fallback
+                else:
+                    args.type = 'histogram'  # default fallback
+            
+            fig = create_plot(df, args.type, columns, figsize=figsize, bins=args.bins)
+            
+            # Apply custom labels if provided
+            if args.title:
+                plt.title(args.title)
+            if args.xlabel:
+                plt.xlabel(args.xlabel)
+            if args.ylabel:
+                plt.ylabel(args.ylabel)
+        
+        # Save or display plot
+        if args.output:
+            save_plot(fig, args.output, dpi=args.dpi, format=args.format)
+            print(f"Plot saved to: {args.output}")
+        else:
+            plt.show()
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
