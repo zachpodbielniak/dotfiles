@@ -1,0 +1,637 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# freebsd_bootstrap - FreeBSD 14 Bootstrap Script
+# ==============================================================================
+# Author: Zach
+# Version: 1.0
+# Last Updated: June 22, 2025
+# Location: ~/.dotfiles/bin/scripts/freebsd_bootstrap
+#
+# Description:
+# A modular bootstrap script for setting up a FreeBSD 14 machine with various
+# development tools and utilities. The script is designed to be extensible,
+# allowing new modules to be added easily.
+#
+# Features:
+# - Modular design for easy extension
+# - Podman container runtime installation and configuration
+# - Comprehensive help and usage information
+# - Error handling and validation
+#
+# Dependencies:
+# - FreeBSD 14 or later
+# - pkg (FreeBSD package manager)
+# - Root/sudo access for system configuration
+#
+# Usage: See the show_help() function or run with --help flag
+# ==============================================================================
+
+# Script configuration
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="1.0"
+
+# Base system packages
+BASE_PACKAGES=(
+    sudo
+    bash
+    htop
+    neovim
+    gcc
+    gmake
+    node22
+    npm
+    yarn
+    just
+    py311-pip
+    stow
+    git
+)
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+show_help() {
+    cat << EOF
+FreeBSD Bootstrap Script v${SCRIPT_VERSION}
+
+USAGE:
+    ${SCRIPT_NAME} <module> [options]
+
+MODULES:
+    all         Run all available modules
+    base        Install essential development packages
+    podman      Install and configure Podman container runtime
+    check-dns   Check and troubleshoot Podman DNS configuration
+    linux-env   Setup Linux compatibility environment manager
+
+OPTIONS:
+    -h, --help  Show this help message
+    --version   Show script version
+
+EXAMPLES:
+    ${SCRIPT_NAME} podman      # Install and configure Podman
+    ${SCRIPT_NAME} all         # Run all bootstrap modules
+
+DESCRIPTION:
+    This script bootstraps a FreeBSD 14 system with various development
+    tools and utilities. Each module handles a specific component or
+    service installation and configuration.
+
+NOTES:
+    - Root or sudo access is required for most operations
+    - Modules are designed to be idempotent where possible
+    - Check logs for detailed information about each operation
+
+EOF
+}
+
+# Check if running as root or with sudo
+check_privileges() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root or with sudo"
+        exit 1
+    fi
+}
+
+# Base packages module
+install_base_packages() {
+    log_info "Installing base development packages..."
+    
+    # Update package repository
+    log_info "Updating package repository..."
+    pkg update
+    
+    # Install packages
+    local failed_packages=()
+    local installed_packages=()
+    
+    for package in "${BASE_PACKAGES[@]}"; do
+        log_info "Installing ${package}..."
+        if pkg install -y "${package}"; then
+            installed_packages+=("${package}")
+            log_success "${package} installed"
+        else
+            failed_packages+=("${package}")
+            log_warning "Failed to install ${package}"
+        fi
+    done
+    
+    # Summary
+    echo
+    log_success "Base packages installation completed"
+    
+    if [[ ${#installed_packages[@]} -gt 0 ]]; then
+        log_info "Successfully installed: ${installed_packages[*]}"
+    fi
+    
+    if [[ ${#failed_packages[@]} -gt 0 ]]; then
+        log_warning "Failed to install: ${failed_packages[*]}"
+    fi
+    
+    # Set bash as default shell for current user if installed
+    if command -v bash &> /dev/null && [[ "${SHELL}" != "$(which bash)" ]]; then
+        log_info "Setting bash as default shell..."
+        local bash_path=$(which bash)
+        if grep -q "${bash_path}" /etc/shells; then
+            chsh -s "${bash_path}" "${SUDO_USER:-$USER}" || log_warning "Could not set bash as default shell"
+        else
+            log_info "Adding bash to /etc/shells..."
+            echo "${bash_path}" >> /etc/shells
+            chsh -s "${bash_path}" "${SUDO_USER:-$USER}" || log_warning "Could not set bash as default shell"
+        fi
+    fi
+    
+    # Create useful aliases
+    if [[ -n "${SUDO_USER}" ]]; then
+        local user_home=$(eval echo ~${SUDO_USER})
+    else
+        local user_home="${HOME}"
+    fi
+    
+    if [[ -d "${user_home}" ]]; then
+        local bashrc="${user_home}/.bashrc"
+        if [[ ! -f "${bashrc}" ]] || ! grep -q "# FreeBSD aliases" "${bashrc}"; then
+            log_info "Adding useful aliases to ${bashrc}..."
+            cat >> "${bashrc}" << 'EOF'
+
+# FreeBSD aliases
+alias ll='ls -lah'
+alias la='ls -A'
+alias l='ls -CF'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias grep='grep --color=auto'
+alias df='df -h'
+alias du='du -h'
+alias free='freecolor -m -o'
+alias vim='nvim'
+alias vi='nvim'
+
+# Development aliases
+alias python='python3.11'
+alias pip='python3.11 -m pip'
+EOF
+            log_success "Aliases added to ${bashrc}"
+        fi
+    fi
+    
+    log_success "Base system setup complete"
+}
+
+# Podman module
+install_podman() {
+    log_info "Starting Podman installation and configuration..."
+    
+    # Check if podman is already installed
+    if command -v podman &> /dev/null; then
+        log_warning "Podman is already installed"
+        podman --version
+    else
+        log_info "Installing podman-suite package..."
+        if pkg install -y podman-suite; then
+            log_success "Podman-suite package installed successfully"
+        else
+            log_error "Failed to install podman-suite package"
+            return 1
+        fi
+    fi
+    
+    # Initial Podman configuration
+    log_info "Configuring Podman..."
+    
+    # Enable PF (Packet Filter) if not already enabled
+    if ! sysrc -n pf_enable &> /dev/null || [ "$(sysrc -n pf_enable)" != "YES" ]; then
+        log_info "Enabling PF (Packet Filter)..."
+        sysrc pf_enable="YES"
+    else
+        log_info "PF is already enabled"
+    fi
+    
+    # Configure PF rules for Podman
+    PF_CONF="/etc/pf.conf"
+    if [[ -f "${PF_CONF}" ]]; then
+        # Check if Podman NAT rules already exist
+        if ! grep -q "# Podman NAT rules" "${PF_CONF}"; then
+            log_info "Adding Podman NAT rules to ${PF_CONF}..."
+            cat >> "${PF_CONF}" << 'EOF'
+
+# Podman NAT rules
+nat on egress from 10.88.0.0/16 to any -> (egress)
+nat on egress from 10.89.0.0/24 to any -> (egress)
+EOF
+            log_success "PF rules added successfully"
+        else
+            log_info "Podman NAT rules already exist in ${PF_CONF}"
+        fi
+    else
+        log_warning "${PF_CONF} not found. Creating basic configuration..."
+        cat > "${PF_CONF}" << 'EOF'
+# Basic PF configuration for Podman
+
+# Podman NAT rules
+nat on egress from 10.88.0.0/16 to any -> (egress)
+nat on egress from 10.89.0.0/24 to any -> (egress)
+EOF
+        log_success "Created ${PF_CONF} with Podman rules"
+    fi
+    
+    # Load kernel modules
+    log_info "Loading required kernel modules..."
+    kldload -n pf 2>/dev/null || true
+    kldload -n pflog 2>/dev/null || true
+    
+    # Start PF service
+    if service pf status &> /dev/null; then
+        log_info "Reloading PF rules..."
+        service pf reload
+    else
+        log_info "Starting PF service..."
+        service pf start
+    fi
+    
+    # Configure sysctl for IP forwarding
+    log_info "Configuring IP forwarding..."
+    if ! sysctl net.inet.ip.forwarding | grep -q "1"; then
+        sysctl net.inet.ip.forwarding=1
+        echo 'net.inet.ip.forwarding=1' >> /etc/sysctl.conf
+        log_success "IP forwarding enabled"
+    else
+        log_info "IP forwarding is already enabled"
+    fi
+    
+    # Enable Linux compatibility
+    log_info "Enabling Linux compatibility layer..."
+    if ! kldstat | grep -q linux64; then
+        kldload linux64
+        log_success "Linux64 kernel module loaded"
+    else
+        log_info "Linux64 module already loaded"
+    fi
+    
+    # Add to boot loader
+    if ! grep -q 'linux64_load="YES"' /boot/loader.conf; then
+        echo 'linux64_load="YES"' >> /boot/loader.conf
+        log_success "Added linux64 to boot loader"
+    fi
+    
+    # Install Linux base if not present
+    if ! pkg info | grep -q linux_base; then
+        log_info "Installing Linux base compatibility..."
+        pkg install -y linux_base-c7
+        log_success "Linux base installed"
+    else
+        log_info "Linux base already installed"
+    fi
+    
+    # Configure container registries
+    log_info "Configuring container registries..."
+    REGISTRIES_CONF="/usr/local/etc/containers/registries.conf"
+    if [[ ! -f "${REGISTRIES_CONF}" ]]; then
+        mkdir -p "$(dirname "${REGISTRIES_CONF}")"
+        cat > "${REGISTRIES_CONF}" << 'EOF'
+unqualified-search-registries = ["docker.io", "quay.io"]
+
+[[registry]]
+prefix = "docker.io"
+location = "docker.io"
+
+[[registry]]
+prefix = "quay.io"
+location = "quay.io"
+EOF
+        log_success "Container registries configured"
+    else
+        log_info "Container registries already configured"
+    fi
+    
+    # Configure storage
+    log_info "Configuring container storage..."
+    STORAGE_CONF="/usr/local/etc/containers/storage.conf"
+    if [[ ! -f "${STORAGE_CONF}" ]]; then
+        mkdir -p "$(dirname "${STORAGE_CONF}")"
+        cat > "${STORAGE_CONF}" << 'EOF'
+[storage]
+driver = "zfs"
+runroot = "/var/run/containers/storage"
+graphroot = "/var/db/containers/storage"
+
+[storage.options]
+mount_program = "/usr/local/bin/fuse-overlayfs"
+EOF
+        log_success "Container storage configured"
+    else
+        log_info "Container storage already configured"
+    fi
+    
+    # Create storage directories
+    mkdir -p /var/run/containers/storage
+    mkdir -p /var/db/containers/storage
+    
+    # Configure DNS for containers
+    log_info "Configuring DNS resolution for containers..."
+    CONTAINERS_CONF="/usr/local/etc/containers/containers.conf"
+    if [[ ! -f "${CONTAINERS_CONF}" ]]; then
+        mkdir -p "$(dirname "${CONTAINERS_CONF}")"
+        cat > "${CONTAINERS_CONF}" << 'EOF'
+[containers]
+# DNS servers for container
+dns_servers = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
+
+# Enable DNS resolution
+dns_options = ["edns0", "trust-ad"]
+
+[network]
+# Default network backend - CNI is default on FreeBSD
+network_backend = "cni"
+default_network = "podman"
+cni_plugin_dirs = ["/usr/local/libexec/cni"]
+EOF
+        log_success "Container DNS configuration created"
+    else
+        log_info "Container configuration already exists"
+    fi
+    
+    # Create resolv.conf for containers if needed
+    CONTAINER_RESOLV="/usr/local/etc/containers/resolv.conf"
+    if [[ ! -f "${CONTAINER_RESOLV}" ]]; then
+        cat > "${CONTAINER_RESOLV}" << 'EOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+options edns0 trust-ad
+EOF
+        log_success "Container resolv.conf created"
+    fi
+    
+    # Configure sysctl for containers
+    log_info "Configuring additional sysctl settings..."
+    
+    # Runtime sysctl settings
+    SYSCTL_SETTINGS=(
+        "kern.elf64.fallback_brand=3"
+        "security.bsd.unprivileged_proc_debug=1"
+    )
+    
+    for setting in "${SYSCTL_SETTINGS[@]}"; do
+        key="${setting%%=*}"
+        value="${setting#*=}"
+        if ! sysctl "$key" | grep -q "$value"; then
+            sysctl "$setting" 2>/dev/null || log_warning "Could not set $setting"
+            if ! grep -q "$setting" /etc/sysctl.conf; then
+                echo "$setting" >> /etc/sysctl.conf
+            fi
+        fi
+    done
+    
+    # Loader tunables (require reboot)
+    LOADER_SETTINGS=(
+        "kern.ipc.shmmni=1024"
+        "kern.ipc.shmseg=1024"
+    )
+    
+    for setting in "${LOADER_SETTINGS[@]}"; do
+        if ! grep -q "$setting" /boot/loader.conf; then
+            echo "$setting" >> /boot/loader.conf
+            log_info "Added $setting to loader.conf (requires reboot)"
+        fi
+    done
+    
+    # Configure CNI networking for DNS
+    log_info "Configuring CNI network for containers..."
+    CNI_DIR="/usr/local/etc/cni/net.d"
+    if [[ ! -d "${CNI_DIR}" ]]; then
+        mkdir -p "${CNI_DIR}"
+    fi
+    
+    # Remove old misconfigured CNI if exists
+    if [[ -f "${CNI_DIR}/87-podman-bridge.conflist" ]]; then
+        rm -f "${CNI_DIR}/87-podman-bridge.conflist"
+        log_info "Removed old CNI configuration"
+    fi
+    
+    # Use Podman's built-in network creation instead of manual CNI config
+    log_info "Creating podman network with DNS..."
+    if ! podman network ls | grep -q "podman"; then
+        # Create a network with explicit DNS servers
+        podman network create --driver bridge \
+            --subnet 10.88.0.0/16 \
+            --gateway 10.88.0.1 \
+            --dns 8.8.8.8 \
+            --dns 8.8.4.4 \
+            podman || log_warning "Could not create podman network"
+    else
+        log_info "Podman network already exists"
+    fi
+    
+    # Also ensure we use the PF sample configuration
+    PF_SAMPLE="/usr/local/etc/containers/pf.conf.sample"
+    if [[ -f "${PF_SAMPLE}" ]] && [[ ! -f "/etc/pf.conf" ]]; then
+        log_info "Copying PF sample configuration..."
+        cp "${PF_SAMPLE}" /etc/pf.conf
+        log_success "PF configuration copied from sample"
+        log_warning "Please edit /etc/pf.conf and set v4egress_if, v6egress_if to your network interfaces"
+    fi
+    
+    # Mount fdescfs and procfs if not already mounted
+    log_info "Checking filesystem mounts..."
+    if ! mount | grep -q "fdescfs on /dev/fd"; then
+        mount -t fdescfs fdesc /dev/fd
+        echo "fdesc   /dev/fd         fdescfs         rw      0       0" >> /etc/fstab
+        log_success "Mounted fdescfs"
+    fi
+    
+    if ! mount | grep -q "procfs on /proc"; then
+        mount -t procfs proc /proc
+        echo "proc    /proc           procfs          rw      0       0" >> /etc/fstab
+        log_success "Mounted procfs"
+    fi
+    
+    # Test Podman installation
+    log_info "Testing Podman installation..."
+    if podman info &> /dev/null; then
+        log_success "Podman is configured and working correctly"
+        podman --version
+        
+        # Try to pull a test image
+        log_info "Testing container functionality..."
+        if podman pull alpine:latest &> /dev/null; then
+            log_success "Successfully pulled test image"
+            podman run --rm alpine:latest echo "Container test successful"
+        else
+            log_warning "Could not pull test image - check network/registry access"
+        fi
+    else
+        log_warning "Podman installed but may need additional configuration"
+    fi
+    
+    # Create helper script for running Linux containers
+    log_info "Creating podman helper script..."
+    HELPER_SCRIPT="/usr/local/bin/podman-linux"
+    cat > "${HELPER_SCRIPT}" << 'EOF'
+#!/bin/sh
+# Wrapper for running Linux containers on FreeBSD with sensible defaults
+exec podman run --os=linux --network=host "$@"
+EOF
+    chmod +x "${HELPER_SCRIPT}"
+    log_success "Created podman-linux helper at ${HELPER_SCRIPT}"
+    
+    # Add configuration to make these defaults
+    log_info "Setting default container OS to Linux..."
+    if ! grep -q "CONTAINER_HOST_OS" /etc/profile; then
+        echo 'export CONTAINER_HOST_OS="linux"' >> /etc/profile
+    fi
+    
+    log_success "Podman module completed"
+    log_info ""
+    log_info "IMPORTANT: For DNS to work in containers, use one of these methods:"
+    log_info "  1. podman run --network host --os=linux <image>"
+    log_info "  2. podman-linux <image> (helper script)"
+    log_info "  3. Set alias: alias podman='podman --os=linux --network=host'"
+}
+
+# DNS troubleshooting function
+check_podman_dns() {
+    log_info "Checking Podman DNS configuration..."
+    
+    # Check host DNS
+    log_info "Host DNS configuration:"
+    cat /etc/resolv.conf
+    
+    # Check container DNS config
+    if [[ -f "/usr/local/etc/containers/containers.conf" ]]; then
+        log_info "Container DNS configuration found"
+    else
+        log_warning "Container DNS configuration missing"
+    fi
+    
+    # Test DNS resolution in container
+    log_info "Testing DNS resolution in container..."
+    if podman run --rm docker.io/library/alpine:latest nslookup google.com &> /dev/null; then
+        log_success "DNS resolution working in containers"
+    else
+        log_warning "DNS resolution not working. Trying with explicit DNS..."
+        if podman run --rm --dns 8.8.8.8 docker.io/library/alpine:latest nslookup google.com; then
+            log_info "DNS works with explicit --dns flag"
+            log_info "You may need to use --dns 8.8.8.8 when running containers"
+        else
+            log_error "DNS resolution failing even with explicit DNS"
+            log_info "Try running: podman run --network host docker.io/library/alpine:latest nslookup google.com"
+        fi
+    fi
+    
+    # Check network backend
+    log_info "Checking network backend..."
+    podman info | grep -A5 "network"
+}
+
+# Linux environment manager module
+setup_linux_env_manager() {
+    log_info "Setting up Linux compatibility environment manager..."
+    
+    # Ensure debootstrap is available for Ubuntu/Debian environments
+    if ! command -v debootstrap &> /dev/null; then
+        log_info "Installing debootstrap for Ubuntu/Debian support..."
+        pkg install -y debootstrap
+    fi
+    
+    # Create environments directory
+    mkdir -p /compat/linux-environments
+    
+    # Create convenience alias
+    if ! grep -q "alias lcm=" /etc/profile; then
+        echo "alias lcm='linux_compat_manager'" >> /etc/profile
+        log_info "Added 'lcm' alias for linux_compat_manager"
+    fi
+    
+    log_success "Linux environment manager ready"
+    log_info ""
+    log_info "Usage examples:"
+    log_info "  linux_compat_manager create ubuntu20 ubuntu20"
+    log_info "  linux_compat_manager create debian debian11"
+    log_info "  linux_compat_manager switch ubuntu20"
+    log_info "  linux_compat_manager list"
+    log_info ""
+    log_info "Or use the alias: lcm <command>"
+}
+
+# Main function to run all modules
+run_all_modules() {
+    log_info "Running all bootstrap modules..."
+    
+    install_base_packages
+    install_podman
+    setup_linux_env_manager
+    
+    log_success "All modules completed"
+}
+
+# Main script logic
+main() {
+    # Parse command line arguments
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit 0
+    fi
+    
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --version)
+            echo "${SCRIPT_NAME} version ${SCRIPT_VERSION}"
+            exit 0
+            ;;
+        all)
+            check_privileges
+            run_all_modules
+            ;;
+        base)
+            check_privileges
+            install_base_packages
+            ;;
+        podman)
+            check_privileges
+            install_podman
+            ;;
+        check-dns)
+            check_privileges
+            check_podman_dns
+            ;;
+        linux-env)
+            check_privileges
+            setup_linux_env_manager
+            ;;
+        *)
+            log_error "Unknown module: $1"
+            echo "Run '${SCRIPT_NAME} --help' for usage information"
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

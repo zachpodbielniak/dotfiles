@@ -1,0 +1,793 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# linux_compat_manager - Manage Multiple Linux Compatibility Environments
+# ==============================================================================
+# Author: Zach
+# Version: 1.0
+# Last Updated: June 22, 2025
+# Location: ~/.dotfiles/bin/scripts/linux_compat_manager
+#
+# Description:
+# Manages multiple Linux compatibility environments on FreeBSD, allowing you to
+# switch between different Linux distributions or versions for the Linuxulator.
+#
+# Features:
+# - Create new Linux compat environments
+# - Switch between different environments
+# - List available environments
+# - Install different Linux distributions (CentOS 7, Ubuntu, Debian)
+# - Manage per-environment settings
+#
+# Usage: See the show_help() function or run with --help flag
+# ==============================================================================
+
+# Configuration
+COMPAT_BASE="/compat"
+DEFAULT_COMPAT="${COMPAT_BASE}/linux"
+ENVIRONMENTS_DIR="${COMPAT_BASE}/linux-environments"
+CURRENT_ENV_LINK="${COMPAT_BASE}/linux"
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+show_help() {
+    cat << EOF
+Linux Compatibility Environment Manager for FreeBSD
+
+USAGE:
+    ${0##*/} <command> [options]
+
+COMMANDS:
+    create <name> <type>    Create a new Linux environment
+    switch <name>           Switch to a different Linux environment
+    list                    List available Linux environments
+    current                 Show current active environment
+    remove <name>           Remove a Linux environment
+    backup <name>           Backup a Linux environment
+    restore <name> <file>   Restore a Linux environment from backup
+
+ENVIRONMENT TYPES:
+    centos7     CentOS 7 (default, most compatible)
+    ubuntu20    Ubuntu 20.04 (using debootstrap)
+    ubuntu22    Ubuntu 22.04 (using debootstrap)
+    debian11    Debian 11 (using debootstrap)
+    alpine      Alpine Linux (minimal)
+    archlinux   Arch Linux (using bootstrap tarball)
+    custom      Custom installation
+
+OPTIONS:
+    -h, --help  Show this help message
+
+EXAMPLES:
+    ${0##*/} create mycentos centos7
+    ${0##*/} create myubuntu ubuntu20
+    ${0##*/} switch myubuntu
+    ${0##*/} list
+
+NOTES:
+    - Requires root/sudo access
+    - Linux kernel module must be loaded
+    - Default environment is at /compat/linux
+    - Additional environments stored in /compat/linux-environments/
+
+EOF
+}
+
+# Check if running as root
+check_privileges() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root or with sudo"
+        exit 1
+    fi
+}
+
+# Ensure Linux compatibility is loaded
+ensure_linux_loaded() {
+    if ! kldstat | grep -q linux64; then
+        log_info "Loading Linux compatibility module..."
+        kldload linux64
+    fi
+}
+
+# Create environments directory
+init_environments_dir() {
+    if [[ ! -d "${ENVIRONMENTS_DIR}" ]]; then
+        mkdir -p "${ENVIRONMENTS_DIR}"
+        log_info "Created environments directory: ${ENVIRONMENTS_DIR}"
+    fi
+}
+
+# Create a new Linux environment
+create_environment() {
+    local name="$1"
+    local type="${2:-centos7}"
+    local env_path="${ENVIRONMENTS_DIR}/${name}"
+    
+    if [[ -d "${env_path}" ]]; then
+        log_error "Environment '${name}' already exists"
+        return 1
+    fi
+    
+    log_info "Creating Linux environment '${name}' of type '${type}'..."
+    mkdir -p "${env_path}"
+    
+    case "${type}" in
+        centos7)
+            create_centos7_env "${env_path}"
+            ;;
+        ubuntu20|ubuntu22)
+            create_ubuntu_env "${env_path}" "${type}"
+            ;;
+        debian11)
+            create_debian_env "${env_path}"
+            ;;
+        alpine)
+            create_alpine_env "${env_path}"
+            ;;
+        archlinux)
+            create_archlinux_env "${env_path}"
+            ;;
+        custom)
+            log_info "Created empty environment at ${env_path}"
+            log_info "Please install your Linux distribution manually"
+            ;;
+        *)
+            log_error "Unknown environment type: ${type}"
+            rm -rf "${env_path}"
+            return 1
+            ;;
+    esac
+    
+    # Create environment metadata
+    cat > "${env_path}/.env_info" << EOF
+NAME=${name}
+TYPE=${type}
+CREATED=$(date)
+FREEBSD_VERSION=$(uname -r)
+EOF
+    
+    log_success "Environment '${name}' created successfully"
+}
+
+# Create CentOS 7 environment
+create_centos7_env() {
+    local env_path="$1"
+    
+    log_info "Installing CentOS 7 base..."
+    
+    # Create temporary directory for package
+    local temp_dir=$(mktemp -d)
+    cd "${temp_dir}"
+    
+    # Download and extract linux_base-c7
+    if pkg fetch -y linux_base-c7; then
+        # Extract the package
+        tar -xf /var/cache/pkg/linux_base-c7*.pkg -C "${env_path}"
+        
+        # The package extracts to compat/linux, so we need to move files
+        if [[ -d "${env_path}/compat/linux" ]]; then
+            mv "${env_path}/compat/linux/"* "${env_path}/"
+            rm -rf "${env_path}/compat"
+        fi
+        
+        log_success "CentOS 7 base installed"
+    else
+        log_error "Failed to fetch linux_base-c7 package"
+        return 1
+    fi
+    
+    # Cleanup
+    cd /
+    rm -rf "${temp_dir}"
+    
+    # Setup basic directories
+    setup_basic_dirs "${env_path}"
+}
+
+# Create Ubuntu environment using debootstrap
+create_ubuntu_env() {
+    local env_path="$1"
+    local version="$2"
+    local codename=""
+    
+    case "${version}" in
+        ubuntu20)
+            codename="focal"
+            ;;
+        ubuntu22)
+            codename="jammy"
+            ;;
+    esac
+    
+    log_info "Installing Ubuntu ${version} (${codename})..."
+    
+    # Check if debootstrap is installed
+    if ! command -v debootstrap &> /dev/null; then
+        log_info "Installing debootstrap..."
+        pkg install -y debootstrap
+    fi
+    
+    # Run debootstrap
+    debootstrap --arch=amd64 "${codename}" "${env_path}" http://archive.ubuntu.com/ubuntu/ || {
+        log_error "debootstrap failed"
+        return 1
+    }
+    
+    # Setup basic configuration
+    setup_ubuntu_config "${env_path}" "${codename}"
+    
+    log_success "Ubuntu ${version} installed"
+}
+
+# Create Debian environment
+create_debian_env() {
+    local env_path="$1"
+    
+    log_info "Installing Debian 11 (bullseye)..."
+    
+    # Check if debootstrap is installed
+    if ! command -v debootstrap &> /dev/null; then
+        log_info "Installing debootstrap..."
+        pkg install -y debootstrap
+    fi
+    
+    # Run debootstrap
+    debootstrap --arch=amd64 bullseye "${env_path}" http://deb.debian.org/debian/ || {
+        log_error "debootstrap failed"
+        return 1
+    }
+    
+    log_success "Debian 11 installed"
+}
+
+# Create Alpine environment
+create_alpine_env() {
+    local env_path="$1"
+    
+    log_info "Installing Alpine Linux..."
+    
+    # Download Alpine mini root filesystem
+    local alpine_version="3.18"
+    local alpine_url="https://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/releases/x86_64/alpine-minirootfs-${alpine_version}.0-x86_64.tar.gz"
+    
+    cd "${env_path}"
+    if fetch "${alpine_url}"; then
+        tar -xzf "alpine-minirootfs-${alpine_version}.0-x86_64.tar.gz"
+        rm "alpine-minirootfs-${alpine_version}.0-x86_64.tar.gz"
+        log_success "Alpine Linux installed"
+    else
+        log_error "Failed to download Alpine Linux"
+        return 1
+    fi
+}
+
+# Create Arch Linux environment
+create_archlinux_env() {
+    local env_path="$1"
+    
+    log_info "Installing Arch Linux..."
+    
+    # Try multiple mirrors and dates
+    cd "${env_path}"
+    local downloaded=false
+    
+    # List of mirrors to try
+    local mirrors=(
+        "https://mirror.rackspace.com/archlinux"
+        "https://mirrors.kernel.org/archlinux"
+        "https://mirror.arizona.edu/archlinux"
+        "https://mirror.stephen304.com/archlinux"
+    )
+    
+    # Try recent months (Arch releases monthly on the 1st)
+    # Try both .tar.zst (new format) and .tar.gz (old format)
+    for months_back in 0 1 2 3; do
+        local try_date=$(date -v-${months_back}m +%Y.%m.01)
+        
+        for ext in "tar.zst" "tar.gz"; do
+            local bootstrap_file="archlinux-bootstrap-${try_date}-x86_64.${ext}"
+            
+            for mirror in "${mirrors[@]}"; do
+                local bootstrap_url="${mirror}/iso/${try_date}/${bootstrap_file}"
+                log_info "Trying ${mirror} for ${try_date} (${ext})..."
+                
+                if fetch "${bootstrap_url}" 2>/dev/null; then
+                    downloaded=true
+                    break 3
+                fi
+            done
+        done
+    done
+    
+    # If still not downloaded, try the latest symlink
+    if [[ "${downloaded}" != "true" ]]; then
+        log_info "Trying 'latest' symlinks..."
+        for ext in "tar.zst" "tar.gz"; do
+            for mirror in "${mirrors[@]}"; do
+                local bootstrap_url="${mirror}/iso/latest/archlinux-bootstrap-x86_64.${ext}"
+                if fetch -o "archlinux-bootstrap-x86_64.${ext}" "${bootstrap_url}" 2>/dev/null; then
+                    bootstrap_file="archlinux-bootstrap-x86_64.${ext}"
+                    downloaded=true
+                    break 2
+                fi
+            done
+        done
+    fi
+    
+    if [[ "${downloaded}" != "true" ]]; then
+        log_error "Failed to download Arch Linux bootstrap from any source"
+        log_info "You can manually download from: https://archlinux.org/download/"
+        log_info "Look for archlinux-bootstrap-*-x86_64.tar.gz"
+        return 1
+    fi
+    
+    log_info "Extracting Arch Linux bootstrap..."
+    
+    # Check if we need zstd for extraction
+    if [[ "${bootstrap_file}" == *.tar.zst ]]; then
+        # Install zstd if not available
+        if ! command -v zstd &> /dev/null; then
+            log_info "Installing zstd for extraction..."
+            pkg install -y zstd
+        fi
+        
+        # Extract with zstd
+        log_info "Using zstd to extract ${bootstrap_file}..."
+        # FreeBSD tar will complain about Linux extended attributes, but still extracts files
+        # Ignore the exit code and suppress the warnings
+        zstd -d -c "${bootstrap_file}" | tar -xf - 2>&1 | grep -v "Cannot restore extended attributes" || true
+        
+        # Check if extraction was successful by looking for expected directories
+        if [[ ! -d "root.x86_64" ]] && [[ ! -d "etc" ]]; then
+            log_error "Failed to extract bootstrap tarball - no files found"
+            rm -f "${bootstrap_file}"
+            return 1
+        fi
+        log_info "Extraction completed (extended attribute warnings are normal on FreeBSD)"
+    else
+        # Extract regular tar.gz
+        log_info "Extracting ${bootstrap_file}..."
+        if ! tar -xzf "${bootstrap_file}"; then
+            log_error "Failed to extract bootstrap tarball"
+            rm -f "${bootstrap_file}"
+            return 1
+        fi
+    fi
+    
+    # The tarball extracts to root.x86_64, move contents up
+    if [[ -d "root.x86_64" ]]; then
+        mv root.x86_64/* . 2>/dev/null || true
+        mv root.x86_64/.* . 2>/dev/null || true
+        rmdir root.x86_64
+    fi
+    
+    rm -f "${bootstrap_file}"
+    
+    # Setup Arch Linux environment
+    setup_archlinux_config "${env_path}"
+    
+    log_success "Arch Linux installed"
+}
+
+# Setup Arch Linux specific configuration
+setup_archlinux_config() {
+    local env_path="$1"
+    
+    # Create resolv.conf
+    cp /etc/resolv.conf "${env_path}/etc/resolv.conf"
+    
+    # Create /etc/mtab for pacman (FreeBSD doesn't have this)
+    ln -sf /proc/mounts "${env_path}/etc/mtab"
+    
+    # Ensure proc directory exists
+    mkdir -p "${env_path}/proc"
+    
+    # Initialize pacman keyring (will need to be done in chroot)
+    cat > "${env_path}/root/init-arch.sh" << 'EOF'
+#!/bin/bash
+# Initialize Arch Linux in chroot
+
+echo "Initializing pacman keyring..."
+# The /dev/fd errors are normal on FreeBSD, pacman-key still works
+pacman-key --init 2>&1 | grep -v "/dev/fd"
+pacman-key --populate archlinux 2>&1 | grep -v "/dev/fd"
+
+echo ""
+echo "Updating package databases..."
+if ! pacman -Sy; then
+    echo ""
+    echo "NOTE: If you see 'no servers configured' error, the mirrorlist is already set up."
+    echo "The bootstrap includes a mirrorlist at /etc/pacman.d/mirrorlist"
+    echo ""
+    
+    # Ensure mirrorlist has uncommented servers
+    if grep -q "^#Server" /etc/pacman.d/mirrorlist; then
+        echo "Uncommenting first 5 mirrors in mirrorlist..."
+        sed -i.bak '0,/^#Server/{s/^#Server/Server/}' /etc/pacman.d/mirrorlist
+        sed -i '0,/^#Server/{s/^#Server/Server/}' /etc/pacman.d/mirrorlist
+        sed -i '0,/^#Server/{s/^#Server/Server/}' /etc/pacman.d/mirrorlist
+        sed -i '0,/^#Server/{s/^#Server/Server/}' /etc/pacman.d/mirrorlist
+        sed -i '0,/^#Server/{s/^#Server/Server/}' /etc/pacman.d/mirrorlist
+        echo "Retrying package sync..."
+        pacman -Sy
+    fi
+fi
+
+echo ""
+echo "Checking mtab..."
+if [[ ! -e /etc/mtab ]]; then
+    echo "Creating /etc/mtab symlink..."
+    ln -sf /proc/mounts /etc/mtab
+fi
+
+echo ""
+echo "Installing base packages..."
+echo "NOTE: The 'landlock' warning is normal on FreeBSD and can be ignored."
+echo ""
+
+# Try to install packages, but don't fail if there are minor issues
+if pacman -S --noconfirm --needed base base-devel; then
+    echo ""
+    echo "Arch Linux initialization complete!"
+    echo "You can now use pacman to install packages."
+else
+    echo ""
+    echo "WARNING: Some packages may have failed to install."
+    echo "This is often due to FreeBSD/Linux compatibility issues."
+    echo ""
+    echo "You can still use pacman to install individual packages."
+    echo "Try: pacman -S <package-name>"
+fi
+
+echo ""
+echo "To use this Arch Linux environment:"
+echo "  1. Exit this chroot (type 'exit')"
+echo "  2. Switch to it: sudo linux_compat_manager switch archlinux"
+echo "  3. Run Linux binaries directly or chroot /compat/linux"
+EOF
+    chmod +x "${env_path}/root/init-arch.sh"
+    
+    # Create pacman mirrorlist if not exists
+    if [[ ! -f "${env_path}/etc/pacman.d/mirrorlist" ]]; then
+        cat > "${env_path}/etc/pacman.d/mirrorlist" << 'EOF'
+# Arch Linux mirrorlist
+Server = https://mirror.rackspace.com/archlinux/$repo/os/$arch
+Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
+Server = https://mirror.leaseweb.net/archlinux/$repo/os/$arch
+EOF
+    fi
+    
+    log_info "Arch Linux environment created."
+    log_info ""
+    log_info "To complete setup:"
+    log_info "  1. Switch to this environment: sudo linux_compat_manager switch $(basename ${env_path})"
+    log_info "  2. Initialize Arch: sudo chroot /compat/linux /root/init-arch.sh"
+    log_info ""
+    log_info "Or directly without switching:"
+    log_info "  sudo chroot ${env_path} /root/init-arch.sh"
+    log_info ""
+    log_info "This will initialize pacman keyring and install base packages."
+}
+
+# Setup basic directories
+setup_basic_dirs() {
+    local env_path="$1"
+    
+    # Ensure essential directories exist
+    local dirs=("proc" "sys" "dev" "dev/pts" "dev/shm" "tmp")
+    for dir in "${dirs[@]}"; do
+        mkdir -p "${env_path}/${dir}"
+    done
+    
+    # Set permissions
+    chmod 1777 "${env_path}/tmp"
+    chmod 755 "${env_path}/dev"
+}
+
+# Setup Ubuntu specific configuration
+setup_ubuntu_config() {
+    local env_path="$1"
+    local codename="$2"
+    
+    # Create basic sources.list
+    cat > "${env_path}/etc/apt/sources.list" << EOF
+deb http://archive.ubuntu.com/ubuntu/ ${codename} main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ ${codename}-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ ${codename}-security main restricted universe multiverse
+EOF
+    
+    # Create resolv.conf
+    cp /etc/resolv.conf "${env_path}/etc/resolv.conf"
+}
+
+# Switch to a different environment
+switch_environment() {
+    local name="$1"
+    local env_path="${ENVIRONMENTS_DIR}/${name}"
+    
+    if [[ ! -d "${env_path}" ]]; then
+        log_error "Environment '${name}' does not exist"
+        return 1
+    fi
+    
+    log_info "Switching to environment '${name}'..."
+    
+    # Unmount proc from old environment if mounted
+    if [[ -L "${CURRENT_ENV_LINK}" ]]; then
+        local old_env=$(readlink "${CURRENT_ENV_LINK}")
+        if mount | grep -q "${old_env}/proc"; then
+            log_info "Unmounting proc from old environment..."
+            umount "${old_env}/proc" 2>/dev/null || true
+        fi
+    fi
+    
+    # Backup current if it's not a symlink
+    if [[ -d "${CURRENT_ENV_LINK}" ]] && [[ ! -L "${CURRENT_ENV_LINK}" ]]; then
+        log_info "Backing up current /compat/linux..."
+        mv "${CURRENT_ENV_LINK}" "${ENVIRONMENTS_DIR}/original-$(date +%Y%m%d-%H%M%S)"
+    fi
+    
+    # Remove current link
+    rm -f "${CURRENT_ENV_LINK}"
+    
+    # Create new symlink
+    ln -s "${env_path}" "${CURRENT_ENV_LINK}"
+    
+    # Mount proc if not already mounted
+    if ! mount | grep -q "${CURRENT_ENV_LINK}/proc"; then
+        log_info "Mounting procfs in new environment..."
+        mount -t procfs proc "${CURRENT_ENV_LINK}/proc" 2>/dev/null || true
+    fi
+    
+    # Ensure mtab exists (as a file, not symlink for FreeBSD)
+    if [[ ! -f "${CURRENT_ENV_LINK}/etc/mtab" ]]; then
+        touch "${CURRENT_ENV_LINK}/etc/mtab"
+    fi
+    
+    log_success "Switched to environment '${name}'"
+    
+    # Update sysctl if needed
+    update_linux_path "${env_path}"
+}
+
+# Update Linux path in sysctl
+update_linux_path() {
+    local env_path="$1"
+    
+    # The compat.linux.emul_path sysctl might need updating
+    if sysctl compat.linux.emul_path &> /dev/null; then
+        sysctl compat.linux.emul_path=/compat/linux
+    fi
+}
+
+# List environments
+list_environments() {
+    log_info "Available Linux environments:"
+    echo
+    
+    if [[ ! -d "${ENVIRONMENTS_DIR}" ]]; then
+        log_warning "No environments found"
+        return
+    fi
+    
+    local current_env=""
+    if [[ -L "${CURRENT_ENV_LINK}" ]]; then
+        current_env=$(readlink "${CURRENT_ENV_LINK}" | xargs basename)
+    fi
+    
+    for env in "${ENVIRONMENTS_DIR}"/*; do
+        if [[ -d "${env}" ]]; then
+            local name=$(basename "${env}")
+            local info=""
+            
+            if [[ -f "${env}/.env_info" ]]; then
+                local type=$(grep "^TYPE=" "${env}/.env_info" | cut -d= -f2)
+                local created=$(grep "^CREATED=" "${env}/.env_info" | cut -d= -f2-)
+                info=" (${type}, created: ${created})"
+            fi
+            
+            if [[ "${name}" == "${current_env}" ]]; then
+                echo -e "  ${GREEN}* ${name}${NC}${info} [ACTIVE]"
+            else
+                echo -e "    ${name}${info}"
+            fi
+        fi
+    done
+    
+    # Check if default exists
+    if [[ -d "${DEFAULT_COMPAT}" ]] && [[ ! -L "${DEFAULT_COMPAT}" ]]; then
+        echo -e "\n  ${YELLOW}Original /compat/linux exists (not managed)${NC}"
+    fi
+}
+
+# Show current environment
+show_current() {
+    if [[ -L "${CURRENT_ENV_LINK}" ]]; then
+        local current=$(readlink "${CURRENT_ENV_LINK}")
+        local name=$(basename "${current}")
+        log_info "Current environment: ${name}"
+        
+        if [[ -f "${current}/.env_info" ]]; then
+            echo
+            cat "${current}/.env_info"
+        fi
+    elif [[ -d "${CURRENT_ENV_LINK}" ]]; then
+        log_info "Using original /compat/linux (not managed)"
+    else
+        log_warning "No Linux environment is active"
+    fi
+}
+
+# Remove an environment
+remove_environment() {
+    local name="$1"
+    local env_path="${ENVIRONMENTS_DIR}/${name}"
+    
+    if [[ ! -d "${env_path}" ]]; then
+        log_error "Environment '${name}' does not exist"
+        return 1
+    fi
+    
+    # Check if it's currently active
+    if [[ -L "${CURRENT_ENV_LINK}" ]]; then
+        local current=$(readlink "${CURRENT_ENV_LINK}" | xargs basename)
+        if [[ "${current}" == "${name}" ]]; then
+            log_error "Cannot remove active environment. Switch to another first."
+            return 1
+        fi
+    fi
+    
+    read -p "Are you sure you want to remove environment '${name}'? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Removing environment '${name}'..."
+        rm -rf "${env_path}"
+        log_success "Environment removed"
+    else
+        log_info "Removal cancelled"
+    fi
+}
+
+# Backup an environment
+backup_environment() {
+    local name="$1"
+    local env_path="${ENVIRONMENTS_DIR}/${name}"
+    local backup_file="${name}-$(date +%Y%m%d-%H%M%S).tar.gz"
+    
+    if [[ ! -d "${env_path}" ]]; then
+        log_error "Environment '${name}' does not exist"
+        return 1
+    fi
+    
+    log_info "Backing up environment '${name}' to ${backup_file}..."
+    
+    cd "${ENVIRONMENTS_DIR}"
+    tar -czf "/tmp/${backup_file}" "${name}/"
+    
+    log_success "Backup saved to /tmp/${backup_file}"
+    log_info "Size: $(du -h "/tmp/${backup_file}" | cut -f1)"
+}
+
+# Restore an environment
+restore_environment() {
+    local name="$1"
+    local backup_file="$2"
+    local env_path="${ENVIRONMENTS_DIR}/${name}"
+    
+    if [[ ! -f "${backup_file}" ]]; then
+        log_error "Backup file '${backup_file}' not found"
+        return 1
+    fi
+    
+    if [[ -d "${env_path}" ]]; then
+        log_error "Environment '${name}' already exists"
+        return 1
+    fi
+    
+    log_info "Restoring environment '${name}' from ${backup_file}..."
+    
+    cd "${ENVIRONMENTS_DIR}"
+    tar -xzf "${backup_file}"
+    
+    # Rename if necessary
+    local extracted_name=$(tar -tzf "${backup_file}" | head -1 | cut -d/ -f1)
+    if [[ "${extracted_name}" != "${name}" ]]; then
+        mv "${extracted_name}" "${name}"
+    fi
+    
+    log_success "Environment restored"
+}
+
+# Main function
+main() {
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit 0
+    fi
+    
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        create)
+            check_privileges
+            ensure_linux_loaded
+            init_environments_dir
+            if [[ $# -lt 2 ]]; then
+                log_error "Usage: $0 create <name> [type]"
+                exit 1
+            fi
+            create_environment "$2" "${3:-centos7}"
+            ;;
+        switch)
+            check_privileges
+            if [[ $# -lt 2 ]]; then
+                log_error "Usage: $0 switch <name>"
+                exit 1
+            fi
+            switch_environment "$2"
+            ;;
+        list)
+            list_environments
+            ;;
+        current)
+            show_current
+            ;;
+        remove)
+            check_privileges
+            if [[ $# -lt 2 ]]; then
+                log_error "Usage: $0 remove <name>"
+                exit 1
+            fi
+            remove_environment "$2"
+            ;;
+        backup)
+            check_privileges
+            if [[ $# -lt 2 ]]; then
+                log_error "Usage: $0 backup <name>"
+                exit 1
+            fi
+            backup_environment "$2"
+            ;;
+        restore)
+            check_privileges
+            if [[ $# -lt 3 ]]; then
+                log_error "Usage: $0 restore <name> <backup-file>"
+                exit 1
+            fi
+            restore_environment "$2" "$3"
+            ;;
+        *)
+            log_error "Unknown command: $1"
+            echo "Run '$0 --help' for usage information"
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"
