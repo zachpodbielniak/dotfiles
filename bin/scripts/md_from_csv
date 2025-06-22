@@ -1,0 +1,207 @@
+#!/usr/bin/python3
+"""
+md_from_csv - Convert CSV/XLSX/ODS files to markdown tables
+
+Usage:
+  md_from_csv [--input file] [--output file] [--sheet name] [--no-header]
+  cat file.csv | md_from_csv
+  md_from_csv --input data.xlsx --output table.md
+
+Supported formats:
+  - CSV (.csv)
+  - Excel (.xlsx, .xls) 
+  - OpenDocument Spreadsheet (.ods)
+
+Format is auto-detected from file extension or content.
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import io
+from pathlib import Path
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas openpyxl odfpy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - openpyxl: Excel (.xlsx) support", file=sys.stderr)
+    print("  - odfpy: OpenDocument (.ods) support", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas openpyxl odfpy", file=sys.stderr)
+    sys.exit(1)
+
+def detect_format(file_path=None, content=None):
+    """Detect file format from extension or content"""
+    if file_path:
+        suffix = Path(file_path).suffix.lower()
+        if suffix in ['.xlsx', '.xls']:
+            return 'excel'
+        elif suffix == '.ods':
+            return 'ods'
+        elif suffix == '.csv':
+            return 'csv'
+    
+    # If no extension or stdin, try to detect from content
+    if content:
+        # Check for Excel/ODS magic bytes
+        if content.startswith(b'PK'):  # ZIP-based formats (xlsx, ods)
+            # Try to determine if it's Excel or ODS by looking deeper
+            if b'xl/' in content[:1000]:
+                return 'excel'
+            elif b'content.xml' in content[:1000]:
+                return 'ods'
+        
+        # Try to decode as text for CSV
+        try:
+            content.decode('utf-8')
+            return 'csv'
+        except UnicodeDecodeError:
+            pass
+    
+    # Default to CSV
+    return 'csv'
+
+def read_file(input_file, file_format, sheet_name=None):
+    """Read file based on format"""
+    try:
+        if file_format == 'excel':
+            if sheet_name:
+                df = pd.read_excel(input_file, sheet_name=sheet_name)
+            else:
+                df = pd.read_excel(input_file)
+        elif file_format == 'ods':
+            if sheet_name:
+                df = pd.read_excel(input_file, sheet_name=sheet_name, engine='odf')
+            else:
+                df = pd.read_excel(input_file, engine='odf')
+        else:  # CSV
+            if isinstance(input_file, str):
+                df = pd.read_csv(input_file)
+            else:
+                df = pd.read_csv(input_file)
+        
+        return df
+    except Exception as e:
+        print(f"Error reading file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def dataframe_to_markdown(df, include_header=True):
+    """Convert pandas DataFrame to markdown table"""
+    if df.empty:
+        return "| (empty table) |\n|----------------|\n"
+    
+    lines = []
+    
+    # Add header row if requested
+    if include_header:
+        headers = [str(col) for col in df.columns]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["-" * (len(h) + 2) for h in headers]) + "|")
+    
+    # Add data rows
+    for _, row in df.iterrows():
+        row_data = []
+        for val in row:
+            # Handle different data types
+            if pd.isna(val):
+                row_data.append("")
+            elif isinstance(val, (int, float)):
+                if pd.isna(val):
+                    row_data.append("")
+                elif isinstance(val, float) and val.is_integer():
+                    row_data.append(str(int(val)))
+                else:
+                    row_data.append(str(val))
+            else:
+                # Escape pipes in cell content
+                cell_content = str(val).replace("|", "\\|")
+                row_data.append(cell_content)
+        
+        lines.append("| " + " | ".join(row_data) + " |")
+    
+    return "\n".join(lines) + "\n"
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convert CSV/XLSX/ODS files to markdown tables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_from_csv --input data.csv --output table.md
+  cat data.csv | md_from_csv > table.md
+  md_from_csv --input spreadsheet.xlsx --sheet Sheet2
+  md_from_csv --input data.ods --no-header
+        """
+    )
+    
+    parser.add_argument('--input', '-i', help='Input file (CSV/XLSX/ODS). Default: stdin')
+    parser.add_argument('--output', '-o', help='Output markdown file. Default: stdout')
+    parser.add_argument('--sheet', '-s', help='Sheet name for Excel/ODS files (default: first sheet)')
+    parser.add_argument('--no-header', action='store_true', help='Do not include header row in output')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Determine input source and format
+        if args.input:
+            file_format = detect_format(file_path=args.input)
+            df = read_file(args.input, file_format, args.sheet)
+        else:
+            # Read from stdin
+            content = sys.stdin.buffer.read()
+            if not content:
+                print("Error: No input data provided", file=sys.stderr)
+                sys.exit(1)
+            
+            file_format = detect_format(content=content)
+            
+            # Create a file-like object from the content
+            if file_format == 'csv':
+                content_str = content.decode('utf-8')
+                df = pd.read_csv(io.StringIO(content_str))
+            else:
+                df = read_file(io.BytesIO(content), file_format, args.sheet)
+        
+        # Convert to markdown
+        include_header = not args.no_header
+        markdown_output = dataframe_to_markdown(df, include_header)
+        
+        # Write output
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(markdown_output)
+            print(f"Converted to markdown: {args.output}", file=sys.stderr)
+        else:
+            print(markdown_output, end='')
+            
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

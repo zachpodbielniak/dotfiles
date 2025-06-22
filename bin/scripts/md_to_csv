@@ -1,0 +1,228 @@
+#!/usr/bin/python3
+"""
+md_to_csv - Convert markdown tables to CSV/XLSX/ODS files
+
+Usage:
+  md_to_csv [--input file] [--output file] [--format csv|xlsx|ods] [--delimiter ,] [--no-header]
+  cat table.md | md_to_csv
+  md_to_csv --input table.md --output data.xlsx --format xlsx
+
+Supported output formats:
+  - CSV (.csv) - default
+  - Excel (.xlsx)
+  - OpenDocument Spreadsheet (.ods)
+
+Format can be specified explicitly or auto-detected from output file extension.
+"""
+
+import sys
+import os
+from subprocess import run
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd = [
+        "distrobox",
+        "enter", 
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    
+    run(cmd)
+    sys.exit(0)
+
+import argparse
+import re
+from pathlib import Path
+from typing import List, Optional
+
+# Try to import pandas with helpful error message
+try:
+    import pandas as pd
+except ImportError:
+    print("Error: Required dependencies not installed.", file=sys.stderr)
+    print("Install with: pip install pandas openpyxl odfpy", file=sys.stderr)
+    print("  - pandas: Core data processing", file=sys.stderr)
+    print("  - openpyxl: Excel (.xlsx) support", file=sys.stderr)
+    print("  - odfpy: OpenDocument (.ods) support", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas openpyxl odfpy", file=sys.stderr)
+    sys.exit(1)
+
+def parse_markdown_table(content: str) -> Optional[pd.DataFrame]:
+    """Parse markdown table content into pandas DataFrame"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    # Find table lines (start with |)
+    table_lines = [line for line in lines if line.startswith('|') and line.endswith('|')]
+    
+    if len(table_lines) < 2:
+        return None
+    
+    # Parse header row
+    header_line = table_lines[0]
+    headers = [cell.strip() for cell in header_line.split('|')[1:-1]]  # Remove first/last empty
+    
+    # Find separator row (contains dashes)
+    separator_idx = None
+    for i, line in enumerate(table_lines[1:], 1):
+        if re.match(r'^\|[\s\-\|]+\|$', line):
+            separator_idx = i
+            break
+    
+    if separator_idx is None:
+        # No separator found, treat first row as data
+        data_lines = table_lines
+        headers = [f"Column{i+1}" for i in range(len(headers))]
+        data_start = 0
+    else:
+        # Skip separator row
+        data_lines = table_lines[separator_idx + 1:]
+        data_start = separator_idx + 1
+    
+    if not data_lines:
+        # Only headers, create empty DataFrame
+        return pd.DataFrame(columns=headers)
+    
+    # Parse data rows
+    data = []
+    for line in data_lines:
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]  # Remove first/last empty
+        
+        # Pad or trim cells to match header count
+        while len(cells) < len(headers):
+            cells.append('')
+        cells = cells[:len(headers)]
+        
+        # Unescape pipes in cell content
+        cells = [cell.replace('\\|', '|') for cell in cells]
+        
+        data.append(cells)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=headers)
+    
+    # Try to convert numeric columns
+    for col in df.columns:
+        # Try to convert to numeric, but keep as string if it fails
+        try:
+            df[col] = pd.to_numeric(df[col])
+        except (ValueError, TypeError):
+            # Keep as string if conversion fails
+            pass
+    
+    return df
+
+def detect_output_format(output_file: str) -> str:
+    """Detect output format from file extension"""
+    if not output_file:
+        return 'csv'
+    
+    suffix = Path(output_file).suffix.lower()
+    if suffix in ['.xlsx', '.xls']:
+        return 'xlsx'
+    elif suffix == '.ods':
+        return 'ods'
+    else:
+        return 'csv'
+
+def write_dataframe(df: pd.DataFrame, output_file: str, file_format: str, delimiter: str = ',', include_header: bool = True):
+    """Write DataFrame to file in specified format"""
+    try:
+        if file_format == 'xlsx':
+            df.to_excel(output_file, index=False, header=include_header)
+        elif file_format == 'ods':
+            df.to_excel(output_file, index=False, header=include_header, engine='odf')
+        else:  # CSV or other delimited format
+            if output_file:
+                df.to_csv(output_file, index=False, sep=delimiter, header=include_header)
+            else:
+                # Write to stdout
+                csv_content = df.to_csv(index=False, sep=delimiter, header=include_header)
+                sys.stdout.write(csv_content)
+    except Exception as e:
+        print(f"Error writing file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convert markdown tables to CSV/XLSX/ODS files',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  md_to_csv --input table.md --output data.csv
+  cat table.md | md_to_csv > data.csv
+  md_to_csv --input table.md --output spreadsheet.xlsx --format xlsx
+  md_to_csv --input table.md --delimiter "\\t" > data.tsv
+  md_to_csv --input table.md --output data.ods --format ods
+        """
+    )
+    
+    parser.add_argument('--input', '-i', help='Input markdown file. Default: stdin')
+    parser.add_argument('--output', '-o', help='Output file (CSV/XLSX/ODS). Default: stdout (CSV)')
+    parser.add_argument('--format', '-f', choices=['csv', 'xlsx', 'ods'], 
+                       help='Output format (auto-detected from extension if not specified)')
+    parser.add_argument('--delimiter', '-d', default=',', 
+                       help='Delimiter for CSV output (default: comma). Use "\\t" for tabs')
+    parser.add_argument('--no-header', action='store_true', help='Do not include header row in output')
+    
+    args = parser.parse_args()
+    
+    # Handle escape sequences in delimiter
+    delimiter = args.delimiter.replace('\\t', '\t').replace('\\n', '\n')
+    
+    try:
+        # Read input
+        if args.input:
+            with open(args.input, 'r', encoding='utf-8') as f:
+                content = f.read()
+        else:
+            content = sys.stdin.read()
+        
+        if not content.strip():
+            print("Error: No input data provided", file=sys.stderr)
+            sys.exit(1)
+        
+        # Parse markdown table
+        df = parse_markdown_table(content)
+        
+        if df is None:
+            print("Error: No valid markdown table found in input", file=sys.stderr)
+            sys.exit(1)
+        
+        if df.empty:
+            print("Warning: Empty table found", file=sys.stderr)
+        
+        # Determine output format
+        if args.format:
+            file_format = args.format
+        else:
+            file_format = detect_output_format(args.output)
+        
+        # Write output
+        include_header = not args.no_header
+        write_dataframe(df, args.output, file_format, delimiter, include_header)
+        
+        if args.output:
+            rows, cols = df.shape
+            print(f"Converted markdown table ({rows} rows, {cols} columns) to {file_format.upper()}: {args.output}", file=sys.stderr)
+            
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: File not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
