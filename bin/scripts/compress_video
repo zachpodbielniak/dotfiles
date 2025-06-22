@@ -27,6 +27,7 @@ set -euo pipefail
 # - podman: Container runtime
 # - linuxserver/ffmpeg container image
 # - /dev/dri/renderD128: For hardware acceleration (optional)
+# - parallel: GNU parallel for concurrent processing (optional)
 #
 # Usage: See show_help() function or run with -h/--help
 # ==============================================================================
@@ -48,6 +49,7 @@ USE_JOURNAL=false
 JOURNAL_FILE=""
 FORCE_RECONVERT=false
 CUSTOM_CRF=""
+PARALLEL_JOBS=1
 
 # Quality presets (CRF values)
 declare -A QUALITY_PRESETS=(
@@ -117,6 +119,7 @@ OPTIONS:
     --force-reconvert          Force reconversion even if file is in journal
     --list-encoders            List available video encoders in the container
     --prefer-software          Prefer software encoding over hardware acceleration
+    --parallel N               Process N files in parallel (default: 1)
 
 EXAMPLES:
     # Basic compression with defaults (H.265, medium quality)
@@ -145,6 +148,12 @@ EXAMPLES:
 
     # Force software encoding (if hardware encoders fail)
     compress_video --prefer-software input.mp4
+    
+    # Process 2 files in parallel
+    compress_video --parallel 2 *.mp4
+    
+    # Parallel processing with journal
+    compress_video --parallel 3 --journal *.mp4
 
 QUALITY GUIDE:
     Software/VAAPI (CRF mode):
@@ -415,6 +424,14 @@ parse_args() {
             --prefer-software)
                 PREFER_SOFTWARE=true
                 shift
+                ;;
+            --parallel)
+                PARALLEL_JOBS="$2"
+                if ! [[ "$PARALLEL_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+                    error "Invalid parallel jobs count: $PARALLEL_JOBS (must be a positive integer)"
+                    exit 1
+                fi
+                shift 2
                 ;;
             -*)
                 error "Unknown option: $1"
@@ -711,6 +728,33 @@ process_video() {
     fi
 }
 
+# Check if parallel is available for concurrent processing
+check_parallel() {
+    if ! command -v parallel >/dev/null 2>&1; then
+        error "GNU parallel is required for --parallel option but not found"
+        error "Install with: sudo apt install parallel (or equivalent for your distro)"
+        exit 1
+    fi
+}
+
+# Export function for parallel to use
+export -f process_video log error debug is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args
+
+# Wrapper function that parallel can call
+process_video_wrapper() {
+    local input_file="$1"
+    local output_file="$2"
+    
+    # Reconstruct associative arrays from environment variables
+    declare -A QUALITY_PRESETS=(["low"]="28" ["medium"]="23" ["high"]="18" ["veryhigh"]="15")
+    declare -A QUALITY_BITRATES=(["low"]="2M" ["medium"]="5M" ["high"]="10M" ["veryhigh"]="20M")
+    declare -A VIDEO_CODEC_MAP=(["h264"]="libx264" ["h265"]="libx265" ["vp9"]="libvpx-vp9" ["av1"]="libaom-av1")
+    declare -A AUDIO_CODEC_MAP=(["vorbis"]="libvorbis" ["opus"]="libopus" ["aac"]="aac" ["mp3"]="libmp3lame" ["copy"]="copy")
+    
+    # Call the main processing function
+    process_video "$input_file" "$output_file"
+}
+
 # Main function
 main() {
     parse_args "$@"
@@ -723,9 +767,16 @@ main() {
         mkdir -p "$OUTPUT_DIR"
     fi
     
-    # Process each input file
+    # Check for parallel dependency if needed
+    if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
+        check_parallel
+    fi
+    
+    # Prepare job list for processing
+    local job_list=()
     local failed=0
     local skipped=0
+    
     for input_file in "${INPUT_FILES[@]}"; do
         # Check if input file exists
         if [[ ! -f "$input_file" ]]; then
@@ -747,13 +798,44 @@ main() {
         # Check if already converted (for counting)
         if is_converted "$input_file" "$output_file"; then
             ((skipped++))
-        fi
-        
-        # Process the video
-        if ! process_video "$input_file" "$output_file"; then
-            ((failed++))
+        else
+            # Add to job list for processing
+            job_list+=("$input_file|$output_file")
         fi
     done
+    
+    # Process videos
+    if [[ ${#job_list[@]} -gt 0 ]]; then
+        if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
+            # Use parallel processing
+            log "Processing ${#job_list[@]} files with $PARALLEL_JOBS parallel jobs..."
+            
+            # Export the wrapper function and variables for parallel
+            export -f process_video_wrapper
+            export QUALITY CUSTOM_CRF VIDEO_CODEC AUDIO_CODEC OUTPUT_FORMAT USE_HWACCEL PREFER_VULKAN
+            export PREFER_SOFTWARE CONTAINER_IMAGE HWACCEL_DEVICE VERBOSE DRY_RUN USE_JOURNAL 
+            export JOURNAL_FILE FORCE_RECONVERT RESOLUTION BITRATE FFMPEG_PRESET
+            
+            # Process jobs in parallel
+            local parallel_failed=0
+            printf '%s\n' "${job_list[@]}" | parallel -j "$PARALLEL_JOBS" --colsep '|' \
+                'if ! process_video_wrapper "{1}" "{2}"; then exit 1; fi' || parallel_failed=$?
+                
+            # Count failures (parallel doesn't give us exact count, so we estimate)
+            if [[ $parallel_failed -ne 0 ]]; then
+                error "Some parallel jobs failed"
+                failed=$parallel_failed
+            fi
+        else
+            # Sequential processing
+            for job in "${job_list[@]}"; do
+                IFS='|' read -r input_file output_file <<< "$job"
+                if ! process_video "$input_file" "$output_file"; then
+                    ((failed++))
+                fi
+            done
+        fi
+    fi
     
     # Summary
     if [[ ${#INPUT_FILES[@]} -gt 1 ]]; then
