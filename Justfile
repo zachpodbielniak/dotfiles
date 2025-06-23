@@ -8,6 +8,7 @@ stow: dep_dirs
         --ignore=CLAUDE.md \
         --ignore=tests \
         --ignore=Containerfile \
+        --ignore=requirements.txt \
         --ignore=trees \
         .
 
@@ -22,6 +23,7 @@ stow_alt: dep_dirs
         --ignore=CLAUDE.md \
         --ignore=tests \
         --ignore=Containerfile \
+        --ignore=requirements.txt \
         --ignore=trees \
         --ignore=.gitconfig \
         .
