@@ -19,6 +19,10 @@ userSettingsOverride defaults = defaults
     , appStderrLogging = True                    -- Enable stderr logging
     , appPluginVerboseLogging = True             -- Plugin debug output enabled for debugging
     
+    -- Web UI Behavior
+    , appWebUIAutoCollapse = True                -- Auto-collapse tool messages longer than threshold
+    , appWebUICollapseThreshold = 20             -- Collapse tool messages after 20 lines
+    
     -- Plugin Configuration - Enable AiChats plugin
     , appPluginRegistry = registerMessagePlugin PluginAiChats.aiChatsPlugin $
                          registerSystemPlugin PluginAiChats.aiChatsPlugin $
