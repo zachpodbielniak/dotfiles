@@ -169,8 +169,8 @@ storeInDatabase ctx userMsg response = do
             let provider = "claude"
             let model = "claude-sonnet-4" 
             
-            -- Call database storage
-            result <- catch (callAipy sessionId userMsg response provider model tags) handleAipyError
+            -- Call database storage with context ID and chat ID (fallback mode)
+            result <- catch (callAipy sessionId sessionId userMsg response provider model tags) handleAipyError
             return result
   where
     handleAipyError :: SomeException -> IO (Either String ())
@@ -201,8 +201,13 @@ storeInDatabaseWithSessionId ctx userMsg response maybeSessionId = do
             let provider = "claude"
             let model = "claude-sonnet-4" 
             
-            -- Call database storage
-            result <- catch (callAipy sessionId userMsg response provider model tags) handleAipyError
+            -- Get context ID from app session, use captured Claude session as chat ID
+            let contextId = case pluginSessionId ctx of
+                    Just appSessionId -> appSessionId
+                    Nothing -> sessionId  -- Fallback to Claude session if no app session
+            
+            -- Call database storage with separate context and chat IDs
+            result <- catch (callAipy contextId sessionId userMsg response provider model tags) handleAipyError
             return result
   where
     handleAipyError :: SomeException -> IO (Either String ())
@@ -225,8 +230,8 @@ hashText text = T.pack $ show $ hash $ T.unpack text
     hash = foldr (\c acc -> fromEnum c + acc * 31) 0
 
 -- | Call database storage
-callAipy :: T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> [T.Text] -> IO (Either String ())
-callAipy sessionId prompt response provider model tags = do
+callAipy :: T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> [T.Text] -> IO (Either String ())
+callAipy contextId claudeSessionId prompt response provider model tags = do
     let dbName = "ai_chats"
     let dbUser = "postgres"
     
@@ -234,8 +239,9 @@ callAipy sessionId prompt response provider model tags = do
     let promptHash = T.take 16 $ hashText prompt
     let responseHash = T.take 16 $ hashText response
     
-    let insertSQL = "INSERT INTO ai_chats (context_uuid, prompt, response, provider, model, prompt_hash, response_hash, tags, metadata) VALUES ('" 
-                   ++ T.unpack sessionId ++ "', '" 
+    let insertSQL = "INSERT INTO ai_chats (id, context_uuid, prompt, response, provider, model, prompt_hash, response_hash, tags, metadata) VALUES ('" 
+                   ++ T.unpack claudeSessionId ++ "', '" 
+                   ++ T.unpack contextId ++ "', '" 
                    ++ escapeSql (T.unpack prompt) ++ "', '" 
                    ++ escapeSql (T.unpack response) ++ "', '" 
                    ++ T.unpack provider ++ "', '" 
@@ -245,7 +251,7 @@ callAipy sessionId prompt response provider model tags = do
                    ++ tagsArray ++ "', '{}');"
     
     let contextSQL = "INSERT INTO ai_chat_contexts (context_uuid, name, tags) VALUES ('" 
-                    ++ T.unpack sessionId ++ "', 'Claude Web UI Session', '" 
+                    ++ T.unpack contextId ++ "', 'Claude Web UI Session', '" 
                     ++ tagsArray ++ "') ON CONFLICT (context_uuid) DO NOTHING;"
     
     result <- catch (do
