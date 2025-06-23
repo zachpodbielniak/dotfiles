@@ -23,6 +23,8 @@ try:
     from tabulate import tabulate
     from colorama import init, Fore, Style, Back
     import yaml
+    import tempfile
+    import shutil
 except ImportError as e:
     # We're inside dev container but missing dependencies
     print(f"Error: Missing required Python module: {e}", file=sys.stderr)
@@ -211,14 +213,47 @@ class TranscriptionManager:
              output_format: str = 'text', no_timestamps: bool = False) -> None:
         """View full transcription content"""
         
+        # Check if identifier looks like a partial UUID (8-36 hex chars with optional dashes)
+        import re
+        uuid_pattern = re.compile(r'^[0-9a-fA-F-]{8,36}$')
+        is_uuid_like = bool(uuid_pattern.match(identifier))
+        
         # Determine if identifier is UUID or filename
-        try:
-            # Try to parse as UUID
-            import uuid
-            uuid.UUID(identifier)
-            is_uuid = True
-        except ValueError:
-            is_uuid = False
+        is_uuid = False
+        if is_uuid_like:
+            try:
+                # Try to parse as full UUID
+                import uuid
+                uuid.UUID(identifier)
+                is_uuid = True
+            except ValueError:
+                # Not a full UUID, but might be a partial one
+                # Check if it's a valid partial UUID (at least 8 hex chars)
+                hex_only = identifier.replace('-', '')
+                if len(hex_only) >= 8 and all(c in '0123456789abcdefABCDEF' for c in hex_only):
+                    # Try to find a matching UUID
+                    self.cursor.execute("""
+                        SELECT id FROM transcriptions 
+                        WHERE id::text LIKE %s
+                        ORDER BY transcribed_at DESC
+                    """, [f"{identifier}%"])
+                    matches = self.cursor.fetchall()
+                    
+                    if len(matches) == 0:
+                        self._error(f"No transcription found matching partial UUID: {identifier}")
+                        return
+                    elif len(matches) > 1:
+                        self._error(f"Multiple transcriptions found matching partial UUID: {identifier}")
+                        print("Please use a longer UUID prefix to uniquely identify the transcription:")
+                        for match in matches[:5]:  # Show first 5 matches
+                            print(f"  - {match['id']}")
+                        if len(matches) > 5:
+                            print(f"  ... and {len(matches) - 5} more")
+                        return
+                    else:
+                        # Exactly one match - use it
+                        identifier = str(matches[0]['id'])
+                        is_uuid = True
         
         # Always aggregate chunks in order to get the full content
         # Use newline separator to properly join chunks
@@ -438,13 +473,47 @@ class TranscriptionManager:
     def delete(self, identifier: str, confirm: bool = False) -> None:
         """Delete a transcription and its chunks"""
         
+        # Check if identifier looks like a partial UUID (8-36 hex chars with optional dashes)
+        import re
+        uuid_pattern = re.compile(r'^[0-9a-fA-F-]{8,36}$')
+        is_uuid_like = bool(uuid_pattern.match(identifier))
+        
         # Determine if identifier is UUID or filename
-        try:
-            import uuid
-            uuid.UUID(identifier)
-            is_uuid = True
-        except ValueError:
-            is_uuid = False
+        is_uuid = False
+        if is_uuid_like:
+            try:
+                # Try to parse as full UUID
+                import uuid
+                uuid.UUID(identifier)
+                is_uuid = True
+            except ValueError:
+                # Not a full UUID, but might be a partial one
+                # Check if it's a valid partial UUID (at least 8 hex chars)
+                hex_only = identifier.replace('-', '')
+                if len(hex_only) >= 8 and all(c in '0123456789abcdefABCDEF' for c in hex_only):
+                    # Try to find a matching UUID
+                    self.cursor.execute("""
+                        SELECT id FROM transcriptions 
+                        WHERE id::text LIKE %s
+                        ORDER BY transcribed_at DESC
+                    """, [f"{identifier}%"])
+                    matches = self.cursor.fetchall()
+                    
+                    if len(matches) == 0:
+                        self._error(f"No transcription found matching partial UUID: {identifier}")
+                        return
+                    elif len(matches) > 1:
+                        self._error(f"Multiple transcriptions found matching partial UUID: {identifier}")
+                        print("Please use a longer UUID prefix to uniquely identify the transcription:")
+                        for match in matches[:5]:  # Show first 5 matches
+                            print(f"  - {match['id']}")
+                        if len(matches) > 5:
+                            print(f"  ... and {len(matches) - 5} more")
+                        return
+                    else:
+                        # Exactly one match - use it
+                        identifier = str(matches[0]['id'])
+                        is_uuid = True
         
         # First, get the transcription details
         if is_uuid:
@@ -553,6 +622,156 @@ class TranscriptionManager:
                 
         except psycopg2.Error as e:
             self._error(f"Stats failed: {e}")
+    
+    def get_transcription_info(self, trans_id: str) -> Optional[Dict]:
+        """Get transcription information by ID.
+        
+        Returns:
+            Dictionary with transcription details or None if not found
+        """
+        try:
+            self.cursor.execute("""
+                SELECT id, filename, file_path, transcribed_at, metadata
+                FROM transcriptions
+                WHERE id = %s::uuid
+            """, [trans_id])
+            
+            result = self.cursor.fetchone()
+            if result:
+                return dict(result)
+            return None
+        except psycopg2.Error as e:
+            self._error(f"Failed to get transcription info: {e}")
+            return None
+    
+    def fzf_select_transcription(self, for_action: str = 'view') -> Optional[str]:
+        """Select a transcription using fzf with preview.
+        
+        Args:
+            for_action: The action to perform ('view', 'delete')
+            
+        Returns:
+            Selected transcription ID or None if cancelled
+        """
+        try:
+            # Check if fzf is available
+            fzf_path = shutil.which('fzf')
+            if not fzf_path:
+                self._error("fzf command not found. Please install fzf.")
+                return None
+            
+            # Get all transcriptions
+            self.cursor.execute("""
+                SELECT 
+                    t.id,
+                    t.filename,
+                    t.file_path,
+                    t.transcribed_at,
+                    t.metadata,
+                    LEFT(string_agg(tc.content, ' ' ORDER BY tc.chunk_number), 100) as preview
+                FROM transcriptions t
+                LEFT JOIN transcription_chunks tc ON t.id = tc.transcription_id
+                GROUP BY t.id
+                ORDER BY t.transcribed_at DESC
+            """)
+            
+            transcriptions = self.cursor.fetchall()
+            
+            if not transcriptions:
+                self._info("No transcriptions found.")
+                return None
+            
+            # Create temporary file with transcription entries for fzf
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                for trans in transcriptions:
+                    # Format: UUID | timestamp | filename | type/tags | preview
+                    timestamp = trans['transcribed_at'].strftime('%Y-%m-%d %H:%M')
+                    
+                    metadata_parts = []
+                    if trans['metadata']:
+                        if trans['metadata'].get('type'):
+                            metadata_parts.append(trans['metadata']['type'])
+                        if trans['metadata'].get('tags'):
+                            metadata_parts.append(f"[{', '.join(trans['metadata']['tags'])}]")
+                    metadata_str = ' '.join(metadata_parts) if metadata_parts else 'no metadata'
+                    
+                    preview = trans['preview'] or ''
+                    preview = preview.replace('\n', ' ').strip()[:80] + '...' if len(preview) > 80 else preview
+                    
+                    line = f"{str(trans['id'])[:8]} | {timestamp} | {trans['filename']} | {metadata_str} | {preview}"
+                    f.write(line + '\n')
+                temp_file = f.name
+            
+            # Set PGPASSWORD if available
+            if DB_CONFIG.get('password'):
+                os.environ['PGPASSWORD'] = DB_CONFIG['password']
+            
+            # Create preview script
+            preview_script = f"""#!/bin/bash
+export PGPASSWORD='{DB_CONFIG.get('password', '')}'
+uuid="${{1%% *}}"
+# Find full UUID from partial
+full_uuid=$(psql -h {DB_CONFIG['host']} -p {DB_CONFIG['port']} -d {DB_CONFIG['database']} -U {DB_CONFIG['user']} -t -c "SELECT id FROM transcriptions WHERE id::text LIKE '$uuid%' LIMIT 1" 2>/dev/null | tr -d ' ')
+if [ -z "$full_uuid" ]; then
+    echo "Transcription not found"
+    exit 1
+fi
+# Get transcription content
+psql -h {DB_CONFIG['host']} -p {DB_CONFIG['port']} -d {DB_CONFIG['database']} -U {DB_CONFIG['user']} -t -c "
+SELECT string_agg(content, E'\\\\n' ORDER BY chunk_number)
+FROM transcription_chunks
+WHERE transcription_id = '$full_uuid'::uuid
+" 2>/dev/null | head -50
+"""
+            
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+                f.write(preview_script)
+                preview_file = f.name
+            
+            os.chmod(preview_file, 0o755)
+            
+            try:
+                # Run fzf
+                action_text = {
+                    'view': 'Select a transcription to view',
+                    'delete': 'Select a transcription to delete'
+                }
+                
+                # Run fzf with proper TTY handling
+                fzf_cmd = [
+                    fzf_path,
+                    '--preview', f'{preview_file} {{}}',
+                    '--preview-window', 'down:50%:wrap',
+                    '--header', f'{action_text.get(for_action, "Select a transcription")} (Ctrl-C to cancel)',
+                    '--bind', 'ctrl-/:toggle-preview'
+                ]
+                
+                # Run fzf
+                result = subprocess.run(fzf_cmd, stdin=open(temp_file), capture_output=True, text=True)
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    selected = result.stdout.strip()
+                    # Extract the partial UUID
+                    trans_uuid = selected.split(' | ')[0]
+                    
+                    # Get full UUID
+                    self.cursor.execute("SELECT id FROM transcriptions WHERE id::text LIKE %s LIMIT 1", [f"{trans_uuid}%"])
+                    full_uuid = self.cursor.fetchone()
+                    
+                    if full_uuid:
+                        return str(full_uuid['id'])
+                
+                return None
+                
+            finally:
+                os.unlink(temp_file)
+                os.unlink(preview_file)
+                if 'PGPASSWORD' in os.environ:
+                    del os.environ['PGPASSWORD']
+                    
+        except Exception as e:
+            self._error(f"FZF selection failed: {e}")
+            return None
 
 
 def main():
@@ -562,24 +781,32 @@ def main():
         epilog="""
 EXAMPLES:
     # Search for content
-    transcriptions-ng search "action items"
-    transcriptions-ng search --type meeting --limit 5 "budget"
+    transcriptions search "action items"
+    transcriptions search --type meeting --limit 5 "budget"
     
     # View transcription
-    transcriptions-ng view 75647fb6-5a16-44a5-9155-2bc0aab58b0f
-    transcriptions-ng view recording.mp3
-    transcriptions-ng view -m recording.mp3  # With metadata
+    transcriptions view 75647fb6-5a16-44a5-9155-2bc0aab58b0f
+    transcriptions view 75647fb6  # Using partial UUID (first 8 chars)
+    transcriptions view recording.mp3
+    transcriptions view -m recording.mp3  # With metadata
+    transcriptions view --fzf  # Select with fzf
     
     # List recent transcriptions
-    transcriptions-ng list
-    transcriptions-ng list --limit 20 --type meeting
+    transcriptions list
+    transcriptions list --limit 20 --type meeting
+    transcriptions list --fzf  # Select and show info table
+    transcriptions list --fzf --id  # Select and output just the ID
+    transcriptions list --fzf --name  # Select and output just the filename
     
     # Delete transcription
-    transcriptions-ng delete recording.mp3
-    transcriptions-ng delete -y 75647fb6-5a16-44a5-9155-2bc0aab58b0f
+    transcriptions delete recording.mp3
+    transcriptions delete -y 75647fb6-5a16-44a5-9155-2bc0aab58b0f
+    transcriptions delete -y 75647fb6  # Using partial UUID
+    transcriptions delete --fzf  # Select with fzf
+    transcriptions delete --fzf -y  # Select with fzf and skip confirmation
     
     # Show statistics
-    transcriptions-ng stats
+    transcriptions stats
 
 ENVIRONMENT VARIABLES:
     TRANSCRIPTION_DB_HOST     Database host (default: 127.0.0.1)
@@ -605,12 +832,13 @@ ENVIRONMENT VARIABLES:
     
     # View command
     view_parser = subparsers.add_parser('view', help='View full transcription content')
-    view_parser.add_argument('identifier', help='UUID or filename')
+    view_parser.add_argument('identifier', nargs='?', help='UUID or filename (omit with --fzf)')
     view_parser.add_argument('-m', '--metadata', action='store_true', help='Include metadata in output')
     view_parser.add_argument('-f', '--format', choices=['text', 'simple', 'json', 'yaml'], 
                             default='text', help='Output format')
     view_parser.add_argument('--no-timestamps', action='store_true', 
                             help='Show content without timestamps (default: show only timestamped lines)')
+    view_parser.add_argument('--fzf', action='store_true', help='Select transcription using fzf')
     
     # List command
     list_parser = subparsers.add_parser('list', help='List recent transcriptions')
@@ -619,11 +847,15 @@ ENVIRONMENT VARIABLES:
     list_parser.add_argument('-T', '--tags', help='Filter by tags (comma-separated)')
     list_parser.add_argument('-f', '--format', choices=['text', 'simple', 'json', 'yaml'], 
                             default='text', help='Output format')
+    list_parser.add_argument('--fzf', action='store_true', help='Select transcription using fzf')
+    list_parser.add_argument('--id', '--uuid', action='store_true', help='With --fzf, output only the ID')
+    list_parser.add_argument('--name', action='store_true', help='With --fzf, output only the filename')
     
     # Delete command
     delete_parser = subparsers.add_parser('delete', help='Delete a transcription and its chunks')
-    delete_parser.add_argument('identifier', help='UUID or filename')
+    delete_parser.add_argument('identifier', nargs='?', help='UUID or filename (omit with --fzf)')
     delete_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt')
+    delete_parser.add_argument('--fzf', action='store_true', help='Select transcription using fzf')
     
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Show database statistics')
@@ -648,14 +880,79 @@ ENVIRONMENT VARIABLES:
                           tags_filter=tags, output_format=args.format,
                           verbose=args.verbose)
         elif args.action == 'view':
-            manager.view(args.identifier, show_metadata=args.metadata,
-                        output_format=args.format, no_timestamps=args.no_timestamps)
+            if args.fzf:
+                selected_id = manager.fzf_select_transcription(for_action='view')
+                if selected_id:
+                    manager.view(selected_id, show_metadata=args.metadata,
+                                output_format=args.format, no_timestamps=args.no_timestamps)
+            elif args.identifier:
+                manager.view(args.identifier, show_metadata=args.metadata,
+                            output_format=args.format, no_timestamps=args.no_timestamps)
+            else:
+                print("Error: Either provide an identifier or use --fzf to select", file=sys.stderr)
+                sys.exit(1)
         elif args.action == 'list':
-            tags = args.tags.split(',') if args.tags else None
-            manager.list(limit=args.limit, type_filter=args.type,
-                        tags_filter=tags, output_format=args.format)
+            if args.fzf:
+                selected_id = manager.fzf_select_transcription(for_action='list')
+                if selected_id:
+                    # Get transcription info
+                    info = manager.get_transcription_info(selected_id)
+                    if info:
+                        if args.id:
+                            # Just print the ID
+                            print(str(info['id']))
+                        elif args.name:
+                            # Just print the filename
+                            print(info['filename'])
+                        else:
+                            # Print markdown table with details - horizontal layout
+                            id_str = str(info['id'])
+                            filename_str = info['filename']
+                            transcribed_str = manager._format_date(info['transcribed_at'])
+                            
+                            # Handle metadata
+                            type_str = '_none_'
+                            tags_str = '_none_'
+                            if info['metadata']:
+                                if info['metadata'].get('type'):
+                                    type_str = info['metadata']['type']
+                                if info['metadata'].get('tags'):
+                                    tags_str = ', '.join(f"`{tag}`" for tag in info['metadata']['tags'])
+                            
+                            # Headers and values
+                            headers = ['ID', 'Filename', 'Transcribed', 'Type', 'Tags']
+                            values = [f"`{id_str[:8]}...`", filename_str, transcribed_str, type_str, tags_str]
+                            
+                            # Calculate column widths
+                            col_widths = []
+                            for i, header in enumerate(headers):
+                                col_widths.append(max(len(header), len(values[i])))
+                            
+                            # Print header row
+                            header_row = '| ' + ' | '.join(f"{headers[i]:<{col_widths[i]}}" for i in range(len(headers))) + ' |'
+                            print(header_row)
+                            
+                            # Print separator row
+                            sep_row = '|' + '|'.join(f"{'-' * (width + 2)}" for width in col_widths) + '|'
+                            print(sep_row)
+                            
+                            # Print data row
+                            data_row = '| ' + ' | '.join(f"{values[i]:<{col_widths[i]}}" for i in range(len(values))) + ' |'
+                            print(data_row)
+            else:
+                tags = args.tags.split(',') if args.tags else None
+                manager.list(limit=args.limit, type_filter=args.type,
+                            tags_filter=tags, output_format=args.format)
         elif args.action == 'delete':
-            manager.delete(args.identifier, confirm=args.yes)
+            if args.fzf:
+                selected_id = manager.fzf_select_transcription(for_action='delete')
+                if selected_id:
+                    manager.delete(selected_id, confirm=args.yes)
+            elif args.identifier:
+                manager.delete(args.identifier, confirm=args.yes)
+            else:
+                print("Error: Either provide an identifier or use --fzf to select", file=sys.stderr)
+                sys.exit(1)
         elif args.action == 'stats':
             manager.stats()
     except KeyboardInterrupt:
