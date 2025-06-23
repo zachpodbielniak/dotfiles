@@ -37,12 +37,15 @@ try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
     import urllib.parse
+    from sqlalchemy import create_engine
+    import numpy as np
 except ImportError:
     print("Error: Required dependencies not installed.", file=sys.stderr)
-    print("Install with: pip install pandas psycopg2-binary", file=sys.stderr)
+    print("Install with: pip install pandas psycopg2-binary sqlalchemy", file=sys.stderr)
     print("  - pandas: Core data processing", file=sys.stderr)
     print("  - psycopg2-binary: PostgreSQL adapter", file=sys.stderr)
-    print("Or in distrobox: distrobox enter dev -- pip install pandas psycopg2-binary", file=sys.stderr)
+    print("  - sqlalchemy: Database toolkit", file=sys.stderr)
+    print("Or in distrobox: distrobox enter dev -- pip install pandas psycopg2-binary sqlalchemy", file=sys.stderr)
     sys.exit(1)
 
 def parse_connection_string(connection_string):
@@ -79,6 +82,39 @@ def get_postgres_connection(connection_params):
         return conn
     except psycopg2.Error as e:
         raise Exception(f"Failed to connect to PostgreSQL: {e}")
+
+def get_sqlalchemy_url(connection_params):
+    """Create SQLAlchemy connection URL from connection parameters"""
+    host = connection_params['host']
+    port = connection_params['port']
+    database = connection_params['database']
+    user = connection_params['user']
+    password = connection_params.get('password', '')
+    
+    if password:
+        return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+    else:
+        return f"postgresql://{user}@{host}:{port}/{database}"
+
+def clean_postgresql_arrays(df):
+    """Convert PostgreSQL arrays to readable strings"""
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # Check if this column contains array-like data
+            for i, val in enumerate(df[col]):
+                if isinstance(val, (list, np.ndarray)):
+                    # Convert array to comma-separated string
+                    df.at[i, col] = ', '.join(str(x) for x in val) if len(val) > 0 else ''
+                elif pd.isna(val):
+                    df.at[i, col] = ''
+                elif str(val).startswith('{') and str(val).endswith('}'):
+                    # Handle PostgreSQL array string format {item1,item2,item3}
+                    array_content = str(val)[1:-1]  # Remove { }
+                    if array_content:
+                        df.at[i, col] = array_content.replace(',', ', ')
+                    else:
+                        df.at[i, col] = ''
+    return df
 
 def parse_markdown_table(content):
     """Parse markdown table content into a pandas DataFrame"""
@@ -153,26 +189,31 @@ def dataframe_to_markdown(df):
 
 def postgres_to_markdown(connection_params, table_name=None, query=None):
     """Pull data from PostgreSQL and convert to markdown"""
-    conn = None
+    engine = None
     try:
-        conn = get_postgres_connection(connection_params)
+        # Create SQLAlchemy engine
+        sqlalchemy_url = get_sqlalchemy_url(connection_params)
+        engine = create_engine(sqlalchemy_url)
         
         if query:
             # Execute custom query
-            df = pd.read_sql(query, conn)
+            df = pd.read_sql(query, engine)
         elif table_name:
             # Query specific table
-            df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+            df = pd.read_sql(f"SELECT * FROM {table_name}", engine)
         else:
             raise ValueError("Either table_name or query must be provided")
+        
+        # Clean PostgreSQL arrays before converting to markdown
+        df = clean_postgresql_arrays(df)
         
         return dataframe_to_markdown(df)
         
     except Exception as e:
         raise Exception(f"Error reading from PostgreSQL: {e}")
     finally:
-        if conn:
-            conn.close()
+        if engine:
+            engine.dispose()
 
 def markdown_to_postgres(content, connection_params, table_name, conflict_resolution='merge', create_table=False):
     """Push markdown table data to PostgreSQL"""
@@ -443,6 +484,20 @@ Examples:
   # Use local PostgreSQL (from local_postgres script config)
   md_table_sync --source database --table users --file users.md --bidirectional --local
   
+  # Local PostgreSQL helper arguments (auto-configures connection)
+  md_table_sync --transcriptions > transcriptions.md
+  md_table_sync --ai-chats > ai_chats.md
+  md_table_sync --ai-contexts > ai_contexts.md
+  md_table_sync --vectors > vectors.md
+  
+  # Push to local PostgreSQL tables
+  md_table_sync --transcriptions --input my_transcriptions.md --push
+  md_table_sync --ai-chats --input my_chats.md --push
+  
+  # Bidirectional sync with local PostgreSQL
+  md_table_sync --transcriptions --file transcriptions.md --bidirectional
+  md_table_sync --ai-contexts --file contexts.md --bidirectional
+  
   # Custom query
   md_table_sync --source database --connection-string "postgresql://localhost/db" \\
                 --query "SELECT name, email FROM users WHERE active = true"
@@ -450,7 +505,7 @@ Examples:
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument('--source', required=True, 
+    parser.add_argument('--source', 
                        choices=['database', 'api', 'csv', 'json'],
                        help='Source type (currently only database/postgresql supported)')
     parser.add_argument('--connection-string', metavar='CONNECTION',
@@ -479,6 +534,20 @@ Examples:
                        help='Create table if it does not exist (for push operations)')
     parser.add_argument('--local', action='store_true',
                        help='Use local PostgreSQL configuration (from local_postgres script)')
+    
+    # Local PostgreSQL helper arguments
+    local_group = parser.add_argument_group('Local PostgreSQL Helpers')
+    local_group.add_argument('--transcriptions', action='store_true',
+                            help='Pull from local transcriptions table (auto-sets --local --source database --table transcriptions)')
+    local_group.add_argument('--transcription-chunks', action='store_true',
+                            help='Pull from local transcription_chunks table (auto-sets --local --source database --table transcription_chunks)')
+    local_group.add_argument('--ai-chats', action='store_true',
+                            help='Pull from local ai_chats table (auto-sets --local --source database --table ai_chats)')
+    local_group.add_argument('--ai-contexts', action='store_true',
+                            help='Pull from local ai_chat_contexts table (auto-sets --local --source database --table ai_chat_contexts)')
+    local_group.add_argument('--vectors', action='store_true',
+                            help='Pull from local second_brain_vectors table (auto-sets --local --source database --table second_brain_vectors)')
+    
     parser.add_argument('--schedule', metavar='CRON',
                        help='Schedule recurring sync (cron syntax) - shows command only')
     parser.add_argument('--dry-run', action='store_true',
@@ -486,18 +555,67 @@ Examples:
     
     args = parser.parse_args()
     
-    if args.source != 'database':
+    # Handle local PostgreSQL helper arguments
+    helper_args = [args.transcriptions, args.transcription_chunks, args.ai_chats, args.ai_contexts, args.vectors]
+    active_helpers = sum(helper_args)
+    
+    if active_helpers > 1:
+        print("Error: Only one local PostgreSQL helper argument can be used at a time", file=sys.stderr)
+        sys.exit(1)
+    
+    if active_helpers == 1:
+        # Auto-configure for local PostgreSQL access
+        args.source = 'database'
+        args.local = True
+        
+        if args.transcriptions:
+            args.table = 'transcriptions'
+            # Use transcriptions database
+            connection_params = get_local_postgres_params()
+            connection_params['database'] = 'transcriptions'
+        elif args.transcription_chunks:
+            args.table = 'transcription_chunks'
+            # Use transcriptions database
+            connection_params = get_local_postgres_params()
+            connection_params['database'] = 'transcriptions'
+        elif args.ai_chats:
+            args.table = 'ai_chats'
+            # Use ai_chats database
+            connection_params = get_local_postgres_params()
+            connection_params['database'] = 'ai_chats'
+        elif args.ai_contexts:
+            args.table = 'ai_chat_contexts'
+            # Use ai_chats database
+            connection_params = get_local_postgres_params()
+            connection_params['database'] = 'ai_chats'
+        elif args.vectors:
+            args.table = 'second_brain_vectors'
+            # Use postgres database
+            connection_params = get_local_postgres_params()
+            connection_params['database'] = 'postgres'
+        
+        # Default to pull operation if no direction specified
+        if not args.push and not args.bidirectional:
+            args.pull = True
+    
+    # Validate source type
+    if active_helpers == 0 and not args.source:
+        print("Error: --source is required when not using helper arguments", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.source and args.source != 'database':
         print("Error: Currently only 'database' source (PostgreSQL) is supported", file=sys.stderr)
         sys.exit(1)
     
-    # Determine connection parameters
-    if args.local:
-        connection_params = get_local_postgres_params()
-    elif args.connection_string:
-        connection_params = parse_connection_string(args.connection_string)
-    else:
-        print("Error: Either --connection-string or --local must be specified", file=sys.stderr)
-        sys.exit(1)
+    # Determine connection parameters (unless already set by helper arguments)
+    if active_helpers == 0:
+        if args.local:
+            connection_params = get_local_postgres_params()
+        elif args.connection_string:
+            connection_params = parse_connection_string(args.connection_string)
+        else:
+            print("Error: Either --connection-string or --local must be specified", file=sys.stderr)
+            sys.exit(1)
     
     if args.dry_run:
         print("DRY RUN MODE - No actual changes will be made")
