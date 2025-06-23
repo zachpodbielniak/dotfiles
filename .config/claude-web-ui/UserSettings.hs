@@ -17,7 +17,7 @@ userSettingsOverride defaults = defaults
     , appProjectRelativeUploads = True          -- Store uploads relative to selected project
     , appVerboseLogging = True                   -- Enable verbose logging
     , appStderrLogging = True                    -- Enable stderr logging
-    , appPluginVerboseLogging = False            -- Plugin debug output disabled for cleaner output
+    , appPluginVerboseLogging = True             -- Plugin debug output enabled for debugging
     
     -- Plugin Configuration - Enable AiChats plugin
     , appPluginRegistry = registerMessagePlugin PluginAiChats.aiChatsPlugin $
