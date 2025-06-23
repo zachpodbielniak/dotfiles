@@ -115,7 +115,7 @@ OPTIONS:
     --verbose                  Enable verbose output
     --container IMAGE          Use custom container image (default: docker.io/linuxserver/ffmpeg:latest)
     --journal                  Enable journal tracking to skip already converted files
-    --journal-file FILE        Custom journal file path (default: ./compress_video_status.log)
+    --journal-file FILE        Custom journal file path (default: ./compress_video_journal.md)
     --force-reconvert          Force reconversion even if file is in journal
     --list-encoders            List available video encoders in the container
     --prefer-software          Prefer software encoding over hardware acceleration
@@ -154,6 +154,45 @@ EXAMPLES:
     
     # Parallel processing with journal
     compress_video --parallel 3 --journal *.mp4
+    
+JOURNAL ANALYSIS EXAMPLES:
+    # Enable journal and compress videos
+    compress_video --journal --quality high *.mp4
+    
+    # Get comprehensive statistics summary
+    md_table_summarize --comprehensive compress_video_journal.md
+    
+    # Find all failed operations
+    md_table_query --query "SELECT * FROM data WHERE status='FAILED'" compress_video_journal.md
+    
+    # Calculate average compression ratio by codec
+    md_table_query --query "SELECT video_codec, AVG(CAST(REPLACE(compression_ratio, ':1', '') AS FLOAT)) as avg_ratio FROM data WHERE status='SUCCESS' GROUP BY video_codec" compress_video_journal.md
+    
+    # Find videos with best compression ratios
+    md_table_query --query "SELECT input_file, compression_ratio FROM data WHERE status='SUCCESS' ORDER BY CAST(REPLACE(compression_ratio, ':1', '') AS FLOAT) DESC LIMIT 10" compress_video_journal.md
+    
+    # Calculate total space saved
+    md_table_calc "SUM(\$_input_size) - SUM(\$_output_size)" compress_video_journal.md
+    
+    # Visualize compression performance by codec
+    md_table_plot --type bar --columns "video_codec,compression_ratio" --title "Compression Ratios by Codec" compress_video_journal.md
+    
+    # Create dashboard for monitoring
+    md_table_dashboard --title "Video Compression Analytics" compress_video_journal.md
+    
+    # Export detailed report to Excel
+    md_table_export_enhanced --format excel --style professional --sheet-name "Compression Log" compress_video_journal.md
+
+JOURNAL INTEGRATION:
+    The --journal flag creates a markdown table (compress_video_journal.md) that tracks:
+    - File sizes, compression ratios, processing times
+    - Success/failure status with detailed notes  
+    - Video codec, audio codec, and quality settings used
+    
+    Journal columns available for analysis:
+    - timestamp, input_file, output_file, input_size, output_size
+    - compression_ratio, video_codec, audio_codec, quality, duration
+    - status, notes
 
 QUALITY GUIDE:
     Software/VAAPI (CRF mode):
@@ -198,17 +237,30 @@ init_journal() {
     if [[ "$USE_JOURNAL" == "true" ]]; then
         # Set default journal file if not specified
         if [[ -z "$JOURNAL_FILE" ]]; then
-            JOURNAL_FILE="./compress_video_status.log"
+            JOURNAL_FILE="./compress_video_journal.md"
         fi
         
         # Create journal file if it doesn't exist
         if [[ ! -f "$JOURNAL_FILE" ]]; then
-            touch "$JOURNAL_FILE"
+            create_journal_header "$JOURNAL_FILE"
             debug "Created journal file: $JOURNAL_FILE"
         else
             debug "Using existing journal file: $JOURNAL_FILE"
         fi
     fi
+}
+
+# Create markdown table header for journal
+create_journal_header() {
+    local journal_file="$1"
+    cat > "$journal_file" << 'EOF'
+# Video Compression Journal
+
+This file tracks video compression operations performed by compress_video script.
+
+| timestamp | input_file | output_file | input_size | output_size | compression_ratio | video_codec | audio_codec | quality | duration | status | notes |
+|-----------|------------|-------------|------------|-------------|-------------------|-------------|-------------|---------|----------|--------|-------|
+EOF
 }
 
 # Check if a file has been converted based on journal
@@ -220,12 +272,12 @@ is_converted() {
         return 1  # Not converted or force reconvert
     fi
     
-    # Create a unique identifier for this conversion
-    local entry="${input_file}|${output_file}|${VIDEO_CODEC}|${AUDIO_CODEC}|${QUALITY}${CUSTOM_CRF:+|crf:$CUSTOM_CRF}"
-    
-    # Check if entry exists in journal
-    if grep -Fxq "$entry" "$JOURNAL_FILE" 2>/dev/null; then
-        return 0  # Already converted
+    # Check if entry exists in journal by looking for the input and output file combination
+    if [[ -f "$JOURNAL_FILE" ]]; then
+        # Skip header lines and check for matching input/output files
+        if tail -n +4 "$JOURNAL_FILE" | grep -q "| .* | $(basename "$input_file") | $(basename "$output_file") | .* | .* | .* | .* | .* | .* | .* | SUCCESS |"; then
+            return 0  # Already converted successfully
+        fi
     fi
     
     return 1  # Not converted
@@ -235,14 +287,69 @@ is_converted() {
 add_to_journal() {
     local input_file="$1"
     local output_file="$2"
+    local status="${3:-SUCCESS}"
+    local notes="${4:-}"
     
     if [[ "$USE_JOURNAL" == "true" ]]; then
-        # Create a unique identifier for this conversion
-        local entry="${input_file}|${output_file}|${VIDEO_CODEC}|${AUDIO_CODEC}|${QUALITY}${CUSTOM_CRF:+|crf:$CUSTOM_CRF}"
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local input_basename=$(basename "$input_file")
+        local output_basename=$(basename "$output_file")
         
-        # Add entry with timestamp
-        echo "$entry" >> "$JOURNAL_FILE"
-        debug "Added to journal: $entry"
+        # Get file sizes
+        local input_size="N/A"
+        local output_size="N/A"
+        local compression_ratio="N/A"
+        
+        if [[ -f "$input_file" ]]; then
+            input_size=$(stat -c%s "$input_file" 2>/dev/null || echo "N/A")
+            if [[ "$input_size" != "N/A" ]]; then
+                input_size=$(numfmt --to=iec --suffix=B "$input_size" 2>/dev/null || echo "$input_size bytes")
+            fi
+        fi
+        
+        if [[ -f "$output_file" && "$status" == "SUCCESS" ]]; then
+            output_size=$(stat -c%s "$output_file" 2>/dev/null || echo "N/A")
+            if [[ "$output_size" != "N/A" ]]; then
+                output_size=$(numfmt --to=iec --suffix=B "$output_size" 2>/dev/null || echo "$output_size bytes")
+                
+                # Calculate compression ratio if both sizes are available
+                if [[ "$input_size" != "N/A" ]]; then
+                    local input_bytes=$(stat -c%s "$input_file" 2>/dev/null)
+                    local output_bytes=$(stat -c%s "$output_file" 2>/dev/null)
+                    if [[ -n "$input_bytes" && -n "$output_bytes" && "$output_bytes" -gt 0 ]]; then
+                        compression_ratio=$(echo "scale=2; $input_bytes / $output_bytes" | bc 2>/dev/null || echo "N/A")
+                        if [[ "$compression_ratio" != "N/A" ]]; then
+                            compression_ratio="${compression_ratio}:1"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+        
+        # Get video duration if available (requires ffprobe, but we'll make it optional)
+        local duration="N/A"
+        if [[ -f "$input_file" ]] && command -v ffprobe >/dev/null 2>&1; then
+            duration=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$input_file" 2>/dev/null | cut -d. -f1)
+            if [[ -n "$duration" && "$duration" != "N/A" ]]; then
+                # Convert seconds to HH:MM:SS
+                duration=$(printf "%02d:%02d:%02d" $((duration/3600)) $(((duration%3600)/60)) $((duration%60)))
+            else
+                duration="N/A"
+            fi
+        fi
+        
+        # Determine quality string
+        local quality_str="$QUALITY"
+        if [[ -n "$CUSTOM_CRF" ]]; then
+            quality_str="crf:$CUSTOM_CRF"
+        fi
+        
+        # Create markdown table row
+        local row="| $timestamp | $input_basename | $output_basename | $input_size | $output_size | $compression_ratio | $VIDEO_CODEC | $AUDIO_CODEC | $quality_str | $duration | $status | $notes |"
+        
+        # Add to journal file
+        echo "$row" >> "$JOURNAL_FILE"
+        debug "Added to journal: $input_basename -> $output_basename ($status)"
     fi
 }
 
@@ -715,16 +822,27 @@ process_video() {
     
     # Execute command
     if [[ "$DRY_RUN" == "false" ]]; then
+        # Record start time for duration calculation
+        local start_time=$(date +%s)
+        
         if "${podman_cmd[@]}"; then
-            log "Successfully compressed: $output_file"
+            local end_time=$(date +%s)
+            local process_duration=$((end_time - start_time))
+            local duration_str=$(printf "%02d:%02d:%02d" $((process_duration/3600)) $(((process_duration%3600)/60)) $((process_duration%60)))
+            
+            log "Successfully compressed: $output_file (took $duration_str)"
             # Add to journal on success
-            add_to_journal "$input_file" "$output_file"
+            add_to_journal "$input_file" "$output_file" "SUCCESS" "Processed in $duration_str"
         else
             error "Failed to compress: $input_file"
+            # Add failure to journal
+            add_to_journal "$input_file" "$output_file" "FAILED" "Compression failed"
             return 1
         fi
     else
         log "[DRY RUN] Would execute: ${podman_cmd[*]}"
+        # Add dry run entry to journal
+        add_to_journal "$input_file" "$output_file" "DRY_RUN" "Command would be: ${podman_cmd[*]:0:50}..."
     fi
 }
 
