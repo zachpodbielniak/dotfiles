@@ -10,7 +10,7 @@ import Control.Monad (when)
 import System.Process (readProcess)
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Regex.Posix ((=~))
-import Data.Maybe (listToMaybe)
+import Data.Time (getCurrentTime, formatTime, defaultTimeLocale)
 
 -- | AI Chats plugin that stores conversations in the ai_chats database
 data AiChatsPlugin = AiChatsPlugin
@@ -170,7 +170,7 @@ storeInDatabase ctx userMsg response = do
             let model = "claude-sonnet-4" 
             
             -- Call database storage with context ID and chat ID (fallback mode)
-            result <- catch (callAipy sessionId sessionId userMsg response provider model tags) handleAipyError
+            result <- catch (callAipy sessionId sessionId userMsg response provider model tags (pluginProject ctx)) handleAipyError
             return result
   where
     handleAipyError :: SomeException -> IO (Either String ())
@@ -207,7 +207,7 @@ storeInDatabaseWithSessionId ctx userMsg response maybeSessionId = do
                     Nothing -> sessionId  -- Fallback to Claude session if no app session
             
             -- Call database storage with separate context and chat IDs
-            result <- catch (callAipy contextId sessionId userMsg response provider model tags) handleAipyError
+            result <- catch (callAipy contextId sessionId userMsg response provider model tags (pluginProject ctx)) handleAipyError
             return result
   where
     handleAipyError :: SomeException -> IO (Either String ())
@@ -229,9 +229,19 @@ hashText text = T.pack $ show $ hash $ T.unpack text
     hash :: String -> Int
     hash = foldr (\c acc -> fromEnum c + acc * 31) 0
 
+-- | Generate dynamic context name with project and timestamp
+generateContextName :: Maybe T.Text -> IO T.Text
+generateContextName maybeProject = do
+    currentTime <- getCurrentTime
+    let timestampStr = formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" currentTime
+        projectName = case maybeProject of
+            Nothing -> "unknown"
+            Just proj -> T.takeWhileEnd (/= '/') proj -- Get last part of path
+    return $ "claude web ui (" <> projectName <> " -- " <> T.pack timestampStr <> ")"
+
 -- | Call database storage
-callAipy :: T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> [T.Text] -> IO (Either String ())
-callAipy contextId claudeSessionId prompt response provider model tags = do
+callAipy :: T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> [T.Text] -> Maybe T.Text -> IO (Either String ())
+callAipy contextId claudeSessionId prompt response provider model tags maybeProject = do
     let dbName = "ai_chats"
     let dbUser = "postgres"
     
@@ -250,8 +260,12 @@ callAipy contextId claudeSessionId prompt response provider model tags = do
                    ++ T.unpack responseHash ++ "', '" 
                    ++ tagsArray ++ "', '{}');"
     
+    -- Generate dynamic context name
+    contextName <- generateContextName maybeProject
+    
     let contextSQL = "INSERT INTO ai_chat_contexts (context_uuid, name, tags) VALUES ('" 
-                    ++ T.unpack contextId ++ "', 'Claude Web UI Session', '" 
+                    ++ T.unpack contextId ++ "', '" 
+                    ++ escapeSql (T.unpack contextName) ++ "', '" 
                     ++ tagsArray ++ "') ON CONFLICT (context_uuid) DO NOTHING;"
     
     result <- catch (do
