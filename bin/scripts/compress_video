@@ -50,6 +50,8 @@ JOURNAL_FILE=""
 FORCE_RECONVERT=false
 CUSTOM_CRF=""
 PARALLEL_JOBS=1
+PARALLEL_TYPE=""
+PARALLEL_CHILD=false
 
 # Quality presets (CRF values)
 declare -A QUALITY_PRESETS=(
@@ -540,6 +542,11 @@ parse_args() {
                 fi
                 shift 2
                 ;;
+            --parallel-child)
+                # Internal flag to indicate this is a child process from moreutils parallel
+                PARALLEL_CHILD=true
+                shift
+                ;;
             -*)
                 error "Unknown option: $1"
                 show_help
@@ -849,9 +856,18 @@ process_video() {
 # Check if parallel is available for concurrent processing
 check_parallel() {
     if ! command -v parallel >/dev/null 2>&1; then
-        error "GNU parallel is required for --parallel option but not found"
+        error "parallel is required for --parallel option but not found"
         error "Install with: sudo apt install parallel (or equivalent for your distro)"
         exit 1
+    fi
+    
+    # Detect which version of parallel we have
+    if parallel --version 2>&1 | grep -q "GNU parallel"; then
+        PARALLEL_TYPE="gnu"
+        debug "GNU parallel detected"
+    else
+        PARALLEL_TYPE="moreutils"
+        debug "moreutils parallel detected"
     fi
 }
 
@@ -924,7 +940,7 @@ main() {
     
     # Process videos
     if [[ ${#job_list[@]} -gt 0 ]]; then
-        if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
+        if [[ "$PARALLEL_JOBS" -gt 1 ]] && [[ "$PARALLEL_CHILD" == "false" ]]; then
             # Use parallel processing
             log "Processing ${#job_list[@]} files with $PARALLEL_JOBS parallel jobs..."
             
@@ -932,12 +948,55 @@ main() {
             export -f process_video_wrapper
             export QUALITY CUSTOM_CRF VIDEO_CODEC AUDIO_CODEC OUTPUT_FORMAT USE_HWACCEL PREFER_VULKAN
             export PREFER_SOFTWARE CONTAINER_IMAGE HWACCEL_DEVICE VERBOSE DRY_RUN USE_JOURNAL 
-            export JOURNAL_FILE FORCE_RECONVERT RESOLUTION BITRATE FFMPEG_PRESET
+            export JOURNAL_FILE FORCE_RECONVERT RESOLUTION BITRATE FFMPEG_PRESET PARALLEL_TYPE
             
             # Process jobs in parallel
             local parallel_failed=0
-            printf '%s\n' "${job_list[@]}" | parallel -j "$PARALLEL_JOBS" --colsep '|' \
-                'if ! process_video_wrapper "{1}" "{2}"; then exit 1; fi' || parallel_failed=$?
+            
+            if [[ "$PARALLEL_TYPE" == "gnu" ]]; then
+                # GNU parallel syntax
+                printf '%s\n' "${job_list[@]}" | parallel -j "$PARALLEL_JOBS" --colsep '|' \
+                    'if ! process_video_wrapper "{1}" "{2}"; then exit 1; fi' || parallel_failed=$?
+            else
+                # moreutils parallel syntax is simpler but less flexible
+                # We need to create a wrapper that can be called with our job format
+                
+                # Build the command with all our current options
+                local cmd_args=()
+                [[ -n "$CUSTOM_CRF" ]] && cmd_args+=("--crf" "$CUSTOM_CRF")
+                [[ "$QUALITY" != "medium" ]] && cmd_args+=("--quality" "$QUALITY")
+                [[ "$VIDEO_CODEC" != "h265" ]] && cmd_args+=("--video-codec" "$VIDEO_CODEC")
+                [[ "$AUDIO_CODEC" != "vorbis" ]] && cmd_args+=("--audio-codec" "$AUDIO_CODEC")
+                [[ "$OUTPUT_FORMAT" != "mkv" ]] && cmd_args+=("--format" "$OUTPUT_FORMAT")
+                [[ "$OUTPUT_DIR" != "output" ]] && cmd_args+=("--output-dir" "$OUTPUT_DIR")
+                [[ "$USE_HWACCEL" == "no" ]] && cmd_args+=("--no-hwaccel")
+                [[ "$USE_HWACCEL" == "force" ]] && cmd_args+=("--force-hwaccel")
+                [[ "$PREFER_VULKAN" == "true" ]] && cmd_args+=("--vulkan")
+                [[ "$PREFER_SOFTWARE" == "true" ]] && cmd_args+=("--prefer-software")
+                [[ -n "${RESOLUTION:-}" ]] && cmd_args+=("--resolution" "$RESOLUTION")
+                [[ -n "${BITRATE:-}" ]] && cmd_args+=("--bitrate" "$BITRATE")
+                [[ -n "${FFMPEG_PRESET:-}" ]] && cmd_args+=("--preset" "$FFMPEG_PRESET")
+                [[ "$VERBOSE" == "true" ]] && cmd_args+=("--verbose")
+                [[ "$DRY_RUN" == "true" ]] && cmd_args+=("--dry-run")
+                [[ "$USE_JOURNAL" == "true" ]] && cmd_args+=("--journal")
+                [[ -n "$JOURNAL_FILE" ]] && [[ "$JOURNAL_FILE" != "./compress_video_journal.md" ]] && cmd_args+=("--journal-file" "$JOURNAL_FILE")
+                [[ "$FORCE_RECONVERT" == "true" ]] && cmd_args+=("--force-reconvert")
+                
+                # Process files one by one in parallel using moreutils syntax
+                # Extract just the input files from job_list
+                local input_files=()
+                for job in "${job_list[@]}"; do
+                    IFS='|' read -r input_file output_file <<< "$job"
+                    input_files+=("$input_file")
+                done
+                
+                # Use moreutils parallel with simple syntax: parallel -j N command args -- file1 file2 ...
+                debug "Executing moreutils parallel with ${#input_files[@]} files"
+                debug "Command: parallel -j $PARALLEL_JOBS $0 --parallel-child ${cmd_args[*]} -- ${input_files[*]}"
+                
+                # moreutils parallel expects files after -- separator
+                parallel -j "$PARALLEL_JOBS" "$0" --parallel-child "${cmd_args[@]}" -- "${input_files[@]}" || parallel_failed=$?
+            fi
                 
             # Count failures (parallel doesn't give us exact count, so we estimate)
             if [[ $parallel_failed -ne 0 ]]; then
