@@ -1,0 +1,1526 @@
+#!/usr/bin/python3
+"""
+Simple Schedule - Multi-session event scheduling tool
+
+This script helps schedule multi-session events across multiple locations while minimizing
+attendee conflicts and respecting various constraints like room capacity, presenter availability,
+and time restrictions.
+
+Author: Simple Schedule Contributors
+License: MIT
+"""
+
+import argparse
+import json
+import sys
+import os
+import re
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Set, Any, NamedTuple
+from dataclasses import dataclass
+from collections import defaultdict
+import csv
+from pathlib import Path
+from subprocess import run
+
+# Check if we're in the correct distrobox
+ctr_id = os.environ.get("CONTAINER_ID", "")
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# If we are not in the 'dev' distrobox, re-exec the script inside it
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    result = run(cmd)
+    sys.exit(result.returncode)
+
+# Check for required dependencies
+try:
+    import pandas as pd
+except ImportError:
+    print("ERROR: pandas is required but not installed.", file=sys.stderr)
+    print("\nThis script requires the 'dev' distrobox environment.", file=sys.stderr)
+    print("The script should automatically run in the dev distrobox.", file=sys.stderr)
+    print("\nIf you're bypassing the distrobox check, install dependencies with:", file=sys.stderr)
+    print("  pip install pandas openpyxl", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import openpyxl
+    XLSX_SUPPORT = True
+except ImportError:
+    XLSX_SUPPORT = False
+
+try:
+    from tabulate import tabulate
+    TABULATE_SUPPORT = True
+except ImportError:
+    TABULATE_SUPPORT = False
+
+
+@dataclass
+class Session:
+    """Represents a session to be scheduled"""
+    name: str
+    max_attendees: int  # 0 means unlimited
+    presenters: List[str]
+    length: int  # minutes
+    required: bool
+    priority: int  # -20 to 19
+    number_of_sessions: int
+    max_per_day: int
+    interested_attendees: Set[str]
+    maybe_attendees: Set[str]
+
+
+@dataclass
+class Location:
+    """Represents a location/room"""
+    name: str
+    soft_limit: int
+    hard_limit: int
+    time_available: List[Tuple[datetime, datetime]]
+
+
+@dataclass
+class TimeSlot:
+    """Represents a time slot in the schedule"""
+    day: int
+    start_time: datetime
+    end_time: datetime
+    
+    def overlaps_with(self, other: 'TimeSlot') -> bool:
+        """Check if this time slot overlaps with another"""
+        if self.day != other.day:
+            return False
+        return (self.start_time < other.end_time and 
+                self.end_time > other.start_time)
+
+
+@dataclass
+class ScheduledSession:
+    """Represents a scheduled session"""
+    session: Session
+    location: Location
+    time_slot: TimeSlot
+    attendees: Set[str]
+    
+    def conflicts_with(self, other: 'ScheduledSession') -> bool:
+        """Check if this scheduled session conflicts with another"""
+        return self.time_slot.overlaps_with(other.time_slot)
+
+
+class SchedulingError(Exception):
+    """Custom exception for scheduling errors"""
+    pass
+
+
+# Global debug flag
+DEBUG = False
+
+
+def debug_log(message: str, indent: int = 0):
+    """Print debug message to stderr if debug mode is enabled"""
+    if DEBUG:
+        prefix = "  " * indent
+        print(f"[DEBUG] {prefix}{message}", file=sys.stderr)
+
+
+def parse_time(time_str: str) -> datetime:
+    """
+    Parse time string in various formats
+    
+    Args:
+        time_str: Time string like "8am", "8:00am", "08:00", "8:30pm", "20:30"
+        
+    Returns:
+        datetime object with the parsed time
+        
+    Raises:
+        ValueError: If time format is invalid
+    """
+    time_str = time_str.strip().lower()
+    
+    # Try different time formats
+    formats = [
+        "%I%p",           # 8am
+        "%I:%M%p",        # 8:00am
+        "%H:%M",          # 08:00 or 20:30
+    ]
+    
+    for fmt in formats:
+        try:
+            # Use a dummy date for parsing time only
+            return datetime.strptime(f"2000-01-01 {time_str}", f"%Y-%m-%d {fmt}")
+        except ValueError:
+            continue
+    
+    raise ValueError(f"Invalid time format: '{time_str}'. Use formats like '8am', '8:00am', or '20:30'")
+
+
+def parse_time_range(time_range: str) -> Tuple[datetime, datetime]:
+    """
+    Parse a time range string
+    
+    Args:
+        time_range: Time range like "8am-12pm" or "09:00-17:00"
+        
+    Returns:
+        Tuple of (start_time, end_time)
+        
+    Raises:
+        ValueError: If format is invalid or start >= end
+    """
+    parts = time_range.strip().split('-')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid time range format: '{time_range}'. Use 'start-end' format")
+    
+    start = parse_time(parts[0])
+    end = parse_time(parts[1])
+    
+    if start >= end:
+        raise ValueError(f"Start time must be before end time in range: '{time_range}'")
+    
+    return start, end
+
+
+def parse_time_list(time_list: str) -> List[Tuple[datetime, datetime]]:
+    """Parse comma-separated list of time ranges"""
+    ranges = []
+    for time_range in time_list.split(','):
+        ranges.append(parse_time_range(time_range))
+    return ranges
+
+
+def parse_slice_duration(slice_str: str) -> timedelta:
+    """
+    Parse slice duration string
+    
+    Args:
+        slice_str: Duration like "30m" or "1h"
+        
+    Returns:
+        timedelta object
+    """
+    match = re.match(r'^(\d+)([mh])$', slice_str.lower())
+    if not match:
+        raise ValueError(f"Invalid slice format: '{slice_str}'. Use '<number>m' or '<number>h'")
+    
+    value = int(match.group(1))
+    unit = match.group(2)
+    
+    if unit == 'm':
+        return timedelta(minutes=value)
+    else:  # 'h'
+        return timedelta(hours=value)
+
+
+def read_csv_file(filepath: Path) -> pd.DataFrame:
+    """Read CSV file with error handling"""
+    try:
+        return pd.read_csv(filepath)
+    except Exception as e:
+        raise SchedulingError(f"Error reading CSV file '{filepath}': {str(e)}")
+
+
+def read_xlsx_file(filepath: Path) -> pd.DataFrame:
+    """Read Excel file with error handling"""
+    if not XLSX_SUPPORT:
+        raise SchedulingError("Excel support not available. Install openpyxl: pip install openpyxl")
+    try:
+        return pd.read_excel(filepath)
+    except Exception as e:
+        raise SchedulingError(f"Error reading Excel file '{filepath}': {str(e)}")
+
+
+def read_markdown_table(filepath: Path) -> pd.DataFrame:
+    """Read Markdown table file"""
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        # Find the table in the markdown
+        lines = content.strip().split('\n')
+        table_lines = []
+        in_table = False
+        
+        for line in lines:
+            if '|' in line:
+                if not in_table:
+                    in_table = True
+                table_lines.append(line)
+            elif in_table and line.strip() == '':
+                break
+        
+        if not table_lines:
+            raise ValueError("No markdown table found in file")
+        
+        # Parse the table
+        header = [cell.strip() for cell in table_lines[0].split('|')[1:-1]]
+        
+        # Skip separator line
+        data_lines = []
+        for line in table_lines[2:]:
+            if line.strip():
+                row = [cell.strip() for cell in line.split('|')[1:-1]]
+                data_lines.append(row)
+        
+        return pd.DataFrame(data_lines, columns=header)
+        
+    except Exception as e:
+        raise SchedulingError(f"Error reading Markdown file '{filepath}': {str(e)}")
+
+
+def read_input_file(filepath: str, file_type: str) -> pd.DataFrame:
+    """Read input file based on extension"""
+    path = Path(filepath)
+    
+    debug_log(f"Reading {file_type} file: {filepath}")
+    
+    if not path.exists():
+        raise SchedulingError(f"File not found: '{filepath}'")
+    
+    ext = path.suffix.lower()
+    debug_log(f"File extension: {ext}", 1)
+    
+    if ext == '.csv':
+        df = read_csv_file(path)
+    elif ext in ['.xlsx', '.xls']:
+        df = read_xlsx_file(path)
+    elif ext == '.md':
+        df = read_markdown_table(path)
+    else:
+        raise SchedulingError(
+            f"Unsupported file format '{ext}' for {file_type}. "
+            f"Supported formats: csv, xlsx, md"
+        )
+    
+    debug_log(f"Read {len(df)} rows from {file_type} file", 1)
+    if DEBUG and len(df) > 0:
+        debug_log(f"Columns: {list(df.columns)}", 2)
+    
+    return df
+
+
+def normalize_bool_value(value: Any) -> bool:
+    """Normalize various boolean representations"""
+    if pd.isna(value):
+        return False
+    str_val = str(value).lower().strip()
+    return str_val in ['true', '1', 'yes', 'y']
+
+
+def normalize_interest_value(value: Any) -> str:
+    """Normalize attendee interest values"""
+    if pd.isna(value) or value == '':
+        return ''
+    str_val = str(value).lower().strip()
+    
+    if str_val in ['1', 'x', 'yes', 'true']:
+        return 'yes'
+    elif str_val in ['?', 'maybe']:
+        return 'maybe'
+    else:
+        return ''
+
+
+def validate_attendees(df: pd.DataFrame, sessions_df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    """
+    Validate and parse attendees data
+    
+    Returns:
+        Dict mapping attendee_name to dict of session_name -> interest_level
+    """
+    debug_log("Validating attendees data")
+    
+    if df.empty:
+        raise SchedulingError("Attendees file is empty")
+    
+    if len(df.columns) < 2:
+        raise SchedulingError("Attendees file must have at least 2 columns (attendee_name and one session)")
+    
+    # First column is attendee name
+    attendee_col = df.columns[0]
+    session_cols = df.columns[1:]
+    
+    debug_log(f"Attendee column: {attendee_col}", 1)
+    debug_log(f"Session columns: {list(session_cols)}", 1)
+    
+    # Check for duplicate attendee names
+    duplicates = df[attendee_col].duplicated()
+    if duplicates.any():
+        dup_names = df[attendee_col][duplicates].unique()
+        raise SchedulingError(f"Duplicate attendee names found: {', '.join(dup_names)}")
+    
+    # Get valid session names from sessions file
+    valid_sessions = set(sessions_df[sessions_df.columns[0]].values)
+    
+    # Validate session columns match sessions in sessions file
+    invalid_sessions = []
+    for session in session_cols:
+        if session not in valid_sessions:
+            invalid_sessions.append(session)
+    
+    if invalid_sessions:
+        raise SchedulingError(
+            f"Sessions in attendees file not found in sessions file: {', '.join(invalid_sessions)}"
+        )
+    
+    # Build attendee interest map
+    attendees = {}
+    for _, row in df.iterrows():
+        attendee_name = str(row[attendee_col]).strip()
+        interests = {}
+        
+        for session in session_cols:
+            interest = normalize_interest_value(row[session])
+            if interest:
+                interests[session] = interest
+        
+        attendees[attendee_name] = interests
+    
+    debug_log(f"Processed {len(attendees)} attendees", 1)
+    if DEBUG and attendees:
+        sample_attendee = list(attendees.keys())[0]
+        debug_log(f"Sample: {sample_attendee} -> {attendees[sample_attendee]}", 2)
+    
+    return attendees
+
+
+def validate_sessions(df: pd.DataFrame, attendees: Dict[str, Dict[str, str]]) -> List[Session]:
+    """Validate and parse sessions data"""
+    if df.empty:
+        raise SchedulingError("Sessions file is empty")
+    
+    required_cols = [
+        'session_name', 'max_attendees', 'presenters', 'length',
+        'required', 'priority', 'number_of_sessions', 'max_per_day'
+    ]
+    
+    # Check column names (case-insensitive)
+    df_cols_lower = [col.lower() for col in df.columns]
+    missing_cols = []
+    col_mapping = {}
+    
+    for req_col in required_cols:
+        found = False
+        for i, df_col in enumerate(df_cols_lower):
+            if req_col.lower() == df_col:
+                col_mapping[req_col] = df.columns[i]
+                found = True
+                break
+        if not found:
+            missing_cols.append(req_col)
+    
+    if missing_cols:
+        raise SchedulingError(
+            f"Missing required columns in sessions file: {', '.join(missing_cols)}\n"
+            f"Expected columns: {', '.join(required_cols)}"
+        )
+    
+    sessions = []
+    all_attendee_names = set(attendees.keys())
+    
+    for idx, row in df.iterrows():
+        try:
+            name = str(row[col_mapping['session_name']]).strip()
+            max_attendees = int(row[col_mapping['max_attendees']])
+            
+            if max_attendees < 0:
+                raise ValueError(f"max_attendees must be >= 0, got {max_attendees}")
+            
+            # Parse presenters
+            presenters_str = str(row[col_mapping['presenters']]).strip()
+            presenters = [p.strip() for p in presenters_str.split(',') if p.strip()]
+            
+            length = int(row[col_mapping['length']])
+            if length <= 0:
+                raise ValueError(f"length must be > 0, got {length}")
+            if length > 480:  # 8 hours
+                raise ValueError(f"length seems too long ({length} minutes). Maximum recommended: 480")
+            
+            required = normalize_bool_value(row[col_mapping['required']])
+            
+            priority = int(row[col_mapping['priority']])
+            if priority < -20 or priority > 19:
+                raise ValueError(f"priority must be between -20 and 19, got {priority}")
+            
+            number_of_sessions = int(row[col_mapping['number_of_sessions']])
+            if number_of_sessions <= 0:
+                raise ValueError(f"number_of_sessions must be > 0, got {number_of_sessions}")
+            
+            max_per_day = int(row[col_mapping['max_per_day']])
+            if max_per_day <= 0:
+                raise ValueError(f"max_per_day must be > 0, got {max_per_day}")
+            if max_per_day > number_of_sessions:
+                raise ValueError(f"max_per_day ({max_per_day}) cannot exceed number_of_sessions ({number_of_sessions})")
+            
+            # Find interested attendees
+            interested = set()
+            maybe = set()
+            
+            for attendee, interests in attendees.items():
+                if name in interests:
+                    if interests[name] == 'yes':
+                        interested.add(attendee)
+                    elif interests[name] == 'maybe':
+                        maybe.add(attendee)
+            
+            sessions.append(Session(
+                name=name,
+                max_attendees=max_attendees,
+                presenters=presenters,
+                length=length,
+                required=required,
+                priority=priority,
+                number_of_sessions=number_of_sessions,
+                max_per_day=max_per_day,
+                interested_attendees=interested,
+                maybe_attendees=maybe
+            ))
+            
+        except ValueError as e:
+            raise SchedulingError(f"Error in sessions file row {idx + 2} ('{name}'): {str(e)}")
+    
+    return sessions
+
+
+def validate_locations(df: pd.DataFrame) -> List[Location]:
+    """Validate and parse locations data"""
+    if df.empty:
+        raise SchedulingError("Locations file is empty")
+    
+    required_cols = ['location_name', 'soft_limit', 'hard_limit', 'time_available']
+    
+    # Check column names (case-insensitive)
+    df_cols_lower = [col.lower() for col in df.columns]
+    missing_cols = []
+    col_mapping = {}
+    
+    for req_col in required_cols:
+        found = False
+        for i, df_col in enumerate(df_cols_lower):
+            if req_col.lower() == df_col:
+                col_mapping[req_col] = df.columns[i]
+                found = True
+                break
+        if not found:
+            missing_cols.append(req_col)
+    
+    if missing_cols:
+        raise SchedulingError(
+            f"Missing required columns in locations file: {', '.join(missing_cols)}\n"
+            f"Expected columns: {', '.join(required_cols)}"
+        )
+    
+    locations = []
+    
+    for idx, row in df.iterrows():
+        try:
+            name = str(row[col_mapping['location_name']]).strip()
+            soft_limit = int(row[col_mapping['soft_limit']])
+            hard_limit = int(row[col_mapping['hard_limit']])
+            
+            if soft_limit <= 0:
+                raise ValueError(f"soft_limit must be > 0, got {soft_limit}")
+            if hard_limit <= 0:
+                raise ValueError(f"hard_limit must be > 0, got {hard_limit}")
+            if soft_limit > hard_limit:
+                raise ValueError(f"soft_limit ({soft_limit}) cannot exceed hard_limit ({hard_limit})")
+            
+            time_available_str = str(row[col_mapping['time_available']]).strip()
+            time_available = parse_time_list(time_available_str)
+            
+            locations.append(Location(
+                name=name,
+                soft_limit=soft_limit,
+                hard_limit=hard_limit,
+                time_available=time_available
+            ))
+            
+        except ValueError as e:
+            raise SchedulingError(f"Error in locations file row {idx + 2} ('{name}'): {str(e)}")
+    
+    return locations
+
+
+def parse_day_names(day_names_str: str, num_days: int) -> List[str]:
+    """
+    Parse day names from CSV string
+    
+    Args:
+        day_names_str: CSV string of day names
+        num_days: Expected number of days
+        
+    Returns:
+        List of day names
+        
+    Raises:
+        SchedulingError: If number of names doesn't match days
+    """
+    if not day_names_str:
+        # Default to "Day 1", "Day 2", etc.
+        return [f"Day {i + 1}" for i in range(num_days)]
+    
+    # Parse CSV string
+    day_names = [name.strip() for name in day_names_str.split(',')]
+    
+    if len(day_names) != num_days:
+        raise SchedulingError(
+            f"Number of day names ({len(day_names)}) doesn't match number of days ({num_days}). "
+            f"Provide exactly {num_days} comma-separated names."
+        )
+    
+    debug_log(f"Using custom day names: {day_names}")
+    
+    return day_names
+
+
+def parse_blackout(blackout_str: str) -> List[Dict[str, Any]]:
+    """Parse blackout JSON string"""
+    if not blackout_str:
+        return []
+    
+    try:
+        blackouts = json.loads(blackout_str)
+        if not isinstance(blackouts, list):
+            raise ValueError("Blackout must be a JSON array")
+        
+        parsed = []
+        for i, blackout in enumerate(blackouts):
+            if not isinstance(blackout, dict):
+                raise ValueError(f"Blackout entry {i} must be a JSON object")
+            
+            if 'day' not in blackout:
+                raise ValueError(f"Blackout entry {i} missing 'day' field")
+            if 'time' not in blackout:
+                raise ValueError(f"Blackout entry {i} missing 'time' field")
+            
+            day = int(blackout['day'])
+            if day < 0:
+                raise ValueError(f"Blackout entry {i}: day must be >= 0")
+            
+            time_ranges = []
+            for time_str in blackout['time']:
+                time_ranges.append(parse_time_range(time_str))
+            
+            name = blackout.get('name', 'blackout')
+            
+            parsed.append({
+                'day': day,
+                'time_ranges': time_ranges,
+                'name': name
+            })
+        
+        return parsed
+        
+    except json.JSONDecodeError as e:
+        raise SchedulingError(f"Invalid JSON in blackout parameter: {str(e)}")
+    except ValueError as e:
+        raise SchedulingError(f"Invalid blackout format: {str(e)}")
+
+
+def generate_time_slots(
+    days: int,
+    global_time: Optional[List[Tuple[datetime, datetime]]],
+    locations: List[Location],
+    blackouts: List[Dict[str, Any]],
+    slice_duration: timedelta
+) -> Dict[int, List[TimeSlot]]:
+    """Generate all available time slots per day"""
+    debug_log(f"Generating time slots for {days} days with {slice_duration} slices")
+    
+    slots_by_day = defaultdict(list)
+    
+    for day in range(days):
+        # Start with location availability
+        day_ranges = []
+        for location in locations:
+            for start, end in location.time_available:
+                if global_time:
+                    # Intersect with global time constraints
+                    for g_start, g_end in global_time:
+                        intersect_start = max(start, g_start)
+                        intersect_end = min(end, g_end)
+                        if intersect_start < intersect_end:
+                            day_ranges.append((intersect_start, intersect_end))
+                else:
+                    day_ranges.append((start, end))
+        
+        # Merge overlapping ranges
+        if day_ranges:
+            day_ranges.sort()
+            merged = [day_ranges[0]]
+            for start, end in day_ranges[1:]:
+                if start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            
+            # Generate time slots
+            for start, end in merged:
+                current = start
+                while current + slice_duration <= end:
+                    slot = TimeSlot(day, current, current + slice_duration)
+                    
+                    # Check blackouts
+                    is_blackout = False
+                    for blackout in blackouts:
+                        if blackout['day'] == day:
+                            for b_start, b_end in blackout['time_ranges']:
+                                if (current >= b_start and current < b_end) or \
+                                   (current + slice_duration > b_start and current + slice_duration <= b_end):
+                                    is_blackout = True
+                                    break
+                        if is_blackout:
+                            break
+                    
+                    if not is_blackout:
+                        slots_by_day[day].append(slot)
+                    
+                    current += slice_duration
+    
+    return dict(slots_by_day)
+
+
+class Scheduler:
+    """Main scheduling algorithm implementation"""
+    
+    def __init__(
+        self,
+        sessions: List[Session],
+        locations: List[Location],
+        attendees: Dict[str, Dict[str, str]],
+        time_slots: Dict[int, List[TimeSlot]],
+        include_overlaps: bool = False
+    ):
+        self.sessions = sorted(sessions, key=lambda s: (s.priority, -len(s.interested_attendees)))
+        self.locations = locations
+        self.attendees = attendees
+        self.time_slots = time_slots
+        self.include_overlaps = include_overlaps
+        self.schedule: List[ScheduledSession] = []
+        self.unscheduled_sessions: List[Tuple[Session, str]] = []
+    
+    def is_presenter_available(self, presenter: str, time_slot: TimeSlot) -> bool:
+        """Check if presenter is available during time slot"""
+        for scheduled in self.schedule:
+            if presenter in scheduled.session.presenters and \
+               scheduled.time_slot.overlaps_with(time_slot):
+                return False
+        return True
+    
+    def is_location_available(self, location: Location, time_slot: TimeSlot) -> bool:
+        """Check if location is available during time slot"""
+        for scheduled in self.schedule:
+            if scheduled.location.name == location.name and \
+               scheduled.time_slot.overlaps_with(time_slot):
+                return False
+        return True
+    
+    def get_attendee_conflicts(self, attendees: Set[str], time_slot: TimeSlot) -> Set[str]:
+        """Get attendees who have conflicts at this time"""
+        conflicts = set()
+        for scheduled in self.schedule:
+            if scheduled.time_slot.overlaps_with(time_slot):
+                conflicts.update(scheduled.attendees & attendees)
+        return conflicts
+    
+    def fits_in_location(self, session: Session, location: Location, time_slot: TimeSlot) -> bool:
+        """Check if session fits in location during time slot"""
+        # Check time availability
+        slot_fits = False
+        for start, end in location.time_available:
+            if time_slot.start_time >= start and time_slot.end_time <= end:
+                slot_fits = True
+                break
+        
+        if not slot_fits:
+            if DEBUG:
+                debug_log(f"        Time {format_time(time_slot.start_time)}-{format_time(time_slot.end_time)} not in location's available times", 6)
+            return False
+        
+        # Check capacity
+        num_attendees = len(session.interested_attendees)
+        if session.max_attendees > 0:
+            num_attendees = min(num_attendees, session.max_attendees)
+        
+        if num_attendees > location.hard_limit:
+            if DEBUG:
+                debug_log(f"        {num_attendees} attendees exceeds location capacity of {location.hard_limit}", 6)
+            return False
+            
+        return True
+    
+    def calculate_session_duration_slots(self, session: Session, slice_duration: timedelta) -> int:
+        """Calculate how many time slots a session needs"""
+        session_duration = timedelta(minutes=session.length)
+        slots_needed = int(session_duration / slice_duration)
+        if session_duration % slice_duration:
+            slots_needed += 1
+        return slots_needed
+    
+    def find_consecutive_slots(
+        self, 
+        day: int, 
+        slots_needed: int,
+        slice_duration: timedelta
+    ) -> List[List[TimeSlot]]:
+        """Find all possible consecutive time slot groups for a session"""
+        if day not in self.time_slots:
+            return []
+        
+        day_slots = self.time_slots[day]
+        if len(day_slots) < slots_needed:
+            return []
+        
+        consecutive_groups = []
+        
+        for i in range(len(day_slots) - slots_needed + 1):
+            # Check if slots are consecutive
+            is_consecutive = True
+            for j in range(slots_needed - 1):
+                if day_slots[i + j].end_time != day_slots[i + j + 1].start_time:
+                    is_consecutive = False
+                    break
+            
+            if is_consecutive:
+                consecutive_groups.append(day_slots[i:i + slots_needed])
+        
+        return consecutive_groups
+    
+    def schedule_session_instance(
+        self, 
+        session: Session, 
+        instance_num: int,
+        sessions_per_day: Dict[int, int]
+    ) -> bool:
+        """Try to schedule one instance of a session"""
+        debug_log(f"  Trying to schedule instance {instance_num + 1} of {session.name}", 1)
+        
+        slice_duration = None
+        if self.time_slots:
+            first_day_slots = next(iter(self.time_slots.values()))
+            if len(first_day_slots) >= 2:
+                slice_duration = first_day_slots[1].start_time - first_day_slots[0].start_time
+            else:
+                slice_duration = timedelta(hours=1)
+        else:
+            slice_duration = timedelta(hours=1)
+        
+        slots_needed = self.calculate_session_duration_slots(session, slice_duration)
+        debug_log(f"  Session needs {slots_needed} time slots ({session.length} minutes)", 2)
+        
+        # Try each day
+        for day in sorted(self.time_slots.keys()):
+            debug_log(f"  Day {day + 1}:", 2)
+            
+            # Check max_per_day constraint
+            if sessions_per_day[session.name].get(day, 0) >= session.max_per_day:
+                debug_log(f"    ✗ Already scheduled {sessions_per_day[session.name].get(day, 0)} sessions (max: {session.max_per_day})", 3)
+                continue
+            
+            # Get possible time slot groups
+            slot_groups = self.find_consecutive_slots(day, slots_needed, slice_duration)
+            
+            if not slot_groups:
+                debug_log(f"    ✗ No consecutive slots available for {slots_needed} time slots", 3)
+                continue
+            
+            # Try each location
+            for location in self.locations:
+                debug_log(f"    Trying location: {location.name}", 3)
+                
+                # Try each time slot group
+                for slot_group in slot_groups:
+                    # Create combined time slot
+                    combined_slot = TimeSlot(
+                        day=day,
+                        start_time=slot_group[0].start_time,
+                        end_time=slot_group[-1].end_time
+                    )
+                    
+                    debug_log(f"      Time slot: {format_time(combined_slot.start_time)}-{format_time(combined_slot.end_time)}", 4)
+                    
+                    # Check if session fits in location
+                    if not self.fits_in_location(session, location, combined_slot):
+                        debug_log(f"      ✗ Session doesn't fit in location (capacity or time)", 5)
+                        continue
+                    
+                    # Check if location is available at this time
+                    if not self.is_location_available(location, combined_slot):
+                        debug_log(f"      ✗ Location already occupied", 5)
+                        continue
+                    
+                    # Check presenter availability
+                    presenters_available = all(
+                        self.is_presenter_available(p, combined_slot)
+                        for p in session.presenters
+                    )
+                    if not presenters_available:
+                        debug_log(f"      ✗ Presenter(s) not available", 5)
+                        continue
+                    
+                    # Check attendee conflicts
+                    conflicts = self.get_attendee_conflicts(
+                        session.interested_attendees, 
+                        combined_slot
+                    )
+                    
+                    # For required sessions, no conflicts allowed
+                    if session.required and conflicts and not self.include_overlaps:
+                        continue
+                    
+                    # Calculate score (minimize conflicts)
+                    score = len(conflicts)
+                    
+                    # Schedule the session
+                    scheduled_attendees = session.interested_attendees - conflicts
+                    if self.include_overlaps:
+                        scheduled_attendees = session.interested_attendees
+                    
+                    # Apply max_attendees limit
+                    if session.max_attendees > 0 and len(scheduled_attendees) > session.max_attendees:
+                        scheduled_attendees = set(list(scheduled_attendees)[:session.max_attendees])
+                    
+                    self.schedule.append(ScheduledSession(
+                        session=session,
+                        location=location,
+                        time_slot=combined_slot,
+                        attendees=scheduled_attendees
+                    ))
+                    
+                    sessions_per_day[session.name][day] = \
+                        sessions_per_day[session.name].get(day, 0) + 1
+                    
+                    debug_log(f"      ✓ Scheduled successfully with {len(scheduled_attendees)} attendees", 5)
+                    if conflicts:
+                        debug_log(f"        Conflicts: {len(conflicts)} attendees", 6)
+                    
+                    return True
+        
+        return False
+    
+    def run(self):
+        """Run the scheduling algorithm"""
+        debug_log(f"Starting scheduler with {len(self.sessions)} sessions")
+        debug_log(f"Available locations: {[loc.name for loc in self.locations]}")
+        debug_log(f"Include overlaps: {self.include_overlaps}")
+        
+        # Track sessions scheduled per day
+        sessions_per_day = defaultdict(lambda: defaultdict(int))
+        
+        # Schedule each session
+        for session in self.sessions:
+            debug_log(f"\nScheduling session: {session.name} (priority={session.priority})")
+            scheduled_count = 0
+            
+            for i in range(session.number_of_sessions):
+                if self.schedule_session_instance(session, i, sessions_per_day):
+                    scheduled_count += 1
+                else:
+                    self.unscheduled_sessions.append(
+                        (session, f"Could not find suitable time/location for instance {i + 1}")
+                    )
+            
+            if scheduled_count == 0 and session.required:
+                raise SchedulingError(
+                    f"Unable to schedule required session '{session.name}'. "
+                    f"Consider relaxing constraints or adding more time/locations."
+                )
+
+
+def format_time(dt: datetime) -> str:
+    """Format datetime as time string"""
+    return dt.strftime("%-I:%M%p").lower()
+
+
+def generate_markdown_output(
+    schedule: List[ScheduledSession],
+    locations: List[Location],
+    days: int,
+    time_slots: Dict[int, List[TimeSlot]],
+    blackouts: List[Dict[str, Any]],
+    slice_duration: timedelta,
+    day_names: List[str]
+) -> str:
+    """Generate markdown table output"""
+    output = []
+    
+    for day in range(days):
+        output.append(f"## {day_names[day]}\n")
+        
+        if day not in time_slots or not time_slots[day]:
+            output.append("*No sessions scheduled*\n")
+            continue
+        
+        # Create time slot index
+        all_times = set()
+        for slot in time_slots[day]:
+            all_times.add(slot.start_time)
+        
+        # Add blackout times
+        for blackout in blackouts:
+            if blackout['day'] == day:
+                for start, end in blackout['time_ranges']:
+                    current = start
+                    while current < end:
+                        all_times.add(current)
+                        current += slice_duration
+        
+        sorted_times = sorted(all_times)
+        
+        # Create table header
+        header = ["Time"] + [loc.name for loc in locations]
+        output.append("| " + " | ".join(header) + " |")
+        output.append("|" + "|".join(["-" * (len(h) + 2) for h in header]) + "|")
+        
+        # Fill in schedule
+        for time in sorted_times:
+            row = [format_time(time)]
+            
+            # Check if this is a blackout time
+            is_blackout = False
+            blackout_name = "blackout"
+            for blackout in blackouts:
+                if blackout['day'] == day:
+                    for start, end in blackout['time_ranges']:
+                        if time >= start and time < end:
+                            is_blackout = True
+                            blackout_name = blackout['name']
+                            break
+            
+            if is_blackout:
+                for _ in locations:
+                    row.append(f"-- {blackout_name} --")
+            else:
+                for location in locations:
+                    # Find session at this time and location
+                    session_found = False
+                    for scheduled in schedule:
+                        if (scheduled.time_slot.day == day and
+                            scheduled.location.name == location.name and
+                            time >= scheduled.time_slot.start_time and
+                            time < scheduled.time_slot.end_time):
+                            
+                            if time == scheduled.time_slot.start_time:
+                                # First slot of session - show name and count
+                                overlaps = ""
+                                if any("(overlap)" in str(a) for a in scheduled.attendees):
+                                    overlaps = " ⚠️"
+                                row.append(f"{scheduled.session.name} ({len(scheduled.attendees)}){overlaps}")
+                            else:
+                                # Continuation of session
+                                row.append("↓")
+                            session_found = True
+                            break
+                    
+                    if not session_found:
+                        row.append("-")
+            
+            output.append("| " + " | ".join(row) + " |")
+        
+        output.append("")
+    
+    return "\n".join(output)
+
+
+def generate_csv_output(
+    schedule: List[ScheduledSession],
+    locations: List[Location],
+    days: int,
+    time_slots: Dict[int, List[TimeSlot]],
+    blackouts: List[Dict[str, Any]],
+    slice_duration: timedelta,
+    day_names: List[str]
+) -> str:
+    """Generate CSV output"""
+    output = []
+    writer = StringWriter()
+    
+    # Write header
+    header = ["Day", "Time"] + [loc.name for loc in locations]
+    writer.writerow(header)
+    
+    for day in range(days):
+        if day not in time_slots or not time_slots[day]:
+            continue
+        
+        # Create time slot index
+        all_times = set()
+        for slot in time_slots[day]:
+            all_times.add(slot.start_time)
+        
+        # Add blackout times
+        for blackout in blackouts:
+            if blackout['day'] == day:
+                for start, end in blackout['time_ranges']:
+                    current = start
+                    while current < end:
+                        all_times.add(current)
+                        current += slice_duration
+        
+        sorted_times = sorted(all_times)
+        
+        # Fill in schedule
+        for time in sorted_times:
+            row = [day_names[day], format_time(time)]
+            
+            # Check if this is a blackout time
+            is_blackout = False
+            blackout_name = "blackout"
+            for blackout in blackouts:
+                if blackout['day'] == day:
+                    for start, end in blackout['time_ranges']:
+                        if time >= start and time < end:
+                            is_blackout = True
+                            blackout_name = blackout['name']
+                            break
+            
+            if is_blackout:
+                for _ in locations:
+                    row.append(f"{blackout_name} (blackout)")
+            else:
+                for location in locations:
+                    # Find session at this time and location
+                    session_found = False
+                    for scheduled in schedule:
+                        if (scheduled.time_slot.day == day and
+                            scheduled.location.name == location.name and
+                            time >= scheduled.time_slot.start_time and
+                            time < scheduled.time_slot.end_time):
+                            
+                            if time == scheduled.time_slot.start_time:
+                                row.append(f"{scheduled.session.name} ({len(scheduled.attendees)})")
+                            else:
+                                row.append(scheduled.session.name)
+                            session_found = True
+                            break
+                    
+                    if not session_found:
+                        row.append("---")
+            
+            writer.writerow(row)
+    
+    return writer.getvalue()
+
+
+def generate_xlsx_output(
+    schedule: List[ScheduledSession],
+    locations: List[Location],
+    days: int,
+    time_slots: Dict[int, List[TimeSlot]],
+    blackouts: List[Dict[str, Any]],
+    slice_duration: timedelta,
+    output_file: str,
+    day_names: List[str]
+):
+    """Generate Excel output"""
+    if not XLSX_SUPPORT:
+        raise SchedulingError("Excel output requires openpyxl. Install with: pip install openpyxl")
+    
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+    
+    wb = Workbook()
+    
+    # Remove default sheet
+    wb.remove(wb.active)
+    
+    # Colors
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    blackout_fill = PatternFill(start_color="808080", end_color="808080", fill_type="solid")
+    session_fills = [
+        PatternFill(start_color="E7F3FF", end_color="E7F3FF", fill_type="solid"),
+        PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),
+        PatternFill(start_color="E7FFE7", end_color="E7FFE7", fill_type="solid"),
+        PatternFill(start_color="FFE7E7", end_color="FFE7E7", fill_type="solid"),
+    ]
+    
+    session_colors = {}
+    color_idx = 0
+    
+    for day in range(days):
+        # Use custom day name for sheet title, but truncate if too long for Excel
+        sheet_title = day_names[day][:31]  # Excel has 31 char limit for sheet names
+        ws = wb.create_sheet(title=sheet_title)
+        
+        if day not in time_slots or not time_slots[day]:
+            ws.append(["No sessions scheduled"])
+            continue
+        
+        # Create time slot index
+        all_times = set()
+        for slot in time_slots[day]:
+            all_times.add(slot.start_time)
+        
+        # Add blackout times
+        for blackout in blackouts:
+            if blackout['day'] == day:
+                for start, end in blackout['time_ranges']:
+                    current = start
+                    while current < end:
+                        all_times.add(current)
+                        current += slice_duration
+        
+        sorted_times = sorted(all_times)
+        
+        # Write header
+        header = ["Time"] + [loc.name for loc in locations]
+        ws.append(header)
+        
+        # Style header
+        for col in range(1, len(header) + 1):
+            cell = ws.cell(row=1, column=col)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+        
+        # Fill in schedule
+        for time_idx, time in enumerate(sorted_times):
+            row = [format_time(time)]
+            
+            # Check if this is a blackout time
+            is_blackout = False
+            blackout_name = "blackout"
+            for blackout in blackouts:
+                if blackout['day'] == day:
+                    for start, end in blackout['time_ranges']:
+                        if time >= start and time < end:
+                            is_blackout = True
+                            blackout_name = blackout['name']
+                            break
+            
+            if is_blackout:
+                for _ in locations:
+                    row.append(blackout_name)
+            else:
+                for location in locations:
+                    # Find session at this time and location
+                    session_found = False
+                    for scheduled in schedule:
+                        if (scheduled.time_slot.day == day and
+                            scheduled.location.name == location.name and
+                            time >= scheduled.time_slot.start_time and
+                            time < scheduled.time_slot.end_time):
+                            
+                            if time == scheduled.time_slot.start_time:
+                                row.append(f"{scheduled.session.name}\n({len(scheduled.attendees)} attendees)")
+                            else:
+                                row.append(scheduled.session.name)
+                            session_found = True
+                            
+                            # Assign color to session
+                            if scheduled.session.name not in session_colors:
+                                session_colors[scheduled.session.name] = session_fills[color_idx % len(session_fills)]
+                                color_idx += 1
+                            
+                            break
+                    
+                    if not session_found:
+                        row.append("")
+            
+            ws.append(row)
+            
+            # Style the row
+            row_num = time_idx + 2
+            if is_blackout:
+                for col in range(2, len(header) + 1):
+                    cell = ws.cell(row=row_num, column=col)
+                    cell.fill = blackout_fill
+                    cell.alignment = Alignment(horizontal="center")
+            else:
+                # Color code sessions
+                for col, location in enumerate(locations, start=2):
+                    for scheduled in schedule:
+                        if (scheduled.time_slot.day == day and
+                            scheduled.location.name == location.name and
+                            time >= scheduled.time_slot.start_time and
+                            time < scheduled.time_slot.end_time):
+                            
+                            cell = ws.cell(row=row_num, column=col)
+                            cell.fill = session_colors[scheduled.session.name]
+                            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+                            break
+        
+        # Adjust column widths
+        for col in range(1, len(header) + 1):
+            ws.column_dimensions[chr(64 + col)].width = 20
+    
+    # Add summary sheet
+    ws_summary = wb.create_sheet(title="Summary", index=0)
+    ws_summary.append(["Scheduling Summary"])
+    ws_summary.append([])
+    ws_summary.append(["Sessions Scheduled:"])
+    
+    # Count sessions
+    session_counts = defaultdict(int)
+    for scheduled in schedule:
+        session_counts[scheduled.session.name] += 1
+    
+    for session_name, count in sorted(session_counts.items()):
+        ws_summary.append([f"  {session_name}: {count} sessions"])
+    
+    ws_summary.append([])
+    ws_summary.append(["Total Conflicts:", sum(1 for s in schedule if any("(overlap)" in str(a) for a in s.attendees))])
+    
+    wb.save(output_file)
+
+
+def create_arg_parser():
+    """Create argument parser with detailed help"""
+    parser = argparse.ArgumentParser(
+        prog='simple_schedule',
+        description='Simple Schedule - Multi-session event scheduling tool',
+        epilog='''Examples:
+  # Basic scheduling for a single-day event
+  simple_schedule --attendees attendees.csv --sessions sessions.csv --locations rooms.csv
+
+  # Multi-day conference with lunch breaks
+  simple_schedule --attendees people.xlsx --sessions talks.xlsx --locations venues.xlsx \\
+      --days 3 --time "9am-12pm,1pm-5pm" --slice 30m \\
+      --blackout '[{"day": 0, "time": ["12pm-1pm"], "name": "Lunch"},
+                   {"day": 1, "time": ["12pm-1pm"], "name": "Lunch"},
+                   {"day": 2, "time": ["12pm-1pm"], "name": "Lunch"}]'
+
+  # Generate markdown output with overlaps allowed for manual resolution
+  simple_schedule --attendees attendees.md --sessions sessions.md --locations locations.md \\
+      --include-overlaps --format md --output schedule.md
+
+  # Complex scheduling with all options
+  simple_schedule --attendees participants.csv --sessions workshops.csv --locations rooms.csv \\
+      --days 2 --time "8:30am-12:30pm,2pm-6pm" --slice 15m \\
+      --blackout '[{"day": 0, "time": ["12:30pm-2pm"], "name": "Lunch & Keynote"},
+                   {"day": 1, "time": ["5pm-6pm"], "name": "Closing Reception"}]' \\
+      --format xlsx --output "conference_schedule.xlsx"
+
+Template files are available at:
+  /var/home/zach/Documents/notes/03_resources/templates/simple_schedule/
+
+For more information, see the documentation at:
+  https://github.com/yourusername/simple_schedule
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument(
+        '--attendees',
+        required=True,
+        help='Path to attendees file (CSV, XLSX, or MD). Rows are attendees, columns are sessions. '
+             'Values: 1/x/yes/true = definite interest, ?/maybe = optional interest'
+    )
+    
+    parser.add_argument(
+        '--sessions',
+        required=True,
+        help='Path to sessions file (CSV, XLSX, or MD) with columns: session_name, max_attendees, '
+             'presenters, length, required, priority, number_of_sessions, max_per_day'
+    )
+    
+    parser.add_argument(
+        '--locations',
+        required=True,
+        help='Path to locations file (CSV, XLSX, or MD) with columns: location_name, soft_limit, '
+             'hard_limit, time_available'
+    )
+    
+    parser.add_argument(
+        '--time',
+        help='Global time constraints (e.g., "8am-12pm,1pm-5pm"). Overrides location times if more restrictive'
+    )
+    
+    parser.add_argument(
+        '--days',
+        type=int,
+        default=1,
+        help='Number of days to schedule across (default: 1)'
+    )
+    
+    parser.add_argument(
+        '--day-names',
+        help='CSV string of custom day names in order (e.g., "Monday,Tuesday,Wednesday"). '
+             'If not specified, defaults to "Day 1", "Day 2", etc.'
+    )
+    
+    parser.add_argument(
+        '--blackout',
+        help='JSON array of blackout periods. Format: \'[{"day": 0, "time": ["12pm-1pm"], "name": "Lunch"}]\''
+    )
+    
+    parser.add_argument(
+        '--slice',
+        default='60m',
+        help='Time increment for schedule display (default: 60m). Examples: 30m, 1h'
+    )
+    
+    parser.add_argument(
+        '--include-overlaps',
+        action='store_true',
+        help='Allow scheduling conflicts but mark them with "(overlap)" for manual resolution'
+    )
+    
+    parser.add_argument(
+        '--format',
+        choices=['md', 'csv', 'xlsx'],
+        default='md',
+        help='Output format (default: md)'
+    )
+    
+    parser.add_argument(
+        '--output',
+        help='Output file path. If not specified, outputs to stdout'
+    )
+    
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Show scheduling statistics and unscheduled sessions'
+    )
+    
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug output to stderr for troubleshooting'
+    )
+    
+    return parser
+
+
+def main():
+    """Main entry point"""
+    parser = create_arg_parser()
+    args = parser.parse_args()
+    
+    # Set global debug flag
+    global DEBUG
+    DEBUG = args.debug
+    
+    if DEBUG:
+        debug_log("Debug mode enabled")
+        debug_log(f"Arguments: {vars(args)}")
+    
+    try:
+        # Read input files
+        attendees_df = read_input_file(args.attendees, "attendees")
+        sessions_df = read_input_file(args.sessions, "sessions")
+        locations_df = read_input_file(args.locations, "locations")
+        
+        # Validate and parse data
+        attendees = validate_attendees(attendees_df, sessions_df)
+        sessions = validate_sessions(sessions_df, attendees)
+        locations = validate_locations(locations_df)
+        
+        # Parse other parameters
+        global_time = parse_time_list(args.time) if args.time else None
+        blackouts = parse_blackout(args.blackout) if args.blackout else []
+        slice_duration = parse_slice_duration(args.slice)
+        day_names = parse_day_names(args.day_names, args.days)
+        
+        # Validate days vs blackouts
+        max_blackout_day = max([b['day'] for b in blackouts], default=-1)
+        if max_blackout_day >= args.days:
+            raise SchedulingError(
+                f"Blackout day {max_blackout_day} exceeds number of days ({args.days})"
+            )
+        
+        # Generate time slots
+        time_slots = generate_time_slots(
+            args.days, global_time, locations, blackouts, slice_duration
+        )
+        
+        if not time_slots or all(len(slots) == 0 for slots in time_slots.values()):
+            raise SchedulingError(
+                "No available time slots found. Check time constraints and blackout periods."
+            )
+        
+        # Run scheduler
+        scheduler = Scheduler(sessions, locations, attendees, time_slots, args.include_overlaps)
+        scheduler.run()
+        
+        # Generate output
+        if args.format == 'md':
+            output = generate_markdown_output(
+                scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
+            )
+            if args.output:
+                with open(args.output, 'w') as f:
+                    f.write(output)
+            else:
+                print(output)
+                
+        elif args.format == 'csv':
+            output = generate_csv_output(
+                scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
+            )
+            if args.output:
+                with open(args.output, 'w') as f:
+                    f.write(output)
+            else:
+                print(output)
+                
+        elif args.format == 'xlsx':
+            if not args.output:
+                raise SchedulingError("Excel format requires --output parameter")
+            generate_xlsx_output(
+                scheduler.schedule, locations, args.days, time_slots, 
+                blackouts, slice_duration, args.output, day_names
+            )
+            print(f"Schedule written to {args.output}")
+        
+        # Show verbose output
+        if args.verbose:
+            print("\n--- Scheduling Statistics ---", file=sys.stderr)
+            print(f"Sessions scheduled: {len(scheduler.schedule)}", file=sys.stderr)
+            
+            if scheduler.unscheduled_sessions:
+                print(f"\nUnscheduled sessions ({len(scheduler.unscheduled_sessions)}):", file=sys.stderr)
+                for session, reason in scheduler.unscheduled_sessions:
+                    print(f"  - {session.name}: {reason}", file=sys.stderr)
+            
+            # Calculate metrics
+            total_conflicts = sum(
+                1 for s in scheduler.schedule 
+                if any("(overlap)" in str(a) for a in s.attendees)
+            )
+            print(f"\nTotal conflicts: {total_conflicts}", file=sys.stderr)
+            
+            # Room utilization
+            room_usage = defaultdict(int)
+            for scheduled in scheduler.schedule:
+                room_usage[scheduled.location.name] += 1
+            
+            print("\nRoom utilization:", file=sys.stderr)
+            for room, count in sorted(room_usage.items()):
+                print(f"  - {room}: {count} sessions", file=sys.stderr)
+    
+    except SchedulingError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+# CSV string writer helper
+class StringWriter:
+    def __init__(self):
+        self.rows = []
+    
+    def writerow(self, row):
+        self.rows.append(row)
+    
+    def getvalue(self):
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        for row in self.rows:
+            writer.writerow(row)
+        return output.getvalue()
+
+
+if __name__ == '__main__':
+    main()

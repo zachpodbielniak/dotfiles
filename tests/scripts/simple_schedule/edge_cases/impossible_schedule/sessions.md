@@ -1,0 +1,7 @@
+# Impossible Schedule - Sessions
+
+| session_name | max_attendees | presenters | length | required | priority | number_of_sessions | max_per_day |
+|--------------|---------------|------------|--------|----------|----------|--------------------|-------------|
+| Session A    | 3             | Presenter1 | 120    | true     | -10      | 1                  | 1           |
+| Session B    | 3             | Presenter2 | 120    | true     | -10      | 1                  | 1           |
+| Session C    | 3             | Presenter3 | 120    | true     | -10      | 1                  | 1           |

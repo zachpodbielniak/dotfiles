@@ -1,0 +1,7 @@
+# Basic Test - Sessions
+
+| session_name     | max_attendees | presenters | length | required | priority | number_of_sessions | max_per_day |
+|------------------|---------------|------------|--------|----------|----------|--------------------|-------------|
+| Morning Workshop | 3             | Alice      | 90     | false    | 0        | 1                  | 1           |
+| Afternoon Talk   | 0             | Bob        | 60     | false    | 5        | 1                  | 1           |
+| Evening Panel    | 4             | Carol      | 45     | false    | 10       | 1                  | 1           |

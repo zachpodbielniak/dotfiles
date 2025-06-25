@@ -1,0 +1,8 @@
+# Day Names Test - Attendees
+
+| attendee_name | Opening Keynote | Workshop A | Workshop B | Closing Session |
+|---------------|-----------------|------------|------------|-----------------|
+| Alice         | 1               | x          | 1          | 1               |
+| Bob           | 1               | 1          |            | 1               |
+| Carol         | 1               |            | x          | 1               |
+| David         | 1               | 1          | 1          | 1               |
