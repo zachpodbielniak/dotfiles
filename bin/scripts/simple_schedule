@@ -81,6 +81,7 @@ class Location:
     soft_limit: int
     hard_limit: int
     time_available: List[Tuple[datetime, datetime]]
+    days_available: Optional[Set[int]] = None  # None means available all days
 
 
 @dataclass
@@ -492,6 +493,7 @@ def validate_locations(df: pd.DataFrame) -> List[Location]:
         raise SchedulingError("Locations file is empty")
     
     required_cols = ['location_name', 'soft_limit', 'hard_limit', 'time_available']
+    optional_cols = ['days_available']
     
     # Check column names (case-insensitive)
     df_cols_lower = [col.lower() for col in df.columns]
@@ -514,6 +516,13 @@ def validate_locations(df: pd.DataFrame) -> List[Location]:
             f"Expected columns: {', '.join(required_cols)}"
         )
     
+    # Check for optional columns
+    for opt_col in optional_cols:
+        for i, df_col in enumerate(df_cols_lower):
+            if opt_col.lower() == df_col:
+                col_mapping[opt_col] = df.columns[i]
+                break
+    
     locations = []
     
     for idx, row in df.iterrows():
@@ -532,11 +541,30 @@ def validate_locations(df: pd.DataFrame) -> List[Location]:
             time_available_str = str(row[col_mapping['time_available']]).strip()
             time_available = parse_time_list(time_available_str)
             
+            # Parse days_available if column exists
+            days_available = None
+            if 'days_available' in col_mapping:
+                days_str = str(row[col_mapping['days_available']]).strip()
+                if days_str and not pd.isna(row[col_mapping['days_available']]):
+                    try:
+                        # Parse CSV string of day indices (0-based)
+                        days_available = set()
+                        for day_str in days_str.split(','):
+                            day_str = day_str.strip()
+                            if day_str:
+                                day_num = int(day_str)
+                                if day_num < 0:
+                                    raise ValueError(f"Day index must be >= 0, got {day_num}")
+                                days_available.add(day_num)
+                    except ValueError as e:
+                        raise ValueError(f"Invalid days_available format: {e}")
+            
             locations.append(Location(
                 name=name,
                 soft_limit=soft_limit,
                 hard_limit=hard_limit,
-                time_available=time_available
+                time_available=time_available,
+                days_available=days_available
             ))
             
         except ValueError as e:
@@ -637,6 +665,10 @@ def generate_time_slots(
         # Start with location availability
         day_ranges = []
         for location in locations:
+            # Skip locations not available on this day
+            if location.days_available is not None and day not in location.days_available:
+                continue
+                
             for start, end in location.time_available:
                 if global_time:
                     # Intersect with global time constraints
@@ -729,6 +761,12 @@ class Scheduler:
     
     def fits_in_location(self, session: Session, location: Location, time_slot: TimeSlot) -> bool:
         """Check if session fits in location during time slot"""
+        # Check day availability first
+        if location.days_available is not None and time_slot.day not in location.days_available:
+            if DEBUG:
+                debug_log(f"        Location not available on day {time_slot.day}", 6)
+            return False
+        
         # Check time availability
         slot_fits = False
         for start, end in location.time_available:
@@ -971,8 +1009,15 @@ def generate_markdown_output(
         
         sorted_times = sorted(all_times)
         
-        # Create table header
-        header = ["Time"] + [loc.name for loc in locations]
+        # Create table header (deduplicate location names for display)
+        unique_location_names = []
+        seen_names = set()
+        for loc in locations:
+            if loc.name not in seen_names:
+                unique_location_names.append(loc.name)
+                seen_names.add(loc.name)
+        
+        header = ["Time"] + unique_location_names
         output.append("| " + " | ".join(header) + " |")
         output.append("|" + "|".join(["-" * (len(h) + 2) for h in header]) + "|")
         
@@ -992,15 +1037,15 @@ def generate_markdown_output(
                             break
             
             if is_blackout:
-                for _ in locations:
+                for _ in unique_location_names:
                     row.append(f"-- {blackout_name} --")
             else:
-                for location in locations:
-                    # Find session at this time and location
+                for location_name in unique_location_names:
+                    # Find session at this time and location name
                     session_found = False
                     for scheduled in schedule:
                         if (scheduled.time_slot.day == day and
-                            scheduled.location.name == location.name and
+                            scheduled.location.name == location_name and
                             time >= scheduled.time_slot.start_time and
                             time < scheduled.time_slot.end_time):
                             
@@ -1039,8 +1084,15 @@ def generate_csv_output(
     output = []
     writer = StringWriter()
     
-    # Write header
-    header = ["Day", "Time"] + [loc.name for loc in locations]
+    # Write header (deduplicate location names)
+    unique_location_names = []
+    seen_names = set()
+    for loc in locations:
+        if loc.name not in seen_names:
+            unique_location_names.append(loc.name)
+            seen_names.add(loc.name)
+    
+    header = ["Day", "Time"] + unique_location_names
     writer.writerow(header)
     
     for day in range(days):
@@ -1079,15 +1131,15 @@ def generate_csv_output(
                             break
             
             if is_blackout:
-                for _ in locations:
+                for _ in unique_location_names:
                     row.append(f"{blackout_name} (blackout)")
             else:
-                for location in locations:
+                for location_name in unique_location_names:
                     # Find session at this time and location
                     session_found = False
                     for scheduled in schedule:
                         if (scheduled.time_slot.day == day and
-                            scheduled.location.name == location.name and
+                            scheduled.location.name == location_name and
                             time >= scheduled.time_slot.start_time and
                             time < scheduled.time_slot.end_time):
                             
@@ -1167,8 +1219,15 @@ def generate_xlsx_output(
         
         sorted_times = sorted(all_times)
         
-        # Write header
-        header = ["Time"] + [loc.name for loc in locations]
+        # Write header (deduplicate location names)
+        unique_location_names = []
+        seen_names = set()
+        for loc in locations:
+            if loc.name not in seen_names:
+                unique_location_names.append(loc.name)
+                seen_names.add(loc.name)
+        
+        header = ["Time"] + unique_location_names
         ws.append(header)
         
         # Style header
@@ -1194,15 +1253,15 @@ def generate_xlsx_output(
                             break
             
             if is_blackout:
-                for _ in locations:
+                for _ in unique_location_names:
                     row.append(blackout_name)
             else:
-                for location in locations:
+                for location_name in unique_location_names:
                     # Find session at this time and location
                     session_found = False
                     for scheduled in schedule:
                         if (scheduled.time_slot.day == day and
-                            scheduled.location.name == location.name and
+                            scheduled.location.name == location_name and
                             time >= scheduled.time_slot.start_time and
                             time < scheduled.time_slot.end_time):
                             
@@ -1233,10 +1292,10 @@ def generate_xlsx_output(
                     cell.alignment = Alignment(horizontal="center")
             else:
                 # Color code sessions
-                for col, location in enumerate(locations, start=2):
+                for col, location_name in enumerate(unique_location_names, start=2):
                     for scheduled in schedule:
                         if (scheduled.time_slot.day == day and
-                            scheduled.location.name == location.name and
+                            scheduled.location.name == location_name and
                             time >= scheduled.time_slot.start_time and
                             time < scheduled.time_slot.end_time):
                             
@@ -1323,7 +1382,8 @@ For more information, see the documentation at:
         '--locations',
         required=True,
         help='Path to locations file (CSV, XLSX, or MD) with columns: location_name, soft_limit, '
-             'hard_limit, time_available'
+             'hard_limit, time_available, and optional days_available (CSV of 0-based day indices). '
+             'Locations can be listed multiple times with different availability.'
     )
     
     parser.add_argument(

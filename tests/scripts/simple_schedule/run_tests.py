@@ -46,15 +46,26 @@ def build_command(test_dir, file_format, output_file, config):
     cmd += f" --format md --output {output_file}"
     
     # Add additional arguments from config
-    args = config.get('args', {})
-    for key, value in args.items():
-        if key == 'include-overlaps' and value:
-            cmd += f" --{key}"
-        elif isinstance(value, bool):
-            if value:
+    # Support both old 'args' format and new 'command' format
+    if 'command' in config:
+        # New format with command array
+        for i in range(0, len(config['command']), 2):
+            if config['command'][i].startswith('--') and i + 1 < len(config['command']):
+                arg = config['command'][i]
+                value = config['command'][i + 1]
+                if arg not in ['--attendees', '--sessions', '--locations', '--format', '--output']:
+                    cmd += f" {arg} '{value}'"
+    else:
+        # Old format with args dict
+        args = config.get('args', {})
+        for key, value in args.items():
+            if key == 'include-overlaps' and value:
                 cmd += f" --{key}"
-        else:
-            cmd += f" --{key} '{value}'"
+            elif isinstance(value, bool):
+                if value:
+                    cmd += f" --{key}"
+            else:
+                cmd += f" --{key} '{value}'"
     
     return cmd
 
@@ -177,7 +188,7 @@ def main():
     
     # Find all test directories
     test_dirs = []
-    for category in ['basic', 'complex', 'edge_cases', 'day_names']:
+    for category in ['basic', 'complex', 'edge_cases', 'day_names', 'days_available']:
         category_dir = test_base / category
         if category_dir.exists():
             if category == 'edge_cases':
@@ -186,7 +197,7 @@ def main():
                     if subdir.is_dir() and (subdir / 'attendees.csv').exists():
                         test_dirs.append(subdir)
             else:
-                # Basic, complex, and day_names are direct test directories
+                # Basic, complex, day_names, and days_available are direct test directories
                 if (category_dir / 'attendees.csv').exists():
                     test_dirs.append(category_dir)
     
