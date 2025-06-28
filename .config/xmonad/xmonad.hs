@@ -7,6 +7,7 @@ import System.Posix.Env (getEnv)
 import Data.Maybe (maybe, fromMaybe)
 
 import XMonad
+import qualified XMonad.StackSet as W
 import XMonad.Util.EZConfig (additionalKeysP)
 import XMonad.Layout.Spacing
 import XMonad.Layout.ThreeColumns
@@ -26,6 +27,8 @@ import XMonad.Config.Gnome
 import XMonad.Config.Kde
 import XMonad.Config.Xfce
 
+import XMonad.Actions.FloatKeys
+
 import System.Environment
 import System.Process
 import System.Posix.Process (forkProcess)
@@ -33,6 +36,7 @@ import Control.Concurrent (forkIO)
 import Data.IntMap (update)
 import Data.List
 import Data.Char
+import qualified Data.Map as M
 
 
 --                      _              _              _   _   _                 
@@ -146,6 +150,7 @@ myConfig = def
     , ("M-S-p", lockAndSuspend)
     , ("M-C-r", restartXmonad)
     , ("M-f", sendMessage $ TGL.Toggle "Full")
+    , ("M-S-f", withFocused toggleFloat)
     , ("M-<XF86MonBrightnessUp>", spawn "brightnessctl set 10%+")
     , ("M-<XF86MonBrightnessDown>", spawn "brightnessctl set 10%-")
     , ("M-<XF86KbdBrightnessUp>", spawn "brightnessctl set 10%+")
@@ -162,6 +167,18 @@ myConfig = def
     , ("C-M1-8", spawn $ toggleHassCmd "server-room")
     , ("C-M1-9", spawn $ toggleHassCmd "fan-01")
     , ("C-M1-0", spawn $ toggleHassCmd "fan-02")
+
+    -- Floating window stuff
+    -- Move with Mod+Ctrl+<hjkl>
+    , ("M-C-h", withFocused $ keysMoveWindow (-20,0))
+    , ("M-C-l", withFocused $ keysMoveWindow (20,0))
+    , ("M-C-k", withFocused $ keysMoveWindow (0,-20))
+    , ("M-C-j", withFocused $ keysMoveWindow (0,20))
+    -- Resize with Mod+Alt+<hjkl>
+    , ("M-M1-h", withFocused $ keysResizeWindow (-20,0) (1,0))
+    , ("M-M1-l", withFocused $ keysResizeWindow (20,0) (1,0))
+    , ("M-M1-k", withFocused $ keysResizeWindow (0,-20) (0,1))
+    , ("M-M1-j", withFocused $ keysResizeWindow (0,20) (0,1))
     ]   
 
 
@@ -207,6 +224,23 @@ myXmobarPP = def
         white = xmobarColor "#f8f8f2" ""
         yellow = xmobarColor "#f1fa8c" ""
 
+
+
+
+--           _           _                 _          _                     
+-- __      _(_)_ __   __| | _____      __ | |__   ___| |_ __   ___ _ __ ___ 
+-- \ \ /\ / / | '_ \ / _` |/ _ \ \ /\ / / | '_ \ / _ \ | '_ \ / _ \ '__/ __|
+--  \ V  V /| | | | | (_| | (_) \ V  V /  | | | |  __/ | |_) |  __/ |  \__ \
+--   \_/\_/ |_|_| |_|\__,_|\___/ \_/\_/   |_| |_|\___|_| .__/ \___|_|  |___/
+--                                                     |_|                  
+
+-- Helper function to toggle floating of a window
+toggleFloat :: Window -> X ()
+toggleFloat w = do 
+    floats <- gets $ W.floating . windowset 
+    if M.member w floats 
+        then withFocused $ windows . W.sink 
+        else float w
 
 
 
