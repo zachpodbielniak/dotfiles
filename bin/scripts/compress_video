@@ -53,6 +53,12 @@ PARALLEL_JOBS=1
 PARALLEL_TYPE=""
 PARALLEL_CHILD=false
 
+# Media library directories (easy to change for different mount points)
+MOVIES_DIR="${HOME}/.mnt/nas/Media/Movies"
+TV_SERIES_DIR="${HOME}/.mnt/nas/Media/TV Series"
+IS_MOVIE=false
+IS_TV_SERIES=false
+
 # Quality presets (CRF values)
 declare -A QUALITY_PRESETS=(
     ["low"]="28"
@@ -122,6 +128,8 @@ OPTIONS:
     --list-encoders            List available video encoders in the container
     --prefer-software          Prefer software encoding over hardware acceleration
     --parallel N               Process N files in parallel (default: 1)
+    --movie                    Copy completed file to movies library directory
+    --tv-series                Copy completed file to TV series library directory
 
 EXAMPLES:
     # Basic compression with defaults (H.265, medium quality)
@@ -156,6 +164,13 @@ EXAMPLES:
     
     # Parallel processing with journal
     compress_video --parallel 3 --journal *.mp4
+    
+    # Compress movie and copy to movies library
+    compress_video --movie "Avatar.mkv"
+    
+    # Compress TV series episode and organize by series/season
+    compress_video --tv-series "The Office - S03E04 - The Convention.mkv"
+    compress_video --tv-series "The Office - S03E05.mkv"  # Also works without episode title
     
 JOURNAL ANALYSIS EXAMPLES:
     # Enable journal and compress videos
@@ -547,6 +562,14 @@ parse_args() {
                 PARALLEL_CHILD=true
                 shift
                 ;;
+            --movie)
+                IS_MOVIE=true
+                shift
+                ;;
+            --tv-series)
+                IS_TV_SERIES=true
+                shift
+                ;;
             -*)
                 error "Unknown option: $1"
                 show_help
@@ -572,6 +595,12 @@ parse_args() {
     # Check for conflicting options
     if [[ -n "${OUTPUT_FILE:-}" ]] && [[ ${#INPUT_FILES[@]} -gt 1 ]]; then
         error "Cannot use --output-file with multiple input files"
+        exit 1
+    fi
+    
+    # Check for conflicting media library options
+    if [[ "$IS_MOVIE" == "true" ]] && [[ "$IS_TV_SERIES" == "true" ]]; then
+        error "Cannot use both --movie and --tv-series options"
         exit 1
     fi
 }
@@ -846,6 +875,15 @@ process_video() {
             add_to_journal "$input_file" "$output_file" "FAILED" "Compression failed"
             return 1
         fi
+        
+        # Copy to media library if requested
+        if [[ "$DRY_RUN" == "false" ]] && [[ -f "$output_file" ]]; then
+            if [[ "$IS_MOVIE" == "true" ]]; then
+                copy_to_movie_library "$output_file"
+            elif [[ "$IS_TV_SERIES" == "true" ]]; then
+                copy_to_tv_series_library "$output_file"
+            fi
+        fi
     else
         log "[DRY RUN] Would execute: ${podman_cmd[*]}"
         # Add dry run entry to journal
@@ -871,8 +909,68 @@ check_parallel() {
     fi
 }
 
+# Copy file to movie library
+copy_to_movie_library() {
+    local output_file="$1"
+    local basename="$(basename "$output_file")"
+    local name="${basename%.*}"
+    
+    # Create movie directory
+    local movie_dir="${MOVIES_DIR}/${name}"
+    if [[ ! -d "$movie_dir" ]]; then
+        debug "Creating movie directory: $movie_dir"
+        mkdir -p "$movie_dir"
+    fi
+    
+    # Copy file with rsync
+    local dest_file="${movie_dir}/${basename}"
+    log "Copying to movie library: $dest_file"
+    if rsync -ruhv --progress "$output_file" "$dest_file"; then
+        log "Successfully copied to movie library"
+    else
+        error "Failed to copy to movie library"
+        return 1
+    fi
+}
+
+# Copy file to TV series library
+copy_to_tv_series_library() {
+    local output_file="$1"
+    local basename="$(basename "$output_file")"
+    
+    # Extract series name (everything before the first ' - ')
+    local series_name="${basename%% - *}"
+    
+    # Extract season number from SxxExx pattern
+    local season=""
+    if [[ "$basename" =~ S([0-9]{2})E[0-9]{2} ]]; then
+        season="${BASH_REMATCH[1]}"
+    else
+        error "Could not extract season number from filename: $basename"
+        error "Expected format: 'Series Name - SxxExx - Episode Title.ext' or 'Series Name - SxxExx.ext'"
+        return 1
+    fi
+    
+    # Create TV series directory structure
+    local tv_dir="${TV_SERIES_DIR}/${series_name}/Season ${season}"
+    if [[ ! -d "$tv_dir" ]]; then
+        debug "Creating TV series directory: $tv_dir"
+        mkdir -p "$tv_dir"
+    fi
+    
+    # Copy file with rsync
+    local dest_file="${tv_dir}/${basename}"
+    log "Copying to TV series library: $dest_file"
+    if rsync -ruhv --progress "$output_file" "$dest_file"; then
+        log "Successfully copied to TV series library"
+    else
+        error "Failed to copy to TV series library"
+        return 1
+    fi
+}
+
 # Export function for parallel to use
-export -f process_video log error debug is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args
+export -f process_video log error debug is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library
 
 # Wrapper function that parallel can call
 process_video_wrapper() {
@@ -949,6 +1047,7 @@ main() {
             export QUALITY CUSTOM_CRF VIDEO_CODEC AUDIO_CODEC OUTPUT_FORMAT USE_HWACCEL PREFER_VULKAN
             export PREFER_SOFTWARE CONTAINER_IMAGE HWACCEL_DEVICE VERBOSE DRY_RUN USE_JOURNAL 
             export JOURNAL_FILE FORCE_RECONVERT RESOLUTION BITRATE FFMPEG_PRESET PARALLEL_TYPE
+            export IS_MOVIE IS_TV_SERIES MOVIES_DIR TV_SERIES_DIR
             
             # Process jobs in parallel
             local parallel_failed=0
@@ -981,6 +1080,8 @@ main() {
                 [[ "$USE_JOURNAL" == "true" ]] && cmd_args+=("--journal")
                 [[ -n "$JOURNAL_FILE" ]] && [[ "$JOURNAL_FILE" != "./compress_video_journal.md" ]] && cmd_args+=("--journal-file" "$JOURNAL_FILE")
                 [[ "$FORCE_RECONVERT" == "true" ]] && cmd_args+=("--force-reconvert")
+                [[ "$IS_MOVIE" == "true" ]] && cmd_args+=("--movie")
+                [[ "$IS_TV_SERIES" == "true" ]] && cmd_args+=("--tv-series")
                 
                 # Process files one by one in parallel using moreutils syntax
                 # Extract just the input files from job_list
