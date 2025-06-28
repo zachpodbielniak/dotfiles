@@ -1,0 +1,635 @@
+#!/usr/bin/python3
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Now import everything else inside the dev container
+import argparse
+import hashlib
+import json
+import re
+import stat
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Try to import database dependencies
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extras import RealDictCursor
+    DB_AVAILABLE = True
+except ImportError:
+    print("Error: psycopg2 is required for notes", file=sys.stderr)
+    print("Install with: pip install psycopg2-binary", file=sys.stderr)
+    sys.exit(1)
+
+# Try to import markdown parser
+try:
+    import frontmatter
+    FRONTMATTER_AVAILABLE = True
+except ImportError:
+    FRONTMATTER_AVAILABLE = False
+
+# Database configuration for notes storage
+NOTES_DB_CONFIG = {
+    'host': os.environ.get('NOTES_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('NOTES_DB_PORT', '5432')),
+    'database': os.environ.get('NOTES_DB_NAME', 'notes'),
+    'user': os.environ.get('NOTES_DB_USER', 'postgres'),
+    'password': os.environ.get('NOTES_DB_PASSWORD', '')
+}
+
+# Default notes directory
+DEFAULT_NOTES_DIR = os.environ.get('NOTES_DIR', '/var/home/zach/Documents/notes')
+
+# PARA categories
+PARA_CATEGORIES = {
+    '00_inbox': 'inbox',
+    '01_projects': 'projects',
+    '02_areas': 'areas',
+    '03_resources': 'resources',
+    '04_archives': 'archives'
+}
+
+def get_para_category(file_path):
+    """Extract PARA category from file path."""
+    path_parts = Path(file_path).parts
+    for part in path_parts:
+        if part in PARA_CATEGORIES:
+            return PARA_CATEGORIES[part]
+    return 'inbox'  # Default to inbox if no PARA folder found
+
+def get_relative_path(file_path, notes_dir):
+    """Get path relative to notes directory."""
+    try:
+        return str(Path(file_path).relative_to(Path(notes_dir)))
+    except ValueError:
+        return str(file_path)
+
+def extract_category_from_path(file_path):
+    """Extract category from file path (second level after PARA)."""
+    path_parts = Path(file_path).parts
+    para_found = False
+    for i, part in enumerate(path_parts):
+        if part in PARA_CATEGORIES:
+            para_found = True
+        elif para_found and i < len(path_parts) - 1:
+            # Return the next directory after PARA (if it's not the file itself)
+            return part
+    return None
+
+def read_file_content(file_path):
+    """Read file content, handling both markdown and neorg files."""
+    try:
+        # Skip 00_index.md files
+        if Path(file_path).name == '00_index.md':
+            return None, None
+            
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        
+        # Skip files with NUL characters
+        if '\x00' in content:
+            return None, None
+            
+        # Extract frontmatter if available
+        metadata = {}
+        if FRONTMATTER_AVAILABLE and file_path.endswith('.md'):
+            try:
+                post = frontmatter.loads(content)
+                metadata = post.metadata
+                content = post.content
+            except:
+                pass
+        
+        return content, metadata
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}", file=sys.stderr)
+        return None, None
+
+def get_file_stats(file_path):
+    """Get file statistics."""
+    try:
+        stat_info = os.stat(file_path)
+        # Import timezone support
+        from datetime import timezone
+        
+        # Create timezone-aware timestamps
+        return {
+            'size': stat_info.st_size,
+            'modified': datetime.fromtimestamp(stat_info.st_mtime, tz=timezone.utc),
+            'accessed': datetime.fromtimestamp(stat_info.st_atime, tz=timezone.utc),
+            'created': datetime.fromtimestamp(stat_info.st_ctime, tz=timezone.utc)
+        }
+    except Exception as e:
+        print(f"Error getting file stats for {file_path}: {e}", file=sys.stderr)
+        from datetime import timezone
+        return {
+            'size': 0,
+            'modified': datetime.now(tz=timezone.utc),
+            'accessed': datetime.now(tz=timezone.utc),
+            'created': datetime.now(tz=timezone.utc)
+        }
+
+def sync_note_to_db(conn, file_path, notes_dir, debug=False):
+    """Sync a single note file to the database.
+    
+    Returns: tuple (success, action) where action is 'added', 'updated', 'skipped', or 'error'
+    """
+    relative_path = get_relative_path(file_path, notes_dir)
+    para = get_para_category(file_path)
+    category = extract_category_from_path(file_path)
+    
+    content, metadata = read_file_content(file_path)
+    
+    # Skip if content couldn't be read
+    if content is None:
+        return False, 'error'
+    
+    file_stats = get_file_stats(file_path)
+    
+    # Extract tags from metadata
+    tags = metadata.get('tags', [])
+    if isinstance(tags, str):
+        tags = [tags]
+    
+    # Prepare data for database
+    note_data = {
+        'path': relative_path,
+        'para': para,
+        'category': category,
+        'content': content,
+        'file_size': file_stats['size'],
+        'last_modified': file_stats['modified'],
+        'created_at': file_stats['created'],
+        'accessed_at': file_stats['accessed'],
+        'metadata': json.dumps(metadata),
+        'tags': tags
+    }
+    
+    cursor = conn.cursor()
+    try:
+        # Check if note already exists
+        cursor.execute("SELECT id, updated_at, last_modified FROM notes WHERE path = %s", (relative_path,))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Only update if file is newer than database record
+            from datetime import timezone
+            db_last_modified = existing[2] if existing[2] else datetime.min.replace(tzinfo=timezone.utc)
+            
+            if note_data['last_modified'] > db_last_modified:
+                # Update existing note
+                cursor.execute("""
+                    UPDATE notes SET
+                        para = %s,
+                        category = %s,
+                        content = %s,
+                        file_size = %s,
+                        last_modified = %s,
+                        accessed_at = %s,
+                        metadata = %s,
+                        tags = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE path = %s
+                """, (
+                    note_data['para'],
+                    note_data['category'],
+                    note_data['content'],
+                    note_data['file_size'],
+                    note_data['last_modified'],
+                    note_data['accessed_at'],
+                    note_data['metadata'],
+                    note_data['tags'],
+                    relative_path
+                ))
+                if debug:
+                    print(f"Updated: {relative_path}")
+                conn.commit()
+                return True, 'updated'
+            else:
+                if debug:
+                    print(f"Skipped (not modified): {relative_path}")
+                return True, 'skipped'
+        else:
+            # Insert new note
+            cursor.execute("""
+                INSERT INTO notes (path, para, category, content, file_size, 
+                                 last_modified, created_at, accessed_at, metadata, tags)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                note_data['path'],
+                note_data['para'],
+                note_data['category'],
+                note_data['content'],
+                note_data['file_size'],
+                note_data['last_modified'],
+                note_data['created_at'],
+                note_data['accessed_at'],
+                note_data['metadata'],
+                note_data['tags']
+            ))
+            if debug:
+                print(f"Added: {relative_path}")
+            conn.commit()
+            return True, 'added'
+    except Exception as e:
+        conn.rollback()
+        print(f"Error syncing {relative_path}: {e}", file=sys.stderr)
+        return False, 'error'
+    finally:
+        cursor.close()
+
+def sync_all_notes(notes_dir, debug=False, quiet=False):
+    """Sync all notes from the file system to the database."""
+    if not quiet:
+        print(f"Syncing notes from {notes_dir}...")
+    
+    # Connect to database
+    conn = psycopg2.connect(**NOTES_DB_CONFIG)
+    
+    # Find all markdown and neorg files in PARA directories only
+    note_files = []
+    para_dirs = ['00_inbox', '01_projects', '02_areas', '03_resources', '04_archives']
+    
+    for para_dir in para_dirs:
+        para_path = Path(notes_dir) / para_dir
+        if para_path.exists():
+            for ext in ['*.md', '*.norg']:
+                note_files.extend(para_path.rglob(ext))
+    
+    # Track statistics
+    added = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+    
+    # Sync each file
+    total_files = len(note_files)
+    for i, note_file in enumerate(note_files):
+        if not quiet and i % 100 == 0:
+            print(f"Progress: {i}/{total_files} files processed...")
+        
+        success, action = sync_note_to_db(conn, str(note_file), notes_dir, debug)
+        if success:
+            if action == 'added':
+                added += 1
+            elif action == 'updated':
+                updated += 1
+            elif action == 'skipped':
+                skipped += 1
+        else:
+            errors += 1
+    
+    # Clean up deleted files
+    cursor = conn.cursor()
+    cursor.execute("SELECT path FROM notes")
+    db_paths = set(row[0] for row in cursor.fetchall())
+    
+    fs_paths = set(get_relative_path(str(f), notes_dir) for f in note_files)
+    deleted_paths = db_paths - fs_paths
+    
+    for path in deleted_paths:
+        cursor.execute("DELETE FROM notes WHERE path = %s", (path,))
+        if debug:
+            print(f"Deleted: {path}")
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    if not quiet:
+        print(f"\nSync complete:")
+        print(f"  Files processed: {len(note_files)}")
+        print(f"  Added: {added}")
+        print(f"  Updated: {updated}")
+        print(f"  Skipped: {skipped}")
+        print(f"  Deleted from DB: {len(deleted_paths)}")
+        if errors > 0:
+            print(f"  Errors: {errors}")
+
+def search_notes(query, para=None, category=None, tags=None, limit=20, offset=0, order_by='last_modified', debug=False):
+    """Search notes in the database."""
+    conn = psycopg2.connect(**NOTES_DB_CONFIG)
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Build query
+    sql_parts = []
+    params = []
+    
+    # Full text search
+    if query:
+        sql_parts.append("to_tsvector('english', content) @@ plainto_tsquery('english', %s)")
+        params.append(query)
+    
+    # PARA filter
+    if para:
+        sql_parts.append("para = %s")
+        params.append(para)
+    
+    # Category filter
+    if category:
+        sql_parts.append("category = %s")
+        params.append(category)
+    
+    # Tags filter
+    if tags:
+        sql_parts.append("%s::text[] && tags")
+        params.append(tags)
+    
+    # Build final query
+    where_clause = " AND ".join(sql_parts) if sql_parts else "1=1"
+    
+    # Map order_by options
+    order_map = {
+        'modified': 'last_modified DESC',
+        'last_modified': 'last_modified DESC',
+        'created': 'created_at DESC',
+        'created_at': 'created_at DESC',
+        'accessed': 'accessed_at DESC',
+        'accessed_at': 'accessed_at DESC',
+        'size': 'file_size DESC',
+        'path': 'path ASC',
+        'relevance': 'ts_rank(content_vector, plainto_tsquery(\'english\', %s)) DESC' if query else 'last_modified DESC'
+    }
+    
+    order_clause = order_map.get(order_by, 'last_modified DESC')
+    
+    # Add relevance parameter if needed
+    if order_by == 'relevance' and query:
+        params.append(query)
+    
+    sql = f"""
+        SELECT id, path, para, category, 
+               substring(content, 1, 200) as snippet,
+               file_size, last_modified, created_at, accessed_at,
+               metadata, tags
+        FROM notes
+        WHERE {where_clause}
+        ORDER BY {order_clause}
+        LIMIT %s OFFSET %s
+    """
+    
+    params.extend([limit, offset])
+    
+    if debug:
+        print(f"SQL: {sql}")
+        print(f"Params: {params}")
+    
+    cursor.execute(sql, params)
+    results = cursor.fetchall()
+    
+    cursor.close()
+    conn.close()
+    
+    return results
+
+def fzf_select_note(results, notes_dir):
+    """Use fzf to select a note from search results."""
+    if not results:
+        print("No notes found.")
+        return None
+    
+    # Format results for fzf
+    fzf_input = []
+    for i, note in enumerate(results):
+        modified = note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'
+        line = f"{i:3d} | {note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}"
+        fzf_input.append(line)
+    
+    # Run fzf
+    try:
+        proc = subprocess.Popen(
+            ['fzf', '--ansi', '--no-sort', '--reverse', '--tiebreak=index'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        stdout, _ = proc.communicate('\n'.join(fzf_input))
+        
+        if proc.returncode == 0 and stdout.strip():
+            # Extract index from selected line
+            selected_index = int(stdout.strip().split('|')[0].strip())
+            return results[selected_index]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: fzf not found. Install fzf to use interactive selection.")
+        return None
+    
+    return None
+
+def open_note_in_editor(note_path, notes_dir):
+    """Open a note in the default editor."""
+    full_path = Path(notes_dir) / note_path
+    editor = os.environ.get('EDITOR', 'vim')
+    
+    try:
+        subprocess.run([editor, str(full_path)])
+    except Exception as e:
+        print(f"Error opening {full_path}: {e}", file=sys.stderr)
+
+def stats_command(args):
+    """Show database statistics."""
+    conn = psycopg2.connect(**NOTES_DB_CONFIG)
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Overall stats
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_notes,
+            COUNT(DISTINCT para) as para_categories,
+            COUNT(DISTINCT category) as unique_categories,
+            SUM(file_size) as total_size,
+            MIN(created_at) as oldest_note,
+            MAX(last_modified) as newest_modified
+        FROM notes
+    """)
+    
+    overall = cursor.fetchone()
+    
+    print("Notes Database Statistics")
+    print("=" * 50)
+    print(f"Total notes: {overall['total_notes']}")
+    print(f"Total size: {overall['total_size'] / 1024 / 1024:.2f} MB")
+    print(f"Oldest note: {overall['oldest_note']}")
+    print(f"Most recent: {overall['newest_modified']}")
+    print()
+    
+    # PARA breakdown
+    cursor.execute("""
+        SELECT para, COUNT(*) as count, SUM(file_size) as total_size
+        FROM notes
+        GROUP BY para
+        ORDER BY 
+            CASE para
+                WHEN 'inbox' THEN 1
+                WHEN 'projects' THEN 2
+                WHEN 'areas' THEN 3
+                WHEN 'resources' THEN 4
+                WHEN 'archives' THEN 5
+            END
+    """)
+    
+    print("PARA Breakdown:")
+    for row in cursor.fetchall():
+        size_mb = row['total_size'] / 1024 / 1024 if row['total_size'] else 0
+        print(f"  {row['para']:10s}: {row['count']:5d} notes ({size_mb:6.2f} MB)")
+    print()
+    
+    # Top categories
+    cursor.execute("""
+        SELECT category, para, COUNT(*) as count
+        FROM notes
+        WHERE category IS NOT NULL
+        GROUP BY category, para
+        ORDER BY count DESC
+        LIMIT 10
+    """)
+    
+    print("Top 10 Categories:")
+    for row in cursor.fetchall():
+        print(f"  {row['para']:10s} / {row['category']:30s}: {row['count']:4d} notes")
+    
+    cursor.close()
+    conn.close()
+
+def list_command(args):
+    """List notes with optional filters."""
+    results = search_notes(
+        query=args.query,
+        para=args.para,
+        category=args.category,
+        tags=args.tags,
+        limit=args.limit,
+        order_by=args.sort,
+        debug=args.debug
+    )
+    
+    if args.json:
+        # Convert datetime objects to strings
+        for note in results:
+            for key in ['last_modified', 'created_at', 'accessed_at']:
+                if note[key]:
+                    note[key] = note[key].isoformat()
+        print(json.dumps(results, indent=2))
+    else:
+        for note in results:
+            modified = note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'
+            print(f"{note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Notes database management tool')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--notes-dir', default=DEFAULT_NOTES_DIR, help='Notes directory path')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Sync command
+    sync_parser = subparsers.add_parser('sync', help='Sync notes from filesystem to database')
+    sync_parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode')
+    
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search notes')
+    search_parser.add_argument('query', nargs='?', help='Search query')
+    search_parser.add_argument('-p', '--para', choices=['inbox', 'projects', 'areas', 'resources', 'archives'],
+                             help='Filter by PARA category')
+    search_parser.add_argument('-c', '--category', help='Filter by category')
+    search_parser.add_argument('-t', '--tags', nargs='+', help='Filter by tags')
+    search_parser.add_argument('-l', '--limit', type=int, default=20, help='Limit results')
+    search_parser.add_argument('-s', '--sort', default='modified',
+                             choices=['modified', 'created', 'accessed', 'size', 'path', 'relevance'],
+                             help='Sort order')
+    search_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    search_parser.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    # List command (alias for search)
+    list_parser = subparsers.add_parser('list', help='List notes')
+    list_parser.add_argument('query', nargs='?', help='Search query')
+    list_parser.add_argument('-p', '--para', choices=['inbox', 'projects', 'areas', 'resources', 'archives'],
+                           help='Filter by PARA category')
+    list_parser.add_argument('-c', '--category', help='Filter by category')
+    list_parser.add_argument('-t', '--tags', nargs='+', help='Filter by tags')
+    list_parser.add_argument('-l', '--limit', type=int, default=20, help='Limit results')
+    list_parser.add_argument('-s', '--sort', default='modified',
+                           choices=['modified', 'created', 'accessed', 'size', 'path', 'relevance'],
+                           help='Sort order')
+    list_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    
+    # Stats command
+    stats_parser = subparsers.add_parser('stats', help='Show database statistics')
+    
+    # FZF command (default behavior)
+    fzf_parser = subparsers.add_parser('fzf', help='Interactive note selection with fzf')
+    fzf_parser.add_argument('query', nargs='?', help='Initial search query')
+    fzf_parser.add_argument('-p', '--para', choices=['inbox', 'projects', 'areas', 'resources', 'archives'],
+                          help='Filter by PARA category')
+    fzf_parser.add_argument('-c', '--category', help='Filter by category')
+    fzf_parser.add_argument('-t', '--tags', nargs='+', help='Filter by tags')
+    
+    args = parser.parse_args()
+    
+    # Default to fzf if no command specified
+    if not args.command:
+        args.command = 'fzf'
+        args.query = None
+        args.para = None
+        args.category = None
+        args.tags = None
+    
+    # Handle commands
+    if args.command == 'sync':
+        sync_all_notes(args.notes_dir, debug=args.debug, quiet=getattr(args, 'quiet', False))
+    
+    elif args.command == 'search':
+        results = search_notes(
+            query=args.query,
+            para=args.para,
+            category=args.category,
+            tags=args.tags,
+            limit=args.limit,
+            order_by=args.sort,
+            debug=args.debug
+        )
+        
+        if args.fzf:
+            selected = fzf_select_note(results, args.notes_dir)
+            if selected:
+                open_note_in_editor(selected['path'], args.notes_dir)
+        else:
+            list_command(args)
+    
+    elif args.command == 'list':
+        list_command(args)
+    
+    elif args.command == 'stats':
+        stats_command(args)
+    
+    elif args.command == 'fzf':
+        # Always sync before interactive selection
+        sync_all_notes(args.notes_dir, debug=args.debug, quiet=True)
+        
+        # Search and select
+        results = search_notes(
+            query=args.query,
+            para=args.para,
+            category=args.category,
+            tags=args.tags,
+            limit=100,  # Get more results for fzf
+            debug=args.debug
+        )
+        
+        selected = fzf_select_note(results, args.notes_dir)
+        if selected:
+            open_note_in_editor(selected['path'], args.notes_dir)
+
+if __name__ == '__main__':
+    main()

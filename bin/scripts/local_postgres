@@ -9,6 +9,7 @@ set -euo pipefail
 SYNC_DATABASES=(
     "transcriptions"
     "ai_chats"
+    "notes"
     "postgres"  # For pgvector/second_brain_vectors table
 )
 
@@ -343,11 +344,78 @@ init_ai_chats_schema() {
     echo "AI chats schema initialized successfully"
 }
 
+# Initialize notes schema
+init_notes_schema() {
+    echo "Initializing notes schema..."
+    
+    # Create notes database if it doesn't exist
+    if ! database_exists "notes"; then
+        echo "Creating notes database..."
+        execute_sql "CREATE DATABASE notes" "postgres" || return 1
+    fi
+    
+    # Create update trigger function in notes database
+    execute_sql "
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS \$\$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    \$\$ language 'plpgsql';" "notes" || return 1
+    
+    # Create main notes table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS notes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        path TEXT NOT NULL UNIQUE,
+        para VARCHAR(20) NOT NULL,
+        category VARCHAR(100),
+        content TEXT NOT NULL,
+        content_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+        file_size BIGINT,
+        last_modified TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        accessed_at TIMESTAMP WITH TIME ZONE,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        metadata JSONB DEFAULT '{}',
+        tags TEXT[],
+        CONSTRAINT valid_para CHECK (para IN ('inbox', 'projects', 'areas', 'resources', 'archives'))
+    );" "notes" || return 1
+    
+    # Create indexes
+    echo "Creating indexes..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_path ON notes(path);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_para ON notes(para);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_category ON notes(category);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_content_vector ON notes USING GIN(content_vector);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_metadata ON notes USING GIN(metadata);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_tags ON notes USING GIN(tags);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_last_modified ON notes(last_modified DESC);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at DESC);" "notes" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_notes_accessed_at ON notes(accessed_at DESC);" "notes" || return 1
+    
+    # Create trigger
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_notes_updated_at') THEN
+            CREATE TRIGGER update_notes_updated_at 
+            BEFORE UPDATE ON notes
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "notes" || return 1
+    
+    echo "Notes schema initialized successfully"
+}
+
 # Initialize all schemas
 init_all_schemas() {
     create_database || return 1
     init_transcriptions_schema || return 1
     init_ai_chats_schema || return 1
+    init_notes_schema || return 1
     init_second_brain_schema || return 1
     echo "All schemas initialized successfully"
 }
@@ -386,6 +454,13 @@ perform_maintenance() {
             
             # Clean up orphaned chats (shouldn't happen due to foreign key, but just in case)
             execute_sql "DELETE FROM ai_chats WHERE context_uuid NOT IN (SELECT context_uuid FROM ai_chat_contexts);" "$db" || echo "Warning: Failed to clean orphaned chats"
+            ;;
+        "notes")
+            # Vacuum and analyze notes table
+            execute_sql "VACUUM ANALYZE notes;" "$db" || echo "Warning: Failed to vacuum notes table"
+            
+            # Reindex notes table
+            execute_sql "REINDEX TABLE notes;" "$db" || echo "Warning: Failed to reindex notes table"
             ;;
         "postgres")
             # Vacuum and analyze vector table if it exists
@@ -486,6 +561,43 @@ show_stats() {
             ORDER BY chat_count DESC
             LIMIT 10;" "$db" || return 1
             ;;
+        "notes")
+            echo -e "\nNotes Statistics:"
+            execute_sql "
+            SELECT 
+                COUNT(*) as total_notes,
+                COUNT(DISTINCT para) as para_categories,
+                COUNT(DISTINCT category) as unique_categories,
+                COUNT(CASE WHEN para = 'inbox' THEN 1 END) as inbox_notes,
+                COUNT(CASE WHEN para = 'projects' THEN 1 END) as project_notes,
+                COUNT(CASE WHEN para = 'areas' THEN 1 END) as area_notes,
+                COUNT(CASE WHEN para = 'resources' THEN 1 END) as resource_notes,
+                COUNT(CASE WHEN para = 'archives' THEN 1 END) as archive_notes,
+                COALESCE(SUM(file_size), 0) as total_size_bytes,
+                pg_size_pretty(COALESCE(SUM(file_size), 0)) as total_size
+            FROM notes;" "$db" || return 1
+            
+            echo -e "\nNotes by Category:"
+            execute_sql "
+            SELECT para, category, COUNT(*) as note_count 
+            FROM notes 
+            WHERE category IS NOT NULL
+            GROUP BY para, category 
+            ORDER BY para, note_count DESC 
+            LIMIT 15;" "$db" || return 1
+            
+            echo -e "\nRecently Modified Notes:"
+            execute_sql "
+            SELECT 
+                path,
+                para,
+                category,
+                last_modified
+            FROM notes
+            WHERE last_modified IS NOT NULL
+            ORDER BY last_modified DESC
+            LIMIT 10;" "$db" || return 1
+            ;;
         "postgres")
             echo -e "\nVector Database Statistics:"
             execute_sql "
@@ -523,6 +635,11 @@ show_all_stats() {
         available_dbs+=("ai_chats")
     fi
     
+    # Check for notes database
+    if database_exists "notes"; then
+        available_dbs+=("notes")
+    fi
+    
     # Check for postgres database (always exists)
     available_dbs+=("postgres")
     
@@ -547,7 +664,7 @@ show_all_stats() {
         COUNT(*) as total_databases,
         pg_size_pretty(SUM(pg_database_size(datname))) as total_size
     FROM pg_database 
-    WHERE datname IN ('transcriptions', 'ai_chats', 'postgres');" "postgres" || return 1
+    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'postgres');" "postgres" || return 1
     
     echo ""
     echo "Individual database sizes:"
@@ -556,7 +673,7 @@ show_all_stats() {
         datname as database,
         pg_size_pretty(pg_database_size(datname)) as size
     FROM pg_database 
-    WHERE datname IN ('transcriptions', 'ai_chats', 'postgres')
+    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'postgres')
     ORDER BY pg_database_size(datname) DESC;" "postgres" || return 1
 }
 
@@ -594,6 +711,15 @@ export_data() {
             FROM ai_chats t
             ORDER BY request_timestamp;" > "$output_file" || {
                 echo "Error exporting ai_chats" >&2
+                return 1
+            }
+            ;;
+        "notes")
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM notes t
+            ORDER BY last_modified DESC;" > "$output_file" || {
+                echo "Error exporting notes" >&2
                 return 1
             }
             ;;
@@ -697,6 +823,10 @@ backup_all_databases() {
         databases+=("ai_chats")
     fi
     
+    if database_exists "notes"; then
+        databases+=("notes")
+    fi
+    
     # Always include postgres database (for second_brain_vectors)
     databases+=("postgres")
     
@@ -790,13 +920,30 @@ archive_old_data() {
                 return 1
             }
             ;;
+        "notes")
+            # First export old notes
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM notes t
+            WHERE last_modified < CURRENT_DATE - INTERVAL '$days days'
+            ORDER BY last_modified;" > "$archive_file" || {
+                echo "Error archiving notes" >&2
+                return 1
+            }
+            
+            # Delete archived notes
+            execute_sql "DELETE FROM notes WHERE last_modified < CURRENT_DATE - INTERVAL '$days days';" "$db" || {
+                echo "Error deleting old notes" >&2
+                return 1
+            }
+            ;;
         "postgres")
             echo "Archiving not implemented for postgres database (vectors are typically persistent)"
             return 1
             ;;
         *)
             echo "Error: Archive not implemented for database '$db'" >&2
-            echo "Supported databases: transcriptions, ai_chats" >&2
+            echo "Supported databases: transcriptions, ai_chats, notes" >&2
             return 1
             ;;
     esac
@@ -1047,6 +1194,25 @@ merge_sync_table() {
                 WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
                 ;;
             
+            "notes")
+                # Merge notes using UUID and updated_at timestamp
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (id) DO UPDATE SET
+                    path = EXCLUDED.path,
+                    para = EXCLUDED.para,
+                    category = EXCLUDED.category,
+                    content = EXCLUDED.content,
+                    file_size = EXCLUDED.file_size,
+                    last_modified = EXCLUDED.last_modified,
+                    accessed_at = EXCLUDED.accessed_at,
+                    metadata = EXCLUDED.metadata,
+                    tags = EXCLUDED.tags,
+                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                ;;
+            
             "second_brain_vectors")
                 # For second_brain_vectors, we don't use timestamps for merge logic
                 # Instead, we merge based on the ID and keep the latest version
@@ -1236,6 +1402,29 @@ push_sync_table() {
                     WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
                 ;;
             
+            "notes")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        path = EXCLUDED.path,
+                        para = EXCLUDED.para,
+                        category = EXCLUDED.category,
+                        content = EXCLUDED.content,
+                        file_size = EXCLUDED.file_size,
+                        last_modified = EXCLUDED.last_modified,
+                        accessed_at = EXCLUDED.accessed_at,
+                        metadata = EXCLUDED.metadata,
+                        tags = EXCLUDED.tags,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                ;;
+            
             "second_brain_vectors")
                 PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
                     -h "$target_host" \
@@ -1357,6 +1546,8 @@ sync_databases() {
                     create_database
                 elif [[ "$db" == "ai_chats" ]]; then
                     init_ai_chats_schema
+                elif [[ "$db" == "notes" ]]; then
+                    init_notes_schema
                 else
                     execute_sql "CREATE DATABASE $db" "postgres" >/dev/null 2>&1
                 fi
@@ -1370,6 +1561,9 @@ sync_databases() {
                     ;;
                 "ai_chats")
                     tables_to_sync=("ai_chat_contexts" "ai_chats")
+                    ;;
+                "notes")
+                    tables_to_sync=("notes")
                     ;;
                 "postgres")
                     # For postgres db, sync the vector table if it exists
@@ -1440,13 +1634,14 @@ usage() {
 Usage: $SCRIPT_NAME [OPTIONS] COMMAND
 
 Universal PostgreSQL management script for local dotfiles.
-Supports multiple databases: transcriptions, ai_chats, postgres.
+Supports multiple databases: transcriptions, ai_chats, notes, postgres.
 
 COMMANDS:
     setup               Setup database and all schemas (alias for init)
-    init                Initialize all schemas (transcriptions + ai_chats + second_brain)
+    init                Initialize all schemas (transcriptions + ai_chats + notes + second_brain)
     init-transcripts    Initialize transcriptions schema only
     init-ai             Initialize ai_chats schema only
+    init-notes          Initialize notes schema only
     init-second-brain   Initialize second brain vector schema only
     maintain            Perform maintenance operations (vacuum, reindex, cleanup)
     stats               Show database statistics
@@ -1460,9 +1655,9 @@ OPTIONS:
     -v, --verbose       Enable verbose output
     --debug             Enable debug output (shows detailed error messages)
     -d, --database DB   Specify target database (required for maintain/export/archive)
-                        Available: transcriptions, ai_chats, postgres
+                        Available: transcriptions, ai_chats, notes, postgres
                         Optional for stats and backup (shows/backs up all databases if not specified)
-    --all               Backup all databases (transcriptions, ai_chats, postgres)
+    --all               Backup all databases (transcriptions, ai_chats, notes, postgres)
     
 ENVIRONMENT VARIABLES:
     LOCAL_DB_HOST             Database host (default: 127.0.0.1)
@@ -1551,7 +1746,7 @@ parse_args() {
                 BACKUP_ALL=true
                 shift
                 ;;
-            setup|init|init-transcripts|init-ai|init-second-brain|maintain|stats|export|archive|backup|sync)
+            setup|init|init-transcripts|init-ai|init-notes|init-second-brain|maintain|stats|export|archive|backup|sync)
                 ACTION="$1"
                 shift
                 break
@@ -1607,6 +1802,9 @@ main() {
             ;;
         init-ai)
             init_ai_chats_schema
+            ;;
+        init-notes)
+            init_notes_schema
             ;;
         init-second-brain)
             init_second_brain_schema
