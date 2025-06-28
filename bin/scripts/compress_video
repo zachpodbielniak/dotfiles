@@ -856,23 +856,69 @@ process_video() {
         debug "Command: ${podman_cmd[*]}"
     fi
     
-    # Execute command
+    # Execute command with retry logic
     if [[ "$DRY_RUN" == "false" ]]; then
         # Record start time for duration calculation
         local start_time=$(date +%s)
         
-        if "${podman_cmd[@]}"; then
-            local end_time=$(date +%s)
-            local process_duration=$((end_time - start_time))
-            local duration_str=$(printf "%02d:%02d:%02d" $((process_duration/3600)) $(((process_duration%3600)/60)) $((process_duration%60)))
+        # Retry logic variables
+        local max_retries=10
+        local retry_count=0
+        local success=false
+        
+        while [[ $retry_count -lt $max_retries ]] && [[ "$success" == "false" ]]; do
+            if [[ $retry_count -gt 0 ]]; then
+                log "Retry attempt $retry_count/$max_retries for: $input_file"
+            fi
             
-            log "Successfully compressed: $output_file (took $duration_str)"
-            # Add to journal on success
-            add_to_journal "$input_file" "$output_file" "SUCCESS" "Processed in $duration_str"
-        else
-            error "Failed to compress: $input_file"
+            # Execute the command and capture exit code
+            "${podman_cmd[@]}"
+            local exit_code=$?
+            
+            if [[ $exit_code -eq 0 ]]; then
+                success=true
+                local end_time=$(date +%s)
+                local process_duration=$((end_time - start_time))
+                local duration_str=$(printf "%02d:%02d:%02d" $((process_duration/3600)) $(((process_duration%3600)/60)) $((process_duration%60)))
+                
+                log "Successfully compressed: $output_file (took $duration_str)"
+                # Add to journal on success
+                local retry_note=""
+                if [[ $retry_count -gt 0 ]]; then
+                    retry_note=" (succeeded after $retry_count retries)"
+                fi
+                add_to_journal "$input_file" "$output_file" "SUCCESS" "Processed in $duration_str$retry_note"
+            else
+                ((retry_count++))
+                error "FFmpeg failed with exit code $exit_code (attempt $retry_count/$max_retries)"
+                
+                # Check for specific exit codes that shouldn't be retried
+                case $exit_code in
+                    1)
+                        # Generic error, worth retrying
+                        debug "Generic error, will retry"
+                        ;;
+                    134|139)
+                        # SIGABRT or SIGSEGV - definitely worth retrying
+                        debug "Segmentation fault or abort detected, will retry"
+                        ;;
+                    *)
+                        # Other exit codes might also be worth retrying
+                        debug "Exit code $exit_code detected, will retry"
+                        ;;
+                esac
+                
+                # Small delay before retry to avoid hammering the system
+                if [[ $retry_count -lt $max_retries ]]; then
+                    sleep 2
+                fi
+            fi
+        done
+        
+        if [[ "$success" == "false" ]]; then
+            error "Failed to compress after $max_retries attempts: $input_file"
             # Add failure to journal
-            add_to_journal "$input_file" "$output_file" "FAILED" "Compression failed"
+            add_to_journal "$input_file" "$output_file" "FAILED" "Compression failed after $max_retries attempts"
             return 1
         fi
         
