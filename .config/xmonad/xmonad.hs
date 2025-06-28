@@ -11,6 +11,7 @@ import XMonad.Util.EZConfig (additionalKeysP)
 import XMonad.Layout.Spacing
 import XMonad.Layout.ThreeColumns
 import XMonad.Layout.Magnifier
+import qualified XMonad.Layout.ToggleLayouts as TGL
 import XMonad.Hooks.EwmhDesktops
 
 import XMonad.Hooks.DynamicLog
@@ -144,6 +145,7 @@ myConfig = def
     , ("M-S-t", spawn "i3lock -c000000")
     , ("M-S-p", lockAndSuspend)
     , ("M-C-r", restartXmonad)
+    , ("M-f", sendMessage $ TGL.Toggle "Full")
     , ("M-<XF86MonBrightnessUp>", spawn "brightnessctl set 10%+")
     , ("M-<XF86MonBrightnessDown>", spawn "brightnessctl set 10%-")
     , ("M-<XF86KbdBrightnessUp>", spawn "brightnessctl set 10%+")
@@ -167,8 +169,9 @@ myConfig = def
 -- myLayout = smartSpacing 24 
 -- myLayout = spacingRaw True (Border 0 4 4 4) True (Border 5 4 4 4) True
 myLayout = 
-    spacingRaw False (Border 10 10 10 10) True (Border 10 10 10 10) True
-    $ tiled ||| Mirror tiled ||| Full ||| threeCol
+    TGL.toggleLayouts Full
+        $ spacingRaw False (Border 10 10 10 10) True (Border 10 10 10 10) True
+        $ tiled ||| Mirror tiled ||| Full ||| threeCol
     where 
         threeCol = magnifiercz' 1.3 $ ThreeColMid nmaster delta ratio
         tiled = Tall nmaster delta ratio 
