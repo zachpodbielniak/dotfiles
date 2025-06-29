@@ -418,7 +418,7 @@ def search_notes(query, para=None, category=None, tags=None, limit=20, offset=0,
     
     return results
 
-def fzf_select_note(results, notes_dir):
+def fzf_select_note(results, notes_dir, show_content=False):
     """Use fzf to select a note from search results."""
     if not results:
         print("No notes found.")
@@ -428,13 +428,22 @@ def fzf_select_note(results, notes_dir):
     fzf_input = []
     for i, note in enumerate(results):
         modified = note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'
-        line = f"{i:3d} | {note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}"
+        line = f"{i:3d} | {note['id']:>6} | {note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}"
+        if show_content and note.get('snippet'):
+            # Add content snippet on next line, indented
+            snippet = note['snippet'].replace('\n', ' ').strip()[:80]
+            if snippet:
+                line += f"\n          {snippet}..."
         fzf_input.append(line)
     
-    # Run fzf
+    # Run fzf with multi-line support if showing content
+    fzf_args = ['fzf', '--ansi', '--no-sort', '--reverse', '--tiebreak=index']
+    if show_content:
+        fzf_args.extend(['--multi-line', '--no-mouse'])
+    
     try:
         proc = subprocess.Popen(
-            ['fzf', '--ansi', '--no-sort', '--reverse', '--tiebreak=index'],
+            fzf_args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True
@@ -460,6 +469,130 @@ def open_note_in_editor(note_path, notes_dir):
         subprocess.run([editor, str(full_path)])
     except Exception as e:
         print(f"Error opening {full_path}: {e}", file=sys.stderr)
+
+def get_note_by_id(note_id):
+    """Get a note by its database ID (UUID or partial UUID)."""
+    conn = psycopg2.connect(**NOTES_DB_CONFIG)
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    result = None
+    
+    try:
+        # Check if it's a full UUID (36 chars with dashes)
+        if len(note_id) == 36 and note_id.count('-') == 4:
+            # Try exact UUID match
+            try:
+                cursor.execute("""
+                    SELECT id, path, para, category, content, 
+                           file_size, last_modified, created_at, accessed_at,
+                           metadata, tags
+                    FROM notes
+                    WHERE id = %s
+                """, (note_id,))
+                
+                result = cursor.fetchone()
+            except psycopg2.errors.InvalidTextRepresentation:
+                # Not a valid UUID format
+                pass
+        
+        # If no result yet and it could be a partial UUID (8+ chars)
+        if not result and len(note_id) >= 8:
+            # Try prefix match
+            cursor.execute("""
+                SELECT id, path, para, category, content, 
+                       file_size, last_modified, created_at, accessed_at,
+                       metadata, tags
+                FROM notes
+                WHERE id::text LIKE %s
+                LIMIT 1
+            """, (note_id + '%',))
+            
+            result = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+    
+    return result
+
+def view_note(identifier, notes_dir, render=False):
+    """View a note by ID or path.
+    
+    Returns the content of the note or None if not found.
+    """
+    # Check if identifier looks like a UUID or database ID
+    note = get_note_by_id(identifier)
+    if note:
+        content = note['content']
+        if render:
+            # Add header with metadata
+            header = f"# {note['path']}\n\n"
+            header += f"**ID:** {note['id']}  \n"
+            header += f"**PARA:** {note['para']}  \n"
+            header += f"**Category:** {note['category'] or 'None'}  \n"
+            header += f"**Modified:** {note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'}  \n"
+            header += f"**Size:** {note['file_size']} bytes  \n"
+            if note['tags']:
+                header += f"**Tags:** {', '.join(note['tags'])}  \n"
+            header += "\n---\n\n"
+            content = header + content
+        return content
+    
+    # Try as file path
+    file_path = Path(notes_dir) / identifier
+    if file_path.exists():
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if render:
+                header = f"# {identifier}\n\n---\n\n"
+                content = header + content
+            return content
+        except Exception as e:
+            print(f"Error reading file {identifier}: {e}", file=sys.stderr)
+            return None
+    
+    # Try as absolute path
+    abs_path = Path(identifier)
+    if abs_path.exists() and abs_path.is_file():
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if render:
+                header = f"# {abs_path.name}\n\n---\n\n"
+                content = header + content
+            return content
+        except Exception as e:
+            print(f"Error reading file {identifier}: {e}", file=sys.stderr)
+            return None
+    
+    print(f"Note not found: {identifier}", file=sys.stderr)
+    return None
+
+def view_command(args):
+    """Handle the view command."""
+    # If using fzf, search and select first
+    if args.fzf:
+        results = search_notes(
+            query=args.query if hasattr(args, 'query') else None,
+            limit=100,
+            debug=args.debug
+        )
+        
+        selected = fzf_select_note(results, args.notes_dir, show_content=args.content)
+        if not selected:
+            return
+        
+        # Replace identifiers with the selected note's ID
+        args.identifiers = [str(selected['id'])]
+    
+    # View each identifier
+    for identifier in args.identifiers:
+        content = view_note(identifier, args.notes_dir, render=args.render)
+        if content:
+            print(content)
+            # Add separator between multiple files
+            if len(args.identifiers) > 1 and identifier != args.identifiers[-1]:
+                print("\n" + "="*80 + "\n")
 
 def stats_command(args):
     """Show database statistics."""
@@ -545,10 +678,73 @@ def list_command(args):
                 if note[key]:
                     note[key] = note[key].isoformat()
         print(json.dumps(results, indent=2))
+    elif getattr(args, 'md_table', False):
+        # Output as markdown table
+        if not results:
+            print("No notes found.")
+            return
+            
+        shorten = getattr(args, 'shorten', False)
+        uuid_header = "UUID" if shorten else "UUID"
+        uuid_sep = "------" if shorten else "--------------------------------------"
+        
+        print(f"| {uuid_header} | PARA | Category | Modified | Path |")
+        print(f"|{uuid_sep}|------|----------|----------|------|")
+        for note in results:
+            uuid_display = note['id'][:8] if shorten else note['id']
+            modified = note['last_modified'].strftime('%Y-%m-%d') if note['last_modified'] else 'Unknown'
+            category = note['category'] or 'None'
+            path = note['path']
+            print(f"| {uuid_display} | {note['para']} | {category} | {modified} | {path} |")
+    elif getattr(args, 'render', False):
+        # Pretty markdown output
+        if not results:
+            print("No notes found.")
+            return
+            
+        print(f"# Search Results\n")
+        if args.query:
+            print(f"**Query:** {args.query}\n")
+        print(f"**Total Results:** {len(results)}\n")
+        print("---\n")
+        
+        for i, note in enumerate(results, 1):
+            modified = note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'
+            print(f"## {i}. {note['path']}\n")
+            print(f"- **UUID:** `{note['id'][:8]}...` (full: `{note['id']}`)")
+            print(f"- **PARA:** {note['para']}")
+            print(f"- **Category:** {note['category'] or 'None'}")
+            print(f"- **Modified:** {modified}")
+            print(f"- **Size:** {note['file_size']} bytes")
+            
+            if note.get('tags'):
+                print(f"- **Tags:** {', '.join(note['tags'])}")
+                
+            if getattr(args, 'content', False) and note.get('snippet'):
+                snippet = note['snippet'].replace('\n', ' ').strip()[:200]
+                if snippet:
+                    print(f"\n**Preview:**")
+                    print(f"> {snippet}...")
+                    
+            print("\n---\n")
     else:
+        # Default table output with headers
+        if not results:
+            print("No notes found.")
+            return
+            
+        # Print header
+        print(f"{'UUID':>36} | {'PARA':^10} | {'Category':^20} | {'Modified':^16} | {'Path'}")
+        print("-" * 36 + "-+-" + "-" * 10 + "-+-" + "-" * 20 + "-+-" + "-" * 16 + "-+-" + "-" * 40)
+        
         for note in results:
             modified = note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'
-            print(f"{note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}")
+            print(f"{note['id']:>36} | {note['para']:^10} | {note['category'] or 'None':^20} | {modified:^16} | {note['path']}")
+            if getattr(args, 'content', False) and note.get('snippet'):
+                # Show content snippet indented
+                snippet = note['snippet'].replace('\n', ' ').strip()[:100]
+                if snippet:
+                    print(f"{' ' * 39}{snippet}...")
 
 def main():
     parser = argparse.ArgumentParser(description='Notes database management tool')
@@ -573,41 +769,37 @@ def main():
                              choices=['modified', 'created', 'accessed', 'size', 'path', 'relevance'],
                              help='Sort order')
     search_parser.add_argument('--json', action='store_true', help='Output as JSON')
-    search_parser.add_argument('--fzf', action='store_true', help='Use fzf for selection')
-    
-    # List command (alias for search)
-    list_parser = subparsers.add_parser('list', help='List notes')
-    list_parser.add_argument('query', nargs='?', help='Search query')
-    list_parser.add_argument('-p', '--para', choices=['inbox', 'projects', 'areas', 'resources', 'archives'],
-                           help='Filter by PARA category')
-    list_parser.add_argument('-c', '--category', help='Filter by category')
-    list_parser.add_argument('-t', '--tags', nargs='+', help='Filter by tags')
-    list_parser.add_argument('-l', '--limit', type=int, default=20, help='Limit results')
-    list_parser.add_argument('-s', '--sort', default='modified',
-                           choices=['modified', 'created', 'accessed', 'size', 'path', 'relevance'],
-                           help='Sort order')
-    list_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    search_parser.add_argument('--fzf', action='store_true', help='Use fzf for interactive selection')
+    search_parser.add_argument('--content', action='store_true', help='Show content snippets in search results')
+    search_parser.add_argument('--md-table', action='store_true', help='Output as markdown table')
+    search_parser.add_argument('--render', action='store_true', help='Render as formatted markdown output')
+    search_parser.add_argument('--shorten', action='store_true', help='Shorten UUIDs to 8 characters')
     
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Show database statistics')
     
-    # FZF command (default behavior)
-    fzf_parser = subparsers.add_parser('fzf', help='Interactive note selection with fzf')
-    fzf_parser.add_argument('query', nargs='?', help='Initial search query')
-    fzf_parser.add_argument('-p', '--para', choices=['inbox', 'projects', 'areas', 'resources', 'archives'],
-                          help='Filter by PARA category')
-    fzf_parser.add_argument('-c', '--category', help='Filter by category')
-    fzf_parser.add_argument('-t', '--tags', nargs='+', help='Filter by tags')
+    # View command
+    view_parser = subparsers.add_parser('view', help='View note content by ID or path')
+    view_parser.add_argument('identifiers', nargs='*', help='Note IDs or file paths to view')
+    view_parser.add_argument('-q', '--query', help='Search query (with --fzf)')
+    view_parser.add_argument('--render', action='store_true', help='Render as formatted markdown')
+    view_parser.add_argument('--fzf', action='store_true', help='Use fzf to select note to view')
+    view_parser.add_argument('--content', action='store_true', help='Show content snippets in fzf selection')
     
     args = parser.parse_args()
     
-    # Default to fzf if no command specified
+    # Default to search with fzf if no command specified
     if not args.command:
-        args.command = 'fzf'
+        args.command = 'search'
         args.query = None
         args.para = None
         args.category = None
         args.tags = None
+        args.limit = 100
+        args.sort = 'modified'
+        args.json = False
+        args.fzf = True
+        args.content = False
     
     # Handle commands
     if args.command == 'sync':
@@ -619,41 +811,27 @@ def main():
             para=args.para,
             category=args.category,
             tags=args.tags,
-            limit=args.limit,
+            limit=args.limit if not args.fzf else 100,  # Get more results for fzf
             order_by=args.sort,
             debug=args.debug
         )
         
         if args.fzf:
-            selected = fzf_select_note(results, args.notes_dir)
+            selected = fzf_select_note(results, args.notes_dir, show_content=args.content)
             if selected:
                 open_note_in_editor(selected['path'], args.notes_dir)
         else:
             list_command(args)
     
-    elif args.command == 'list':
-        list_command(args)
-    
     elif args.command == 'stats':
         stats_command(args)
     
-    elif args.command == 'fzf':
-        # Always sync before interactive selection
-        sync_all_notes(args.notes_dir, debug=args.debug, quiet=True)
-        
-        # Search and select
-        results = search_notes(
-            query=args.query,
-            para=args.para,
-            category=args.category,
-            tags=args.tags,
-            limit=100,  # Get more results for fzf
-            debug=args.debug
-        )
-        
-        selected = fzf_select_note(results, args.notes_dir)
-        if selected:
-            open_note_in_editor(selected['path'], args.notes_dir)
+    elif args.command == 'view':
+        # Validate arguments
+        if not args.identifiers and not args.fzf:
+            print("Error: Must provide at least one identifier or use --fzf", file=sys.stderr)
+            sys.exit(1)
+        view_command(args)
 
 if __name__ == '__main__':
     main()
