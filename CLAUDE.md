@@ -1,9 +1,10 @@
 # CLAUDE.md
-
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build and Test Commands
+## Things to NEVER do 
+- run `local_postgres drop` . never do this, instead prompt me to run `psql`. ALWAYS ask for permission to run psql commands.
 
+## Build and Test Commands
 - Test Qtile configuration: `just test`
 - Install dotfiles: `just stow`
 - Install dotfiles (alternative): `just stow_alt`
@@ -12,7 +13,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Bootstrap dependencies: `just bootstrap`
 
 ## Code Style Guidelines
-
 - Shell Scripts:
   - All scripts use bash (`#!/bin/bash`) and often include `set -euo pipefail`
   - Parameter validation for scripts with user input
@@ -36,7 +36,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - Content type detection and appropriate handling
 
 ## Script Utilities
-
 - `sbi` (Second Brain Ingest):
   - Helps ingest content into a PARA-organized knowledge base
   - Supports text, audio, video, and URLs (including YouTube)
@@ -75,14 +74,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - can use our second_brain MCP to interact with this 
 
 ## Script Documentation
-
 - For any scripts in ./bin/scripts, to understand details:
-  - Check the corresponding Neorg file at with out second-brain mcp 02_areas/repos/dotfiles/<script_name>.md
-  - If the Neorg file does not exist, create one with:
+  - Check the corresponding markkdown file at with out second-brain mcp 02_areas/repos/dotfiles/<script_name>.md
+  - If the markdown file does not exist, create one with:
     - Script details and purpose
     - Logic flow
     - Requirements
     - Potential pitfalls and bugs
     - Maintenance guidelines
     - Ideas for future expansion
-  - Update this Neorg file whenever the script is modified
+  - Update this markdown file whenever the script is modified
