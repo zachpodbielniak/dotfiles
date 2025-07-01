@@ -1013,6 +1013,21 @@ get_table_info() {
     ORDER BY ordinal_position;" 2>/dev/null
 }
 
+# Get non-generated columns for COPY operations
+get_non_generated_columns() {
+    local db="$1"
+    local table="$2"
+    
+    local columns=$(psql -d "$(get_connection_string "" "" "$db")" -tAc "
+    SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
+    FROM information_schema.columns 
+    WHERE table_name = '$table' 
+    AND table_schema = 'public'
+    AND (is_generated = 'NEVER' OR is_generated IS NULL);" 2>/dev/null)
+    
+    echo "$columns"
+}
+
 # Check if table has timestamp columns
 table_has_timestamps() {
     local db="$1"
@@ -1102,8 +1117,26 @@ merge_sync_table() {
     fi
     [[ "$DEBUG" == true ]] && echo "        Debug: Staging table created successfully"
     
+    # Get non-generated columns for tables that have generated columns
+    local column_list=""
+    if [[ "$table" == "notes" ]] || [[ "$table" == "transcription_chunks" ]]; then
+        column_list=$(get_non_generated_columns "$db" "$table")
+        if [[ -n "$column_list" ]]; then
+            [[ "$DEBUG" == true ]] && echo "        Debug: Using column list for $table: $column_list"
+        fi
+    fi
+    
     # Copy data from remote host
     local error_file="/tmp/psql_sync_error_$$"
+    local copy_from_cmd="\\COPY $table TO STDOUT"
+    local copy_to_cmd="\\COPY $temp_table FROM STDIN"
+    
+    # Use column list if available
+    if [[ -n "$column_list" ]]; then
+        copy_from_cmd="\\COPY $table($column_list) TO STDOUT"
+        copy_to_cmd="\\COPY $temp_table($column_list) FROM STDIN"
+    fi
+    
     # Use a subshell to capture both exit codes
     if (
         set -o pipefail
@@ -1112,13 +1145,13 @@ merge_sync_table() {
             -p "$DEFAULT_DB_PORT" \
             -U "$DEFAULT_DB_USER" \
             -d "$db" \
-            -c "\\COPY $table TO STDOUT" 2>"${error_file}_remote" | \
+            -c "$copy_from_cmd" 2>"${error_file}_remote" | \
         PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
             -h "$DEFAULT_DB_HOST" \
             -p "$DEFAULT_DB_PORT" \
             -U "$DEFAULT_DB_USER" \
             -d "$db" \
-            -c "\\COPY $temp_table FROM STDIN" 2>"${error_file}_local"
+            -c "$copy_to_cmd" 2>"${error_file}_local"
     ); then
         
         # Perform the merge based on table type
@@ -1143,10 +1176,18 @@ merge_sync_table() {
             
             "transcription_chunks")
                 # Merge chunks - only insert if not exists (they shouldn't change)
-                execute_sql "
-                INSERT INTO $table 
-                SELECT * FROM $temp_table
-                ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" "$db" >/dev/null 2>&1
+                # Use column list to avoid generated column issues
+                if [[ -n "$column_list" ]]; then
+                    execute_sql "
+                    INSERT INTO $table ($column_list)
+                    SELECT $column_list FROM $temp_table
+                    ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" "$db" >/dev/null 2>&1
+                else
+                    execute_sql "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" "$db" >/dev/null 2>&1
+                fi
                 ;;
             
             "ai_chats")
@@ -1196,21 +1237,40 @@ merge_sync_table() {
             
             "notes")
                 # Merge notes using UUID and updated_at timestamp
-                execute_sql "
-                INSERT INTO $table 
-                SELECT * FROM $temp_table
-                ON CONFLICT (id) DO UPDATE SET
-                    path = EXCLUDED.path,
-                    para = EXCLUDED.para,
-                    category = EXCLUDED.category,
-                    content = EXCLUDED.content,
-                    file_size = EXCLUDED.file_size,
-                    last_modified = EXCLUDED.last_modified,
-                    accessed_at = EXCLUDED.accessed_at,
-                    metadata = EXCLUDED.metadata,
-                    tags = EXCLUDED.tags,
-                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
-                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                # Use column list to avoid generated column issues
+                if [[ -n "$column_list" ]]; then
+                    execute_sql "
+                    INSERT INTO $table ($column_list)
+                    SELECT $column_list FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        path = EXCLUDED.path,
+                        para = EXCLUDED.para,
+                        category = EXCLUDED.category,
+                        content = EXCLUDED.content,
+                        file_size = EXCLUDED.file_size,
+                        last_modified = EXCLUDED.last_modified,
+                        accessed_at = EXCLUDED.accessed_at,
+                        metadata = EXCLUDED.metadata,
+                        tags = EXCLUDED.tags,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                else
+                    execute_sql "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        path = EXCLUDED.path,
+                        para = EXCLUDED.para,
+                        category = EXCLUDED.category,
+                        content = EXCLUDED.content,
+                        file_size = EXCLUDED.file_size,
+                        last_modified = EXCLUDED.last_modified,
+                        accessed_at = EXCLUDED.accessed_at,
+                        metadata = EXCLUDED.metadata,
+                        tags = EXCLUDED.tags,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                fi
                 ;;
             
             "second_brain_vectors")
@@ -1295,8 +1355,26 @@ push_sync_table() {
     fi
     [[ "$DEBUG" == true ]] && echo "        Debug: Remote staging table created successfully"
     
+    # Get non-generated columns for tables that have generated columns
+    local column_list=""
+    if [[ "$table" == "notes" ]] || [[ "$table" == "transcription_chunks" ]]; then
+        column_list=$(get_non_generated_columns "$db" "$table")
+        if [[ -n "$column_list" ]]; then
+            [[ "$DEBUG" == true ]] && echo "        Debug: Using column list for $table: $column_list"
+        fi
+    fi
+    
     # Copy data to remote host
     local error_file="/tmp/psql_push_error_$$"
+    local copy_from_cmd="\\COPY $table TO STDOUT"
+    local copy_to_cmd="\\COPY $temp_table FROM STDIN"
+    
+    # Use column list if available
+    if [[ -n "$column_list" ]]; then
+        copy_from_cmd="\\COPY $table($column_list) TO STDOUT"
+        copy_to_cmd="\\COPY $temp_table($column_list) FROM STDIN"
+    fi
+    
     if (
         set -o pipefail
         PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
@@ -1304,13 +1382,13 @@ push_sync_table() {
             -p "$DEFAULT_DB_PORT" \
             -U "$DEFAULT_DB_USER" \
             -d "$db" \
-            -c "\\COPY $table TO STDOUT" 2>"${error_file}_local" | \
+            -c "$copy_from_cmd" 2>"${error_file}_local" | \
         PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
             -h "$target_host" \
             -p "$DEFAULT_DB_PORT" \
             -U "$DEFAULT_DB_USER" \
             -d "$db" \
-            -c "\\COPY $temp_table FROM STDIN" 2>"${error_file}_remote"
+            -c "$copy_to_cmd" 2>"${error_file}_remote"
     ); then
         
         # Perform the merge on remote host using the same logic
@@ -1338,15 +1416,28 @@ push_sync_table() {
                 ;;
             
             "transcription_chunks")
-                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
-                    -h "$target_host" \
-                    -p "$DEFAULT_DB_PORT" \
-                    -U "$DEFAULT_DB_USER" \
-                    -d "$db" \
-                    -c "
-                    INSERT INTO $table 
-                    SELECT * FROM $temp_table
-                    ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" >/dev/null 2>&1
+                # For transcription_chunks table, we need to specify columns to avoid generated column issues
+                if [[ -n "$column_list" ]]; then
+                    PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                        -h "$target_host" \
+                        -p "$DEFAULT_DB_PORT" \
+                        -U "$DEFAULT_DB_USER" \
+                        -d "$db" \
+                        -c "
+                        INSERT INTO $table ($column_list)
+                        SELECT $column_list FROM $temp_table
+                        ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" >/dev/null 2>&1
+                else
+                    PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                        -h "$target_host" \
+                        -p "$DEFAULT_DB_PORT" \
+                        -U "$DEFAULT_DB_USER" \
+                        -d "$db" \
+                        -c "
+                        INSERT INTO $table 
+                        SELECT * FROM $temp_table
+                        ON CONFLICT (transcription_id, chunk_number) DO NOTHING;" >/dev/null 2>&1
+                fi
                 ;;
             
             "ai_chats")
@@ -1403,26 +1494,50 @@ push_sync_table() {
                 ;;
             
             "notes")
-                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
-                    -h "$target_host" \
-                    -p "$DEFAULT_DB_PORT" \
-                    -U "$DEFAULT_DB_USER" \
-                    -d "$db" \
-                    -c "
-                    INSERT INTO $table 
-                    SELECT * FROM $temp_table
-                    ON CONFLICT (id) DO UPDATE SET
-                        path = EXCLUDED.path,
-                        para = EXCLUDED.para,
-                        category = EXCLUDED.category,
-                        content = EXCLUDED.content,
-                        file_size = EXCLUDED.file_size,
-                        last_modified = EXCLUDED.last_modified,
-                        accessed_at = EXCLUDED.accessed_at,
-                        metadata = EXCLUDED.metadata,
-                        tags = EXCLUDED.tags,
-                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
-                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                # For notes table, we need to specify columns to avoid generated column issues
+                if [[ -n "$column_list" ]]; then
+                    PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                        -h "$target_host" \
+                        -p "$DEFAULT_DB_PORT" \
+                        -U "$DEFAULT_DB_USER" \
+                        -d "$db" \
+                        -c "
+                        INSERT INTO $table ($column_list)
+                        SELECT $column_list FROM $temp_table
+                        ON CONFLICT (id) DO UPDATE SET
+                            path = EXCLUDED.path,
+                            para = EXCLUDED.para,
+                            category = EXCLUDED.category,
+                            content = EXCLUDED.content,
+                            file_size = EXCLUDED.file_size,
+                            last_modified = EXCLUDED.last_modified,
+                            accessed_at = EXCLUDED.accessed_at,
+                            metadata = EXCLUDED.metadata,
+                            tags = EXCLUDED.tags,
+                            updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                        WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                else
+                    PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                        -h "$target_host" \
+                        -p "$DEFAULT_DB_PORT" \
+                        -U "$DEFAULT_DB_USER" \
+                        -d "$db" \
+                        -c "
+                        INSERT INTO $table 
+                        SELECT * FROM $temp_table
+                        ON CONFLICT (id) DO UPDATE SET
+                            path = EXCLUDED.path,
+                            para = EXCLUDED.para,
+                            category = EXCLUDED.category,
+                            content = EXCLUDED.content,
+                            file_size = EXCLUDED.file_size,
+                            last_modified = EXCLUDED.last_modified,
+                            accessed_at = EXCLUDED.accessed_at,
+                            metadata = EXCLUDED.metadata,
+                            tags = EXCLUDED.tags,
+                            updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                        WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                fi
                 ;;
             
             "second_brain_vectors")
