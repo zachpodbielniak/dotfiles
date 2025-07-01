@@ -868,13 +868,17 @@ process_video() {
         debug "Command: ${podman_cmd[*]}"
     fi
     
-    # Execute command with retry logic
+    # Execute command with retry logic (simplified for parallel child processes)
     if [[ "$DRY_RUN" == "false" ]]; then
         # Record start time for duration calculation
         local start_time=$(date +%s)
         
-        # Retry logic variables
-        local max_retries=10
+        # Retry logic variables - reduce retries for parallel child processes
+        local max_retries=3
+        if [[ "$PARALLEL_CHILD" == "true" ]]; then
+            max_retries=1  # No retries in parallel child processes to avoid job queue issues
+        fi
+        
         local retry_count=0
         local success=false
         
@@ -903,6 +907,11 @@ process_video() {
             else
                 ((retry_count++))
                 error "FFmpeg failed with exit code $exit_code (attempt $retry_count/$max_retries)"
+                
+                # For parallel child processes, don't retry on failure to avoid blocking the queue
+                if [[ "$PARALLEL_CHILD" == "true" ]]; then
+                    break
+                fi
                 
                 # Check for specific exit codes that shouldn't be retried
                 case $exit_code in
@@ -1115,9 +1124,7 @@ main() {
                 printf '%s\n' "${job_list[@]}" | parallel -j "$PARALLEL_JOBS" --colsep '|' \
                     'if ! process_video_wrapper "{1}" "{2}"; then exit 1; fi' || parallel_failed=$?
             else
-                # moreutils parallel syntax is simpler but less flexible
-                # We need to create a wrapper that can be called with our job format
-                
+                # moreutils parallel with retry mechanism at parent level
                 # Build the command with all our current options
                 local cmd_args=()
                 [[ -n "$CUSTOM_CRF" ]] && cmd_args+=("--crf" "$CUSTOM_CRF")
@@ -1141,20 +1148,67 @@ main() {
                 [[ "$IS_MOVIE" == "true" ]] && cmd_args+=("--movie")
                 [[ "$IS_TV_SERIES" == "true" ]] && cmd_args+=("--tv-series")
                 
-                # Process files one by one in parallel using moreutils syntax
-                # Extract just the input files from job_list
-                local input_files=()
-                for job in "${job_list[@]}"; do
-                    IFS='|' read -r input_file output_file <<< "$job"
-                    input_files+=("$input_file")
+                # Implement retry logic at parent level for moreutils parallel
+                local remaining_jobs=("${job_list[@]}")
+                local max_retry_rounds=3
+                local retry_round=0
+                
+                while [[ ${#remaining_jobs[@]} -gt 0 ]] && [[ $retry_round -lt $max_retry_rounds ]]; do
+                    if [[ $retry_round -gt 0 ]]; then
+                        log "Retry round $retry_round: ${#remaining_jobs[@]} files remaining"
+                    fi
+                    
+                    # Extract input files from remaining jobs
+                    local input_files=()
+                    for job in "${remaining_jobs[@]}"; do
+                        IFS='|' read -r input_file output_file <<< "$job"
+                        input_files+=("$input_file")
+                    done
+                    
+                    # Run moreutils parallel on current batch
+                    debug "Executing moreutils parallel with ${#input_files[@]} files (round $((retry_round + 1)))"
+                    
+                    local batch_failed=0
+                    parallel -j "$PARALLEL_JOBS" "$0" --parallel-child "${cmd_args[@]}" -- "${input_files[@]}" || batch_failed=$?
+                    
+                    # Check which jobs actually failed by examining journal/output files
+                    local new_remaining_jobs=()
+                    for job in "${remaining_jobs[@]}"; do
+                        IFS='|' read -r input_file output_file <<< "$job"
+                        
+                        # Check if conversion was successful
+                        if [[ -f "$output_file" ]] && [[ "$USE_JOURNAL" == "true" ]] && is_converted "$input_file" "$output_file"; then
+                            # Success - don't add to retry list
+                            continue
+                        elif [[ -f "$output_file" ]] && [[ "$USE_JOURNAL" != "true" ]]; then
+                            # Success without journal - don't add to retry list
+                            continue
+                        else
+                            # Failed - add to retry list
+                            new_remaining_jobs+=("$job")
+                        fi
+                    done
+                    
+                    remaining_jobs=("${new_remaining_jobs[@]}")
+                    ((retry_round++))
+                    
+                    # If no jobs remain, we're done
+                    if [[ ${#remaining_jobs[@]} -eq 0 ]]; then
+                        break
+                    fi
+                    
+                    # Small delay between retry rounds
+                    if [[ $retry_round -lt $max_retry_rounds ]] && [[ ${#remaining_jobs[@]} -gt 0 ]]; then
+                        log "Waiting 5 seconds before retry round $((retry_round + 1))..."
+                        sleep 5
+                    fi
                 done
                 
-                # Use moreutils parallel with simple syntax: parallel -j N command args -- file1 file2 ...
-                debug "Executing moreutils parallel with ${#input_files[@]} files"
-                debug "Command: parallel -j $PARALLEL_JOBS $0 --parallel-child ${cmd_args[*]} -- ${input_files[*]}"
-                
-                # moreutils parallel expects files after -- separator
-                parallel -j "$PARALLEL_JOBS" "$0" --parallel-child "${cmd_args[@]}" -- "${input_files[@]}" || parallel_failed=$?
+                # Set parallel_failed based on remaining jobs
+                if [[ ${#remaining_jobs[@]} -gt 0 ]]; then
+                    parallel_failed=${#remaining_jobs[@]}
+                    error "Failed to process ${#remaining_jobs[@]} files after $max_retry_rounds retry rounds"
+                fi
             fi
                 
             # Count failures (parallel doesn't give us exact count, so we estimate)
