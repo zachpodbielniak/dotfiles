@@ -52,6 +52,10 @@ CUSTOM_CRF=""
 PARALLEL_JOBS=1
 PARALLEL_TYPE=""
 PARALLEL_CHILD=false
+CONTAINER_CPUS=""
+CONTAINER_MEMORY=""
+AUTO_QUALITY=false
+CUSTOM_QP=""
 
 # Media library directories (easy to change for different mount points)
 MOVIES_DIR="${HOME}/.mnt/nas/Media/Movies"
@@ -62,7 +66,7 @@ IS_TV_SERIES=false
 # Quality presets (CRF values)
 declare -A QUALITY_PRESETS=(
     ["low"]="28"
-    ["medium"]="23"
+    ["medium"]="24"
     ["high"]="18"
     ["veryhigh"]="15"
 )
@@ -108,6 +112,8 @@ OPTIONS:
     -h, --help                  Show this help message
     -q, --quality QUALITY       Quality preset: low, medium, high, veryhigh (default: medium)
     -c, --crf VALUE            Custom CRF value (overrides quality preset)
+    --qp VALUE                 Custom QP value for GPU encoding (overrides quality preset)
+    --auto-quality             Automatically adjust quality based on video resolution
     -v, --video-codec CODEC    Video codec: h264, h265, vp9, av1 (default: h265)
     -a, --audio-codec CODEC    Audio codec: vorbis, opus, aac, mp3, copy (default: vorbis)
     -f, --format FORMAT        Output format: mkv, mp4, webm (default: mkv)
@@ -128,6 +134,8 @@ OPTIONS:
     --list-encoders            List available video encoders in the container
     --prefer-software          Prefer software encoding over hardware acceleration
     --parallel N               Process N files in parallel (default: 1)
+    --cpus N                   Limit CPU usage per container (e.g., 2, 1.5)
+    --memory SIZE              Limit memory usage per container (e.g., 4096m, 4g)
     --movie                    Copy completed file to movies library directory
     --tv-series                Copy completed file to TV series library directory
 
@@ -172,6 +180,21 @@ EXAMPLES:
     compress_video --tv-series "The Office - S03E04 - The Convention.mkv"
     compress_video --tv-series "The Office - S03E05.mkv"  # Also works without episode title
     
+    # Limit resources per container
+    compress_video --cpus 2 --memory 4g input.mp4
+    
+    # Parallel processing with resource limits (each container gets 2 CPUs and 4GB RAM)
+    compress_video --parallel 2 --cpus 2 --memory 4096m *.mp4
+    
+    # Auto-quality based on resolution
+    compress_video --auto-quality input.mp4
+    
+    # GPU encoding with custom QP value
+    compress_video --qp 25 input.mp4
+    
+    # Auto-quality with hardware acceleration
+    compress_video --auto-quality --force-hwaccel *.mkv
+    
 JOURNAL ANALYSIS EXAMPLES:
     # Enable journal and compress videos
     compress_video --journal --quality high *.mp4
@@ -212,17 +235,26 @@ JOURNAL INTEGRATION:
     - status, notes
 
 QUALITY GUIDE:
-    Software/VAAPI (CRF mode):
+    Software encoding (CRF mode):
     - low (CRF 28): Smaller files, acceptable quality
-    - medium (CRF 23): Balanced size/quality (default)
+    - medium (CRF 24): Balanced size/quality (default)
     - high (CRF 18): Very good quality, larger files
     - veryhigh (CRF 15): Excellent quality, much larger files
+    
+    VAAPI encoding (CRF or QP mode):
+    - Uses CRF by default, or QP with --qp option
+    - QP values typically range from 20-35 (lower = better quality)
     
     Vulkan (Bitrate mode):
     - low: 2 Mbps bitrate
     - medium: 5 Mbps bitrate (default)
     - high: 10 Mbps bitrate
     - veryhigh: 20 Mbps bitrate
+    
+    Auto-quality (--auto-quality):
+    - Width ≤ 1280px: CRF 24 (software) / QP 26 (GPU)
+    - Width > 1280px: CRF 26 (software) / QP 28 (GPU)
+    - Width > 1920px: CRF 28 (software) / QP 30 (GPU)
 
 VULKAN SUPPORT:
     The script automatically detects your GPU vendor and sets the appropriate
@@ -368,6 +400,68 @@ add_to_journal() {
         echo "$row" >> "$JOURNAL_FILE"
         debug "Added to journal: $input_basename -> $output_basename ($status)"
     fi
+}
+
+# Get video resolution from input file
+get_video_resolution() {
+    local input_file="$1"
+    local width=""
+    
+    # Try to get video width using ffprobe in the container
+    local ffprobe_cmd=(
+        "podman" "run" "--rm"
+        "--security-opt" "label=disable"
+        "-v" "$(dirname "$(realpath "$input_file")"):/input:z"
+        "$CONTAINER_IMAGE"
+        "-v" "error"
+        "-select_streams" "v:0"
+        "-show_entries" "stream=width"
+        "-of" "default=noprint_wrappers=1:nokey=1"
+        "/input/$(basename "$input_file")"
+    )
+    
+    width=$("${ffprobe_cmd[@]}" 2>/dev/null | head -1)
+    
+    if [[ -z "$width" ]] || ! [[ "$width" =~ ^[0-9]+$ ]]; then
+        debug "Could not determine video width, using default quality"
+        echo ""
+    else
+        debug "Detected video width: $width"
+        echo "$width"
+    fi
+}
+
+# Determine automatic quality based on resolution
+get_auto_quality() {
+    local width="$1"
+    local is_gpu="$2"
+    local quality=""
+    
+    # Default CRF values for software encoding
+    local default_crf=24
+    local crf_1280=26
+    local crf_1920=28
+    
+    # For GPU encoding, add 2 to each value
+    if [[ "$is_gpu" == "true" ]]; then
+        ((default_crf+=2))
+        ((crf_1280+=2))
+        ((crf_1920+=2))
+    fi
+    
+    # Determine quality based on width
+    if [[ -z "$width" ]] || ! [[ "$width" =~ ^[0-9]+$ ]]; then
+        quality=$default_crf
+    elif [[ $width -gt 1920 ]]; then
+        quality=$crf_1920
+    elif [[ $width -gt 1280 ]]; then
+        quality=$crf_1280
+    else
+        quality=$default_crf
+    fi
+    
+    debug "Auto-quality: width=$width, is_gpu=$is_gpu, quality=$quality"
+    echo "$quality"
 }
 
 # Check if hardware acceleration is available
@@ -570,6 +664,22 @@ parse_args() {
                 IS_TV_SERIES=true
                 shift
                 ;;
+            --cpus)
+                CONTAINER_CPUS="$2"
+                shift 2
+                ;;
+            --memory)
+                CONTAINER_MEMORY="$2"
+                shift 2
+                ;;
+            --auto-quality)
+                AUTO_QUALITY=true
+                shift
+                ;;
+            --qp)
+                CUSTOM_QP="$2"
+                shift 2
+                ;;
             -*)
                 error "Unknown option: $1"
                 show_help
@@ -613,9 +723,6 @@ build_ffmpeg_args() {
     local output_dir="$4"
     local args=()
     
-    # Determine CRF value
-    local crf="${CUSTOM_CRF:-${QUALITY_PRESETS[$QUALITY]}}"
-    
     # Determine hardware acceleration type
     local hw_type="none"
     local use_hw=false
@@ -645,6 +752,35 @@ build_ffmpeg_args() {
         fi
     else
         debug "Using software encoding (hardware acceleration disabled or software preferred)"
+    fi
+    
+    # Determine if using GPU encoding
+    local is_gpu_encoding=false
+    if [[ "$hw_type" == "vaapi" ]] || [[ "$hw_type" == "vulkan" ]]; then
+        is_gpu_encoding=true
+    fi
+    
+    # Determine CRF/QP value
+    local crf=""
+    local qp=""
+    
+    if [[ "$AUTO_QUALITY" == "true" ]]; then
+        # Get video resolution for auto quality
+        local width=$(get_video_resolution "$input_file")
+        local auto_value=$(get_auto_quality "$width" "$is_gpu_encoding")
+        
+        if [[ "$is_gpu_encoding" == "true" ]]; then
+            qp="${CUSTOM_QP:-$auto_value}"
+        else
+            crf="${CUSTOM_CRF:-$auto_value}"
+        fi
+    else
+        # Use manual settings
+        if [[ "$is_gpu_encoding" == "true" ]] && [[ -n "$CUSTOM_QP" ]]; then
+            qp="$CUSTOM_QP"
+        else
+            crf="${CUSTOM_CRF:-${QUALITY_PRESETS[$QUALITY]}}"
+        fi
     fi
     
     # Build FFmpeg arguments based on acceleration type
@@ -719,9 +855,14 @@ build_ffmpeg_args() {
         local vulkan_bitrate="${QUALITY_BITRATES[$QUALITY]}"
         args+=("-b:v" "$vulkan_bitrate")
         debug "Using bitrate $vulkan_bitrate for Vulkan (quality: $QUALITY)"
-    else
-        # Use CRF for software and VAAPI encoding
+    elif [[ "$hw_type" == "vaapi" ]] && [[ -n "$qp" ]]; then
+        # VAAPI with QP value
+        args+=("-qp" "$qp")
+        debug "Using QP $qp for VAAPI encoding"
+    elif [[ -n "$crf" ]]; then
+        # Use CRF for software encoding (and VAAPI without QP)
         args+=("-crf" "$crf")
+        debug "Using CRF $crf for encoding"
     fi
     
     # FFmpeg preset if specified
@@ -813,6 +954,14 @@ process_video() {
         "podman" "run" "--rm" "-it"
         "--security-opt" "label=disable"
     )
+    
+    # Add resource limits if specified
+    if [[ -n "$CONTAINER_CPUS" ]]; then
+        podman_cmd+=("--cpus" "$CONTAINER_CPUS")
+    fi
+    if [[ -n "$CONTAINER_MEMORY" ]]; then
+        podman_cmd+=("--memory" "$CONTAINER_MEMORY")
+    fi
     
     # Add hardware acceleration device if needed
     if [[ "$USE_HWACCEL" != "no" ]]; then
@@ -1037,7 +1186,7 @@ copy_to_tv_series_library() {
 }
 
 # Export function for parallel to use
-export -f process_video log error debug is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library
+export -f process_video log error debug is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library get_video_resolution get_auto_quality
 
 # Wrapper function that parallel can call
 process_video_wrapper() {
@@ -1115,6 +1264,7 @@ main() {
             export PREFER_SOFTWARE CONTAINER_IMAGE HWACCEL_DEVICE VERBOSE DRY_RUN USE_JOURNAL 
             export JOURNAL_FILE FORCE_RECONVERT RESOLUTION BITRATE FFMPEG_PRESET PARALLEL_TYPE
             export IS_MOVIE IS_TV_SERIES MOVIES_DIR TV_SERIES_DIR
+            export CONTAINER_CPUS CONTAINER_MEMORY AUTO_QUALITY CUSTOM_QP
             
             # Process jobs in parallel
             local parallel_failed=0
@@ -1147,6 +1297,10 @@ main() {
                 [[ "$FORCE_RECONVERT" == "true" ]] && cmd_args+=("--force-reconvert")
                 [[ "$IS_MOVIE" == "true" ]] && cmd_args+=("--movie")
                 [[ "$IS_TV_SERIES" == "true" ]] && cmd_args+=("--tv-series")
+                [[ -n "$CONTAINER_CPUS" ]] && cmd_args+=("--cpus" "$CONTAINER_CPUS")
+                [[ -n "$CONTAINER_MEMORY" ]] && cmd_args+=("--memory" "$CONTAINER_MEMORY")
+                [[ "$AUTO_QUALITY" == "true" ]] && cmd_args+=("--auto-quality")
+                [[ -n "$CUSTOM_QP" ]] && cmd_args+=("--qp" "$CUSTOM_QP")
                 
                 # Implement retry logic at parent level for moreutils parallel
                 local remaining_jobs=("${job_list[@]}")
