@@ -10,6 +10,7 @@ SYNC_DATABASES=(
     "transcriptions"
     "ai_chats"
     "notes"
+    "media"
     "postgres"  # For pgvector/second_brain_vectors table
 )
 
@@ -410,12 +411,183 @@ init_notes_schema() {
     echo "Notes schema initialized successfully"
 }
 
+# Initialize media schema (for movies, TV series, music, videos)
+init_media_schema() {
+    echo "Initializing media schema..."
+    
+    # Create media database if it doesn't exist
+    if ! database_exists "media"; then
+        echo "Creating media database..."
+        execute_sql "CREATE DATABASE media" "postgres" || return 1
+    fi
+    
+    # Create update trigger function in media database
+    execute_sql "
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS \$\$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    \$\$ language 'plpgsql';" "media" || return 1
+    
+    # Create main media table with all fields
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS media (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL,
+        dirname TEXT NOT NULL,
+        full_filepath TEXT NOT NULL UNIQUE,
+        media_type VARCHAR(50) NOT NULL,
+        video_codec VARCHAR(50),
+        audio_codec VARCHAR(50),
+        resolution_width INTEGER,
+        resolution_height INTEGER,
+        metadata JSONB,
+        filesize BIGINT NOT NULL,
+        duration FLOAT,
+        file_hash VARCHAR(64),
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        second_brain_ingestion TEXT,
+        transcription_id UUID,
+        tags TEXT,
+        
+        -- Movie specific fields
+        title TEXT,
+        year INTEGER,
+        director TEXT,
+        genre TEXT,
+        imdb_id VARCHAR(20),
+        tmdb_id VARCHAR(20),
+        
+        -- TV Series specific fields
+        series_name TEXT,
+        season INTEGER,
+        episode INTEGER,
+        episode_title TEXT,
+        air_date DATE,
+        
+        -- Music specific fields
+        artist TEXT,
+        album TEXT,
+        track_number INTEGER,
+        
+        -- Generic video fields
+        category TEXT,
+        source TEXT,
+        
+        -- Watch history fields
+        watched BOOLEAN DEFAULT FALSE,
+        last_watched TIMESTAMP WITH TIME ZONE,
+        watch_count INTEGER DEFAULT 0,
+        rating INTEGER CHECK (rating >= 1 AND rating <= 5),
+        
+        CONSTRAINT valid_media_type CHECK (media_type IN ('movie', 'tv_series', 'music', 'video'))
+    );" "media" || return 1
+    
+    # Create indexes
+    echo "Creating indexes..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_full_filepath ON media(full_filepath);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_media_type ON media(media_type);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_name ON media(name);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_tags ON media(tags);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_video_codec ON media(video_codec);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_audio_codec ON media(audio_codec);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_resolution_width ON media(resolution_width);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_filesize ON media(filesize);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at DESC);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_updated_at ON media(updated_at DESC);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_series_name ON media(series_name);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_artist ON media(artist);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_album ON media(album);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_metadata ON media USING GIN(metadata);" "media" || return 1
+    
+    # Create trigger
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_media_updated_at') THEN
+            CREATE TRIGGER update_media_updated_at 
+            BEFORE UPDATE ON media
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "media" || return 1
+    
+    # Add new columns to existing media table if they don't exist
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'media' AND column_name = 'watched') THEN
+            ALTER TABLE media ADD COLUMN watched BOOLEAN DEFAULT FALSE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'media' AND column_name = 'last_watched') THEN
+            ALTER TABLE media ADD COLUMN last_watched TIMESTAMP WITH TIME ZONE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'media' AND column_name = 'watch_count') THEN
+            ALTER TABLE media ADD COLUMN watch_count INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'media' AND column_name = 'rating') THEN
+            ALTER TABLE media ADD COLUMN rating INTEGER CHECK (rating >= 1 AND rating <= 5);
+        END IF;
+    END
+    \$\$;" "media" || return 1
+    
+    # Create collections table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS media_collections (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL UNIQUE,
+        description TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "media" || return 1
+    
+    # Create collection items table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS media_collection_items (
+        collection_id UUID REFERENCES media_collections(id) ON DELETE CASCADE,
+        media_id UUID REFERENCES media(id) ON DELETE CASCADE,
+        position INTEGER,
+        added_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (collection_id, media_id)
+    );" "media" || return 1
+    
+    # Create watchlist table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS media_watchlist (
+        media_id UUID REFERENCES media(id) ON DELETE CASCADE PRIMARY KEY,
+        added_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        priority INTEGER DEFAULT 0
+    );" "media" || return 1
+    
+    # Create saved searches table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS media_saved_searches (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL UNIQUE,
+        search_params JSONB NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "media" || return 1
+    
+    # Add indexes for new tables
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_watched ON media(watched);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_last_watched ON media(last_watched DESC);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_media_rating ON media(rating);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_collection_items_media ON media_collection_items(media_id);" "media" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_watchlist_added ON media_watchlist(added_at DESC);" "media" || return 1
+    
+    echo "Media schema initialized successfully"
+}
+
 # Initialize all schemas
 init_all_schemas() {
     create_database || return 1
     init_transcriptions_schema || return 1
     init_ai_chats_schema || return 1
     init_notes_schema || return 1
+    init_media_schema || return 1
     init_second_brain_schema || return 1
     echo "All schemas initialized successfully"
 }
@@ -1818,10 +1990,11 @@ Supports multiple databases: transcriptions, ai_chats, notes, postgres.
 
 COMMANDS:
     setup               Setup database and all schemas (alias for init)
-    init                Initialize all schemas (transcriptions + ai_chats + notes + second_brain)
+    init                Initialize all schemas (transcriptions + ai_chats + notes + media + second_brain)
     init-transcripts    Initialize transcriptions schema only
     init-ai             Initialize ai_chats schema only
     init-notes          Initialize notes schema only
+    init-media          Initialize media schema only (movies, TV series, music, videos)
     init-second-brain   Initialize second brain vector schema only
     maintain            Perform maintenance operations (vacuum, reindex, cleanup)
     stats               Show database statistics
@@ -1931,7 +2104,7 @@ parse_args() {
                 BACKUP_ALL=true
                 shift
                 ;;
-            setup|init|init-transcripts|init-ai|init-notes|init-second-brain|maintain|stats|export|archive|backup|sync|drop)
+            setup|init|init-transcripts|init-ai|init-notes|init-media|init-second-brain|maintain|stats|export|archive|backup|sync|drop)
                 ACTION="$1"
                 shift
                 break
@@ -1990,6 +2163,9 @@ main() {
             ;;
         init-notes)
             init_notes_schema
+            ;;
+        init-media)
+            init_media_schema
             ;;
         init-second-brain)
             init_second_brain_schema

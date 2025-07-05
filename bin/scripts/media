@@ -1,0 +1,2226 @@
+#!/usr/bin/python3
+"""
+Media Database Management System
+
+A unified system for tracking various media types including movies, TV series, 
+music, and generic videos with metadata extraction and search capabilities.
+"""
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Standard library imports
+import argparse
+import hashlib
+import json
+import uuid
+import pathlib
+import datetime
+import concurrent.futures
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Any
+
+# Third-party imports
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor, Json
+    import yaml
+    from rich.console import Console
+    from rich.table import Table
+    from rich.markdown import Markdown
+except ImportError as e:
+    print(f"Error importing required modules: {e}", file=sys.stderr)
+    print("Please ensure you're running in the dev container or install requirements.txt", file=sys.stderr)
+    sys.exit(1)
+
+# Configuration
+DEFAULT_MEDIA_DIRS = {
+    'movies': os.path.expanduser('~/.mnt/nas/Media/Movies'),
+    'tv_series': os.path.expanduser('~/.mnt/nas/Media/TV Series'),
+    'music': os.path.expanduser('~/.mnt/nas/Media/Music'),
+    'videos': os.path.expanduser('~/.mnt/nas/Media/Videos'),
+}
+
+# Database configuration
+DB_CONFIG = {
+    'host': os.environ.get('MEDIA_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('MEDIA_DB_PORT', '5432')),
+    'database': os.environ.get('MEDIA_DB_NAME', 'media'),
+    'user': os.environ.get('MEDIA_DB_USER', 'postgres'),
+    'password': os.environ.get('MEDIA_DB_PASSWORD', '')
+}
+
+# Media type configurations
+MEDIA_TYPE_CONFIG = {
+    'movie': {
+        'extensions': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'],
+        'extra_fields': ['year', 'director', 'genre', 'imdb_id', 'tmdb_id']
+    },
+    'tv_series': {
+        'extensions': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'],
+        'extra_fields': ['series_name', 'season', 'episode', 'episode_title', 'air_date']
+    },
+    'music': {
+        'extensions': ['.mp3', '.flac', '.wav', '.aac', '.ogg', '.m4a', '.wma'],
+        'extra_fields': ['artist', 'album', 'track_number', 'genre', 'year']
+    },
+    'video': {
+        'extensions': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'],
+        'extra_fields': ['category', 'source']
+    }
+}
+
+# Global debug flag
+DEBUG = False
+console = Console()
+
+def debug_print(msg: str):
+    """Print debug messages when DEBUG is True."""
+    if DEBUG:
+        console.print(f"[dim cyan][DEBUG][/dim cyan] {msg}")
+
+def get_db_connection():
+    """Create and return a database connection."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
+        return conn
+    except psycopg2.Error as e:
+        console.print(f"[red]Database connection error:[/red] {e}")
+        sys.exit(1)
+
+def get_file_hash(filepath: str, chunk_size: int = 8192) -> str:
+    """Calculate SHA256 hash of a file."""
+    sha256 = hashlib.sha256()
+    try:
+        with open(filepath, 'rb') as f:
+            while chunk := f.read(chunk_size):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+    except Exception as e:
+        debug_print(f"Error hashing {filepath}: {e}")
+        return ""
+
+def extract_metadata_ffprobe(filepath: str) -> Dict[str, Any]:
+    """Extract metadata from media file using ffprobe."""
+    try:
+        # Run ffprobe to get JSON output
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', '-show_streams', filepath
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            metadata = json.loads(result.stdout)
+            
+            # Extract relevant information
+            info = {
+                'format': metadata.get('format', {}).get('format_name'),
+                'duration': float(metadata.get('format', {}).get('duration', 0)),
+                'bit_rate': int(metadata.get('format', {}).get('bit_rate', 0)),
+                'tags': metadata.get('format', {}).get('tags', {})
+            }
+            
+            # Extract video stream info
+            video_streams = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'video']
+            if video_streams:
+                video = video_streams[0]
+                info['video_codec'] = video.get('codec_name')
+                info['width'] = video.get('width')
+                info['height'] = video.get('height')
+                info['fps'] = eval(video.get('r_frame_rate', '0/1'))
+            
+            # Extract audio stream info
+            audio_streams = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'audio']
+            if audio_streams:
+                audio = audio_streams[0]
+                info['audio_codec'] = audio.get('codec_name')
+                info['sample_rate'] = int(audio.get('sample_rate', 0))
+                info['channels'] = audio.get('channels')
+            
+            # Store full metadata as JSON
+            info['full_metadata'] = metadata
+            
+            return info
+        else:
+            debug_print(f"ffprobe failed for {filepath}: {result.stderr}")
+            return {}
+    except Exception as e:
+        debug_print(f"Error extracting metadata from {filepath}: {e}")
+        return {}
+
+def parse_tv_series_filename(filename: str) -> Dict[str, Any]:
+    """Parse TV series filename to extract series, season, and episode info."""
+    import re
+    
+    info = {}
+    
+    # Pattern: Series Name - SxxExx - Episode Title
+    pattern1 = r'^(.+?)\s*-\s*S(\d{2})E(\d{2})\s*(?:-\s*(.+?))?(?:\.\w+)?$'
+    # Pattern: Series Name SxxExx
+    pattern2 = r'^(.+?)\s+S(\d{2})E(\d{2})(?:\.\w+)?$'
+    
+    match = re.match(pattern1, filename) or re.match(pattern2, filename)
+    if match:
+        info['series_name'] = match.group(1).strip()
+        info['season'] = int(match.group(2))
+        info['episode'] = int(match.group(3))
+        if len(match.groups()) >= 4 and match.group(4):
+            info['episode_title'] = match.group(4).strip()
+    
+    return info
+
+def parse_movie_filename(filename: str) -> Dict[str, Any]:
+    """Parse movie filename to extract title and year."""
+    import re
+    
+    info = {}
+    
+    # Pattern: Movie Title (Year)
+    pattern = r'^(.+?)\s*\((\d{4})\)(?:\.\w+)?$'
+    match = re.match(pattern, filename)
+    
+    if match:
+        info['title'] = match.group(1).strip()
+        info['year'] = int(match.group(2))
+    else:
+        # Fallback: use filename without extension as title
+        info['title'] = pathlib.Path(filename).stem
+    
+    return info
+
+def determine_media_type(filepath: str, media_dirs: Dict[str, str]) -> str:
+    """Determine media type based on file location and extension."""
+    path = pathlib.Path(filepath)
+    ext = path.suffix.lower()
+    
+    # Check by directory
+    for media_type, base_dir in media_dirs.items():
+        if str(path).startswith(str(base_dir)):
+            # Verify extension matches
+            if ext in MEDIA_TYPE_CONFIG.get(media_type, {}).get('extensions', []):
+                return media_type
+    
+    # Fallback to extension-based detection
+    for media_type, config in MEDIA_TYPE_CONFIG.items():
+        if ext in config.get('extensions', []):
+            return media_type
+    
+    return 'video'  # Default type
+
+def scan_media_file(filepath: str, media_type: str) -> Dict[str, Any]:
+    """Scan a single media file and extract all information."""
+    path = pathlib.Path(filepath)
+    stat = path.stat()
+    
+    # Basic file info
+    info = {
+        'id': str(uuid.uuid4()),
+        'name': path.name,
+        'dirname': str(path.parent),
+        'full_filepath': str(path),
+        'media_type': media_type,
+        'filesize': stat.st_size,
+        'created_at': datetime.datetime.fromtimestamp(stat.st_ctime, tz=datetime.timezone.utc),
+        'file_hash': get_file_hash(str(path)),
+        'tags': ''
+    }
+    
+    # Extract metadata
+    metadata = extract_metadata_ffprobe(str(path))
+    if metadata:
+        info['video_codec'] = metadata.get('video_codec')
+        info['audio_codec'] = metadata.get('audio_codec')
+        info['resolution_width'] = metadata.get('width')
+        info['resolution_height'] = metadata.get('height')
+        info['metadata'] = Json(metadata.get('full_metadata', {}))
+        info['duration'] = metadata.get('duration')
+    
+    # Parse filename based on media type
+    if media_type == 'tv_series':
+        tv_info = parse_tv_series_filename(path.name)
+        info.update(tv_info)
+    elif media_type == 'movie':
+        movie_info = parse_movie_filename(path.name)
+        info.update(movie_info)
+    elif media_type == 'music':
+        # Extract from metadata tags if available
+        tags = metadata.get('tags', {})
+        info['artist'] = tags.get('artist', tags.get('ARTIST'))
+        info['album'] = tags.get('album', tags.get('ALBUM'))
+        info['track_number'] = tags.get('track', tags.get('TRACK'))
+        info['genre'] = tags.get('genre', tags.get('GENRE'))
+        info['year'] = tags.get('date', tags.get('DATE', ''))[:4] if tags.get('date') or tags.get('DATE') else None
+    
+    return info
+
+def ingest_media(media_type: str, path: str, recursive: bool = False, update: bool = False, 
+                 remove_missing: bool = False, parallel_jobs: int = 4) -> Dict[str, int]:
+    """Ingest media files from a specific path."""
+    stats = defaultdict(int)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Validate parallel_jobs
+    if parallel_jobs < 1:
+        parallel_jobs = 1
+    elif parallel_jobs > 32:
+        console.print(f"[yellow]Warning: Limiting parallel jobs to 32 (requested: {parallel_jobs})[/yellow]")
+        parallel_jobs = 32
+    
+    try:
+        # Validate media type
+        if media_type not in MEDIA_TYPE_CONFIG:
+            console.print(f"[red]Invalid media type:[/red] {media_type}")
+            console.print(f"Valid types: {', '.join(MEDIA_TYPE_CONFIG.keys())}")
+            return dict(stats)
+        
+        # Check if path exists
+        if not os.path.exists(path):
+            console.print(f"[red]Path not found:[/red] {path}")
+            return dict(stats)
+        
+        # Get existing files from database for this media type
+        cur.execute("SELECT full_filepath, file_hash, metadata FROM media WHERE media_type = %s", (media_type,))
+        existing_files = {row['full_filepath']: {'hash': row['file_hash'], 'metadata': row['metadata']} 
+                         for row in cur.fetchall()}
+        
+        # Find media files
+        files_to_process = []
+        valid_extensions = MEDIA_TYPE_CONFIG[media_type]['extensions']
+        
+        if os.path.isfile(path):
+            # Single file
+            ext = pathlib.Path(path).suffix.lower()
+            if ext in valid_extensions:
+                files_to_process.append(os.path.abspath(path))
+            else:
+                console.print(f"[yellow]File extension {ext} not valid for {media_type}[/yellow]")
+        else:
+            # Directory
+            if recursive:
+                for root, _, files in os.walk(path):
+                    for filename in files:
+                        if filename.startswith('.') or filename.startswith('._'):
+                            continue
+                        ext = pathlib.Path(filename).suffix.lower()
+                        if ext in valid_extensions:
+                            files_to_process.append(os.path.abspath(os.path.join(root, filename)))
+            else:
+                for filename in os.listdir(path):
+                    if filename.startswith('.') or filename.startswith('._'):
+                        continue
+                    filepath = os.path.join(path, filename)
+                    if os.path.isfile(filepath):
+                        ext = pathlib.Path(filename).suffix.lower()
+                        if ext in valid_extensions:
+                            files_to_process.append(os.path.abspath(filepath))
+        
+        console.print(f"Found {len(files_to_process)} {media_type} files to process...")
+        if parallel_jobs > 1:
+            console.print(f"Using {parallel_jobs} parallel workers")
+        
+        import time
+        start_time = time.time()
+        
+        # Process files
+        from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console
+        ) as progress:
+            task = progress.add_task(f"Processing {media_type} files...", total=len(files_to_process))
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_jobs) as executor:
+                future_to_file = {
+                    executor.submit(scan_media_file, filepath, media_type): filepath
+                    for filepath in files_to_process
+                }
+                
+                for future in concurrent.futures.as_completed(future_to_file):
+                    filepath = future_to_file[future]
+                    try:
+                        info = future.result()
+                        progress.advance(task)
+                        
+                        if filepath in existing_files:
+                            if update:
+                                # Check if update needed
+                                existing = existing_files[filepath]
+                                if existing['hash'] != info.get('file_hash'):
+                                    # File changed, update it
+                                    update_media_record(cur, info)
+                                    stats['updated'] += 1
+                                    debug_print(f"Updated: {filepath}")
+                                else:
+                                    stats['skipped'] += 1
+                            else:
+                                stats['skipped'] += 1
+                        else:
+                            # New file
+                            insert_media_record(cur, info)
+                            stats['added'] += 1
+                            debug_print(f"Added: {filepath}")
+                            
+                    except Exception as e:
+                        console.print(f"[red]Error processing {filepath}:[/red] {e}")
+                        stats['errors'] += 1
+                        progress.advance(task)
+        
+        # Handle remove_missing
+        if remove_missing:
+            missing_files = []
+            for existing_file in existing_files:
+                if existing_file not in [os.path.abspath(f) for f in files_to_process]:
+                    missing_files.append(existing_file)
+            
+            if missing_files:
+                console.print(f"\n[yellow]Found {len(missing_files)} files in database that no longer exist:[/yellow]")
+                for f in missing_files[:10]:  # Show first 10
+                    console.print(f"  - {f}")
+                if len(missing_files) > 10:
+                    console.print(f"  ... and {len(missing_files) - 10} more")
+                
+                if console.input("\n[bold]Remove these from database? (y/n):[/bold] ").lower() == 'y':
+                    for filepath in missing_files:
+                        cur.execute("DELETE FROM media WHERE full_filepath = %s", (filepath,))
+                        stats['deleted'] += 1
+                    console.print(f"[green]Removed {len(missing_files)} entries[/green]")
+                else:
+                    console.print("[yellow]Skipping removal[/yellow]")
+        
+        conn.commit()
+        
+        # Show timing info
+        elapsed = time.time() - start_time
+        if elapsed > 1:
+            console.print(f"\n[dim]Processing took {elapsed:.1f} seconds ({len(files_to_process)/elapsed:.1f} files/sec)[/dim]")
+        
+        return dict(stats)
+        
+    except Exception as e:
+        conn.rollback()
+        console.print(f"[red]Ingest error:[/red] {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+def sync_media_to_db(media_dirs: Dict[str, str], media_types: List[str] = None) -> Dict[str, int]:
+    """Sync media files to database."""
+    stats = defaultdict(int)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get existing files from database
+        cur.execute("SELECT full_filepath, file_hash FROM media")
+        existing_files = {row['full_filepath']: row['file_hash'] for row in cur.fetchall()}
+        
+        # Scan directories
+        files_to_process = []
+        for media_type, base_dir in media_dirs.items():
+            if media_types and media_type not in media_types:
+                continue
+                
+            if not os.path.exists(base_dir):
+                debug_print(f"Directory not found: {base_dir}")
+                continue
+            
+            debug_print(f"Scanning {media_type} directory: {base_dir}")
+            
+            for root, _, files in os.walk(base_dir):
+                for filename in files:
+                    # Skip hidden and system files
+                    if filename.startswith('.') or filename.startswith('._'):
+                        continue
+                    
+                    filepath = os.path.join(root, filename)
+                    ext = pathlib.Path(filename).suffix.lower()
+                    
+                    # Check if it's a valid media file
+                    if ext in MEDIA_TYPE_CONFIG.get(media_type, {}).get('extensions', []):
+                        files_to_process.append((filepath, media_type))
+        
+        # Process files
+        console.print(f"Found {len(files_to_process)} media files to process...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_file = {
+                executor.submit(scan_media_file, filepath, media_type): filepath
+                for filepath, media_type in files_to_process
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_file):
+                filepath = future_to_file[future]
+                try:
+                    info = future.result()
+                    
+                    # Check if file needs updating
+                    if filepath in existing_files:
+                        if existing_files[filepath] == info.get('file_hash'):
+                            stats['skipped'] += 1
+                            continue
+                        else:
+                            # Update existing record
+                            update_media_record(cur, info)
+                            stats['updated'] += 1
+                    else:
+                        # Insert new record
+                        insert_media_record(cur, info)
+                        stats['added'] += 1
+                        
+                except Exception as e:
+                    console.print(f"[red]Error processing {filepath}:[/red] {e}")
+                    stats['errors'] += 1
+        
+        # Clean up deleted files
+        current_files = {f[0] for f in files_to_process}
+        for existing_file in existing_files:
+            if existing_file not in current_files:
+                cur.execute("DELETE FROM media WHERE full_filepath = %s", (existing_file,))
+                stats['deleted'] += 1
+        
+        conn.commit()
+        return dict(stats)
+        
+    except Exception as e:
+        conn.rollback()
+        console.print(f"[red]Sync error:[/red] {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+def insert_media_record(cur, info: Dict[str, Any]):
+    """Insert a new media record into the database."""
+    # Build dynamic insert query based on available fields
+    fields = []
+    values = []
+    placeholders = []
+    
+    # Core fields
+    core_fields = ['id', 'name', 'dirname', 'full_filepath', 'media_type', 'filesize', 
+                   'created_at', 'file_hash', 'tags', 'video_codec', 'audio_codec',
+                   'resolution_width', 'resolution_height', 'metadata', 'duration']
+    
+    # Media type specific fields
+    type_fields = MEDIA_TYPE_CONFIG.get(info['media_type'], {}).get('extra_fields', [])
+    
+    for field in core_fields + type_fields:
+        if field in info and info[field] is not None:
+            fields.append(field)
+            values.append(info[field])
+            placeholders.append('%s')
+    
+    query = f"""
+        INSERT INTO media ({', '.join(fields)})
+        VALUES ({', '.join(placeholders)})
+    """
+    
+    cur.execute(query, values)
+
+def update_media_record(cur, info: Dict[str, Any]):
+    """Update an existing media record in the database."""
+    # Build dynamic update query
+    set_clauses = []
+    values = []
+    
+    # Updateable fields (exclude id and created_at)
+    update_fields = ['name', 'dirname', 'filesize', 'file_hash', 'video_codec', 
+                     'audio_codec', 'resolution_width', 'resolution_height', 
+                     'metadata', 'duration', 'tags']
+    
+    # Add media type specific fields
+    type_fields = MEDIA_TYPE_CONFIG.get(info['media_type'], {}).get('extra_fields', [])
+    update_fields.extend(type_fields)
+    
+    for field in update_fields:
+        if field in info and info[field] is not None:
+            set_clauses.append(f"{field} = %s")
+            values.append(info[field])
+    
+    # Always update the updated_at timestamp
+    set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+    
+    # Add filepath for WHERE clause
+    values.append(info['full_filepath'])
+    
+    query = f"""
+        UPDATE media
+        SET {', '.join(set_clauses)}
+        WHERE full_filepath = %s
+    """
+    
+    cur.execute(query, values)
+
+def search_media(query: str = None, media_type: str = None, filters: Dict[str, Any] = None,
+                save_search: str = None, load_search: str = None) -> List[Dict]:
+    """Search media database with enhanced filters."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Load saved search if specified
+        if load_search:
+            cur.execute("SELECT search_params FROM media_saved_searches WHERE name = %s", (load_search,))
+            saved = cur.fetchone()
+            if saved:
+                saved_params = saved['search_params']
+                query = saved_params.get('query')
+                media_type = saved_params.get('media_type')
+                filters = saved_params.get('filters', {})
+            else:
+                console.print(f"[yellow]Saved search not found: {load_search}[/yellow]")
+        
+        # Build query
+        where_clauses = []
+        params = []
+        
+        if query:
+            # Full text search on name and tags
+            where_clauses.append("(name ILIKE %s OR tags ILIKE %s)")
+            params.extend([f'%{query}%', f'%{query}%'])
+        
+        if media_type:
+            where_clauses.append("media_type = %s")
+            params.append(media_type)
+        
+        if filters:
+            for key, value in filters.items():
+                if key == 'resolution_min':
+                    where_clauses.append("resolution_width >= %s")
+                    params.append(value)
+                elif key == 'resolution_max':
+                    where_clauses.append("resolution_width <= %s")
+                    params.append(value)
+                elif key == 'tag':
+                    where_clauses.append("tags ILIKE %s")
+                    params.append(f'%{value}%')
+                elif key == 'unwatched':
+                    where_clauses.append("watched = FALSE")
+                elif key == 'watched':
+                    where_clauses.append("watched = TRUE")
+                elif key == 'size':
+                    try:
+                        operator, bytes_value = parse_size_filter(value)
+                        where_clauses.append(f"filesize {operator} %s")
+                        params.append(bytes_value)
+                    except ValueError as e:
+                        console.print(f"[red]Invalid size filter: {e}[/red]")
+                elif key == 'added_after':
+                    where_clauses.append("created_at >= %s::date")
+                    params.append(value)
+                elif key == 'added_before':
+                    where_clauses.append("created_at < %s::date")
+                    params.append(value)
+                else:
+                    where_clauses.append(f"{key} = %s")
+                    params.append(value)
+        
+        # Build final query
+        sql = "SELECT * FROM media"
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(where_clauses)
+        sql += " ORDER BY media_type, name"
+        
+        cur.execute(sql, params)
+        results = cur.fetchall()
+        
+        # Save search if requested
+        if save_search:
+            search_params = {
+                'query': query,
+                'media_type': media_type,
+                'filters': filters
+            }
+            cur.execute("""
+                INSERT INTO media_saved_searches (name, search_params)
+                VALUES (%s, %s)
+                ON CONFLICT (name) DO UPDATE SET search_params = EXCLUDED.search_params
+            """, (save_search, Json(search_params)))
+            conn.commit()
+            console.print(f"[green]Search saved as '{save_search}'[/green]")
+        
+        return results
+        
+    finally:
+        cur.close()
+        conn.close()
+
+def fzf_select_media(results: List[Dict], show_details: bool = False) -> Optional[Dict]:
+    """Use fzf to select from media results."""
+    if not results:
+        return None
+    
+    # Format results for fzf
+    lines = []
+    for i, item in enumerate(results):
+        if show_details:
+            line = f"{i}|{item['media_type']}|{item['name']}|{format_size(item['filesize'])}|{item.get('video_codec', 'N/A')}|{item.get('resolution_width', 'N/A')}x{item.get('resolution_height', 'N/A')}"
+        else:
+            line = f"{i}|{item['media_type']}|{item['name']}"
+        lines.append(line)
+    
+    # Run fzf
+    try:
+        cmd = ['fzf', '--delimiter', '|', '--with-nth', '2..']
+        if show_details:
+            cmd.extend(['--preview-window', 'down:3:wrap'])
+        
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        stdout, _ = process.communicate(input='\n'.join(lines))
+        
+        if process.returncode == 0 and stdout.strip():
+            index = int(stdout.strip().split('|')[0])
+            return results[index]
+    except Exception as e:
+        debug_print(f"fzf error: {e}")
+    
+    return None
+
+def format_size(size_bytes: int) -> str:
+    """Format file size in human readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f}{unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f}PB"
+
+def format_output(results: List[Dict], format_type: str = 'text', render: bool = False):
+    """Format and display results in requested format."""
+    if not results:
+        console.print("No results found.")
+        return
+    
+    if format_type == 'json':
+        # Convert datetime objects to strings
+        for result in results:
+            for key, value in result.items():
+                if isinstance(value, datetime.datetime):
+                    result[key] = value.isoformat()
+        print(json.dumps(results, indent=2))
+        
+    elif format_type == 'yaml':
+        # Convert datetime objects to strings
+        for result in results:
+            for key, value in result.items():
+                if isinstance(value, datetime.datetime):
+                    result[key] = value.isoformat()
+        print(yaml.dump(results, default_flow_style=False))
+        
+    elif format_type == 'markdown' or render:
+        # Create markdown table
+        headers = ['Type', 'Name', 'Size', 'Resolution', 'Video', 'Audio', 'Path']
+        rows = []
+        
+        for item in results:
+            res = f"{item.get('resolution_width', 'N/A')}x{item.get('resolution_height', 'N/A')}" if item.get('resolution_width') else 'N/A'
+            rows.append([
+                item['media_type'],
+                item['name'],
+                format_size(item['filesize']),
+                res,
+                item.get('video_codec', 'N/A'),
+                item.get('audio_codec', 'N/A'),
+                item['dirname']
+            ])
+        
+        # Build markdown table
+        md_lines = ['| ' + ' | '.join(headers) + ' |']
+        md_lines.append('| ' + ' | '.join(['---'] * len(headers)) + ' |')
+        for row in rows:
+            md_lines.append('| ' + ' | '.join(str(cell) for cell in row) + ' |')
+        
+        md_text = '\n'.join(md_lines)
+        
+        if render:
+            console.print(Markdown(md_text))
+        else:
+            print(md_text)
+            
+    else:  # text format
+        # Create rich table
+        table = Table(title="Media Library")
+        table.add_column("Type", style="cyan")
+        table.add_column("Name", style="green")
+        table.add_column("Size", style="yellow")
+        table.add_column("Resolution")
+        table.add_column("Video Codec")
+        table.add_column("Audio Codec")
+        table.add_column("Path", style="dim")
+        
+        for item in results:
+            res = f"{item.get('resolution_width', 'N/A')}x{item.get('resolution_height', 'N/A')}" if item.get('resolution_width') else 'N/A'
+            table.add_row(
+                item['media_type'],
+                item['name'],
+                format_size(item['filesize']),
+                res,
+                item.get('video_codec', 'N/A'),
+                item.get('audio_codec', 'N/A'),
+                item['dirname']
+            )
+        
+        console.print(table)
+
+def view_media_details(media_id: str):
+    """View detailed information about a media file."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("SELECT * FROM media WHERE id = %s", (media_id,))
+        result = cur.fetchone()
+        
+        if not result:
+            console.print(f"[red]Media not found:[/red] {media_id}")
+            return
+        
+        # Display details
+        console.print(f"\n[bold cyan]Media Details[/bold cyan]")
+        console.print(f"[bold]ID:[/bold] {result['id']}")
+        console.print(f"[bold]Type:[/bold] {result['media_type']}")
+        console.print(f"[bold]Name:[/bold] {result['name']}")
+        console.print(f"[bold]Path:[/bold] {result['full_filepath']}")
+        console.print(f"[bold]Size:[/bold] {format_size(result['filesize'])}")
+        
+        if result.get('resolution_width'):
+            console.print(f"[bold]Resolution:[/bold] {result['resolution_width']}x{result['resolution_height']}")
+        
+        if result.get('video_codec'):
+            console.print(f"[bold]Video Codec:[/bold] {result['video_codec']}")
+            
+        if result.get('audio_codec'):
+            console.print(f"[bold]Audio Codec:[/bold] {result['audio_codec']}")
+            
+        if result.get('duration'):
+            console.print(f"[bold]Duration:[/bold] {datetime.timedelta(seconds=int(result['duration']))}")
+        
+        # Media type specific fields
+        if result['media_type'] == 'tv_series':
+            if result.get('series_name'):
+                console.print(f"[bold]Series:[/bold] {result['series_name']}")
+                console.print(f"[bold]Season:[/bold] {result.get('season', 'N/A')}")
+                console.print(f"[bold]Episode:[/bold] {result.get('episode', 'N/A')}")
+                if result.get('episode_title'):
+                    console.print(f"[bold]Episode Title:[/bold] {result['episode_title']}")
+        
+        elif result['media_type'] == 'movie':
+            if result.get('year'):
+                console.print(f"[bold]Year:[/bold] {result['year']}")
+            if result.get('director'):
+                console.print(f"[bold]Director:[/bold] {result['director']}")
+            if result.get('genre'):
+                console.print(f"[bold]Genre:[/bold] {result['genre']}")
+        
+        elif result['media_type'] == 'music':
+            if result.get('artist'):
+                console.print(f"[bold]Artist:[/bold] {result['artist']}")
+            if result.get('album'):
+                console.print(f"[bold]Album:[/bold] {result['album']}")
+            if result.get('track_number'):
+                console.print(f"[bold]Track:[/bold] {result['track_number']}")
+        
+        if result.get('tags'):
+            console.print(f"[bold]Tags:[/bold] {result['tags']}")
+        
+        console.print(f"[bold]Created:[/bold] {result['created_at']}")
+        console.print(f"[bold]Updated:[/bold] {result['updated_at']}")
+        
+    finally:
+        cur.close()
+        conn.close()
+
+def open_media_file(media_id: str):
+    """Open a media file with the default application."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("SELECT full_filepath FROM media WHERE id = %s", (media_id,))
+        result = cur.fetchone()
+        
+        if not result:
+            console.print(f"[red]Media not found:[/red] {media_id}")
+            return
+        
+        filepath = result['full_filepath']
+        if not os.path.exists(filepath):
+            console.print(f"[red]File not found:[/red] {filepath}")
+            return
+        
+        # Open with default application
+        if sys.platform == 'darwin':  # macOS
+            subprocess.run(['open', filepath])
+        elif sys.platform == 'win32':  # Windows
+            os.startfile(filepath)
+        else:  # Linux and others
+            subprocess.run(['xdg-open', filepath])
+            
+    finally:
+        cur.close()
+        conn.close()
+
+def delete_media_entry(identifier: str) -> bool:
+    """Delete a media entry by ID or filepath."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # First try to find by UUID
+        try:
+            uuid.UUID(identifier)  # Validate UUID format
+            cur.execute("SELECT id, name, full_filepath FROM media WHERE id = %s", (identifier,))
+        except ValueError:
+            # Not a UUID, try as filepath
+            cur.execute("SELECT id, name, full_filepath FROM media WHERE full_filepath = %s", (identifier,))
+        
+        result = cur.fetchone()
+        
+        if not result:
+            console.print(f"[red]Media not found:[/red] {identifier}")
+            return False
+        
+        # Confirm deletion
+        console.print(f"\n[yellow]About to delete:[/yellow]")
+        console.print(f"  ID: {result['id']}")
+        console.print(f"  Name: {result['name']}")
+        console.print(f"  Path: {result['full_filepath']}")
+        
+        if console.input("\n[bold]Delete this entry? (y/n):[/bold] ").lower() == 'y':
+            cur.execute("DELETE FROM media WHERE id = %s", (result['id'],))
+            conn.commit()
+            console.print(f"[green]Deleted media entry:[/green] {result['name']}")
+            return True
+        else:
+            console.print("[yellow]Deletion cancelled[/yellow]")
+            return False
+            
+    finally:
+        cur.close()
+        conn.close()
+
+def update_media_tags(media_id: str, tags: str, append: bool = False):
+    """Update tags for a media file."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        if append:
+            cur.execute("SELECT tags FROM media WHERE id = %s", (media_id,))
+            result = cur.fetchone()
+            if result and result['tags']:
+                existing_tags = set(t.strip() for t in result['tags'].split(','))
+                new_tags = set(t.strip() for t in tags.split(','))
+                tags = ','.join(sorted(existing_tags | new_tags))
+        
+        cur.execute("UPDATE media SET tags = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", 
+                   (tags, media_id))
+        conn.commit()
+        
+        console.print(f"[green]Tags updated for media {media_id}[/green]")
+        
+    finally:
+        cur.close()
+        conn.close()
+
+def get_stats():
+    """Get statistics about the media library."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Overall stats
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_files,
+                SUM(filesize) as total_size,
+                COUNT(DISTINCT media_type) as media_types
+            FROM media
+        """)
+        overall = cur.fetchone()
+        
+        # Stats by media type
+        cur.execute("""
+            SELECT 
+                media_type,
+                COUNT(*) as count,
+                SUM(filesize) as total_size,
+                AVG(filesize) as avg_size
+            FROM media
+            GROUP BY media_type
+            ORDER BY media_type
+        """)
+        by_type = cur.fetchall()
+        
+        # Display stats
+        console.print("\n[bold cyan]Media Library Statistics[/bold cyan]")
+        console.print(f"[bold]Total Files:[/bold] {overall['total_files']:,}")
+        console.print(f"[bold]Total Size:[/bold] {format_size(overall['total_size'] or 0)}")
+        console.print(f"[bold]Media Types:[/bold] {overall['media_types']}")
+        
+        console.print("\n[bold]By Media Type:[/bold]")
+        table = Table()
+        table.add_column("Type", style="cyan")
+        table.add_column("Count", justify="right")
+        table.add_column("Total Size", justify="right")
+        table.add_column("Avg Size", justify="right")
+        
+        for row in by_type:
+            table.add_row(
+                row['media_type'],
+                f"{row['count']:,}",
+                format_size(row['total_size']),
+                format_size(int(row['avg_size']))
+            )
+        
+        console.print(table)
+        
+        # Codec stats for video content
+        cur.execute("""
+            SELECT 
+                video_codec,
+                COUNT(*) as count
+            FROM media
+            WHERE video_codec IS NOT NULL
+            GROUP BY video_codec
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        codecs = cur.fetchall()
+        
+        if codecs:
+            console.print("\n[bold]Top Video Codecs:[/bold]")
+            for codec in codecs:
+                console.print(f"  {codec['video_codec']}: {codec['count']:,}")
+        
+    finally:
+        cur.close()
+        conn.close()
+
+def parse_size_filter(size_str: str) -> Tuple[str, int]:
+    """Parse size filter string like '>1GB' into operator and bytes."""
+    import re
+    match = re.match(r'([<>]=?)(\d+(?:\.\d+)?)\s*([KMGT]?B)?', size_str.strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Invalid size filter: {size_str}")
+    
+    operator, value, unit = match.groups()
+    value = float(value)
+    
+    # Convert to bytes
+    units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+    unit = (unit or 'B').upper()
+    bytes_value = int(value * units.get(unit, 1))
+    
+    return operator, bytes_value
+
+def mark_as_watched(media_id: str):
+    """Mark media as watched."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE media 
+            SET watched = TRUE, 
+                last_watched = CURRENT_TIMESTAMP,
+                watch_count = COALESCE(watch_count, 0) + 1
+            WHERE id = %s
+        """, (media_id,))
+        
+        if cur.rowcount > 0:
+            conn.commit()
+            console.print(f"[green]Marked as watched[/green]")
+        else:
+            console.print(f"[red]Media not found:[/red] {media_id}")
+    finally:
+        cur.close()
+        conn.close()
+
+def manage_watchlist(action: str, media_id: str = None, priority: int = 0, media_type: str = None):
+    """Manage watchlist operations."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        if action == 'add' and media_id:
+            cur.execute("""
+                INSERT INTO media_watchlist (media_id, priority)
+                VALUES (%s, %s)
+                ON CONFLICT (media_id) DO UPDATE SET priority = EXCLUDED.priority
+            """, (media_id, priority))
+            conn.commit()
+            console.print(f"[green]Added to watchlist[/green]")
+            
+        elif action == 'remove' and media_id:
+            cur.execute("DELETE FROM media_watchlist WHERE media_id = %s", (media_id,))
+            if cur.rowcount > 0:
+                conn.commit()
+                console.print(f"[green]Removed from watchlist[/green]")
+            else:
+                console.print(f"[yellow]Not in watchlist[/yellow]")
+                
+        elif action == 'list':
+            query = """
+                SELECT m.*, w.priority, w.added_at as watchlist_added
+                FROM media m
+                JOIN media_watchlist w ON m.id = w.media_id
+            """
+            params = []
+            if media_type:
+                query += " WHERE m.media_type = %s"
+                params.append(media_type)
+            query += " ORDER BY w.priority DESC, w.added_at DESC"
+            
+            cur.execute(query, params)
+            results = cur.fetchall()
+            return results
+            
+    finally:
+        cur.close()
+        conn.close()
+
+def find_duplicates(media_type: str = None, tolerance: int = 5) -> List[List[Dict]]:
+    """Find potential duplicate media files."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Find duplicates by various criteria
+        query = """
+            WITH potential_dupes AS (
+                SELECT 
+                    name,
+                    filesize,
+                    duration,
+                    resolution_width,
+                    resolution_height,
+                    file_hash,
+                    COUNT(*) OVER (PARTITION BY file_hash) as hash_count,
+                    COUNT(*) OVER (PARTITION BY name) as name_count,
+                    COUNT(*) OVER (PARTITION BY filesize, duration) as size_duration_count
+                FROM media
+                WHERE 1=1
+        """
+        params = []
+        if media_type:
+            query += " AND media_type = %s"
+            params.append(media_type)
+            
+        query += """
+            )
+            SELECT * FROM media 
+            WHERE id IN (
+                SELECT id FROM media m
+                JOIN potential_dupes p ON m.file_hash = p.file_hash
+                WHERE p.hash_count > 1
+            )
+            OR id IN (
+                SELECT id FROM media m
+                JOIN potential_dupes p ON m.name = p.name
+                WHERE p.name_count > 1
+            )
+            ORDER BY name, filesize DESC
+        """
+        
+        cur.execute(query, params)
+        all_dupes = cur.fetchall()
+        
+        # Group duplicates
+        grouped = defaultdict(list)
+        for item in all_dupes:
+            # Group by name similarity or exact hash
+            key = item['file_hash'] if item['file_hash'] else item['name']
+            grouped[key].append(dict(item))
+        
+        return [group for group in grouped.values() if len(group) > 1]
+        
+    finally:
+        cur.close()
+        conn.close()
+
+def bulk_operations(operation: str, **kwargs):
+    """Perform bulk operations on media entries."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        if operation == 'tag':
+            # Build WHERE clause
+            where_conditions = []
+            
+            if kwargs.get('type'):
+                where_conditions.append(f"media_type = '{kwargs['type']}'")
+            
+            if kwargs.get('where'):
+                where_conditions.append(f"({kwargs['where']})")
+            
+            where_clause = ' AND '.join(where_conditions) if where_conditions else '1=1'
+            
+            # Get affected items count first
+            count_query = f"SELECT COUNT(*) as cnt FROM media WHERE {where_clause}"
+            cur.execute(count_query)
+            count = cur.fetchone()['cnt']
+            
+            if count == 0:
+                console.print("[yellow]No media items match the criteria[/yellow]")
+                return
+            
+            console.print(f"[yellow]This will affect {count} items[/yellow]")
+            if console.input("Continue? (y/n): ").lower() != 'y':
+                return
+            
+            # Perform tagging
+            tags = kwargs['tag']
+            if kwargs.get('append'):
+                update_query = f"""
+                    UPDATE media 
+                    SET tags = CASE 
+                        WHEN tags IS NULL OR tags = '' THEN '{tags}'
+                        ELSE tags || ',' || '{tags}'
+                    END
+                    WHERE {where_clause}
+                """
+            else:
+                update_query = f"UPDATE media SET tags = '{tags}' WHERE {where_clause}"
+            
+            cur.execute(update_query)
+            conn.commit()
+            console.print(f"[green]Updated {cur.rowcount} items[/green]")
+            
+        elif operation == 'delete':
+            # Build WHERE clause
+            where_parts = ["1=1"]
+            params = []
+            
+            if kwargs.get('type'):
+                where_parts.append("media_type = %s")
+                params.append(kwargs['type'])
+            
+            if kwargs.get('where'):
+                where_parts.append(f"({kwargs['where']})")
+            
+            if kwargs.get('older_than'):
+                where_parts.append("created_at < %s::date")
+                params.append(kwargs['older_than'])
+            
+            # Get items to delete
+            select_query = f"SELECT id, name, full_filepath FROM media WHERE {' AND '.join(where_parts)}"
+            cur.execute(select_query, params)
+            items = cur.fetchall()
+            
+            if not items:
+                console.print("[yellow]No items match the criteria[/yellow]")
+                return
+            
+            console.print(f"[red]Will delete {len(items)} items:[/red]")
+            for i, item in enumerate(items[:10]):
+                console.print(f"  - {item['name']}")
+            if len(items) > 10:
+                console.print(f"  ... and {len(items) - 10} more")
+            
+            if not kwargs.get('confirm'):
+                if console.input("\n[bold]Delete these items? (yes/no):[/bold] ").lower() != 'yes':
+                    return
+            
+            # Delete items
+            delete_query = f"DELETE FROM media WHERE {' AND '.join(where_parts)}"
+            cur.execute(delete_query, params)
+            conn.commit()
+            console.print(f"[green]Deleted {cur.rowcount} items[/green]")
+            
+    finally:
+        cur.close()
+        conn.close()
+
+def analyze_quality(media_type: str = None, min_resolution: int = 720, 
+                   max_bitrate: int = None, suggest_compress: bool = False):
+    """Analyze media quality and suggest improvements."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Low resolution files
+        query = """
+            SELECT id, name, full_filepath, resolution_width, resolution_height, 
+                   filesize, video_codec, duration
+            FROM media
+            WHERE resolution_height < %s AND resolution_height IS NOT NULL
+        """
+        params = [min_resolution]
+        if media_type:
+            query += " AND media_type = %s"
+            params.append(media_type)
+        query += " ORDER BY resolution_height ASC"
+        
+        cur.execute(query, params)
+        low_res = cur.fetchall()
+        
+        if low_res:
+            console.print(f"\n[yellow]Low Resolution Files (< {min_resolution}p):[/yellow]")
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("Name", width=40)
+            table.add_column("Resolution", justify="right")
+            table.add_column("Codec")
+            table.add_column("Size", justify="right")
+            
+            for item in low_res[:20]:
+                table.add_row(
+                    item['name'][:40],
+                    f"{item['resolution_width']}x{item['resolution_height']}",
+                    item['video_codec'] or 'Unknown',
+                    format_size(item['filesize'])
+                )
+            console.print(table)
+            if len(low_res) > 20:
+                console.print(f"... and {len(low_res) - 20} more")
+        
+        # Files needing compression
+        if suggest_compress:
+            # Find large files with old codecs or high bitrate
+            query = """
+                SELECT id, name, full_filepath, filesize, duration, video_codec,
+                       resolution_width, resolution_height,
+                       CASE WHEN duration > 0 THEN filesize / duration / 125000.0 ELSE 0 END as bitrate_mbps
+                FROM media
+                WHERE (
+                    video_codec IN ('mpeg4', 'msmpeg4v3', 'wmv3', 'mpeg2video', 'h263')
+                    OR filesize > 5368709120  -- > 5GB
+                    OR (duration > 0 AND filesize / duration / 125000.0 > 20)  -- > 20 Mbps
+                )
+            """
+            params = []
+            if media_type:
+                query += " AND media_type = %s"
+                params.append(media_type)
+            query += " ORDER BY filesize DESC"
+            
+            cur.execute(query, params)
+            compress_candidates = cur.fetchall()
+            
+            if compress_candidates:
+                console.print(f"\n[yellow]Compression Candidates:[/yellow]")
+                table = Table(show_header=True, header_style="bold magenta")
+                table.add_column("Name", width=35)
+                table.add_column("Size", justify="right")
+                table.add_column("Codec")
+                table.add_column("Bitrate", justify="right")
+                table.add_column("Est. Savings", justify="right")
+                
+                total_size = 0
+                total_savings = 0
+                
+                for item in compress_candidates[:20]:
+                    size = item['filesize']
+                    total_size += size
+                    
+                    # Estimate compressed size (rough approximation)
+                    if item['resolution_height'] and item['resolution_height'] >= 1080:
+                        target_bitrate = 8  # 8 Mbps for 1080p+
+                    else:
+                        target_bitrate = 4  # 4 Mbps for < 1080p
+                    
+                    if item['duration'] and item['duration'] > 0:
+                        estimated_size = item['duration'] * target_bitrate * 125000
+                        savings = max(0, size - estimated_size)
+                    else:
+                        savings = size * 0.4  # Assume 40% savings
+                    
+                    total_savings += savings
+                    
+                    table.add_row(
+                        item['name'][:35],
+                        format_size(size),
+                        item['video_codec'] or 'Unknown',
+                        f"{item['bitrate_mbps']:.1f} Mbps" if item['bitrate_mbps'] else 'N/A',
+                        format_size(savings)
+                    )
+                
+                console.print(table)
+                if len(compress_candidates) > 20:
+                    console.print(f"... and {len(compress_candidates) - 20} more")
+                
+                console.print(f"\n[bold]Total potential savings: {format_size(total_savings)} "
+                            f"({total_savings / total_size * 100:.1f}% reduction)[/bold]")
+        
+        # Codec statistics
+        cur.execute("""
+            SELECT video_codec, COUNT(*) as count, AVG(filesize) as avg_size
+            FROM media
+            WHERE video_codec IS NOT NULL
+            GROUP BY video_codec
+            ORDER BY count DESC
+        """)
+        codec_stats = cur.fetchall()
+        
+        console.print("\n[bold]Codec Distribution:[/bold]")
+        for stat in codec_stats[:10]:
+            console.print(f"  {stat['video_codec']}: {stat['count']} files "
+                        f"(avg {format_size(stat['avg_size'])})")
+        
+    finally:
+        cur.close()
+        conn.close()
+
+def manage_collections(action: str, **kwargs):
+    """Manage media collections."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        if action == 'create':
+            cur.execute("""
+                INSERT INTO media_collections (name, description)
+                VALUES (%s, %s)
+            """, (kwargs['name'], kwargs.get('description')))
+            conn.commit()
+            console.print(f"[green]Collection '{kwargs['name']}' created[/green]")
+            
+        elif action == 'list':
+            cur.execute("""
+                SELECT c.*, COUNT(ci.media_id) as item_count
+                FROM media_collections c
+                LEFT JOIN media_collection_items ci ON c.id = ci.collection_id
+                GROUP BY c.id, c.name, c.description, c.created_at, c.updated_at
+                ORDER BY c.name
+            """)
+            collections = cur.fetchall()
+            
+            if collections:
+                table = Table(show_header=True, header_style="bold magenta")
+                table.add_column("Name", width=30)
+                table.add_column("Items", justify="right")
+                table.add_column("Description", width=40)
+                table.add_column("Created", width=20)
+                
+                for coll in collections:
+                    table.add_row(
+                        coll['name'],
+                        str(coll['item_count']),
+                        (coll['description'] or '')[:40],
+                        coll['created_at'].strftime('%Y-%m-%d')
+                    )
+                console.print(table)
+            else:
+                console.print("[yellow]No collections found[/yellow]")
+            
+        elif action == 'add':
+            # Get collection ID
+            cur.execute("SELECT id FROM media_collections WHERE name = %s", (kwargs['collection'],))
+            collection = cur.fetchone()
+            if not collection:
+                console.print(f"[red]Collection not found:[/red] {kwargs['collection']}")
+                return
+            
+            # Add media to collection
+            cur.execute("""
+                INSERT INTO media_collection_items (collection_id, media_id)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+            """, (collection['id'], kwargs['media_id']))
+            
+            if cur.rowcount > 0:
+                conn.commit()
+                console.print(f"[green]Added to collection '{kwargs['collection']}'[/green]")
+            else:
+                console.print(f"[yellow]Already in collection[/yellow]")
+            
+        elif action == 'remove':
+            # Get collection ID
+            cur.execute("SELECT id FROM media_collections WHERE name = %s", (kwargs['collection'],))
+            collection = cur.fetchone()
+            if not collection:
+                console.print(f"[red]Collection not found:[/red] {kwargs['collection']}")
+                return
+            
+            # Remove from collection
+            cur.execute("""
+                DELETE FROM media_collection_items
+                WHERE collection_id = %s AND media_id = %s
+            """, (collection['id'], kwargs['media_id']))
+            
+            if cur.rowcount > 0:
+                conn.commit()
+                console.print(f"[green]Removed from collection[/green]")
+            else:
+                console.print(f"[yellow]Not in collection[/yellow]")
+            
+        elif action == 'view':
+            # Get collection with items
+            cur.execute("""
+                SELECT m.*, ci.position
+                FROM media m
+                JOIN media_collection_items ci ON m.id = ci.media_id
+                JOIN media_collections c ON ci.collection_id = c.id
+                WHERE c.name = %s
+                ORDER BY ci.position, ci.added_at
+            """, (kwargs['collection'],))
+            
+            items = cur.fetchall()
+            if items:
+                console.print(f"\n[bold]Collection: {kwargs['collection']}[/bold]")
+                return items
+            else:
+                console.print(f"[yellow]Collection is empty or not found[/yellow]")
+                return []
+            
+        elif action == 'export':
+            # Get collection items
+            cur.execute("""
+                SELECT m.full_filepath, m.name
+                FROM media m
+                JOIN media_collection_items ci ON m.id = ci.media_id
+                JOIN media_collections c ON ci.collection_id = c.id
+                WHERE c.name = %s
+                ORDER BY ci.position, ci.added_at
+            """, (kwargs['collection'],))
+            
+            items = cur.fetchall()
+            if not items:
+                console.print(f"[yellow]Collection is empty or not found[/yellow]")
+                return
+            
+            # Generate playlist
+            format_type = kwargs.get('format', 'm3u')
+            output_file = kwargs.get('output') or f"{kwargs['collection']}.{format_type}"
+            
+            with open(output_file, 'w', encoding='utf-8') as f:
+                if format_type == 'm3u':
+                    f.write("#EXTM3U\n")
+                    for item in items:
+                        f.write(f"#EXTINF:-1,{item['name']}\n")
+                        f.write(f"{item['full_filepath']}\n")
+                        
+                elif format_type == 'pls':
+                    f.write("[playlist]\n")
+                    for i, item in enumerate(items, 1):
+                        f.write(f"File{i}={item['full_filepath']}\n")
+                        f.write(f"Title{i}={item['name']}\n")
+                    f.write(f"NumberOfEntries={len(items)}\n")
+                    f.write("Version=2\n")
+                    
+            console.print(f"[green]Exported to {output_file}[/green]")
+            
+        elif action == 'delete':
+            cur.execute("DELETE FROM media_collections WHERE name = %s", (kwargs['collection'],))
+            if cur.rowcount > 0:
+                conn.commit()
+                console.print(f"[green]Collection deleted[/green]")
+            else:
+                console.print(f"[red]Collection not found[/red]")
+        
+        elif action == 'ingest':
+            # Parse playlist file
+            playlist_file = kwargs['file']
+            if not os.path.exists(playlist_file):
+                console.print(f"[red]Playlist file not found:[/red] {playlist_file}")
+                return
+            
+            # Read and parse playlist
+            paths = []
+            try:
+                with open(playlist_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    
+                # Detect format and extract paths
+                if playlist_file.endswith('.m3u') or playlist_file.endswith('.m3u8'):
+                    # M3U format - skip comments and EXTINF lines
+                    for line in content.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            paths.append(line)
+                
+                elif playlist_file.endswith('.pls'):
+                    # PLS format - extract File entries
+                    import re
+                    for match in re.finditer(r'^File\d+=(.+)$', content, re.MULTILINE):
+                        paths.append(match.group(1))
+                
+                elif playlist_file.endswith('.xspf'):
+                    # XSPF (XML) format
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(content)
+                    # Handle namespace
+                    ns = {'xspf': 'http://xspf.org/ns/0/'}
+                    for location in root.findall('.//xspf:location', ns):
+                        if location.text:
+                            # Remove file:// prefix if present
+                            path = location.text
+                            if path.startswith('file://'):
+                                path = path[7:]
+                            paths.append(path)
+                
+                else:
+                    # Default: treat as plain text, one path per line
+                    for line in content.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            paths.append(line)
+                            
+            except Exception as e:
+                console.print(f"[red]Error reading playlist:[/red] {e}")
+                return
+            
+            if not paths:
+                console.print("[yellow]No media paths found in playlist[/yellow]")
+                return
+            
+            console.print(f"Found {len(paths)} entries in playlist")
+            
+            # Check if collection exists
+            collection_name = kwargs['collection']
+            cur.execute("SELECT id FROM media_collections WHERE name = %s", (collection_name,))
+            collection = cur.fetchone()
+            
+            if not collection:
+                if kwargs.get('create_missing'):
+                    # Create collection
+                    cur.execute("""
+                        INSERT INTO media_collections (name, description)
+                        VALUES (%s, %s)
+                        RETURNING id
+                    """, (collection_name, f"Imported from {os.path.basename(playlist_file)}"))
+                    collection = cur.fetchone()
+                    conn.commit()
+                    console.print(f"[green]Created collection '{collection_name}'[/green]")
+                else:
+                    console.print(f"[red]Collection not found:[/red] {collection_name}")
+                    console.print("Use --create-missing to create it automatically")
+                    return
+            
+            collection_id = collection['id']
+            
+            # Match paths to media entries
+            added = 0
+            not_found = []
+            already_in = 0
+            
+            for path in paths:
+                # Try exact filepath match first
+                cur.execute("SELECT id FROM media WHERE full_filepath = %s", (path,))
+                media = cur.fetchone()
+                
+                if not media:
+                    # Try basename match
+                    basename = os.path.basename(path)
+                    cur.execute("SELECT id FROM media WHERE name = %s", (basename,))
+                    media = cur.fetchone()
+                    
+                    if not media:
+                        # Try partial basename match (without extension)
+                        name_without_ext = os.path.splitext(basename)[0]
+                        cur.execute("SELECT id FROM media WHERE name LIKE %s", (f"{name_without_ext}%",))
+                        media = cur.fetchone()
+                
+                if media:
+                    # Add to collection
+                    try:
+                        cur.execute("""
+                            INSERT INTO media_collection_items (collection_id, media_id)
+                            VALUES (%s, %s)
+                        """, (collection_id, media['id']))
+                        added += 1
+                    except psycopg2.IntegrityError:
+                        # Already in collection
+                        already_in += 1
+                else:
+                    not_found.append(path)
+            
+            conn.commit()
+            
+            # Report results
+            console.print(f"\n[bold]Import Results:[/bold]")
+            console.print(f"  Added to collection: {added}")
+            console.print(f"  Already in collection: {already_in}")
+            console.print(f"  Not found in database: {len(not_found)}")
+            
+            if not_found and len(not_found) <= 20:
+                console.print("\n[yellow]Not found:[/yellow]")
+                for path in not_found:
+                    console.print(f"  - {path}")
+            elif not_found:
+                console.print(f"\n[yellow]Not found: {len(not_found)} files (too many to list)[/yellow]")
+            
+    finally:
+        cur.close()
+        conn.close()
+
+def verify_media_files(media_type: str = None, check_integrity: bool = False, 
+                      remove_missing: bool = False):
+    """Verify media files exist and are accessible."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        query = "SELECT id, name, full_filepath FROM media WHERE 1=1"
+        params = []
+        if media_type:
+            query += " AND media_type = %s"
+            params.append(media_type)
+        
+        cur.execute(query, params)
+        all_files = cur.fetchall()
+        
+        missing = []
+        corrupted = []
+        
+        from rich.progress import Progress
+        with Progress(console=console) as progress:
+            task = progress.add_task("Verifying files...", total=len(all_files))
+            
+            for item in all_files:
+                progress.advance(task)
+                filepath = item['full_filepath']
+                
+                if not os.path.exists(filepath):
+                    missing.append(item)
+                elif check_integrity:
+                    # Use ffmpeg to check file integrity
+                    cmd = ['ffmpeg', '-v', 'error', '-i', filepath, '-f', 'null', '-']
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        corrupted.append({**item, 'error': result.stderr})
+        
+        # Report results
+        if missing:
+            console.print(f"\n[red]Missing files ({len(missing)}):[/red]")
+            for item in missing[:20]:
+                console.print(f"  - {item['name']}")
+            if len(missing) > 20:
+                console.print(f"  ... and {len(missing) - 20} more")
+            
+            if remove_missing:
+                if console.input("\n[bold]Remove missing entries from database? (y/n):[/bold] ").lower() == 'y':
+                    ids = [item['id'] for item in missing]
+                    cur.execute("DELETE FROM media WHERE id = ANY(%s)", (ids,))
+                    conn.commit()
+                    console.print(f"[green]Removed {cur.rowcount} entries[/green]")
+        
+        if corrupted:
+            console.print(f"\n[red]Corrupted files ({len(corrupted)}):[/red]")
+            for item in corrupted[:10]:
+                console.print(f"  - {item['name']}")
+                console.print(f"    Error: {item['error'][:100]}")
+            if len(corrupted) > 10:
+                console.print(f"  ... and {len(corrupted) - 10} more")
+        
+        if not missing and not corrupted:
+            console.print(f"[green]All {len(all_files)} files verified successfully[/green]")
+        
+    finally:
+        cur.close()
+        conn.close()
+
+def main():
+    """Main entry point."""
+    global DEBUG
+    
+    parser = argparse.ArgumentParser(description='Media Database Management System')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    
+    # Output format options
+    parser.add_argument('--format', choices=['text', 'json', 'yaml', 'markdown'], 
+                       default='text', help='Output format')
+    parser.add_argument('--render', action='store_true', 
+                       help='Render markdown output (implies --format markdown)')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Sync command
+    sync_parser = subparsers.add_parser('sync', help='Sync media files to database')
+    sync_parser.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'],
+                           help='Sync only specific media type')
+    sync_parser.add_argument('--dir', help='Override default directory for media type')
+    
+    # Ingest command
+    ingest_parser = subparsers.add_parser('ingest', help='Ingest media files from a specific path')
+    ingest_parser.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'],
+                             required=True, help='Media type to ingest')
+    ingest_parser.add_argument('--path', required=True, help='Path to search for media files')
+    ingest_parser.add_argument('--recursive', '-r', action='store_true',
+                             help='Search recursively in subdirectories')
+    ingest_parser.add_argument('--update', '-u', action='store_true',
+                             help='Update existing entries if metadata changed')
+    ingest_parser.add_argument('--remove-missing', action='store_true',
+                             help='Remove database entries for files that no longer exist')
+    ingest_parser.add_argument('--parallel', type=int, default=4, metavar='N',
+                             help='Number of parallel workers (default: 4)')
+    
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search media library')
+    search_parser.add_argument('query', nargs='?', help='Search query')
+    search_parser.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'],
+                             help='Filter by media type')
+    search_parser.add_argument('--resolution-min', type=int, help='Minimum resolution width')
+    search_parser.add_argument('--resolution-max', type=int, help='Maximum resolution width')
+    search_parser.add_argument('--tag', help='Filter by tag')
+    search_parser.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    search_parser.add_argument('--unwatched', action='store_true', help='Show only unwatched media')
+    search_parser.add_argument('--watched', action='store_true', help='Show only watched media')
+    search_parser.add_argument('--size', help='Size filter (e.g., ">1GB", "<500MB")')
+    search_parser.add_argument('--added-after', help='Added after date (YYYY-MM-DD)')
+    search_parser.add_argument('--added-before', help='Added before date (YYYY-MM-DD)')
+    search_parser.add_argument('--save-as', help='Save this search with a name')
+    search_parser.add_argument('--load-search', help='Load a saved search by name')
+    
+    # View command
+    view_parser = subparsers.add_parser('view', help='View media details')
+    view_parser.add_argument('media_id', nargs='?', help='Media ID')
+    view_parser.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    # Open command
+    open_parser = subparsers.add_parser('open', help='Open media file')
+    open_parser.add_argument('media_id', nargs='?', help='Media ID')
+    open_parser.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    # Tag command
+    tag_parser = subparsers.add_parser('tag', help='Update media tags')
+    tag_parser.add_argument('media_id', help='Media ID')
+    tag_parser.add_argument('tags', help='Comma-separated tags')
+    tag_parser.add_argument('--append', action='store_true', help='Append to existing tags')
+    
+    # Delete command
+    delete_parser = subparsers.add_parser('delete', help='Delete media entry')
+    delete_parser.add_argument('identifier', nargs='?', help='Media ID or filepath to delete')
+    delete_parser.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    # Stats command
+    stats_parser = subparsers.add_parser('stats', help='Show library statistics')
+    
+    # Query command (advanced SQL queries)
+    query_parser = subparsers.add_parser('query', help='Run custom SQL query')
+    query_parser.add_argument('sql', help='SQL query (use "media" as table name)')
+    
+    # Watch command
+    watch_parser = subparsers.add_parser('watch', help='Mark media as watched')
+    watch_parser.add_argument('media_id', nargs='?', help='Media ID')
+    watch_parser.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    # Watchlist command
+    watchlist_parser = subparsers.add_parser('watchlist', help='Manage watchlist')
+    watchlist_sub = watchlist_parser.add_subparsers(dest='action', help='Watchlist actions')
+    
+    watchlist_add = watchlist_sub.add_parser('add', help='Add to watchlist')
+    watchlist_add.add_argument('media_id', nargs='?', help='Media ID')
+    watchlist_add.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    watchlist_add.add_argument('--priority', type=int, default=0, help='Priority (higher = more important)')
+    
+    watchlist_remove = watchlist_sub.add_parser('remove', help='Remove from watchlist')
+    watchlist_remove.add_argument('media_id', nargs='?', help='Media ID')
+    watchlist_remove.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    watchlist_list = watchlist_sub.add_parser('list', help='List watchlist items')
+    watchlist_list.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'], help='Filter by type')
+    
+    # Duplicates command
+    duplicates_parser = subparsers.add_parser('duplicates', help='Find duplicate media files')
+    duplicates_parser.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'], help='Filter by type')
+    duplicates_parser.add_argument('--auto-keep', choices=['best', 'newest', 'largest'], help='Automatically keep one version')
+    duplicates_parser.add_argument('--tolerance', type=int, default=5, help='Duration tolerance in seconds')
+    
+    # Bulk commands
+    bulk_parser = subparsers.add_parser('bulk', help='Bulk operations')
+    bulk_sub = bulk_parser.add_subparsers(dest='operation', help='Bulk operations')
+    
+    bulk_tag = bulk_sub.add_parser('tag', help='Bulk tag operations')
+    bulk_tag.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'], help='Filter by type')
+    bulk_tag.add_argument('--where', help='SQL WHERE clause (e.g., "name LIKE \'%%Marvel%%\'")')
+    bulk_tag.add_argument('--tag', required=True, help='Tags to apply (comma-separated)')
+    bulk_tag.add_argument('--append', action='store_true', help='Append to existing tags')
+    
+    bulk_delete = bulk_sub.add_parser('delete', help='Bulk delete operations')
+    bulk_delete.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'], help='Filter by type')
+    bulk_delete.add_argument('--where', help='SQL WHERE clause')
+    bulk_delete.add_argument('--older-than', help='Delete files older than date (YYYY-MM-DD)')
+    bulk_delete.add_argument('--confirm', action='store_true', help='Skip confirmation prompt')
+    
+    # Quality command
+    quality_parser = subparsers.add_parser('quality', help='Analyze media quality')
+    quality_parser.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'], help='Filter by type')
+    quality_parser.add_argument('--suggest-compress', action='store_true', help='Suggest files for compression')
+    quality_parser.add_argument('--min-resolution', type=int, default=720, help='Minimum acceptable resolution height')
+    quality_parser.add_argument('--max-bitrate', type=int, help='Maximum acceptable bitrate (Mbps)')
+    
+    # Collections command
+    collections_parser = subparsers.add_parser('collections', help='Manage collections')
+    collections_sub = collections_parser.add_subparsers(dest='action', help='Collection actions')
+    
+    collections_create = collections_sub.add_parser('create', help='Create a collection')
+    collections_create.add_argument('name', help='Collection name')
+    collections_create.add_argument('--description', help='Collection description')
+    
+    collections_list = collections_sub.add_parser('list', help='List all collections')
+    
+    collections_add = collections_sub.add_parser('add', help='Add media to collection')
+    collections_add.add_argument('collection', help='Collection name')
+    collections_add.add_argument('media_id', nargs='?', help='Media ID')
+    collections_add.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    collections_remove = collections_sub.add_parser('remove', help='Remove media from collection')
+    collections_remove.add_argument('collection', help='Collection name')
+    collections_remove.add_argument('media_id', nargs='?', help='Media ID')
+    collections_remove.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    collections_view = collections_sub.add_parser('view', help='View collection contents')
+    collections_view.add_argument('collection', help='Collection name')
+    
+    collections_export = collections_sub.add_parser('export', help='Export collection as playlist')
+    collections_export.add_argument('collection', help='Collection name')
+    collections_export.add_argument('--playlist-format', choices=['m3u', 'pls', 'xspf'], default='m3u', help='Playlist format')
+    collections_export.add_argument('--output', help='Output file (defaults to collection_name.format)')
+    
+    collections_delete = collections_sub.add_parser('delete', help='Delete a collection')
+    collections_delete.add_argument('collection', help='Collection name')
+    
+    collections_ingest = collections_sub.add_parser('ingest', help='Import playlist into collection')
+    collections_ingest.add_argument('collection', help='Collection name (will be created if needed)')
+    collections_ingest.add_argument('file', help='Playlist file (txt, m3u, pls, etc.)')
+    collections_ingest.add_argument('--create-missing', action='store_true', help='Create collection if it doesn\'t exist')
+    
+    # Verify command
+    verify_parser = subparsers.add_parser('verify', help='Verify media files exist and are accessible')
+    verify_parser.add_argument('--type', choices=['movie', 'tv_series', 'music', 'video'], help='Filter by type')
+    verify_parser.add_argument('--check-integrity', action='store_true', help='Deep scan with ffmpeg')
+    verify_parser.add_argument('--remove-missing', action='store_true', help='Remove entries for missing files')
+    
+    args = parser.parse_args()
+    DEBUG = args.debug
+    
+    # Handle render flag
+    if args.render:
+        args.format = 'markdown'
+    
+    # Default to search with fzf if no command specified
+    if not args.command:
+        args.command = 'search'
+        args.query = None
+        args.type = None
+        args.resolution_min = None
+        args.resolution_max = None
+        args.tag = None
+        args.fzf = True
+    
+    try:
+        if args.command == 'sync':
+            media_dirs = DEFAULT_MEDIA_DIRS.copy()
+            if args.dir and args.type:
+                media_dirs[args.type] = args.dir
+            
+            media_types = [args.type] if args.type else None
+            stats = sync_media_to_db(media_dirs, media_types)
+            
+            console.print("[green]Sync completed:[/green]")
+            console.print(f"  Added: {stats.get('added', 0)}")
+            console.print(f"  Updated: {stats.get('updated', 0)}")
+            console.print(f"  Skipped: {stats.get('skipped', 0)}")
+            console.print(f"  Deleted: {stats.get('deleted', 0)}")
+            console.print(f"  Errors: {stats.get('errors', 0)}")
+            
+        elif args.command == 'ingest':
+            stats = ingest_media(
+                media_type=args.type,
+                path=args.path,
+                recursive=args.recursive,
+                update=args.update,
+                remove_missing=args.remove_missing,
+                parallel_jobs=args.parallel
+            )
+            
+            console.print("[green]Ingest completed:[/green]")
+            console.print(f"  Added: {stats.get('added', 0)}")
+            console.print(f"  Updated: {stats.get('updated', 0)}")
+            console.print(f"  Skipped: {stats.get('skipped', 0)}")
+            console.print(f"  Deleted: {stats.get('deleted', 0)}")
+            console.print(f"  Errors: {stats.get('errors', 0)}")
+            
+        elif args.command == 'search':
+            filters = {}
+            if args.resolution_min:
+                filters['resolution_min'] = args.resolution_min
+            if args.resolution_max:
+                filters['resolution_max'] = args.resolution_max
+            if args.tag:
+                filters['tag'] = args.tag
+            if args.unwatched:
+                filters['unwatched'] = True
+            if args.watched:
+                filters['watched'] = True
+            if args.size:
+                filters['size'] = args.size
+            if args.added_after:
+                filters['added_after'] = args.added_after
+            if args.added_before:
+                filters['added_before'] = args.added_before
+            
+            results = search_media(args.query, args.type, filters, 
+                                 save_search=args.save_as, load_search=args.load_search)
+            
+            if args.fzf and results:
+                selected = fzf_select_media(results, show_details=True)
+                if selected:
+                    view_media_details(selected['id'])
+            else:
+                format_output(results, args.format, args.render)
+                
+        elif args.command == 'view':
+            if args.fzf or not args.media_id:
+                results = search_media()
+                selected = fzf_select_media(results)
+                if selected:
+                    view_media_details(selected['id'])
+            else:
+                view_media_details(args.media_id)
+                
+        elif args.command == 'open':
+            if args.fzf or not args.media_id:
+                results = search_media()
+                selected = fzf_select_media(results, show_details=True)
+                if selected:
+                    open_media_file(selected['id'])
+            else:
+                open_media_file(args.media_id)
+                
+        elif args.command == 'tag':
+            update_media_tags(args.media_id, args.tags, args.append)
+            
+        elif args.command == 'delete':
+            if args.fzf or not args.identifier:
+                results = search_media()
+                selected = fzf_select_media(results, show_details=True)
+                if selected:
+                    delete_media_entry(selected['id'])
+            else:
+                delete_media_entry(args.identifier)
+                
+        elif args.command == 'stats':
+            get_stats()
+            
+        elif args.command == 'query':
+            conn = get_db_connection()
+            cur = conn.cursor(cursor_factory=RealDictCursor)  # Use RealDictCursor to get dict results
+            try:
+                cur.execute(args.sql)
+                results = cur.fetchall()
+                
+                if not results:
+                    console.print("No results found.")
+                elif args.format == 'json':
+                    # Convert to list of dicts and handle datetime
+                    dict_results = []
+                    for row in results:
+                        row_dict = dict(row)
+                        for key, value in row_dict.items():
+                            if isinstance(value, datetime.datetime):
+                                row_dict[key] = value.isoformat()
+                        dict_results.append(row_dict)
+                    print(json.dumps(dict_results, indent=2))
+                elif args.format == 'yaml':
+                    # Convert to list of dicts and handle datetime
+                    dict_results = []
+                    for row in results:
+                        row_dict = dict(row)
+                        for key, value in row_dict.items():
+                            if isinstance(value, datetime.datetime):
+                                row_dict[key] = value.isoformat()
+                        dict_results.append(row_dict)
+                    print(yaml.dump(dict_results, default_flow_style=False))
+                else:
+                    # Create a generic table for arbitrary SQL results
+                    if results:
+                        # Get column names from the first result
+                        columns = list(results[0].keys())
+                        
+                        table = Table(title="Query Results")
+                        for col in columns:
+                            table.add_column(col)
+                        
+                        for row in results:
+                            # Convert values to strings, handling special types
+                            values = []
+                            for col in columns:
+                                val = row[col]
+                                if val is None:
+                                    values.append('NULL')
+                                elif isinstance(val, datetime.datetime):
+                                    values.append(val.strftime('%Y-%m-%d %H:%M:%S'))
+                                elif isinstance(val, dict):
+                                    values.append(json.dumps(val))
+                                elif col == 'filesize' and isinstance(val, (int, float)):
+                                    values.append(format_size(int(val)))
+                                else:
+                                    values.append(str(val))
+                            table.add_row(*values)
+                        
+                        console.print(table)
+            finally:
+                cur.close()
+                conn.close()
+        
+        elif args.command == 'watch':
+            if args.fzf or not args.media_id:
+                results = search_media()
+                selected = fzf_select_media(results, show_details=True)
+                if selected:
+                    mark_as_watched(selected['id'])
+            else:
+                mark_as_watched(args.media_id)
+        
+        elif args.command == 'watchlist':
+            if args.action == 'add':
+                if args.fzf or not args.media_id:
+                    results = search_media()
+                    selected = fzf_select_media(results, show_details=True)
+                    if selected:
+                        manage_watchlist('add', selected['id'], args.priority)
+                else:
+                    manage_watchlist('add', args.media_id, args.priority)
+            
+            elif args.action == 'remove':
+                if args.fzf or not args.media_id:
+                    # Show only watchlist items
+                    results = manage_watchlist('list', media_type=args.type)
+                    selected = fzf_select_media(results, show_details=True)
+                    if selected:
+                        manage_watchlist('remove', selected['id'])
+                else:
+                    manage_watchlist('remove', args.media_id)
+            
+            elif args.action == 'list':
+                results = manage_watchlist('list', media_type=args.type)
+                format_output(results, args.format, args.render)
+        
+        elif args.command == 'duplicates':
+            dupes = find_duplicates(args.type, args.tolerance)
+            
+            if dupes:
+                console.print(f"[yellow]Found {len(dupes)} groups of duplicates[/yellow]\n")
+                
+                for group in dupes:
+                    console.print(f"[bold]Duplicate group ({len(group)} files):[/bold]")
+                    table = Table(show_header=True, header_style="bold magenta")
+                    table.add_column("Name", width=40)
+                    table.add_column("Size", justify="right")
+                    table.add_column("Resolution", justify="right")
+                    table.add_column("Codec")
+                    table.add_column("Path", width=50)
+                    
+                    for item in group:
+                        res = f"{item.get('resolution_width', 'N/A')}x{item.get('resolution_height', 'N/A')}"
+                        table.add_row(
+                            item['name'][:40],
+                            format_size(item['filesize']),
+                            res,
+                            item.get('video_codec', 'N/A'),
+                            item['full_filepath'][:50]
+                        )
+                    console.print(table)
+                    console.print()
+                    
+                    if args.auto_keep:
+                        # Auto-select which to keep
+                        if args.auto_keep == 'best':
+                            # Keep highest resolution
+                            keep = max(group, key=lambda x: (x.get('resolution_height', 0), x['filesize']))
+                        elif args.auto_keep == 'newest':
+                            keep = max(group, key=lambda x: x['created_at'])
+                        elif args.auto_keep == 'largest':
+                            keep = max(group, key=lambda x: x['filesize'])
+                        
+                        console.print(f"[green]Keeping: {keep['name']}[/green]")
+                        for item in group:
+                            if item['id'] != keep['id']:
+                                console.print(f"[red]Would delete: {item['name']}[/red]")
+            else:
+                console.print("[green]No duplicates found[/green]")
+        
+        elif args.command == 'bulk':
+            if args.operation == 'tag':
+                bulk_operations('tag', 
+                              type=args.type,
+                              where=args.where,
+                              tag=args.tag,
+                              append=args.append)
+            elif args.operation == 'delete':
+                bulk_operations('delete',
+                              type=args.type,
+                              where=args.where,
+                              older_than=args.older_than,
+                              confirm=args.confirm)
+        
+        elif args.command == 'quality':
+            analyze_quality(args.type, args.min_resolution, args.max_bitrate, args.suggest_compress)
+        
+        elif args.command == 'collections':
+            if args.action == 'create':
+                manage_collections('create', name=args.name, description=args.description)
+            
+            elif args.action == 'list':
+                manage_collections('list')
+            
+            elif args.action == 'add':
+                if args.fzf or not args.media_id:
+                    results = search_media()
+                    selected = fzf_select_media(results, show_details=True)
+                    if selected:
+                        manage_collections('add', collection=args.collection, media_id=selected['id'])
+                else:
+                    manage_collections('add', collection=args.collection, media_id=args.media_id)
+            
+            elif args.action == 'remove':
+                if args.fzf or not args.media_id:
+                    # Show collection items
+                    items = manage_collections('view', collection=args.collection)
+                    selected = fzf_select_media(items, show_details=True)
+                    if selected:
+                        manage_collections('remove', collection=args.collection, media_id=selected['id'])
+                else:
+                    manage_collections('remove', collection=args.collection, media_id=args.media_id)
+            
+            elif args.action == 'view':
+                items = manage_collections('view', collection=args.collection)
+                format_output(items, args.format, args.render)
+            
+            elif args.action == 'export':
+                manage_collections('export', 
+                                 collection=args.collection,
+                                 format=args.playlist_format,
+                                 output=args.output)
+            
+            elif args.action == 'delete':
+                manage_collections('delete', collection=args.collection)
+            
+            elif args.action == 'ingest':
+                manage_collections('ingest', 
+                                 collection=args.collection,
+                                 file=args.file,
+                                 create_missing=args.create_missing)
+        
+        elif args.command == 'verify':
+            verify_media_files(args.type, args.check_integrity, args.remove_missing)
+                
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        if DEBUG:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

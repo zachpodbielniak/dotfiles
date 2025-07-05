@@ -62,6 +62,14 @@ MOVIES_DIR="${HOME}/.mnt/nas/Media/Movies"
 TV_SERIES_DIR="${HOME}/.mnt/nas/Media/TV Series"
 IS_MOVIE=false
 IS_TV_SERIES=false
+IS_VIDEO=false
+MEDIA_TAGS=""
+
+# Logging configuration
+LOG_FILE="./compress_video.log"
+LOG_LEVEL="INFO"  # DEBUG, INFO, WARN, ERROR
+LOG_TO_FILE=true
+LOG_TO_STDERR=true
 
 # Quality presets (CRF values)
 declare -A QUALITY_PRESETS=(
@@ -131,13 +139,18 @@ OPTIONS:
     --journal                  Enable journal tracking to skip already converted files
     --journal-file FILE        Custom journal file path (default: ./compress_video_journal.md)
     --force-reconvert          Force reconversion even if file is in journal
+    --log-file FILE            Write detailed logs to specified file (default: ./compress_video.log)
+    --log-level LEVEL          Set log level: DEBUG, INFO, WARN, ERROR (default: INFO)
+    --no-log                   Disable file logging (console output only)
     --list-encoders            List available video encoders in the container
     --prefer-software          Prefer software encoding over hardware acceleration
     --parallel N               Process N files in parallel (default: 1)
     --cpus N                   Limit CPU usage per container (e.g., 2, 1.5)
     --memory SIZE              Limit memory usage per container (e.g., 4096m, 4g)
-    --movie                    Copy completed file to movies library directory
-    --tv-series                Copy completed file to TV series library directory
+    --movie                    Copy completed file to movies library directory and add to media DB
+    --tv-series                Copy completed file to TV series library directory and add to media DB
+    --video                    Add completed file to media DB as generic video
+    --tags TAGS                Comma-separated tags to add to media DB entry
 
 EXAMPLES:
     # Basic compression with defaults (H.265, medium quality)
@@ -194,6 +207,12 @@ EXAMPLES:
     
     # Auto-quality with hardware acceleration
     compress_video --auto-quality --force-hwaccel *.mkv
+    
+    # Compress and add to media DB as generic video with tags
+    compress_video --video --tags "family,vacation" vacation.mp4
+    
+    # Compress movie and add to DB with custom tags
+    compress_video --movie --tags "action,favorite" "Die Hard (1988).mkv"
     
 JOURNAL ANALYSIS EXAMPLES:
     # Enable journal and compress videos
@@ -266,19 +285,83 @@ VULKAN SUPPORT:
 EOF
 }
 
-# Logging functions
+# Initialize logging
+init_logging() {
+    if [[ "$LOG_TO_FILE" == "true" ]]; then
+        # Use the configured log file (defaults to ./compress_video.log)
+        # The LOG_FILE variable is already set with default value
+        
+        # Create log file and directory if needed
+        local log_dir="$(dirname "$LOG_FILE")"
+        if [[ ! -d "$log_dir" ]]; then
+            mkdir -p "$log_dir" || {
+                echo "[ERROR] Failed to create log directory: $log_dir" >&2
+                LOG_TO_FILE=false
+                return 1
+            }
+        fi
+        
+        # Initialize log file with header
+        {
+            echo "=========================================="
+            echo "compress_video log - $(date)"
+            echo "PID: $$"
+            echo "Command: $0 $*"
+            echo "=========================================="
+        } >> "$LOG_FILE" 2>/dev/null || {
+            echo "[ERROR] Failed to initialize log file: $LOG_FILE" >&2
+            LOG_TO_FILE=false
+            return 1
+        }
+    fi
+}
+
+# Enhanced logging functions with file support
+write_log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    local log_entry="[$timestamp] [$level] $message"
+    
+    # Write to log file if enabled
+    if [[ "$LOG_TO_FILE" == "true" ]] && [[ -n "$LOG_FILE" ]]; then
+        echo "$log_entry" >> "$LOG_FILE" 2>/dev/null
+    fi
+    
+    # Write to console based on level and settings
+    case "$level" in
+        ERROR)
+            [[ "$LOG_TO_STDERR" == "true" ]] && echo "$log_entry" >&2
+            ;;
+        WARN)
+            [[ "$LOG_TO_STDERR" == "true" ]] && echo "$log_entry" >&2
+            ;;
+        INFO)
+            echo "$message"  # Keep simple format for user-facing messages
+            ;;
+        DEBUG)
+            if [[ "$VERBOSE" == "true" ]] || [[ "$LOG_LEVEL" == "DEBUG" ]]; then
+                [[ "$LOG_TO_STDERR" == "true" ]] && echo "$log_entry" >&2
+            fi
+            ;;
+    esac
+}
+
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    write_log "INFO" "$@"
 }
 
 error() {
-    echo "[ERROR] $*" >&2
+    write_log "ERROR" "$@"
+}
+
+warn() {
+    write_log "WARN" "$@"
 }
 
 debug() {
-    if [[ "$VERBOSE" == "true" ]]; then
-        echo "[DEBUG] $*" >&2
-    fi
+    write_log "DEBUG" "$@"
 }
 
 # Journal functions
@@ -323,8 +406,12 @@ is_converted() {
     
     # Check if entry exists in journal by looking for the input and output file combination
     if [[ -f "$JOURNAL_FILE" ]]; then
+        # Escape special regex characters in filenames
+        local escaped_input=$(basename "$input_file" | sed 's/[[\.^$()|*+?{]/\\&/g')
+        local escaped_output=$(basename "$output_file" | sed 's/[[\.^$()|*+?{]/\\&/g')
+        
         # Skip header lines and check for matching input/output files
-        if tail -n +4 "$JOURNAL_FILE" | grep -q "| .* | $(basename "$input_file") | $(basename "$output_file") | .* | .* | .* | .* | .* | .* | .* | SUCCESS |"; then
+        if tail -n +4 "$JOURNAL_FILE" | grep -qE "\| [^|]+ \| ${escaped_input} \| ${escaped_output} \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| SUCCESS \|"; then
             return 0  # Already converted successfully
         fi
     fi
@@ -396,10 +483,108 @@ add_to_journal() {
         # Create markdown table row
         local row="| $timestamp | $input_basename | $output_basename | $input_size | $output_size | $compression_ratio | $VIDEO_CODEC | $AUDIO_CODEC | $quality_str | $duration | $status | $notes |"
         
-        # Add to journal file
-        echo "$row" >> "$JOURNAL_FILE"
-        debug "Added to journal: $input_basename -> $output_basename ($status)"
+        # Add to journal file with file locking to prevent race conditions
+        local lock_file="${JOURNAL_FILE}.lock"
+        local lock_acquired=false
+        local retry_count=0
+        local max_retries=10
+        
+        while [[ $retry_count -lt $max_retries ]]; do
+            if (set -C; echo $$ > "$lock_file") 2>/dev/null; then
+                lock_acquired=true
+                break
+            fi
+            # Wait a bit and retry
+            sleep 0.1
+            ((retry_count++))
+        done
+        
+        if [[ "$lock_acquired" == "true" ]]; then
+            # We have the lock, write to journal
+            echo "$row" >> "$JOURNAL_FILE"
+            local write_status=$?
+            
+            # Remove lock file
+            rm -f "$lock_file"
+            
+            if [[ $write_status -eq 0 ]]; then
+                debug "Added to journal: $input_basename -> $output_basename ($status)"
+            else
+                error "Failed to write to journal file: $JOURNAL_FILE"
+                warn "Journal entry lost: $row"
+            fi
+        else
+            error "Failed to acquire journal lock after $max_retries attempts"
+            warn "Journal entry lost: $row"
+        fi
     fi
+}
+
+# Input validation functions
+validate_crf() {
+    local crf="$1"
+    if ! [[ "$crf" =~ ^[0-9]+$ ]]; then
+        error "CRF value must be a positive integer"
+        return 1
+    fi
+    if [[ $crf -lt 0 ]] || [[ $crf -gt 51 ]]; then
+        error "CRF value must be between 0 and 51 (got: $crf)"
+        return 1
+    fi
+    return 0
+}
+
+validate_qp() {
+    local qp="$1"
+    if ! [[ "$qp" =~ ^[0-9]+$ ]]; then
+        error "QP value must be a positive integer"
+        return 1
+    fi
+    if [[ $qp -lt 0 ]] || [[ $qp -gt 51 ]]; then
+        error "QP value must be between 0 and 51 (got: $qp)"
+        return 1
+    fi
+    return 0
+}
+
+validate_resolution() {
+    local resolution="$1"
+    if ! [[ "$resolution" =~ ^[0-9]+x[0-9]+$ ]]; then
+        error "Resolution must be in format WIDTHxHEIGHT (e.g., 1920x1080)"
+        return 1
+    fi
+    local width="${resolution%x*}"
+    local height="${resolution#*x}"
+    if [[ $width -lt 1 ]] || [[ $height -lt 1 ]]; then
+        error "Resolution dimensions must be positive integers"
+        return 1
+    fi
+    if [[ $width -gt 7680 ]] || [[ $height -gt 4320 ]]; then
+        warn "Resolution exceeds 8K (7680x4320). This may cause performance issues."
+    fi
+    return 0
+}
+
+validate_bitrate() {
+    local bitrate="$1"
+    if ! [[ "$bitrate" =~ ^[0-9]+(\.?[0-9]*)?[KkMmGg]?$ ]]; then
+        error "Bitrate must be a number optionally followed by K, M, or G (e.g., 5M, 2000K)"
+        return 1
+    fi
+    return 0
+}
+
+validate_parallel_jobs() {
+    local jobs="$1"
+    if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+        error "Parallel jobs must be a positive integer"
+        return 1
+    fi
+    if [[ $jobs -gt 32 ]]; then
+        error "Parallel jobs cannot exceed 32 (got: $jobs)"
+        return 1
+    fi
+    return 0
 }
 
 # Get video resolution from input file
@@ -556,6 +741,9 @@ parse_args() {
                 shift 2
                 ;;
             -c|--crf)
+                if ! validate_crf "$2"; then
+                    exit 1
+                fi
                 CUSTOM_CRF="$2"
                 shift 2
                 ;;
@@ -600,10 +788,16 @@ parse_args() {
                 shift
                 ;;
             --resolution)
+                if ! validate_resolution "$2"; then
+                    exit 1
+                fi
                 RESOLUTION="$2"
                 shift 2
                 ;;
             --bitrate)
+                if ! validate_bitrate "$2"; then
+                    exit 1
+                fi
                 BITRATE="$2"
                 shift 2
                 ;;
@@ -632,6 +826,23 @@ parse_args() {
                 JOURNAL_FILE="$2"
                 shift 2
                 ;;
+            --log-file)
+                LOG_TO_FILE=true
+                LOG_FILE="$2"
+                shift 2
+                ;;
+            --log-level)
+                LOG_LEVEL="$2"
+                if [[ ! "$LOG_LEVEL" =~ ^(DEBUG|INFO|WARN|ERROR)$ ]]; then
+                    error "Invalid log level: $LOG_LEVEL (must be DEBUG, INFO, WARN, or ERROR)"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --no-log)
+                LOG_TO_FILE=false
+                shift
+                ;;
             --force-reconvert)
                 FORCE_RECONVERT=true
                 shift
@@ -644,11 +855,10 @@ parse_args() {
                 shift
                 ;;
             --parallel)
-                PARALLEL_JOBS="$2"
-                if ! [[ "$PARALLEL_JOBS" =~ ^[1-9][0-9]*$ ]]; then
-                    error "Invalid parallel jobs count: $PARALLEL_JOBS (must be a positive integer)"
+                if ! validate_parallel_jobs "$2"; then
                     exit 1
                 fi
+                PARALLEL_JOBS="$2"
                 shift 2
                 ;;
             --parallel-child)
@@ -664,6 +874,14 @@ parse_args() {
                 IS_TV_SERIES=true
                 shift
                 ;;
+            --video)
+                IS_VIDEO=true
+                shift
+                ;;
+            --tags)
+                MEDIA_TAGS="$2"
+                shift 2
+                ;;
             --cpus)
                 CONTAINER_CPUS="$2"
                 shift 2
@@ -677,6 +895,9 @@ parse_args() {
                 shift
                 ;;
             --qp)
+                if ! validate_qp "$2"; then
+                    exit 1
+                fi
                 CUSTOM_QP="$2"
                 shift 2
                 ;;
@@ -709,8 +930,13 @@ parse_args() {
     fi
     
     # Check for conflicting media library options
-    if [[ "$IS_MOVIE" == "true" ]] && [[ "$IS_TV_SERIES" == "true" ]]; then
-        error "Cannot use both --movie and --tv-series options"
+    local media_count=0
+    [[ "$IS_MOVIE" == "true" ]] && ((media_count++))
+    [[ "$IS_TV_SERIES" == "true" ]] && ((media_count++))
+    [[ "$IS_VIDEO" == "true" ]] && ((media_count++))
+    
+    if [[ $media_count -gt 1 ]]; then
+        error "Cannot use multiple media type options (--movie, --tv-series, --video) together"
         exit 1
     fi
 }
@@ -1036,11 +1262,13 @@ process_video() {
                 log "Retry attempt $retry_count/$max_retries for: $input_file"
             fi
             
-            # Execute the command and capture exit code
-            "${podman_cmd[@]}"
+            # Execute the command and capture exit code and stderr
+            local stderr_file=$(mktemp)
+            "${podman_cmd[@]}" 2>"$stderr_file"
             local exit_code=$?
             
             if [[ $exit_code -eq 0 ]]; then
+                rm -f "$stderr_file"
                 success=true
                 local end_time=$(date +%s)
                 local process_duration=$((end_time - start_time))
@@ -1057,8 +1285,16 @@ process_video() {
                 ((retry_count++))
                 error "FFmpeg failed with exit code $exit_code (attempt $retry_count/$max_retries)"
                 
+                # Log stderr output for debugging
+                if [[ -f "$stderr_file" ]] && [[ -s "$stderr_file" ]]; then
+                    local stderr_content=$(tail -n 20 "$stderr_file")
+                    error "FFmpeg stderr output:"
+                    error "$stderr_content"
+                fi
+                
                 # For parallel child processes, don't retry on failure to avoid blocking the queue
                 if [[ "$PARALLEL_CHILD" == "true" ]]; then
+                    rm -f "$stderr_file"
                     break
                 fi
                 
@@ -1085,6 +1321,9 @@ process_video() {
             fi
         done
         
+        # Clean up temp stderr file
+        rm -f "$stderr_file"
+        
         if [[ "$success" == "false" ]]; then
             error "Failed to compress after $max_retries attempts: $input_file"
             # Add failure to journal
@@ -1098,6 +1337,9 @@ process_video() {
                 copy_to_movie_library "$output_file"
             elif [[ "$IS_TV_SERIES" == "true" ]]; then
                 copy_to_tv_series_library "$output_file"
+            elif [[ "$IS_VIDEO" == "true" ]]; then
+                # Just add to media database without copying
+                add_to_media_db "$output_file" "video"
             fi
         fi
     else
@@ -1143,8 +1385,69 @@ copy_to_movie_library() {
     log "Copying to movie library: $dest_file"
     if rsync -ruhv --progress "$output_file" "$dest_file"; then
         log "Successfully copied to movie library"
+        # Add to media database
+        add_to_media_db "$dest_file" "movie"
     else
         error "Failed to copy to movie library"
+        return 1
+    fi
+}
+
+# Add entry to media database
+add_to_media_db() {
+    local output_file="$1"
+    local media_type="$2"
+    
+    # Check if media script exists
+    if ! command -v media >/dev/null 2>&1; then
+        debug "media script not found, skipping database entry"
+        return 0
+    fi
+    
+    # Run media ingest for the specific file
+    debug "Adding $output_file to media database as $media_type"
+    
+    # Use ingest command which is more direct for single files
+    log "Running media ingest for: $output_file"
+    if media ingest --type "$media_type" --path "$output_file" >/dev/null 2>&1; then
+        debug "Successfully ingested file to media database"
+        
+        # If tags were specified, update them
+        if [[ -n "$MEDIA_TAGS" ]]; then
+            debug "Attempting to add tags: $MEDIA_TAGS"
+            
+            # Use jq with --arg to safely pass the filepath (prevents injection)
+            local media_id=$(media --format json search --type "$media_type" 2>/dev/null | \
+                jq -r --arg filepath "$output_file" '.[] | select(.full_filepath == $filepath) | .id' 2>/dev/null | head -1)
+            
+            if [[ -n "$media_id" ]] && [[ "$media_id" != "null" ]]; then
+                if media tag "$media_id" "$MEDIA_TAGS" >/dev/null 2>&1; then
+                    log "Successfully updated tags for media ID $media_id"
+                else
+                    error "Failed to update tags for media ID $media_id"
+                fi
+            else
+                warn "Could not find media ID for tagging. File path: $output_file"
+                # Try alternative search by basename
+                local basename=$(basename "$output_file")
+                debug "Attempting to find media by basename: $basename"
+                media_id=$(media --format json search --type "$media_type" 2>/dev/null | \
+                    jq -r --arg name "$basename" '.[] | select(.name == $name) | .id' 2>/dev/null | head -1)
+                
+                if [[ -n "$media_id" ]] && [[ "$media_id" != "null" ]]; then
+                    if media tag "$media_id" "$MEDIA_TAGS" >/dev/null 2>&1; then
+                        log "Successfully updated tags for media ID $media_id (found by basename)"
+                    else
+                        error "Failed to update tags for media ID $media_id"
+                    fi
+                else
+                    error "Could not find media entry for tagging"
+                fi
+            fi
+        fi
+        log "Successfully added to media database"
+    else
+        error "Failed to add to media database: $output_file"
         return 1
     fi
 }
@@ -1179,6 +1482,8 @@ copy_to_tv_series_library() {
     log "Copying to TV series library: $dest_file"
     if rsync -ruhv --progress "$output_file" "$dest_file"; then
         log "Successfully copied to TV series library"
+        # Add to media database
+        add_to_media_db "$dest_file" "tv_series"
     else
         error "Failed to copy to TV series library"
         return 1
@@ -1186,7 +1491,7 @@ copy_to_tv_series_library() {
 }
 
 # Export function for parallel to use
-export -f process_video log error debug is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library get_video_resolution get_auto_quality
+export -f process_video log error warn debug write_log is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library add_to_media_db get_video_resolution get_auto_quality
 
 # Wrapper function that parallel can call
 process_video_wrapper() {
@@ -1206,6 +1511,9 @@ process_video_wrapper() {
 # Main function
 main() {
     parse_args "$@"
+    
+    # Initialize logging
+    init_logging "$@"
     
     # Initialize journal if enabled
     init_journal
@@ -1263,8 +1571,8 @@ main() {
             export QUALITY CUSTOM_CRF VIDEO_CODEC AUDIO_CODEC OUTPUT_FORMAT USE_HWACCEL PREFER_VULKAN
             export PREFER_SOFTWARE CONTAINER_IMAGE HWACCEL_DEVICE VERBOSE DRY_RUN USE_JOURNAL 
             export JOURNAL_FILE FORCE_RECONVERT RESOLUTION BITRATE FFMPEG_PRESET PARALLEL_TYPE
-            export IS_MOVIE IS_TV_SERIES MOVIES_DIR TV_SERIES_DIR
-            export CONTAINER_CPUS CONTAINER_MEMORY AUTO_QUALITY CUSTOM_QP
+            export IS_MOVIE IS_TV_SERIES IS_VIDEO MOVIES_DIR TV_SERIES_DIR
+            export CONTAINER_CPUS CONTAINER_MEMORY AUTO_QUALITY CUSTOM_QP MEDIA_TAGS
             
             # Process jobs in parallel
             local parallel_failed=0
@@ -1297,6 +1605,8 @@ main() {
                 [[ "$FORCE_RECONVERT" == "true" ]] && cmd_args+=("--force-reconvert")
                 [[ "$IS_MOVIE" == "true" ]] && cmd_args+=("--movie")
                 [[ "$IS_TV_SERIES" == "true" ]] && cmd_args+=("--tv-series")
+                [[ "$IS_VIDEO" == "true" ]] && cmd_args+=("--video")
+                [[ -n "$MEDIA_TAGS" ]] && cmd_args+=("--tags" "$MEDIA_TAGS")
                 [[ -n "$CONTAINER_CPUS" ]] && cmd_args+=("--cpus" "$CONTAINER_CPUS")
                 [[ -n "$CONTAINER_MEMORY" ]] && cmd_args+=("--memory" "$CONTAINER_MEMORY")
                 [[ "$AUTO_QUALITY" == "true" ]] && cmd_args+=("--auto-quality")
@@ -1388,6 +1698,13 @@ main() {
         if [[ "$USE_JOURNAL" == "true" ]]; then
             log "Journal file: $JOURNAL_FILE"
         fi
+    fi
+    
+    # Log final status
+    if [[ "$LOG_TO_FILE" == "true" ]]; then
+        log "Log file: $LOG_FILE"
+        write_log "INFO" "=== Compression session completed ==="
+        write_log "INFO" "Total files: ${#INPUT_FILES[@]}, Processed: $((${#INPUT_FILES[@]} - failed - skipped)), Failed: $failed, Skipped: $skipped"
     fi
     
     # Exit with error if any files failed

@@ -1,0 +1,2416 @@
+#!/usr/bin/python3
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Now import everything else inside the dev container
+import argparse
+import asyncio
+import json
+import logging
+import re
+import uuid
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Tuple
+from pathlib import Path
+import hashlib
+
+# Try to import database dependencies
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extras import RealDictCursor, Json
+    DB_AVAILABLE = True
+except ImportError:
+    print("Error: psycopg2 is required for media-serve", file=sys.stderr)
+    print("Install with: pip install psycopg2-binary", file=sys.stderr)
+    sys.exit(1)
+
+# Try to import web server dependencies
+try:
+    from quart import Quart, render_template_string, request, jsonify, redirect, url_for, websocket
+    from quart_cors import cors
+    import markdown
+except ImportError:
+    print("Error: Quart, quart-cors and markdown are required for media-serve", file=sys.stderr)
+    print("Install with: pip install quart quart-cors markdown", file=sys.stderr)
+    sys.exit(1)
+
+# Try to import MCP dependencies
+try:
+    from mcp.server import Server, NotificationOptions
+    from mcp.server.models import InitializationOptions
+    import mcp.server.stdio
+    import mcp.types as types
+    MCP_AVAILABLE = True
+except ImportError:
+    print("Warning: MCP not available. Install with: pip install mcp", file=sys.stderr)
+    MCP_AVAILABLE = False
+
+# Database configuration
+MEDIA_DB_CONFIG = {
+    'host': os.environ.get('MEDIA_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('MEDIA_DB_PORT', '5432')),
+    'database': os.environ.get('MEDIA_DB_NAME', 'media'),
+    'user': os.environ.get('MEDIA_DB_USER', 'postgres'),
+    'password': os.environ.get('MEDIA_DB_PASSWORD', '')
+}
+
+# Media type configurations
+MEDIA_TYPE_CONFIG = {
+    'movie': {
+        'extensions': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'],
+        'extra_fields': ['year', 'director', 'genre', 'imdb_id', 'tmdb_id']
+    },
+    'tv_series': {
+        'extensions': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'],
+        'extra_fields': ['series_name', 'season', 'episode', 'episode_title', 'air_date']
+    },
+    'music': {
+        'extensions': ['.mp3', '.flac', '.wav', '.aac', '.ogg', '.m4a', '.wma'],
+        'extra_fields': ['artist', 'album', 'track_number', 'genre', 'year']
+    },
+    'video': {
+        'extensions': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'],
+        'extra_fields': ['category', 'source']
+    }
+}
+
+# Initialize Quart app
+app = Quart(__name__)
+app = cors(app, allow_origin="*")
+
+# Initialize MCP server if available
+mcp_server = None
+if MCP_AVAILABLE:
+    mcp_server = Server("media-serve")
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Database connection helper
+def get_db_connection():
+    """Create and return a database connection."""
+    try:
+        conn = psycopg2.connect(**MEDIA_DB_CONFIG, cursor_factory=RealDictCursor)
+        return conn
+    except psycopg2.Error as e:
+        logger.error(f"Database connection error: {e}")
+        raise
+
+# Format file size helper
+def format_size(size_bytes: int) -> str:
+    """Format bytes into human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} PB"
+
+# Parse size filter helper
+def parse_size_filter(size_str: str) -> Tuple[str, int]:
+    """Parse size filter string like '>1GB' into operator and bytes."""
+    match = re.match(r'([<>]=?)(\d+(?:\.\d+)?)\s*([KMGT]?B)?', size_str.strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Invalid size filter: {size_str}")
+    
+    operator, value, unit = match.groups()
+    value = float(value)
+    
+    # Convert to bytes
+    units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+    unit = (unit or 'B').upper()
+    bytes_value = int(value * units.get(unit, 1))
+    
+    return operator, bytes_value
+
+# HTML template
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Media Library</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+            background: #f5f5f5;
+            color: #333;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        
+        /* Header */
+        .header {
+            background: white;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        .header h1 { color: #2c3e50; margin-bottom: 10px; }
+        .stats { display: flex; gap: 20px; flex-wrap: wrap; }
+        .stat-card {
+            background: #f8f9fa;
+            padding: 15px 20px;
+            border-radius: 8px;
+            border: 1px solid #e9ecef;
+        }
+        .stat-label { font-size: 0.875rem; color: #6c757d; }
+        .stat-value { font-size: 1.5rem; font-weight: bold; color: #2c3e50; }
+        
+        /* Navigation */
+        .nav-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .nav-tab {
+            padding: 10px 20px;
+            background: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        .nav-tab:hover { background: #e9ecef; }
+        .nav-tab.active { 
+            background: #007bff; 
+            color: white;
+        }
+        
+        /* Search and filters */
+        .search-section {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .search-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+        .search-input, .filter-select {
+            flex: 1;
+            min-width: 200px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        .btn-primary {
+            background: #007bff;
+            color: white;
+        }
+        .btn-primary:hover { background: #0056b3; }
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+        .btn-sm {
+            padding: 5px 10px;
+            font-size: 14px;
+        }
+        
+        /* Content sections */
+        .content-section {
+            display: none;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .content-section.active { display: block; }
+        
+        /* Media grid */
+        .media-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .media-card {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            transition: all 0.3s;
+        }
+        .media-card:hover {
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+        }
+        .media-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #2c3e50;
+        }
+        .media-info {
+            font-size: 0.875rem;
+            color: #6c757d;
+            margin-bottom: 5px;
+        }
+        .media-tags {
+            display: flex;
+            gap: 5px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+        .tag {
+            background: #e9ecef;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+        }
+        .media-actions {
+            display: flex;
+            gap: 5px;
+            margin-top: 10px;
+            flex-wrap: wrap;
+        }
+        
+        /* Collections */
+        .collection-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .collection-card {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .collection-card:hover {
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+        }
+        .modal-content {
+            position: relative;
+            background: white;
+            margin: 50px auto;
+            padding: 20px;
+            width: 90%;
+            max-width: 600px;
+            border-radius: 8px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .close {
+            font-size: 28px;
+            cursor: pointer;
+            color: #999;
+        }
+        .close:hover { color: #333; }
+        
+        /* Forms */
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+        }
+        .form-control {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        
+        /* Loading spinner */
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #007bff;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Watchlist priority colors */
+        .priority-high { border-left: 4px solid #dc3545; }
+        .priority-medium { border-left: 4px solid #ffc107; }
+        .priority-low { border-left: 4px solid #28a745; }
+        
+        /* Quality indicators */
+        .quality-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            font-weight: bold;
+        }
+        .quality-4k { background: #7c3aed; color: white; }
+        .quality-1080p { background: #2563eb; color: white; }
+        .quality-720p { background: #059669; color: white; }
+        .quality-sd { background: #6b7280; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Media Library</h1>
+            <div class="stats" id="stats">
+                <div class="spinner"></div>
+            </div>
+        </div>
+        
+        <div class="nav-tabs">
+            <button class="nav-tab active" onclick="showSection('library')">Library</button>
+            <button class="nav-tab" onclick="showSection('watchlist')">Watchlist</button>
+            <button class="nav-tab" onclick="showSection('collections')">Collections</button>
+            <button class="nav-tab" onclick="showSection('duplicates')">Duplicates</button>
+            <button class="nav-tab" onclick="showSection('quality')">Quality Report</button>
+            <button class="nav-tab" onclick="showSection('verify')">File Verification</button>
+        </div>
+        
+        <!-- Library Section -->
+        <div id="library-section" class="content-section active">
+            <div class="search-section">
+                <div class="search-row">
+                    <input type="text" id="search-query" class="search-input" placeholder="Search media...">
+                    <select id="media-type-filter" class="filter-select">
+                        <option value="">All Types</option>
+                        <option value="movie">Movies</option>
+                        <option value="tv_series">TV Series</option>
+                        <option value="music">Music</option>
+                        <option value="video">Videos</option>
+                    </select>
+                    <select id="watch-filter" class="filter-select">
+                        <option value="">All</option>
+                        <option value="unwatched">Unwatched</option>
+                        <option value="watched">Watched</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="searchMedia()">Search</button>
+                    <button class="btn btn-secondary" onclick="showAdvancedSearch()">Advanced</button>
+                </div>
+            </div>
+            <div id="media-results" class="media-grid">
+                <div class="spinner"></div>
+            </div>
+        </div>
+        
+        <!-- Watchlist Section -->
+        <div id="watchlist-section" class="content-section">
+            <div class="search-section">
+                <button class="btn btn-primary" onclick="showAddToWatchlist()">Add to Watchlist</button>
+                <select id="watchlist-type-filter" class="filter-select" onchange="loadWatchlist()">
+                    <option value="">All Types</option>
+                    <option value="movie">Movies</option>
+                    <option value="tv_series">TV Series</option>
+                    <option value="music">Music</option>
+                    <option value="video">Videos</option>
+                </select>
+            </div>
+            <div id="watchlist-results" class="media-grid">
+                <div class="spinner"></div>
+            </div>
+        </div>
+        
+        <!-- Collections Section -->
+        <div id="collections-section" class="content-section">
+            <div class="search-section">
+                <button class="btn btn-primary" onclick="showCreateCollection()">Create Collection</button>
+                <button class="btn btn-secondary" onclick="showImportPlaylist()">Import Playlist</button>
+            </div>
+            <div id="collections-list" class="collection-list">
+                <div class="spinner"></div>
+            </div>
+        </div>
+        
+        <!-- Duplicates Section -->
+        <div id="duplicates-section" class="content-section">
+            <div class="search-section">
+                <select id="duplicate-type-filter" class="filter-select">
+                    <option value="">All Types</option>
+                    <option value="movie">Movies</option>
+                    <option value="tv_series">TV Series</option>
+                    <option value="music">Music</option>
+                    <option value="video">Videos</option>
+                </select>
+                <button class="btn btn-primary" onclick="findDuplicates()">Find Duplicates</button>
+                <select id="auto-keep" class="filter-select">
+                    <option value="">Manual Review</option>
+                    <option value="best">Auto-Keep Best Quality</option>
+                    <option value="newest">Auto-Keep Newest</option>
+                    <option value="largest">Auto-Keep Largest</option>
+                </select>
+            </div>
+            <div id="duplicates-results">
+                <div class="spinner"></div>
+            </div>
+        </div>
+        
+        <!-- Quality Report Section -->
+        <div id="quality-section" class="content-section">
+            <div class="search-section">
+                <select id="quality-type-filter" class="filter-select">
+                    <option value="">All Types</option>
+                    <option value="movie">Movies</option>
+                    <option value="tv_series">TV Series</option>
+                    <option value="video">Videos</option>
+                </select>
+                <input type="number" id="min-resolution" class="search-input" placeholder="Min resolution (e.g., 720)" value="720">
+                <button class="btn btn-primary" onclick="analyzeQuality()">Analyze</button>
+                <button class="btn btn-secondary" onclick="analyzeQuality(true)">Suggest Compression</button>
+            </div>
+            <div id="quality-results">
+                <div class="spinner"></div>
+            </div>
+        </div>
+        
+        <!-- File Verification Section -->
+        <div id="verify-section" class="content-section">
+            <div class="search-section">
+                <select id="verify-type-filter" class="filter-select">
+                    <option value="">All Types</option>
+                    <option value="movie">Movies</option>
+                    <option value="tv_series">TV Series</option>
+                    <option value="music">Music</option>
+                    <option value="video">Videos</option>
+                </select>
+                <button class="btn btn-primary" onclick="verifyFiles()">Verify Files</button>
+                <button class="btn btn-danger" onclick="verifyFiles(true)">Check Integrity</button>
+            </div>
+            <div id="verify-results">
+                <div class="spinner"></div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal -->
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Modal Title</h2>
+                <span class="close" onclick="closeModal()">&times;</span>
+            </div>
+            <div id="modal-body">
+                <!-- Dynamic content -->
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Global state
+        let currentSection = 'library';
+        let searchResults = [];
+        let collections = [];
+        
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadStats();
+            searchMedia();
+        });
+        
+        // API calls
+        async function apiCall(endpoint, method = 'GET', data = null) {
+            const options = {
+                method,
+                headers: { 'Content-Type': 'application/json' }
+            };
+            if (data) {
+                options.body = JSON.stringify(data);
+            }
+            
+            try {
+                const response = await fetch(`/api${endpoint}`, options);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return await response.json();
+            } catch (error) {
+                console.error('API call failed:', error);
+                alert('Error: ' + error.message);
+                throw error;
+            }
+        }
+        
+        // Load statistics
+        async function loadStats() {
+            try {
+                const stats = await apiCall('/stats');
+                console.log('Stats loaded:', stats);
+                
+                let statsHtml = '';
+                if (stats.by_type && Object.keys(stats.by_type).length > 0) {
+                    statsHtml = Object.entries(stats.by_type).map(([type, data]) => `
+                        <div class="stat-card">
+                            <div class="stat-label">${type.replace('_', ' ').toUpperCase()}</div>
+                            <div class="stat-value">${data.count} files</div>
+                            <div class="stat-label">${formatSize(parseInt(data.total_size) || 0)}</div>
+                        </div>
+                    `).join('');
+                }
+                
+                document.getElementById('stats').innerHTML = statsHtml + `
+                    <div class="stat-card">
+                        <div class="stat-label">TOTAL</div>
+                        <div class="stat-value">${stats.total.count} files</div>
+                        <div class="stat-label">${formatSize(parseInt(stats.total.total_size) || 0)}</div>
+                    </div>
+                `;
+            } catch (error) {
+                console.error('Failed to load statistics:', error);
+                document.getElementById('stats').innerHTML = `<p style="color: red;">Failed to load statistics: ${error.message}</p>`;
+            }
+        }
+        
+        // Section navigation
+        function showSection(section) {
+            // Update tabs
+            document.querySelectorAll('.nav-tab').forEach(tab => tab.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Update sections
+            document.querySelectorAll('.content-section').forEach(sec => sec.classList.remove('active'));
+            document.getElementById(`${section}-section`).classList.add('active');
+            
+            currentSection = section;
+            
+            // Load section data
+            switch(section) {
+                case 'library':
+                    searchMedia();
+                    break;
+                case 'watchlist':
+                    loadWatchlist();
+                    break;
+                case 'collections':
+                    loadCollections();
+                    break;
+                case 'duplicates':
+                    findDuplicates();
+                    break;
+                case 'quality':
+                    analyzeQuality();
+                    break;
+                case 'verify':
+                    verifyFiles();
+                    break;
+            }
+        }
+        
+        // Search media
+        async function searchMedia() {
+            const query = document.getElementById('search-query').value;
+            const mediaType = document.getElementById('media-type-filter').value;
+            const watchFilter = document.getElementById('watch-filter').value;
+            
+            const params = new URLSearchParams();
+            if (query) params.append('q', query);
+            if (mediaType) params.append('type', mediaType);
+            if (watchFilter === 'watched') params.append('watched', 'true');
+            if (watchFilter === 'unwatched') params.append('unwatched', 'true');
+            
+            try {
+                const results = await apiCall(`/media/search?${params}`);
+                searchResults = results;
+                displayMediaGrid(results, 'media-results');
+            } catch (error) {
+                document.getElementById('media-results').innerHTML = '<p>Failed to load media</p>';
+            }
+        }
+        
+        // Display media grid
+        function displayMediaGrid(items, containerId) {
+            const container = document.getElementById(containerId);
+            
+            if (items.length === 0) {
+                container.innerHTML = '<p>No media found</p>';
+                return;
+            }
+            
+            container.innerHTML = items.map(item => {
+                const tags = item.tags ? item.tags.split(',').map(t => `<span class="tag">${t.trim()}</span>`).join('') : '';
+                const quality = getQualityBadge(item.resolution_height);
+                const watched = item.watched ? '✓ Watched' : '';
+                
+                return `
+                    <div class="media-card ${item.watched ? 'watched' : ''}">
+                        <div class="media-title">${item.name}</div>
+                        <div class="media-info">Type: ${item.media_type}</div>
+                        <div class="media-info">Size: ${formatSize(item.filesize)}</div>
+                        ${item.resolution_width ? `<div class="media-info">Resolution: ${item.resolution_width}x${item.resolution_height} ${quality}</div>` : ''}
+                        ${item.duration ? `<div class="media-info">Duration: ${formatDuration(item.duration)}</div>` : ''}
+                        ${watched ? `<div class="media-info">${watched} (${item.watch_count || 1}x)</div>` : ''}
+                        ${item.rating ? `<div class="media-info">Rating: ${'★'.repeat(item.rating)}${'☆'.repeat(5-item.rating)}</div>` : ''}
+                        <div class="media-tags">${tags}</div>
+                        <div class="media-actions">
+                            <button class="btn btn-sm btn-primary" onclick="viewDetails('${item.id}')">Details</button>
+                            ${!item.watched ? `<button class="btn btn-sm btn-success" onclick="markWatched('${item.id}')">Mark Watched</button>` : ''}
+                            <button class="btn btn-sm btn-secondary" onclick="editMedia('${item.id}')">Edit</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+        // Load watchlist
+        async function loadWatchlist() {
+            const mediaType = document.getElementById('watchlist-type-filter').value;
+            const params = mediaType ? `?type=${mediaType}` : '';
+            
+            try {
+                const results = await apiCall(`/watchlist${params}`);
+                displayWatchlistGrid(results, 'watchlist-results');
+            } catch (error) {
+                document.getElementById('watchlist-results').innerHTML = '<p>Failed to load watchlist</p>';
+            }
+        }
+        
+        // Display watchlist grid
+        function displayWatchlistGrid(items, containerId) {
+            const container = document.getElementById(containerId);
+            
+            if (items.length === 0) {
+                container.innerHTML = '<p>Your watchlist is empty</p>';
+                return;
+            }
+            
+            container.innerHTML = items.map(item => {
+                const priorityClass = item.priority > 7 ? 'priority-high' : item.priority > 3 ? 'priority-medium' : 'priority-low';
+                return `
+                    <div class="media-card ${priorityClass}">
+                        <div class="media-title">${item.name}</div>
+                        <div class="media-info">Priority: ${item.priority}</div>
+                        <div class="media-info">Added: ${new Date(item.watchlist_added).toLocaleDateString()}</div>
+                        <div class="media-actions">
+                            <button class="btn btn-sm btn-success" onclick="markWatched('${item.id}')">Watch Now</button>
+                            <button class="btn btn-sm btn-danger" onclick="removeFromWatchlist('${item.id}')">Remove</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+        // Load collections
+        async function loadCollections() {
+            try {
+                const results = await apiCall('/collections');
+                collections = results;
+                displayCollections(results);
+            } catch (error) {
+                document.getElementById('collections-list').innerHTML = '<p>Failed to load collections</p>';
+            }
+        }
+        
+        // Display collections
+        function displayCollections(items) {
+            const container = document.getElementById('collections-list');
+            
+            if (items.length === 0) {
+                container.innerHTML = '<p>No collections found</p>';
+                return;
+            }
+            
+            container.innerHTML = items.map(item => `
+                <div class="collection-card" onclick="viewCollection('${item.id}')">
+                    <h3>${item.name}</h3>
+                    <p>${item.description || 'No description'}</p>
+                    <p><strong>${item.item_count || 0}</strong> items</p>
+                    <div class="media-actions" onclick="event.stopPropagation()">
+                        <button class="btn btn-sm btn-secondary" onclick="exportCollection('${item.id}')">Export</button>
+                        <button class="btn btn-sm btn-danger" onclick="deleteCollection('${item.id}')">Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        // Find duplicates
+        async function findDuplicates() {
+            const mediaType = document.getElementById('duplicate-type-filter').value;
+            const autoKeep = document.getElementById('auto-keep').value;
+            
+            const params = new URLSearchParams();
+            if (mediaType) params.append('type', mediaType);
+            if (autoKeep) params.append('auto_keep', autoKeep);
+            
+            try {
+                const results = await apiCall(`/duplicates?${params}`);
+                displayDuplicates(results);
+            } catch (error) {
+                document.getElementById('duplicates-results').innerHTML = '<p>Failed to find duplicates</p>';
+            }
+        }
+        
+        // Display duplicates
+        function displayDuplicates(groups) {
+            const container = document.getElementById('duplicates-results');
+            
+            if (groups.length === 0) {
+                container.innerHTML = '<p>No duplicates found</p>';
+                return;
+            }
+            
+            container.innerHTML = '<h3>Duplicate Groups</h3>' + groups.map((group, idx) => `
+                <div style="margin-bottom: 30px; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+                    <h4>Group ${idx + 1} (${group.length} files)</h4>
+                    <div class="media-grid">
+                        ${group.map(item => `
+                            <div class="media-card">
+                                <div class="media-title">${item.name}</div>
+                                <div class="media-info">Size: ${formatSize(item.filesize)}</div>
+                                <div class="media-info">Hash: ${item.file_hash ? item.file_hash.substring(0, 8) + '...' : 'N/A'}</div>
+                                ${item.resolution_height ? `<div class="media-info">Resolution: ${item.resolution_width}x${item.resolution_height}</div>` : ''}
+                                <div class="media-actions">
+                                    <button class="btn btn-sm btn-success" onclick="keepDuplicate('${item.id}', ${idx})">Keep This</button>
+                                    <button class="btn btn-sm btn-danger" onclick="deleteDuplicate('${item.id}')">Delete</button>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        // Analyze quality
+        async function analyzeQuality(suggestCompress = false) {
+            const mediaType = document.getElementById('quality-type-filter').value;
+            const minResolution = document.getElementById('min-resolution').value;
+            
+            const params = new URLSearchParams();
+            if (mediaType) params.append('type', mediaType);
+            if (minResolution) params.append('min_resolution', minResolution);
+            if (suggestCompress) params.append('suggest_compress', 'true');
+            
+            try {
+                const results = await apiCall(`/quality?${params}`);
+                displayQualityReport(results);
+            } catch (error) {
+                document.getElementById('quality-results').innerHTML = '<p>Failed to analyze quality</p>';
+            }
+        }
+        
+        // Display quality report
+        function displayQualityReport(report) {
+            const container = document.getElementById('quality-results');
+            
+            let html = '<h3>Quality Analysis</h3>';
+            
+            if (report.low_resolution && report.low_resolution.length > 0) {
+                html += '<h4>Low Resolution Files</h4><div class="media-grid">';
+                html += report.low_resolution.map(item => `
+                    <div class="media-card">
+                        <div class="media-title">${item.name}</div>
+                        <div class="media-info">Resolution: ${item.resolution_width}x${item.resolution_height}</div>
+                        <div class="media-info">Codec: ${item.video_codec || 'Unknown'}</div>
+                        <div class="media-info">Size: ${formatSize(item.filesize)}</div>
+                    </div>
+                `).join('');
+                html += '</div>';
+            }
+            
+            if (report.compression_candidates && report.compression_candidates.length > 0) {
+                html += '<h4>Compression Candidates</h4><div class="media-grid">';
+                html += report.compression_candidates.map(item => `
+                    <div class="media-card">
+                        <div class="media-title">${item.name}</div>
+                        <div class="media-info">Current Size: ${formatSize(item.filesize)}</div>
+                        <div class="media-info">Est. Savings: ${formatSize(item.estimated_savings)}</div>
+                        <div class="media-info">Codec: ${item.video_codec}</div>
+                        <div class="media-info">Bitrate: ${item.bitrate_mbps.toFixed(1)} Mbps</div>
+                    </div>
+                `).join('');
+                html += '</div>';
+                
+                if (report.total_savings) {
+                    html += `<p><strong>Total potential savings: ${formatSize(report.total_savings)}</strong></p>`;
+                }
+            }
+            
+            if (report.codec_stats) {
+                html += '<h4>Codec Distribution</h4><ul>';
+                report.codec_stats.forEach(stat => {
+                    html += `<li>${stat.video_codec}: ${stat.count} files (avg ${formatSize(stat.avg_size)})</li>`;
+                });
+                html += '</ul>';
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        // Verify files
+        async function verifyFiles(checkIntegrity = false) {
+            const mediaType = document.getElementById('verify-type-filter').value;
+            
+            const params = new URLSearchParams();
+            if (mediaType) params.append('type', mediaType);
+            if (checkIntegrity) params.append('check_integrity', 'true');
+            
+            try {
+                const results = await apiCall(`/verify?${params}`);
+                displayVerifyResults(results);
+            } catch (error) {
+                document.getElementById('verify-results').innerHTML = '<p>Failed to verify files</p>';
+            }
+        }
+        
+        // Display verify results
+        function displayVerifyResults(results) {
+            const container = document.getElementById('verify-results');
+            
+            let html = '<h3>File Verification Results</h3>';
+            
+            if (results.missing && results.missing.length > 0) {
+                html += `<h4>Missing Files (${results.missing.length})</h4><div class="media-grid">`;
+                html += results.missing.map(item => `
+                    <div class="media-card" style="border-color: #dc3545;">
+                        <div class="media-title">${item.name}</div>
+                        <div class="media-info">Path: ${item.full_filepath}</div>
+                        <div class="media-actions">
+                            <button class="btn btn-sm btn-danger" onclick="removeFromDatabase('${item.id}')">Remove from DB</button>
+                        </div>
+                    </div>
+                `).join('');
+                html += '</div>';
+            }
+            
+            if (results.corrupted && results.corrupted.length > 0) {
+                html += `<h4>Corrupted Files (${results.corrupted.length})</h4><div class="media-grid">`;
+                html += results.corrupted.map(item => `
+                    <div class="media-card" style="border-color: #ffc107;">
+                        <div class="media-title">${item.name}</div>
+                        <div class="media-info">Error: ${item.error}</div>
+                    </div>
+                `).join('');
+                html += '</div>';
+            }
+            
+            if (!results.missing?.length && !results.corrupted?.length) {
+                html += '<p>All files verified successfully!</p>';
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        // Helper functions
+        function formatSize(bytes) {
+            if (!bytes) return '0 B';
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let size = bytes;
+            let unitIndex = 0;
+            while (size >= 1024 && unitIndex < units.length - 1) {
+                size /= 1024;
+                unitIndex++;
+            }
+            return `${size.toFixed(2)} ${units[unitIndex]}`;
+        }
+        
+        function formatDuration(seconds) {
+            if (!seconds) return 'N/A';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            return h > 0 ? `${h}h ${m}m` : `${m}m ${s}s`;
+        }
+        
+        function getQualityBadge(height) {
+            if (!height) return '';
+            if (height >= 2160) return '<span class="quality-badge quality-4k">4K</span>';
+            if (height >= 1080) return '<span class="quality-badge quality-1080p">1080p</span>';
+            if (height >= 720) return '<span class="quality-badge quality-720p">720p</span>';
+            return '<span class="quality-badge quality-sd">SD</span>';
+        }
+        
+        // Media actions
+        async function viewDetails(id) {
+            try {
+                const media = await apiCall(`/media/${id}`);
+                showModal('Media Details', `
+                    <div>
+                        <h3>${media.name}</h3>
+                        <p><strong>Type:</strong> ${media.media_type}</p>
+                        <p><strong>Path:</strong> ${media.full_filepath}</p>
+                        <p><strong>Size:</strong> ${formatSize(media.filesize)}</p>
+                        ${media.resolution_width ? `<p><strong>Resolution:</strong> ${media.resolution_width}x${media.resolution_height}</p>` : ''}
+                        ${media.video_codec ? `<p><strong>Video Codec:</strong> ${media.video_codec}</p>` : ''}
+                        ${media.audio_codec ? `<p><strong>Audio Codec:</strong> ${media.audio_codec}</p>` : ''}
+                        ${media.duration ? `<p><strong>Duration:</strong> ${formatDuration(media.duration)}</p>` : ''}
+                        ${media.watched ? `<p><strong>Watched:</strong> Yes (${media.watch_count}x)</p>` : ''}
+                        ${media.last_watched ? `<p><strong>Last Watched:</strong> ${new Date(media.last_watched).toLocaleString()}</p>` : ''}
+                        ${media.rating ? `<p><strong>Rating:</strong> ${'★'.repeat(media.rating)}${'☆'.repeat(5-media.rating)}</p>` : ''}
+                        ${media.tags ? `<p><strong>Tags:</strong> ${media.tags}</p>` : ''}
+                    </div>
+                    <div class="media-actions" style="margin-top: 20px;">
+                        <button class="btn btn-primary" onclick="openMedia('${id}')">Open File</button>
+                        <button class="btn btn-secondary" onclick="editMedia('${id}')">Edit</button>
+                        <button class="btn btn-danger" onclick="deleteMedia('${id}')">Delete</button>
+                    </div>
+                `);
+            } catch (error) {
+                alert('Failed to load media details');
+            }
+        }
+        
+        async function markWatched(id) {
+            try {
+                await apiCall(`/media/${id}/watch`, 'POST');
+                searchMedia(); // Refresh
+                if (currentSection === 'watchlist') loadWatchlist();
+            } catch (error) {
+                alert('Failed to mark as watched');
+            }
+        }
+        
+        async function editMedia(id) {
+            try {
+                const media = await apiCall(`/media/${id}`);
+                showModal('Edit Media', `
+                    <form onsubmit="saveMedia(event, '${id}')">
+                        <div class="form-group">
+                            <label class="form-label">Tags</label>
+                            <input type="text" class="form-control" id="edit-tags" value="${media.tags || ''}" placeholder="tag1, tag2, tag3">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Rating</label>
+                            <select class="form-control" id="edit-rating">
+                                <option value="">No rating</option>
+                                ${[1,2,3,4,5].map(r => `<option value="${r}" ${media.rating === r ? 'selected' : ''}>${'★'.repeat(r)}</option>`).join('')}
+                            </select>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Save</button>
+                    </form>
+                `);
+            } catch (error) {
+                alert('Failed to load media for editing');
+            }
+        }
+        
+        async function saveMedia(event, id) {
+            event.preventDefault();
+            try {
+                const data = {
+                    tags: document.getElementById('edit-tags').value,
+                    rating: document.getElementById('edit-rating').value || null
+                };
+                await apiCall(`/media/${id}`, 'PATCH', data);
+                closeModal();
+                searchMedia(); // Refresh
+            } catch (error) {
+                alert('Failed to save media');
+            }
+        }
+        
+        async function deleteMedia(id) {
+            if (confirm('Are you sure you want to delete this media entry?')) {
+                try {
+                    await apiCall(`/media/${id}`, 'DELETE');
+                    closeModal();
+                    searchMedia(); // Refresh
+                } catch (error) {
+                    alert('Failed to delete media');
+                }
+            }
+        }
+        
+        async function openMedia(id) {
+            try {
+                await apiCall(`/media/${id}/open`, 'POST');
+            } catch (error) {
+                alert('Failed to open media file');
+            }
+        }
+        
+        // Watchlist actions
+        async function showAddToWatchlist() {
+            const mediaHtml = searchResults.filter(m => !m.watched).map(m => `
+                <div style="margin-bottom: 10px;">
+                    <input type="checkbox" id="wl-${m.id}" value="${m.id}">
+                    <label for="wl-${m.id}">${m.name}</label>
+                </div>
+            `).join('');
+            
+            showModal('Add to Watchlist', `
+                <form onsubmit="addToWatchlist(event)">
+                    <div class="form-group">
+                        <label class="form-label">Priority (0-10)</label>
+                        <input type="number" class="form-control" id="watchlist-priority" min="0" max="10" value="5">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Select Media</label>
+                        <div style="max-height: 300px; overflow-y: auto;">
+                            ${mediaHtml}
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Add Selected</button>
+                </form>
+            `);
+        }
+        
+        async function addToWatchlist(event) {
+            event.preventDefault();
+            const priority = document.getElementById('watchlist-priority').value;
+            const selected = Array.from(document.querySelectorAll('input[id^="wl-"]:checked')).map(cb => cb.value);
+            
+            try {
+                for (const mediaId of selected) {
+                    await apiCall('/watchlist', 'POST', { media_id: mediaId, priority: parseInt(priority) });
+                }
+                closeModal();
+                loadWatchlist();
+            } catch (error) {
+                alert('Failed to add to watchlist');
+            }
+        }
+        
+        async function removeFromWatchlist(id) {
+            if (confirm('Remove from watchlist?')) {
+                try {
+                    await apiCall(`/watchlist/${id}`, 'DELETE');
+                    loadWatchlist();
+                } catch (error) {
+                    alert('Failed to remove from watchlist');
+                }
+            }
+        }
+        
+        // Collection actions
+        async function showCreateCollection() {
+            showModal('Create Collection', `
+                <form onsubmit="createCollection(event)">
+                    <div class="form-group">
+                        <label class="form-label">Name</label>
+                        <input type="text" class="form-control" id="collection-name" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Description</label>
+                        <textarea class="form-control" id="collection-description" rows="3"></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </form>
+            `);
+        }
+        
+        async function createCollection(event) {
+            event.preventDefault();
+            try {
+                const data = {
+                    name: document.getElementById('collection-name').value,
+                    description: document.getElementById('collection-description').value
+                };
+                await apiCall('/collections', 'POST', data);
+                closeModal();
+                loadCollections();
+            } catch (error) {
+                alert('Failed to create collection');
+            }
+        }
+        
+        async function viewCollection(id) {
+            try {
+                const items = await apiCall(`/collections/${id}/items`);
+                const collection = collections.find(c => c.id === id);
+                
+                showModal(collection.name, `
+                    <p>${collection.description || 'No description'}</p>
+                    <div class="media-grid" style="margin-top: 20px;">
+                        ${items.length ? items.map(item => `
+                            <div class="media-card">
+                                <div class="media-title">${item.name}</div>
+                                <div class="media-actions">
+                                    <button class="btn btn-sm btn-danger" onclick="removeFromCollection('${id}', '${item.id}')">Remove</button>
+                                </div>
+                            </div>
+                        `).join('') : '<p>No items in collection</p>'}
+                    </div>
+                    <div style="margin-top: 20px;">
+                        <button class="btn btn-primary" onclick="showAddToCollection('${id}')">Add Items</button>
+                        <button class="btn btn-secondary" onclick="exportCollection('${id}')">Export Playlist</button>
+                    </div>
+                `);
+            } catch (error) {
+                alert('Failed to load collection');
+            }
+        }
+        
+        async function showAddToCollection(collectionId) {
+            const mediaHtml = searchResults.map(m => `
+                <div style="margin-bottom: 10px;">
+                    <input type="checkbox" id="col-${m.id}" value="${m.id}">
+                    <label for="col-${m.id}">${m.name}</label>
+                </div>
+            `).join('');
+            
+            showModal('Add to Collection', `
+                <form onsubmit="addToCollection(event, '${collectionId}')">
+                    <div class="form-group">
+                        <label class="form-label">Select Media</label>
+                        <div style="max-height: 300px; overflow-y: auto;">
+                            ${mediaHtml}
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Add Selected</button>
+                </form>
+            `);
+        }
+        
+        async function addToCollection(event, collectionId) {
+            event.preventDefault();
+            const selected = Array.from(document.querySelectorAll('input[id^="col-"]:checked')).map(cb => cb.value);
+            
+            try {
+                for (const mediaId of selected) {
+                    await apiCall(`/collections/${collectionId}/items`, 'POST', { media_id: mediaId });
+                }
+                closeModal();
+                viewCollection(collectionId);
+            } catch (error) {
+                alert('Failed to add to collection');
+            }
+        }
+        
+        async function removeFromCollection(collectionId, mediaId) {
+            try {
+                await apiCall(`/collections/${collectionId}/items/${mediaId}`, 'DELETE');
+                viewCollection(collectionId); // Refresh
+            } catch (error) {
+                alert('Failed to remove from collection');
+            }
+        }
+        
+        async function exportCollection(id) {
+            try {
+                const response = await fetch(`/api/collections/${id}/export?format=m3u`);
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `collection_${id}.m3u`;
+                a.click();
+                window.URL.revokeObjectURL(url);
+            } catch (error) {
+                alert('Failed to export collection');
+            }
+        }
+        
+        async function deleteCollection(id) {
+            if (confirm('Are you sure you want to delete this collection?')) {
+                try {
+                    await apiCall(`/collections/${id}`, 'DELETE');
+                    loadCollections();
+                } catch (error) {
+                    alert('Failed to delete collection');
+                }
+            }
+        }
+        
+        async function showImportPlaylist() {
+            showModal('Import Playlist', `
+                <form onsubmit="importPlaylist(event)">
+                    <div class="form-group">
+                        <label class="form-label">Collection Name</label>
+                        <input type="text" class="form-control" id="import-collection-name" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Playlist File</label>
+                        <input type="file" class="form-control" id="import-file" accept=".m3u,.m3u8,.pls,.txt" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Import</button>
+                </form>
+            `);
+        }
+        
+        async function importPlaylist(event) {
+            event.preventDefault();
+            const formData = new FormData();
+            formData.append('collection_name', document.getElementById('import-collection-name').value);
+            formData.append('file', document.getElementById('import-file').files[0]);
+            
+            try {
+                const response = await fetch('/api/collections/import', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                closeModal();
+                alert(`Imported ${result.added} items to collection`);
+                loadCollections();
+            } catch (error) {
+                alert('Failed to import playlist');
+            }
+        }
+        
+        // Modal functions
+        function showModal(title, content) {
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-body').innerHTML = content;
+            document.getElementById('modal').style.display = 'block';
+        }
+        
+        function closeModal() {
+            document.getElementById('modal').style.display = 'none';
+        }
+        
+        // Close modal when clicking outside
+        window.onclick = function(event) {
+            const modal = document.getElementById('modal');
+            if (event.target === modal) {
+                closeModal();
+            }
+        }
+        
+        // Advanced search
+        function showAdvancedSearch() {
+            showModal('Advanced Search', `
+                <form onsubmit="advancedSearch(event)">
+                    <div class="form-group">
+                        <label class="form-label">Size Filter</label>
+                        <input type="text" class="form-control" id="adv-size" placeholder="e.g., >1GB, <500MB">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Added After</label>
+                        <input type="date" class="form-control" id="adv-added-after">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Added Before</label>
+                        <input type="date" class="form-control" id="adv-added-before">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Save Search As</label>
+                        <input type="text" class="form-control" id="adv-save-as" placeholder="Optional: save this search">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Search</button>
+                </form>
+            `);
+        }
+        
+        async function advancedSearch(event) {
+            event.preventDefault();
+            
+            const params = new URLSearchParams();
+            const query = document.getElementById('search-query').value;
+            if (query) params.append('q', query);
+            
+            const size = document.getElementById('adv-size').value;
+            if (size) params.append('size', size);
+            
+            const addedAfter = document.getElementById('adv-added-after').value;
+            if (addedAfter) params.append('added_after', addedAfter);
+            
+            const addedBefore = document.getElementById('adv-added-before').value;
+            if (addedBefore) params.append('added_before', addedBefore);
+            
+            const saveAs = document.getElementById('adv-save-as').value;
+            if (saveAs) params.append('save_as', saveAs);
+            
+            try {
+                const results = await apiCall(`/media/search?${params}`);
+                searchResults = results;
+                displayMediaGrid(results, 'media-results');
+                closeModal();
+            } catch (error) {
+                alert('Search failed');
+            }
+        }
+        
+        // Duplicate actions
+        async function keepDuplicate(id, groupIndex) {
+            // In a real implementation, this would mark others in the group for deletion
+            alert(`Would keep media ${id} and mark others in group ${groupIndex} for deletion`);
+        }
+        
+        async function deleteDuplicate(id) {
+            if (confirm('Delete this duplicate?')) {
+                try {
+                    await apiCall(`/media/${id}`, 'DELETE');
+                    findDuplicates(); // Refresh
+                } catch (error) {
+                    alert('Failed to delete duplicate');
+                }
+            }
+        }
+        
+        async function removeFromDatabase(id) {
+            if (confirm('Remove this missing file from the database?')) {
+                try {
+                    await apiCall(`/media/${id}`, 'DELETE');
+                    verifyFiles(); // Refresh
+                } catch (error) {
+                    alert('Failed to remove from database');
+                }
+            }
+        }
+    </script>
+</body>
+</html>
+'''
+
+# REST API routes
+@app.route('/')
+async def index():
+    """Serve the main web interface."""
+    return HTML_TEMPLATE
+
+@app.route('/api/stats', methods=['GET'])
+async def get_stats():
+    """Get media library statistics."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Overall stats
+        cur.execute("""
+            SELECT 
+                COUNT(*) as count,
+                COALESCE(SUM(filesize), 0) as total_size
+            FROM media
+        """)
+        total = cur.fetchone()
+        
+        # Stats by type
+        cur.execute("""
+            SELECT 
+                media_type,
+                COUNT(*) as count,
+                COALESCE(SUM(filesize), 0) as total_size,
+                COALESCE(AVG(filesize), 0) as avg_size
+            FROM media
+            GROUP BY media_type
+            ORDER BY media_type
+        """)
+        by_type = {}
+        for row in cur.fetchall():
+            by_type[row['media_type']] = {
+                'media_type': row['media_type'],
+                'count': row['count'],
+                'total_size': str(int(row['total_size'])),  # Convert to string to avoid scientific notation
+                'avg_size': str(int(row['avg_size']))
+            }
+        
+        return jsonify({
+            'total': {
+                'count': total['count'],
+                'total_size': str(int(total['total_size']))
+            },
+            'by_type': by_type
+        })
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/media/search', methods=['GET'])
+async def search_media():
+    """Search media with filters."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Build query
+        where_clauses = []
+        params = []
+        
+        # Text search
+        query = request.args.get('q')
+        if query:
+            where_clauses.append("(name ILIKE %s OR tags ILIKE %s)")
+            params.extend([f'%{query}%', f'%{query}%'])
+        
+        # Type filter
+        media_type = request.args.get('type')
+        if media_type:
+            where_clauses.append("media_type = %s")
+            params.append(media_type)
+        
+        # Watch status
+        if request.args.get('watched') == 'true':
+            where_clauses.append("watched = TRUE")
+        elif request.args.get('unwatched') == 'true':
+            where_clauses.append("watched = FALSE")
+        
+        # Size filter
+        size_filter = request.args.get('size')
+        if size_filter:
+            try:
+                operator, bytes_value = parse_size_filter(size_filter)
+                where_clauses.append(f"filesize {operator} %s")
+                params.append(bytes_value)
+            except ValueError:
+                pass
+        
+        # Date filters
+        added_after = request.args.get('added_after')
+        if added_after:
+            where_clauses.append("created_at >= %s::date")
+            params.append(added_after)
+        
+        added_before = request.args.get('added_before')
+        if added_before:
+            where_clauses.append("created_at < %s::date")
+            params.append(added_before)
+        
+        # Build final query
+        sql = "SELECT * FROM media"
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(where_clauses)
+        sql += " ORDER BY media_type, name LIMIT 1000"
+        
+        cur.execute(sql, params)
+        results = [dict(row) for row in cur.fetchall()]
+        
+        # Save search if requested
+        save_as = request.args.get('save_as')
+        if save_as:
+            search_params = {
+                'query': query,
+                'media_type': media_type,
+                'filters': {k: v for k, v in request.args.items() 
+                          if k not in ['q', 'type', 'save_as']}
+            }
+            cur.execute("""
+                INSERT INTO media_saved_searches (name, search_params)
+                VALUES (%s, %s)
+                ON CONFLICT (name) DO UPDATE SET search_params = EXCLUDED.search_params
+            """, (save_as, Json(search_params)))
+            conn.commit()
+        
+        return jsonify(results)
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/media/<media_id>', methods=['GET'])
+async def get_media(media_id):
+    """Get media details."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("SELECT * FROM media WHERE id = %s", (media_id,))
+        result = cur.fetchone()
+        
+        if not result:
+            return jsonify({'error': 'Media not found'}), 404
+        
+        return jsonify(dict(result))
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/media/<media_id>', methods=['PATCH'])
+async def update_media(media_id):
+    """Update media metadata."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        data = await request.json
+        
+        # Build update query
+        updates = []
+        params = []
+        
+        if 'tags' in data:
+            updates.append("tags = %s")
+            params.append(data['tags'])
+        
+        if 'rating' in data:
+            updates.append("rating = %s")
+            params.append(data['rating'])
+        
+        if updates:
+            sql = f"UPDATE media SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = %s"
+            params.append(media_id)
+            
+            cur.execute(sql, params)
+            conn.commit()
+        
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/media/<media_id>', methods=['DELETE'])
+async def delete_media(media_id):
+    """Delete media entry."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("DELETE FROM media WHERE id = %s", (media_id,))
+        conn.commit()
+        
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/media/<media_id>/watch', methods=['POST'])
+async def mark_watched(media_id):
+    """Mark media as watched."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            UPDATE media 
+            SET watched = TRUE, 
+                last_watched = CURRENT_TIMESTAMP,
+                watch_count = COALESCE(watch_count, 0) + 1
+            WHERE id = %s
+        """, (media_id,))
+        
+        # Remove from watchlist if present
+        cur.execute("DELETE FROM media_watchlist WHERE media_id = %s", (media_id,))
+        
+        conn.commit()
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/media/<media_id>/open', methods=['POST'])
+async def open_media(media_id):
+    """Open media file with system default application."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("SELECT full_filepath FROM media WHERE id = %s", (media_id,))
+        result = cur.fetchone()
+        
+        if not result:
+            return jsonify({'error': 'Media not found'}), 404
+        
+        filepath = result['full_filepath']
+        
+        # Open file with system default
+        if sys.platform == 'darwin':  # macOS
+            subprocess.run(['open', filepath])
+        elif sys.platform == 'win32':  # Windows
+            os.startfile(filepath)
+        else:  # Linux and others
+            subprocess.run(['xdg-open', filepath])
+        
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/watchlist', methods=['GET'])
+async def get_watchlist():
+    """Get watchlist items."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        query = """
+            SELECT m.*, w.priority, w.added_at as watchlist_added
+            FROM media m
+            JOIN media_watchlist w ON m.id = w.media_id
+        """
+        params = []
+        
+        media_type = request.args.get('type')
+        if media_type:
+            query += " WHERE m.media_type = %s"
+            params.append(media_type)
+        
+        query += " ORDER BY w.priority DESC, w.added_at DESC"
+        
+        cur.execute(query, params)
+        results = [dict(row) for row in cur.fetchall()]
+        
+        return jsonify(results)
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/watchlist', methods=['POST'])
+async def add_to_watchlist():
+    """Add media to watchlist."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        data = await request.json
+        media_id = data.get('media_id')
+        priority = data.get('priority', 0)
+        
+        cur.execute("""
+            INSERT INTO media_watchlist (media_id, priority)
+            VALUES (%s, %s)
+            ON CONFLICT (media_id) DO UPDATE SET priority = EXCLUDED.priority
+        """, (media_id, priority))
+        
+        conn.commit()
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/watchlist/<media_id>', methods=['DELETE'])
+async def remove_from_watchlist(media_id):
+    """Remove from watchlist."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("DELETE FROM media_watchlist WHERE media_id = %s", (media_id,))
+        conn.commit()
+        
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections', methods=['GET'])
+async def get_collections():
+    """Get all collections."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT c.*, COUNT(ci.media_id) as item_count
+            FROM media_collections c
+            LEFT JOIN media_collection_items ci ON c.id = ci.collection_id
+            GROUP BY c.id
+            ORDER BY c.name
+        """)
+        results = [dict(row) for row in cur.fetchall()]
+        
+        return jsonify(results)
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections', methods=['POST'])
+async def create_collection():
+    """Create a new collection."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        data = await request.json
+        name = data.get('name')
+        description = data.get('description')
+        
+        cur.execute("""
+            INSERT INTO media_collections (name, description)
+            VALUES (%s, %s)
+            RETURNING id
+        """, (name, description))
+        
+        collection_id = cur.fetchone()['id']
+        conn.commit()
+        
+        return jsonify({'id': collection_id, 'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections/<collection_id>', methods=['DELETE'])
+async def delete_collection(collection_id):
+    """Delete a collection."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("DELETE FROM media_collections WHERE id = %s", (collection_id,))
+        conn.commit()
+        
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections/<collection_id>/items', methods=['GET'])
+async def get_collection_items(collection_id):
+    """Get items in a collection."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT m.*, ci.position
+            FROM media m
+            JOIN media_collection_items ci ON m.id = ci.media_id
+            WHERE ci.collection_id = %s
+            ORDER BY ci.position, ci.added_at
+        """, (collection_id,))
+        
+        results = [dict(row) for row in cur.fetchall()]
+        return jsonify(results)
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections/<collection_id>/items', methods=['POST'])
+async def add_to_collection(collection_id):
+    """Add media to collection."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        data = await request.json
+        media_id = data.get('media_id')
+        
+        cur.execute("""
+            INSERT INTO media_collection_items (collection_id, media_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+        """, (collection_id, media_id))
+        
+        conn.commit()
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections/<collection_id>/items/<media_id>', methods=['DELETE'])
+async def remove_from_collection(collection_id, media_id):
+    """Remove media from collection."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            DELETE FROM media_collection_items
+            WHERE collection_id = %s AND media_id = %s
+        """, (collection_id, media_id))
+        
+        conn.commit()
+        return jsonify({'success': True})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections/<collection_id>/export', methods=['GET'])
+async def export_collection(collection_id):
+    """Export collection as playlist."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get collection name
+        cur.execute("SELECT name FROM media_collections WHERE id = %s", (collection_id,))
+        collection = cur.fetchone()
+        if not collection:
+            return jsonify({'error': 'Collection not found'}), 404
+        
+        # Get items
+        cur.execute("""
+            SELECT m.full_filepath, m.name
+            FROM media m
+            JOIN media_collection_items ci ON m.id = ci.media_id
+            WHERE ci.collection_id = %s
+            ORDER BY ci.position, ci.added_at
+        """, (collection_id,))
+        
+        items = cur.fetchall()
+        format_type = request.args.get('format', 'm3u')
+        
+        # Generate playlist
+        if format_type == 'm3u':
+            content = "#EXTM3U\n"
+            for item in items:
+                content += f"#EXTINF:-1,{item['name']}\n"
+                content += f"{item['full_filepath']}\n"
+        
+        elif format_type == 'pls':
+            content = "[playlist]\n"
+            for i, item in enumerate(items, 1):
+                content += f"File{i}={item['full_filepath']}\n"
+                content += f"Title{i}={item['name']}\n"
+            content += f"NumberOfEntries={len(items)}\n"
+            content += "Version=2\n"
+        
+        else:
+            return jsonify({'error': 'Unsupported format'}), 400
+        
+        # Return as download
+        response = await make_response(content)
+        response.headers['Content-Type'] = 'text/plain'
+        response.headers['Content-Disposition'] = f'attachment; filename="{collection["name"]}.{format_type}"'
+        return response
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/collections/import', methods=['POST'])
+async def import_playlist():
+    """Import a playlist file into a collection."""
+    files = await request.files
+    form = await request.form
+    
+    if 'file' not in files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = files['file']
+    collection_name = form.get('collection_name')
+    
+    if not collection_name:
+        return jsonify({'error': 'Collection name required'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Create or get collection
+        cur.execute("""
+            INSERT INTO media_collections (name, description)
+            VALUES (%s, %s)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+        """, (collection_name, f"Imported from {file.filename}"))
+        
+        collection_id = cur.fetchone()['id']
+        
+        # Parse playlist
+        content = (await file.read()).decode('utf-8')
+        paths = []
+        
+        if file.filename.endswith(('.m3u', '.m3u8')):
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    paths.append(line)
+        
+        elif file.filename.endswith('.pls'):
+            import re
+            for match in re.finditer(r'^File\d+=(.+)$', content, re.MULTILINE):
+                paths.append(match.group(1))
+        
+        else:  # Plain text
+            for line in content.splitlines():
+                line = line.strip()
+                if line:
+                    paths.append(line)
+        
+        # Match paths to media
+        added = 0
+        for path in paths:
+            # Try exact match
+            cur.execute("SELECT id FROM media WHERE full_filepath = %s", (path,))
+            media = cur.fetchone()
+            
+            if not media:
+                # Try basename match
+                basename = os.path.basename(path)
+                cur.execute("SELECT id FROM media WHERE name = %s", (basename,))
+                media = cur.fetchone()
+            
+            if media:
+                cur.execute("""
+                    INSERT INTO media_collection_items (collection_id, media_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (collection_id, media['id']))
+                if cur.rowcount > 0:
+                    added += 1
+        
+        conn.commit()
+        return jsonify({'success': True, 'added': added, 'total': len(paths)})
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/duplicates', methods=['GET'])
+async def find_duplicates():
+    """Find duplicate media files."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        media_type = request.args.get('type')
+        
+        # Find duplicates by hash and name
+        query = """
+            WITH duplicate_groups AS (
+                SELECT file_hash, COUNT(*) as count
+                FROM media
+                WHERE file_hash IS NOT NULL
+        """
+        params = []
+        if media_type:
+            query += " AND media_type = %s"
+            params.append(media_type)
+        
+        query += """
+                GROUP BY file_hash
+                HAVING COUNT(*) > 1
+            )
+            SELECT m.*
+            FROM media m
+            JOIN duplicate_groups dg ON m.file_hash = dg.file_hash
+            ORDER BY m.file_hash, m.filesize DESC
+        """
+        
+        cur.execute(query, params)
+        all_dupes = cur.fetchall()
+        
+        # Group by hash
+        grouped = {}
+        for item in all_dupes:
+            key = item['file_hash']
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(dict(item))
+        
+        # Convert to list of groups
+        duplicate_groups = list(grouped.values())
+        
+        return jsonify(duplicate_groups)
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/quality', methods=['GET'])
+async def analyze_quality():
+    """Analyze media quality."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        media_type = request.args.get('type')
+        min_resolution = int(request.args.get('min_resolution', 720))
+        suggest_compress = request.args.get('suggest_compress') == 'true'
+        
+        result = {}
+        
+        # Low resolution files
+        query = """
+            SELECT id, name, full_filepath, resolution_width, resolution_height, 
+                   filesize, video_codec, duration
+            FROM media
+            WHERE resolution_height < %s AND resolution_height IS NOT NULL
+        """
+        params = [min_resolution]
+        if media_type:
+            query += " AND media_type = %s"
+            params.append(media_type)
+        query += " ORDER BY resolution_height ASC LIMIT 100"
+        
+        cur.execute(query, params)
+        result['low_resolution'] = [dict(row) for row in cur.fetchall()]
+        
+        # Compression candidates
+        if suggest_compress:
+            query = """
+                SELECT id, name, full_filepath, filesize, duration, video_codec,
+                       resolution_width, resolution_height,
+                       CASE WHEN duration > 0 THEN filesize / duration / 125000.0 ELSE 0 END as bitrate_mbps
+                FROM media
+                WHERE (
+                    video_codec IN ('mpeg4', 'msmpeg4v3', 'wmv3', 'mpeg2video', 'h263')
+                    OR filesize > 5368709120
+                    OR (duration > 0 AND filesize / duration / 125000.0 > 20)
+                )
+            """
+            params = []
+            if media_type:
+                query += " AND media_type = %s"
+                params.append(media_type)
+            query += " ORDER BY filesize DESC LIMIT 100"
+            
+            cur.execute(query, params)
+            candidates = []
+            total_savings = 0
+            
+            for row in cur.fetchall():
+                item = dict(row)
+                # Estimate savings
+                if item['resolution_height'] and item['resolution_height'] >= 1080:
+                    target_bitrate = 8
+                else:
+                    target_bitrate = 4
+                
+                if item['duration'] and item['duration'] > 0:
+                    estimated_size = item['duration'] * target_bitrate * 125000
+                    savings = max(0, item['filesize'] - estimated_size)
+                else:
+                    savings = item['filesize'] * 0.4
+                
+                item['estimated_savings'] = int(savings)
+                total_savings += savings
+                candidates.append(item)
+            
+            result['compression_candidates'] = candidates
+            result['total_savings'] = total_savings
+        
+        # Codec statistics
+        cur.execute("""
+            SELECT video_codec, COUNT(*) as count, AVG(filesize) as avg_size
+            FROM media
+            WHERE video_codec IS NOT NULL
+            GROUP BY video_codec
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        result['codec_stats'] = [dict(row) for row in cur.fetchall()]
+        
+        return jsonify(result)
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/verify', methods=['GET'])
+async def verify_files():
+    """Verify media files exist."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        media_type = request.args.get('type')
+        check_integrity = request.args.get('check_integrity') == 'true'
+        
+        query = "SELECT id, name, full_filepath FROM media WHERE 1=1"
+        params = []
+        if media_type:
+            query += " AND media_type = %s"
+            params.append(media_type)
+        query += " LIMIT 1000"
+        
+        cur.execute(query, params)
+        all_files = cur.fetchall()
+        
+        missing = []
+        corrupted = []
+        
+        for item in all_files:
+            filepath = item['full_filepath']
+            
+            if not os.path.exists(filepath):
+                missing.append(dict(item))
+            elif check_integrity:
+                # Basic integrity check using ffprobe
+                cmd = ['ffprobe', '-v', 'error', filepath]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    corrupted.append({
+                        **dict(item),
+                        'error': result.stderr[:200]
+                    })
+        
+        return jsonify({
+            'total': len(all_files),
+            'missing': missing,
+            'corrupted': corrupted
+        })
+        
+    finally:
+        cur.close()
+        conn.close()
+
+# MCP Server implementation
+if MCP_AVAILABLE and mcp_server:
+    @mcp_server.list_resources()
+    async def handle_list_resources() -> list[types.Resource]:
+        """List available MCP resources."""
+        return [
+            types.Resource(
+                uri="media://library",
+                name="Media Library",
+                description="Access to media library database",
+                mimeType="application/json",
+            ),
+            types.Resource(
+                uri="media://collections",
+                name="Media Collections",
+                description="Access to media collections",
+                mimeType="application/json",
+            ),
+            types.Resource(
+                uri="media://watchlist",
+                name="Watchlist",
+                description="Access to personal watchlist",
+                mimeType="application/json",
+            ),
+        ]
+
+    @mcp_server.read_resource()
+    async def handle_read_resource(uri: str) -> str:
+        """Read MCP resource."""
+        if uri == "media://library":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT * FROM media ORDER BY media_type, name LIMIT 100")
+                results = [dict(row) for row in cur.fetchall()]
+                return json.dumps(results, default=str)
+            finally:
+                cur.close()
+                conn.close()
+                
+        elif uri == "media://collections":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    SELECT c.*, COUNT(ci.media_id) as item_count
+                    FROM media_collections c
+                    LEFT JOIN media_collection_items ci ON c.id = ci.collection_id
+                    GROUP BY c.id
+                    ORDER BY c.name
+                """)
+                results = [dict(row) for row in cur.fetchall()]
+                return json.dumps(results, default=str)
+            finally:
+                cur.close()
+                conn.close()
+                
+        elif uri == "media://watchlist":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    SELECT m.*, w.priority, w.added_at as watchlist_added
+                    FROM media m
+                    JOIN media_watchlist w ON m.id = w.media_id
+                    ORDER BY w.priority DESC, w.added_at DESC
+                """)
+                results = [dict(row) for row in cur.fetchall()]
+                return json.dumps(results, default=str)
+            finally:
+                cur.close()
+                conn.close()
+        
+        raise ValueError(f"Unknown resource: {uri}")
+
+    @mcp_server.list_tools()
+    async def handle_list_tools() -> list[types.Tool]:
+        """List available MCP tools."""
+        return [
+            types.Tool(
+                name="search_media",
+                description="Search media library",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "media_type": {"type": "string", "enum": ["movie", "tv_series", "music", "video"]},
+                        "unwatched": {"type": "boolean", "description": "Show only unwatched"},
+                    },
+                },
+            ),
+            types.Tool(
+                name="mark_watched",
+                description="Mark media as watched",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "media_id": {"type": "string", "description": "Media ID"},
+                    },
+                    "required": ["media_id"],
+                },
+            ),
+            types.Tool(
+                name="add_to_collection",
+                description="Add media to a collection",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "collection_name": {"type": "string", "description": "Collection name"},
+                        "media_id": {"type": "string", "description": "Media ID"},
+                    },
+                    "required": ["collection_name", "media_id"],
+                },
+            ),
+        ]
+
+    @mcp_server.call_tool()
+    async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+        """Handle MCP tool calls."""
+        if name == "search_media":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                where_clauses = []
+                params = []
+                
+                if arguments.get("query"):
+                    where_clauses.append("(name ILIKE %s OR tags ILIKE %s)")
+                    params.extend([f'%{arguments["query"]}%', f'%{arguments["query"]}%'])
+                
+                if arguments.get("media_type"):
+                    where_clauses.append("media_type = %s")
+                    params.append(arguments["media_type"])
+                
+                if arguments.get("unwatched"):
+                    where_clauses.append("watched = FALSE")
+                
+                sql = "SELECT * FROM media"
+                if where_clauses:
+                    sql += " WHERE " + " AND ".join(where_clauses)
+                sql += " ORDER BY name LIMIT 20"
+                
+                cur.execute(sql, params)
+                results = [dict(row) for row in cur.fetchall()]
+                
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps(results, default=str)
+                )]
+            finally:
+                cur.close()
+                conn.close()
+                
+        elif name == "mark_watched":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                media_id = arguments["media_id"]
+                cur.execute("""
+                    UPDATE media 
+                    SET watched = TRUE, 
+                        last_watched = CURRENT_TIMESTAMP,
+                        watch_count = COALESCE(watch_count, 0) + 1
+                    WHERE id = %s
+                """, (media_id,))
+                conn.commit()
+                
+                return [types.TextContent(
+                    type="text",
+                    text=f"Marked media {media_id} as watched"
+                )]
+            finally:
+                cur.close()
+                conn.close()
+                
+        elif name == "add_to_collection":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                collection_name = arguments["collection_name"]
+                media_id = arguments["media_id"]
+                
+                # Get or create collection
+                cur.execute("""
+                    INSERT INTO media_collections (name)
+                    VALUES (%s)
+                    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                    RETURNING id
+                """, (collection_name,))
+                collection_id = cur.fetchone()['id']
+                
+                # Add media to collection
+                cur.execute("""
+                    INSERT INTO media_collection_items (collection_id, media_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (collection_id, media_id))
+                conn.commit()
+                
+                return [types.TextContent(
+                    type="text",
+                    text=f"Added media {media_id} to collection '{collection_name}'"
+                )]
+            finally:
+                cur.close()
+                conn.close()
+        
+        raise ValueError(f"Unknown tool: {name}")
+
+# Main entry point
+async def main():
+    """Main entry point for the server."""
+    parser = argparse.ArgumentParser(description='Media Library Web Server')
+    parser.add_argument('--port', type=int, default=5002, help='Port to run server on')
+    parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
+    parser.add_argument('--mcp', action='store_true', help='Run as MCP server')
+    
+    args = parser.parse_args()
+    
+    if args.mcp and MCP_AVAILABLE:
+        # Run as MCP server
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await mcp_server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="media-serve",
+                    server_version="1.0.0",
+                    capabilities=mcp_server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
+                ),
+            )
+    else:
+        # Run as web server
+        logger.info(f"Starting Media Server on {args.host}:{args.port}")
+        await app.run_task(host=args.host, port=args.port)
+
+if __name__ == '__main__':
+    asyncio.run(main())
