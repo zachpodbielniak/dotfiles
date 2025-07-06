@@ -28,6 +28,7 @@ import XMonad.Config.Kde
 import XMonad.Config.Xfce
 
 import XMonad.Actions.FloatKeys
+import qualified XMonad.Actions.FlexibleResize as Flex
 
 import System.Environment
 import System.Process
@@ -132,6 +133,7 @@ myConfig = def
     , layoutHook = myLayout -- use custom layout
     , focusedBorderColor = "#0663d6"
     , terminal = myTerminal
+    , mouseBindings = myMouseBindings
     }
     -- https://xmonad.github.io/xmonad-docs/xmonad-contrib/XMonad-Util-EZConfig.html
     -- to get keys:
@@ -224,6 +226,13 @@ myXmobarPP = def
         white = xmobarColor "#f8f8f2" ""
         yellow = xmobarColor "#f1fa8c" ""
 
+
+-- mouse bindings configuration
+myMouseBindings :: XConfig l -> M.Map (KeyMask, Button) (Window -> X ())
+myMouseBindings (XConfig {XMonad.modMask = modMask}) = M.fromList
+    [ ((controlMask, button2), \w -> focus w >> mouseMoveWindow w)
+    , ((controlMask, button3), \w -> focus w >> Flex.mouseResizeWindow w)
+    ]
 
 
 
