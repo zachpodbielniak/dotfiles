@@ -98,7 +98,7 @@ main = do
     -- _ <- spawn xrandrCmd
 
     -- spawn compistor
-    _ <- spawn $ "picom --config " 
+    _ <- spawn $ "picom --vsync --config " 
         <> homeDir 
         <> "/.config/picom/"
         <> getPicomConf hostName
