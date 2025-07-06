@@ -351,7 +351,7 @@ getXsettings hostName =
 
 getPicomConf :: String -> String 
 getPicomConf hostName 
-    -- | hostName == "lt-zach" = "picom-gpu.conf"
+    | hostName == "lt-zach" = "picom-gpu.conf"
     | otherwise = "picom.conf"
 
 
