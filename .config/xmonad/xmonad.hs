@@ -39,6 +39,7 @@ import Data.List
 import Data.Char
 import qualified Data.Map as M
 
+import XMonad.Hooks.ManageHelpers
 
 --                      _              _              _   _   _                 
 --   ___ ___  _ __  ___| |_ __ _ _ __ | |_   ___  ___| |_| |_(_)_ __   __ _ ___ 
@@ -78,6 +79,83 @@ myNoOp = "sleep 0"
 
 
  
+--                                              _                 _        
+--  _ __ ___   __ _ _ __   __ _  __ _  ___  | |__   ___   ___ | | _____ 
+-- | '_ ` _ \ / _` | '_ \ / _` |/ _` |/ _ \ | '_ \ / _ \ / _ \| |/ / __|
+-- | | | | | | (_| | | | | (_| | (_| |  __/ | | | | (_) | (_) |   <\__ \
+-- |_| |_| |_|\__,_|_| |_|\__,_|\__, |\___| |_| |_|\___/ \___/|_|\_\___/
+--                              |___/                                   
+
+myManageHook :: ManageHook
+myManageHook = composeAll
+    [ isDialog            --> doFloat
+    , isFullscreen        --> doFullFloat
+    , className =? "Gimp" --> doFloat
+    , className =? "Galculator" --> doFloat
+    , className =? "Pavucontrol" --> doFloat
+    , className =? "Nm-connection-editor" --> doFloat
+    , className =? "Xmessage" --> doFloat
+    , className =? "feh" --> doFloat
+    , className =? "Pinentry" --> doFloat
+    , className =? "Pinentry-gtk-2" --> doFloat
+    , className =? "Gpick" --> doFloat
+    , className =? "Lxappearance" --> doFloat
+    , className =? "Nitrogen" --> doFloat
+    , className =? "Arandr" --> doFloat
+    , className =? "SimpleScreenRecorder" --> doFloat
+    , className =? "Blueman-manager" --> doFloat
+    , className =? "Gnome-calculator" --> doFloat
+    , className =? "flameshot" --> doFloat
+    , className =? "Flameshot" --> doFloat
+    , className =? "mpv" --> doFloat
+    , className =? "vlc" --> doFloat
+    , className =? "VirtualBox Manager" --> doFloat
+    , className =? "VirtualBox Machine" --> doFloat
+    , className =? "Virt-manager" --> doFloat
+    , className =? "qemu" --> doFloat
+    , className =? "Qemu-system-x86_64" --> doFloat
+    , className =? "File-roller" --> doFloat
+    , className =? "Engrampa" --> doFloat
+    , className =? "zoom" --> doFloat
+    , className =? "zoom " --> doFloat
+    , className =? "Zoom - Free Account" --> doFloat
+    , className =? "Zoom Meeting" --> doFloat
+    , className =? "Zoom Cloud Meetings" --> doFloat
+    , className =? "Steam" --> doFloat
+    , className =? "steam" --> doFloat
+    , className =? "Wine" --> doFloat
+    , className =? "Wine-Programs" --> doFloat
+    , className =? "Lutris" --> doFloat
+    , className =? "Heroic" --> doFloat
+    , resource  =? "Dialog" --> doFloat
+    , resource  =? "dialog" --> doFloat
+    , title     =? "Mozilla Firefox" --> doFloat
+    , title     =? "Picture-in-Picture" --> doFloat
+    , title     =? "Library" --> doFloat  -- Firefox download window
+    , title     =? "Save As" --> doFloat
+    , title     =? "Open File" --> doFloat
+    , title     =? "Choose Files" --> doFloat
+    , title     =? "Upload" --> doFloat
+    , title     =? "Download" --> doFloat
+    , title     =? "Preferences" --> doFloat
+    , title     =? "Settings" --> doFloat
+    , title     =? "Properties" --> doFloat
+    , title     =? "Options" --> doFloat
+    , title     =? "About" --> doFloat
+    , title     =? "Warning" --> doFloat
+    , title     =? "Error" --> doFloat
+    , title     =? "Information" --> doFloat
+    , title     =? "Question" --> doFloat
+    , title     =? "Confirm" --> doFloat
+    , title     =? "Alert" --> doFloat
+    , stringProperty "WM_WINDOW_ROLE" =? "pop-up" --> doFloat
+    , stringProperty "WM_WINDOW_ROLE" =? "bubble" --> doFloat
+    , stringProperty "WM_WINDOW_ROLE" =? "task_dialog" --> doFloat
+    , stringProperty "WM_WINDOW_ROLE" =? "Preferences" --> doFloat
+    , stringProperty "WM_WINDOW_ROLE" =? "About" --> doFloat
+    , stringProperty "WM_WINDOW_ROLE" =? "toolbox" --> doFloat
+    , stringProperty "WM_WINDOW_ROLE" =? "splash" --> doFloat
+    ]
 
 
 --                  _       
@@ -131,6 +209,7 @@ main = do
 myConfig = def 
     { modMask = mod4Mask -- rebind mod to super
     , layoutHook = myLayout -- use custom layout
+    , manageHook = myManageHook <+> manageHook def
     , focusedBorderColor = "#0663d6"
     , terminal = myTerminal
     , mouseBindings = myMouseBindings
