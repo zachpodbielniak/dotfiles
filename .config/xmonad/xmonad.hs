@@ -78,6 +78,41 @@ myNoOp :: String
 myNoOp = "sleep 0"
 
 
+--            _                             _         
+--   ___ __ _| |_ _ __  _ __  _   _  ___ ___(_)_ __  
+--  / __/ _` | __| '_ \| '_ \| | | |/ __/ __| | '_ \ 
+-- | (_| (_| | |_| |_) | |_) | |_| | (_| (__| | | | |
+--  \___\__,_|\__| .__/| .__/ \__,_|\___\___|_|_| |_|
+--              |_|   |_|                           
+
+-- Catppuccin Mocha color palette
+catRosewater = "#f5e0dc"
+catFlamingo = "#f2cdcd"
+catPink = "#f5c2e7"
+catMauve = "#cba6f7"
+catRed = "#f38ba8"
+catMaroon = "#eba0ac"
+catPeach = "#fab387"
+catYellow = "#f9e2af"
+catGreen = "#a6e3a1"
+catTeal = "#94e2d5"
+catSky = "#89dceb"
+catSapphire = "#74c7ec"
+catBlue = "#89b4fa"
+catLavender = "#b4befe"
+catText = "#cdd6f4"
+catSubtext1 = "#bac2de"
+catSubtext0 = "#a6adc8"
+catOverlay2 = "#9399b2"
+catOverlay1 = "#7f849c"
+catOverlay0 = "#6c7086"
+catSurface2 = "#585b70"
+catSurface1 = "#45475a"
+catSurface0 = "#313244"
+catBase = "#1e1e2e"
+catMantle = "#181825"
+catCrust = "#11111b"
+
  
 --                                              _                 _        
 --  _ __ ___   __ _ _ __   __ _  __ _  ___  | |__   ___   ___ | | _____ 
@@ -210,7 +245,9 @@ myConfig = def
     { modMask = mod4Mask -- rebind mod to super
     , layoutHook = myLayout -- use custom layout
     , manageHook = myManageHook <+> manageHook def
-    , focusedBorderColor = "#0663d6"
+    , focusedBorderColor = catBlue
+    , normalBorderColor = catSurface0
+    , borderWidth = 2
     , terminal = myTerminal
     , mouseBindings = myMouseBindings
     }
@@ -280,30 +317,55 @@ myLayout =
 
 myXmobarPP :: PP 
 myXmobarPP = def
-    { ppSep = magenta " * " 
+    { ppSep = mauve " | " 
     , ppTitleSanitize = xmobarStrip 
-    , ppCurrent = wrap " " "" . xmobarBorder "Top" "#8be9fd" 2
-    , ppHidden = white . wrap " " ""
-    , ppHiddenNoWindows = lowWhite . wrap " " ""
+    , ppCurrent = wrap " " "" . xmobarBorder "Top" catBlue 2
+    , ppHidden = text . wrap " " ""
+    , ppHiddenNoWindows = overlay0 . wrap " " ""
     , ppUrgent = red . wrap (yellow "!") (yellow "!")
     , ppOrder = \[ws, l, _, wins] -> [ws, l, wins]
     , ppExtras = [logTitles formatFocused formatUnfocused]
     }
     where 
-        formatFocused = wrap (white "[") (white "]") . magenta . ppWindow 
-        formatUnfocused = wrap (lowWhite "[") (white "]") . blue . ppWindow 
+        formatFocused = wrap (text "[") (text "]") . pink . ppWindow 
+        formatUnfocused = wrap (subtext1 "[") (subtext1 "]") . lavender . ppWindow 
 
         -- | Windows should have "some" title, which should not exceed a sane length 
         ppWindow :: String -> String 
         ppWindow = xmobarRaw . (\w -> if null w then "untitled" else w) . shorten 30
 
-        blue, lowWhite, magenta, red, white, yellow :: String -> String 
-        blue = xmobarColor "#bd93f9" "" 
-        lowWhite = xmobarColor "#bbbbbb" "" 
-        magenta = xmobarColor "#ff79c6" "" 
-        red = xmobarColor "#ff5555" "" 
-        white = xmobarColor "#f8f8f2" ""
-        yellow = xmobarColor "#f1fa8c" ""
+        -- Catppuccin Mocha color functions for XMobar
+        rosewater, flamingo, pink, mauve, red, maroon, peach, yellow :: String -> String
+        green, teal, sky, sapphire, blue, lavender :: String -> String
+        text, subtext1, subtext0, overlay2, overlay1, overlay0 :: String -> String
+        surface2, surface1, surface0, base, mantle, crust :: String -> String
+        
+        rosewater = xmobarColor catRosewater ""
+        flamingo = xmobarColor catFlamingo ""
+        pink = xmobarColor catPink ""
+        mauve = xmobarColor catMauve ""
+        red = xmobarColor catRed ""
+        maroon = xmobarColor catMaroon ""
+        peach = xmobarColor catPeach ""
+        yellow = xmobarColor catYellow ""
+        green = xmobarColor catGreen ""
+        teal = xmobarColor catTeal ""
+        sky = xmobarColor catSky ""
+        sapphire = xmobarColor catSapphire ""
+        blue = xmobarColor catBlue ""
+        lavender = xmobarColor catLavender ""
+        text = xmobarColor catText ""
+        subtext1 = xmobarColor catSubtext1 ""
+        subtext0 = xmobarColor catSubtext0 ""
+        overlay2 = xmobarColor catOverlay2 ""
+        overlay1 = xmobarColor catOverlay1 ""
+        overlay0 = xmobarColor catOverlay0 ""
+        surface2 = xmobarColor catSurface2 ""
+        surface1 = xmobarColor catSurface1 ""
+        surface0 = xmobarColor catSurface0 ""
+        base = xmobarColor catBase ""
+        mantle = xmobarColor catMantle ""
+        crust = xmobarColor catCrust ""
 
 
 -- mouse bindings configuration
