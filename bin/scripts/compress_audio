@@ -1,0 +1,1027 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# compress_audio - Audio Compression Utility
+# ==============================================================================
+# Author: Zach
+# Version: 1.0
+# Last Updated: $(date)
+# Location: ~/.dotfiles/bin/scripts/compress_audio
+#
+# Description:
+# A robust audio compression script that uses podman with the linuxserver/ffmpeg
+# container. Supports batch processing, recursive directory traversal, 
+# configurable codecs, quality settings, and parallel processing.
+#
+# Features:
+# - MP3 and Vorbis (OGG) encoding support
+# - Configurable quality settings
+# - Batch processing support
+# - Recursive directory processing with structure preservation
+# - Output directory management
+# - Flexible codec and format options
+# - Parallel processing support
+#
+# Dependencies:
+# - podman: Container runtime
+# - linuxserver/ffmpeg container image
+# - parallel: GNU parallel for concurrent processing (optional)
+#
+# Usage: See show_help() function or run with -h/--help
+# ==============================================================================
+
+# Default configuration
+QUALITY="high"
+OUTPUT_FORMAT="mp3"
+OUTPUT_DIR="output"
+CONTAINER_IMAGE="docker.io/linuxserver/ffmpeg:latest"
+VERBOSE=false
+DRY_RUN=false
+USE_JOURNAL=false
+JOURNAL_FILE=""
+FORCE_RECONVERT=false
+CUSTOM_BITRATE=""
+PARALLEL_JOBS=1
+PARALLEL_TYPE=""
+PARALLEL_CHILD=false
+CONTAINER_CPUS=""
+CONTAINER_MEMORY=""
+RECURSIVE=false
+INPUT_FORMAT_FILTER=""
+
+# Logging configuration
+LOG_FILE="./compress_audio.log"
+LOG_LEVEL="INFO"  # DEBUG, INFO, WARN, ERROR
+LOG_TO_FILE=true
+LOG_TO_STDERR=true
+
+# Quality presets (bitrates in kbps)
+declare -A QUALITY_PRESETS_MP3=(
+    ["low"]="128"
+    ["medium"]="192"
+    ["high"]="320"
+    ["veryhigh"]="320"
+)
+
+declare -A QUALITY_PRESETS_VORBIS=(
+    ["low"]="3"      # ~112 kbps
+    ["medium"]="5"   # ~160 kbps
+    ["high"]="7"     # ~224 kbps
+    ["veryhigh"]="10" # ~500 kbps (max)
+)
+
+# Audio codec mapping
+declare -A AUDIO_CODEC_MAP=(
+    ["mp3"]="libmp3lame"
+    ["vorbis"]="libvorbis"
+    ["ogg"]="libvorbis"
+    ["opus"]="libopus"
+    ["aac"]="aac"
+    ["flac"]="flac"
+    ["copy"]="copy"
+)
+
+# Common audio file extensions
+AUDIO_EXTENSIONS=(mp3 ogg oga wav flac m4a aac opus wma ape wavpack wv)
+
+# Show help message
+show_help() {
+    cat << EOF
+compress_audio - Audio compression utility using podman and ffmpeg
+
+USAGE:
+    compress_audio [OPTIONS] <input_file_or_directory> [input_file2 ...]
+
+DESCRIPTION:
+    Compress audio files using ffmpeg in a podman container. Supports batch
+    processing, recursive directory traversal, and various audio codecs.
+
+OPTIONS:
+    -h, --help                  Show this help message
+    -q, --quality QUALITY       Quality preset: low, medium, high, veryhigh (default: high)
+    -b, --bitrate VALUE        Custom bitrate (e.g., 192k, 320k) - overrides quality preset
+    -f, --format FORMAT        Output format: mp3, ogg, opus, aac, flac (default: mp3)
+    -o, --output-dir DIR       Output directory (default: ./output)
+    -O, --output-file FILE     Specific output filename (single file mode only)
+    -r, --recursive            Process directories recursively
+    --input-format EXT         Filter input files by extension (e.g., wav, flac)
+    --dry-run                  Show command without executing
+    --verbose                  Enable verbose output
+    --container IMAGE          Use custom container image (default: docker.io/linuxserver/ffmpeg:latest)
+    --journal                  Enable journal tracking to skip already converted files
+    --journal-file FILE        Custom journal file path (default: ./compress_audio_journal.md)
+    --force-reconvert          Force reconversion even if file is in journal
+    --log-file FILE            Write detailed logs to specified file (default: ./compress_audio.log)
+    --log-level LEVEL          Set log level: DEBUG, INFO, WARN, ERROR (default: INFO)
+    --no-log                   Disable file logging (console output only)
+    --parallel N               Process N files in parallel (default: 1)
+    --cpus N                   Limit CPU usage per container (e.g., 2, 1.5)
+    --memory SIZE              Limit memory usage per container (e.g., 4096m, 4g)
+
+EXAMPLES:
+    # Basic compression to MP3 (320 kbps)
+    compress_audio input.wav
+
+    # Convert to OGG Vorbis with medium quality
+    compress_audio -f ogg -q medium input.flac
+
+    # Batch convert all WAV files to MP3
+    compress_audio *.wav
+
+    # Recursive conversion with custom output directory
+    compress_audio -r -o /path/to/output /path/to/music/directory
+
+    # Convert only FLAC files recursively to OGG
+    compress_audio -r --input-format flac -f ogg /music/library
+
+    # Custom bitrate MP3 conversion
+    compress_audio -b 256k input.wav
+
+    # Process 4 files in parallel
+    compress_audio --parallel 4 *.flac
+
+    # Batch processing with journal (resumable)
+    compress_audio --journal -r /music/collection
+
+    # Resume interrupted batch processing
+    compress_audio --journal -r /music/collection  # Will skip already converted files
+
+    # Process with resource limits
+    compress_audio --cpus 2 --memory 4g --parallel 2 *.wav
+
+QUALITY GUIDE:
+    MP3:
+    - low (128 kbps): Acceptable quality, smaller files
+    - medium (192 kbps): Good quality for most uses
+    - high (320 kbps): Maximum MP3 quality (default)
+    - veryhigh (320 kbps): Same as high for MP3
+    
+    Vorbis (OGG):
+    - low (q3, ~112 kbps): Acceptable quality
+    - medium (q5, ~160 kbps): Good quality
+    - high (q7, ~224 kbps): Very good quality
+    - veryhigh (q10, ~500 kbps): Maximum quality
+
+RECURSIVE MODE:
+    When using -r/--recursive, the script will:
+    - Search for all audio files in the input directory
+    - Preserve the directory structure in the output
+    - Skip non-audio files automatically
+    - Support filtering by input format with --input-format
+
+JOURNAL INTEGRATION:
+    The --journal flag creates a markdown table (compress_audio_journal.md) that tracks:
+    - File sizes, compression ratios, processing times
+    - Success/failure status with detailed notes
+    - Audio codec and quality settings used
+    
+    Journal columns available for analysis:
+    - timestamp, input_file, output_file, input_size, output_size
+    - compression_ratio, audio_codec, quality, duration, status, notes
+
+EOF
+}
+
+# Initialize logging
+init_logging() {
+    if [[ "$LOG_TO_FILE" == "true" ]]; then
+        local log_dir="$(dirname "$LOG_FILE")"
+        if [[ ! -d "$log_dir" ]]; then
+            mkdir -p "$log_dir" || {
+                echo "[ERROR] Failed to create log directory: $log_dir" >&2
+                LOG_TO_FILE=false
+                return 1
+            }
+        fi
+        
+        # Initialize log file with header
+        {
+            echo "=========================================="
+            echo "compress_audio log - $(date)"
+            echo "PID: $$"
+            echo "Command: $0 $*"
+            echo "=========================================="
+        } >> "$LOG_FILE" 2>/dev/null || {
+            echo "[ERROR] Failed to initialize log file: $LOG_FILE" >&2
+            LOG_TO_FILE=false
+            return 1
+        }
+    fi
+}
+
+# Enhanced logging functions with file support
+write_log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    local log_entry="[$timestamp] [$level] $message"
+    
+    # Write to log file if enabled
+    if [[ "$LOG_TO_FILE" == "true" ]] && [[ -n "$LOG_FILE" ]]; then
+        echo "$log_entry" >> "$LOG_FILE" 2>/dev/null
+    fi
+    
+    # Write to console based on level and settings
+    case "$level" in
+        ERROR)
+            [[ "$LOG_TO_STDERR" == "true" ]] && echo "$log_entry" >&2
+            ;;
+        WARN)
+            [[ "$LOG_TO_STDERR" == "true" ]] && echo "$log_entry" >&2
+            ;;
+        INFO)
+            echo "$message"  # Keep simple format for user-facing messages
+            ;;
+        DEBUG)
+            if [[ "$VERBOSE" == "true" ]] || [[ "$LOG_LEVEL" == "DEBUG" ]]; then
+                [[ "$LOG_TO_STDERR" == "true" ]] && echo "$log_entry" >&2
+            fi
+            ;;
+    esac
+}
+
+log() {
+    write_log "INFO" "$@"
+}
+
+error() {
+    write_log "ERROR" "$@"
+}
+
+warn() {
+    write_log "WARN" "$@"
+}
+
+debug() {
+    write_log "DEBUG" "$@"
+}
+
+# Journal functions
+init_journal() {
+    if [[ "$USE_JOURNAL" == "true" ]]; then
+        # Set default journal file if not specified
+        if [[ -z "$JOURNAL_FILE" ]]; then
+            JOURNAL_FILE="./compress_audio_journal.md"
+        fi
+        
+        # Create journal file if it doesn't exist
+        if [[ ! -f "$JOURNAL_FILE" ]]; then
+            create_journal_header "$JOURNAL_FILE"
+            debug "Created journal file: $JOURNAL_FILE"
+        else
+            debug "Using existing journal file: $JOURNAL_FILE"
+        fi
+    fi
+}
+
+# Create markdown table header for journal
+create_journal_header() {
+    local journal_file="$1"
+    cat > "$journal_file" << 'EOF'
+# Audio Compression Journal
+
+This file tracks audio compression operations performed by compress_audio script.
+
+| timestamp | input_file | output_file | input_size | output_size | compression_ratio | audio_codec | quality | duration | status | notes |
+|-----------|------------|-------------|------------|-------------|-------------------|-------------|---------|----------|--------|-------|
+EOF
+}
+
+# Check if a file has been converted based on journal
+is_converted() {
+    local input_file="$1"
+    local output_file="$2"
+    
+    if [[ "$USE_JOURNAL" != "true" ]] || [[ "$FORCE_RECONVERT" == "true" ]]; then
+        return 1  # Not converted or force reconvert
+    fi
+    
+    # Check if entry exists in journal by looking for the input and output file combination
+    if [[ -f "$JOURNAL_FILE" ]]; then
+        # Escape special regex characters in filenames
+        local escaped_input=$(basename "$input_file" | sed 's/[[\.^$()|*+?{]/\\&/g')
+        local escaped_output=$(basename "$output_file" | sed 's/[[\.^$()|*+?{]/\\&/g')
+        
+        # Skip header lines and check for matching input/output files
+        if tail -n +4 "$JOURNAL_FILE" | grep -qE "\| [^|]+ \| ${escaped_input} \| ${escaped_output} \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| SUCCESS \|"; then
+            return 0  # Already converted successfully
+        fi
+    fi
+    
+    return 1  # Not converted
+}
+
+# Add entry to journal
+add_to_journal() {
+    local input_file="$1"
+    local output_file="$2"
+    local status="${3:-SUCCESS}"
+    local notes="${4:-}"
+    
+    if [[ "$USE_JOURNAL" == "true" ]]; then
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local input_basename=$(basename "$input_file")
+        local output_basename=$(basename "$output_file")
+        
+        # Get file sizes
+        local input_size="N/A"
+        local output_size="N/A"
+        local compression_ratio="N/A"
+        
+        if [[ -f "$input_file" ]]; then
+            input_size=$(stat -c%s "$input_file" 2>/dev/null || echo "N/A")
+            if [[ "$input_size" != "N/A" ]]; then
+                input_size=$(numfmt --to=iec --suffix=B "$input_size" 2>/dev/null || echo "$input_size bytes")
+            fi
+        fi
+        
+        if [[ -f "$output_file" && "$status" == "SUCCESS" ]]; then
+            output_size=$(stat -c%s "$output_file" 2>/dev/null || echo "N/A")
+            if [[ "$output_size" != "N/A" ]]; then
+                output_size=$(numfmt --to=iec --suffix=B "$output_size" 2>/dev/null || echo "$output_size bytes")
+                
+                # Calculate compression ratio if both sizes are available
+                if [[ "$input_size" != "N/A" ]]; then
+                    local input_bytes=$(stat -c%s "$input_file" 2>/dev/null)
+                    local output_bytes=$(stat -c%s "$output_file" 2>/dev/null)
+                    if [[ -n "$input_bytes" && -n "$output_bytes" && "$output_bytes" -gt 0 ]]; then
+                        compression_ratio=$(echo "scale=2; $input_bytes / $output_bytes" | bc 2>/dev/null || echo "N/A")
+                        if [[ "$compression_ratio" != "N/A" ]]; then
+                            compression_ratio="${compression_ratio}:1"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+        
+        # Get audio duration if available (requires ffprobe, but we'll make it optional)
+        local duration="N/A"
+        if [[ -f "$input_file" ]] && command -v ffprobe >/dev/null 2>&1; then
+            duration=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$input_file" 2>/dev/null | cut -d. -f1)
+            if [[ -n "$duration" && "$duration" != "N/A" ]]; then
+                # Convert seconds to HH:MM:SS
+                duration=$(printf "%02d:%02d:%02d" $((duration/3600)) $(((duration%3600)/60)) $((duration%60)))
+            else
+                duration="N/A"
+            fi
+        fi
+        
+        # Determine quality string
+        local quality_str="$QUALITY"
+        if [[ -n "$CUSTOM_BITRATE" ]]; then
+            quality_str="bitrate:$CUSTOM_BITRATE"
+        fi
+        
+        # Create markdown table row
+        local row="| $timestamp | $input_basename | $output_basename | $input_size | $output_size | $compression_ratio | $OUTPUT_FORMAT | $quality_str | $duration | $status | $notes |"
+        
+        # Add to journal file with file locking to prevent race conditions
+        local lock_file="${JOURNAL_FILE}.lock"
+        local lock_acquired=false
+        local retry_count=0
+        local max_retries=10
+        
+        while [[ $retry_count -lt $max_retries ]]; do
+            if (set -C; echo $$ > "$lock_file") 2>/dev/null; then
+                lock_acquired=true
+                break
+            fi
+            # Wait a bit and retry
+            sleep 0.1
+            ((retry_count++))
+        done
+        
+        if [[ "$lock_acquired" == "true" ]]; then
+            # We have the lock, write to journal
+            echo "$row" >> "$JOURNAL_FILE"
+            local write_status=$?
+            
+            # Remove lock file
+            rm -f "$lock_file"
+            
+            if [[ $write_status -eq 0 ]]; then
+                debug "Added to journal: $input_basename -> $output_basename ($status)"
+            else
+                error "Failed to write to journal file: $JOURNAL_FILE"
+                warn "Journal entry lost: $row"
+            fi
+        else
+            error "Failed to acquire journal lock after $max_retries attempts"
+            warn "Journal entry lost: $row"
+        fi
+    fi
+}
+
+# Input validation functions
+validate_bitrate() {
+    local bitrate="$1"
+    if ! [[ "$bitrate" =~ ^[0-9]+(\.?[0-9]*)?[Kk]?$ ]]; then
+        error "Bitrate must be a number optionally followed by k (e.g., 192k, 320k)"
+        return 1
+    fi
+    return 0
+}
+
+validate_parallel_jobs() {
+    local jobs="$1"
+    if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+        error "Parallel jobs must be a positive integer"
+        return 1
+    fi
+    if [[ $jobs -gt 32 ]]; then
+        error "Parallel jobs cannot exceed 32 (got: $jobs)"
+        return 1
+    fi
+    return 0
+}
+
+# Check if file is an audio file
+is_audio_file() {
+    local file="$1"
+    local extension="${file##*.}"
+    extension="${extension,,}"  # Convert to lowercase
+    
+    # Check against known audio extensions
+    for ext in "${AUDIO_EXTENSIONS[@]}"; do
+        if [[ "$extension" == "$ext" ]]; then
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# Find audio files recursively
+find_audio_files() {
+    local input_dir="$1"
+    local find_cmd=("find" "$input_dir" "-type" "f")
+    
+    # Add extension filter if specified
+    if [[ -n "$INPUT_FORMAT_FILTER" ]]; then
+        find_cmd+=("-iname" "*.${INPUT_FORMAT_FILTER}")
+    else
+        # Build find command with all audio extensions
+        find_cmd+=("(")
+        local first=true
+        for ext in "${AUDIO_EXTENSIONS[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                find_cmd+=("-o")
+            fi
+            find_cmd+=("-iname" "*.${ext}")
+        done
+        find_cmd+=(")")
+    fi
+    
+    # Execute find command and sort results
+    "${find_cmd[@]}" | sort
+}
+
+# Check if parallel is available for concurrent processing
+check_parallel() {
+    if ! command -v parallel >/dev/null 2>&1; then
+        error "parallel is required for --parallel option but not found"
+        error "Install with: sudo apt install parallel (or equivalent for your distro)"
+        exit 1
+    fi
+    
+    # Detect which version of parallel we have
+    if parallel --version 2>&1 | grep -q "GNU parallel"; then
+        PARALLEL_TYPE="gnu"
+        debug "GNU parallel detected"
+    else
+        PARALLEL_TYPE="moreutils"
+        debug "moreutils parallel detected"
+    fi
+}
+
+# Parse command line arguments
+parse_args() {
+    local args=()
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -q|--quality)
+                QUALITY="$2"
+                shift 2
+                ;;
+            -b|--bitrate)
+                if ! validate_bitrate "$2"; then
+                    exit 1
+                fi
+                CUSTOM_BITRATE="$2"
+                shift 2
+                ;;
+            -f|--format)
+                OUTPUT_FORMAT="$2"
+                if [[ ! "${AUDIO_CODEC_MAP[$OUTPUT_FORMAT]+isset}" ]]; then
+                    error "Invalid format: $OUTPUT_FORMAT"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            -o|--output-dir)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            -O|--output-file)
+                OUTPUT_FILE="$2"
+                shift 2
+                ;;
+            -r|--recursive)
+                RECURSIVE=true
+                shift
+                ;;
+            --input-format)
+                INPUT_FORMAT_FILTER="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --container)
+                CONTAINER_IMAGE="$2"
+                shift 2
+                ;;
+            --journal)
+                USE_JOURNAL=true
+                shift
+                ;;
+            --journal-file)
+                USE_JOURNAL=true
+                JOURNAL_FILE="$2"
+                shift 2
+                ;;
+            --log-file)
+                LOG_TO_FILE=true
+                LOG_FILE="$2"
+                shift 2
+                ;;
+            --log-level)
+                LOG_LEVEL="$2"
+                if [[ ! "$LOG_LEVEL" =~ ^(DEBUG|INFO|WARN|ERROR)$ ]]; then
+                    error "Invalid log level: $LOG_LEVEL (must be DEBUG, INFO, WARN, or ERROR)"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --no-log)
+                LOG_TO_FILE=false
+                shift
+                ;;
+            --force-reconvert)
+                FORCE_RECONVERT=true
+                shift
+                ;;
+            --parallel)
+                if ! validate_parallel_jobs "$2"; then
+                    exit 1
+                fi
+                PARALLEL_JOBS="$2"
+                shift 2
+                ;;
+            --parallel-child)
+                # Internal flag to indicate this is a child process from moreutils parallel
+                PARALLEL_CHILD=true
+                shift
+                ;;
+            --cpus)
+                CONTAINER_CPUS="$2"
+                shift 2
+                ;;
+            --memory)
+                CONTAINER_MEMORY="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # Store remaining arguments as input files/directories
+    INPUT_PATHS=("${args[@]}")
+    
+    # Validate input
+    if [[ ${#INPUT_PATHS[@]} -eq 0 ]]; then
+        error "No input files or directories specified"
+        show_help
+        exit 1
+    fi
+    
+    # Check for conflicting options
+    if [[ -n "${OUTPUT_FILE:-}" ]] && [[ ${#INPUT_PATHS[@]} -gt 1 ]]; then
+        error "Cannot use --output-file with multiple input files"
+        exit 1
+    fi
+    
+    if [[ -n "${OUTPUT_FILE:-}" ]] && [[ "$RECURSIVE" == "true" ]]; then
+        error "Cannot use --output-file with recursive mode"
+        exit 1
+    fi
+}
+
+# Build FFmpeg command arguments
+build_ffmpeg_args() {
+    local input_file="$1"
+    local output_file="$2"
+    local input_dir="$3"
+    local output_dir="$4"
+    local args=()
+    
+    # Determine input path in container
+    local input_basename
+    input_basename="$(basename "$input_file")"
+    if [[ "$input_dir" == "$output_dir" ]]; then
+        args+=("-i" "/config/${input_basename}")
+    else
+        args+=("-i" "/input/${input_basename}")
+    fi
+    
+    # Audio codec settings
+    local codec="${AUDIO_CODEC_MAP[$OUTPUT_FORMAT]}"
+    args+=("-c:a" "$codec")
+    
+    # Quality/bitrate settings
+    if [[ -n "$CUSTOM_BITRATE" ]]; then
+        # User specified bitrate
+        args+=("-b:a" "$CUSTOM_BITRATE")
+    elif [[ "$OUTPUT_FORMAT" == "mp3" ]]; then
+        # MP3 uses bitrate
+        local bitrate="${QUALITY_PRESETS_MP3[$QUALITY]}"
+        args+=("-b:a" "${bitrate}k")
+    elif [[ "$OUTPUT_FORMAT" == "vorbis" ]] || [[ "$OUTPUT_FORMAT" == "ogg" ]]; then
+        # Vorbis uses quality scale (0-10)
+        local quality="${QUALITY_PRESETS_VORBIS[$QUALITY]}"
+        args+=("-q:a" "$quality")
+    elif [[ "$OUTPUT_FORMAT" == "opus" ]]; then
+        # Opus uses bitrate (default to 128k for good quality)
+        args+=("-b:a" "128k")
+    elif [[ "$OUTPUT_FORMAT" == "aac" ]]; then
+        # AAC uses bitrate
+        args+=("-b:a" "192k")
+    fi
+    
+    # Sample rate (optional - let ffmpeg choose by default)
+    # args+=("-ar" "44100")
+    
+    # Remove video streams if present
+    args+=("-vn")
+    
+    # Map only audio streams
+    args+=("-map" "0:a")
+    
+    # Metadata preservation
+    args+=("-map_metadata" "0")
+    
+    # Determine output path in container
+    local output_basename
+    output_basename="$(basename "$output_file")"
+    if [[ "$input_dir" == "$output_dir" ]]; then
+        args+=("/config/${output_basename}")
+    else
+        args+=("/output/${output_basename}")
+    fi
+    
+    # Output each argument on a separate line
+    printf '%s\n' "${args[@]}"
+}
+
+# Process a single audio file
+process_audio() {
+    local input_file="$1"
+    local output_file="$2"
+    
+    # Check journal to see if already converted
+    if is_converted "$input_file" "$output_file"; then
+        log "Skipping (already converted): $input_file"
+        return 0
+    fi
+    
+    log "Processing: $input_file -> $output_file"
+    
+    # Get absolute paths
+    local input_dir="$(dirname "$(realpath "$input_file")")"
+    
+    # Create output directory if needed
+    local output_parent="$(dirname "$output_file")"
+    if [[ ! -d "$output_parent" ]]; then
+        mkdir -p "$output_parent"
+    fi
+    
+    local output_dir="$(realpath "$output_parent")"
+    
+    # Build FFmpeg arguments as array
+    local ffmpeg_args=()
+    while IFS= read -r arg; do
+        ffmpeg_args+=("$arg")
+    done < <(build_ffmpeg_args "$input_file" "$output_file" "$input_dir" "$output_dir")
+    
+    # Build podman command
+    local podman_cmd=(
+        "podman" "run" "--rm" "-it"
+        "--security-opt" "label=disable"
+    )
+    
+    # Add resource limits if specified
+    if [[ -n "$CONTAINER_CPUS" ]]; then
+        podman_cmd+=("--cpus" "$CONTAINER_CPUS")
+    fi
+    if [[ -n "$CONTAINER_MEMORY" ]]; then
+        podman_cmd+=("--memory" "$CONTAINER_MEMORY")
+    fi
+    
+    # Add volume mounts
+    # If input and output directories are the same, mount once
+    if [[ "$input_dir" == "$output_dir" ]]; then
+        podman_cmd+=("-v" "${input_dir}:/config:z")
+    else
+        # Mount both directories
+        podman_cmd+=(
+            "-v" "${input_dir}:/input:z"
+            "-v" "${output_dir}:/output:z"
+        )
+    fi
+    
+    # Add container image and ffmpeg command
+    podman_cmd+=(
+        "$CONTAINER_IMAGE"
+        "${ffmpeg_args[@]}"
+    )
+    
+    # Show command if verbose or dry run
+    if [[ "$VERBOSE" == "true" ]] || [[ "$DRY_RUN" == "true" ]]; then
+        debug "Command: ${podman_cmd[*]}"
+    fi
+    
+    # Execute command
+    if [[ "$DRY_RUN" == "false" ]]; then
+        # Record start time for duration calculation
+        local start_time=$(date +%s)
+        
+        # Execute the command and capture exit code
+        local stderr_file=$(mktemp)
+        "${podman_cmd[@]}" 2>"$stderr_file"
+        local exit_code=$?
+        
+        if [[ $exit_code -eq 0 ]]; then
+            rm -f "$stderr_file"
+            local end_time=$(date +%s)
+            local process_duration=$((end_time - start_time))
+            local duration_str=$(printf "%02d:%02d:%02d" $((process_duration/3600)) $(((process_duration%3600)/60)) $((process_duration%60)))
+            
+            log "Successfully compressed: $output_file (took $duration_str)"
+            # Add to journal on success
+            add_to_journal "$input_file" "$output_file" "SUCCESS" "Processed in $duration_str"
+        else
+            error "FFmpeg failed with exit code $exit_code"
+            
+            # Log stderr output for debugging
+            if [[ -f "$stderr_file" ]] && [[ -s "$stderr_file" ]]; then
+                local stderr_content=$(tail -n 20 "$stderr_file")
+                error "FFmpeg stderr output:"
+                error "$stderr_content"
+            fi
+            
+            rm -f "$stderr_file"
+            
+            # Add failure to journal
+            add_to_journal "$input_file" "$output_file" "FAILED" "FFmpeg exit code: $exit_code"
+            return 1
+        fi
+    else
+        log "[DRY RUN] Would execute: ${podman_cmd[*]}"
+        # Add dry run entry to journal
+        add_to_journal "$input_file" "$output_file" "DRY_RUN" "Command would be: ${podman_cmd[*]:0:50}..."
+    fi
+}
+
+# Export function for parallel to use
+export -f process_audio log error warn debug write_log is_converted add_to_journal build_ffmpeg_args
+
+# Wrapper function that parallel can call
+process_audio_wrapper() {
+    local input_file="$1"
+    local output_file="$2"
+    
+    # Reconstruct associative arrays from environment variables
+    declare -A QUALITY_PRESETS_MP3=(["low"]="128" ["medium"]="192" ["high"]="320" ["veryhigh"]="320")
+    declare -A QUALITY_PRESETS_VORBIS=(["low"]="3" ["medium"]="5" ["high"]="7" ["veryhigh"]="10")
+    declare -A AUDIO_CODEC_MAP=(["mp3"]="libmp3lame" ["vorbis"]="libvorbis" ["ogg"]="libvorbis" ["opus"]="libopus" ["aac"]="aac" ["flac"]="flac" ["copy"]="copy")
+    
+    # Call the main processing function
+    process_audio "$input_file" "$output_file"
+}
+
+# Main function
+main() {
+    parse_args "$@"
+    
+    # Initialize logging
+    init_logging "$@"
+    
+    # Initialize journal if enabled
+    init_journal
+    
+    # Create output directory if it doesn't exist
+    if [[ -z "${OUTPUT_FILE:-}" ]] && [[ "$DRY_RUN" == "false" ]]; then
+        mkdir -p "$OUTPUT_DIR"
+    fi
+    
+    # Check for parallel dependency if needed
+    if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
+        check_parallel
+    fi
+    
+    # Build list of input files
+    local input_files=()
+    
+    for input_path in "${INPUT_PATHS[@]}"; do
+        if [[ -f "$input_path" ]]; then
+            # Single file
+            if is_audio_file "$input_path"; then
+                input_files+=("$input_path")
+            else
+                warn "Skipping non-audio file: $input_path"
+            fi
+        elif [[ -d "$input_path" ]]; then
+            # Directory
+            if [[ "$RECURSIVE" == "true" ]]; then
+                # Find audio files recursively
+                while IFS= read -r file; do
+                    input_files+=("$file")
+                done < <(find_audio_files "$input_path")
+            else
+                # Non-recursive: only files in the directory
+                for file in "$input_path"/*; do
+                    if [[ -f "$file" ]] && is_audio_file "$file"; then
+                        input_files+=("$file")
+                    fi
+                done
+            fi
+        else
+            error "Input path not found: $input_path"
+        fi
+    done
+    
+    if [[ ${#input_files[@]} -eq 0 ]]; then
+        error "No audio files found to process"
+        exit 1
+    fi
+    
+    # Prepare job list for processing
+    local job_list=()
+    local failed=0
+    local skipped=0
+    
+    # Get the common base path for recursive operations
+    local base_input_dir=""
+    if [[ "$RECURSIVE" == "true" ]] && [[ ${#INPUT_PATHS[@]} -eq 1 ]] && [[ -d "${INPUT_PATHS[0]}" ]]; then
+        base_input_dir="$(realpath "${INPUT_PATHS[0]}")"
+    fi
+    
+    for input_file in "${input_files[@]}"; do
+        # Determine output filename
+        local output_file
+        if [[ -n "${OUTPUT_FILE:-}" ]]; then
+            output_file="$OUTPUT_FILE"
+        else
+            local input_realpath="$(realpath "$input_file")"
+            local basename="$(basename "$input_file")"
+            local name="${basename%.*}"
+            
+            # Determine extension based on format
+            local extension="$OUTPUT_FORMAT"
+            if [[ "$OUTPUT_FORMAT" == "vorbis" ]]; then
+                extension="ogg"
+            fi
+            
+            # Handle recursive directory structure preservation
+            if [[ "$RECURSIVE" == "true" ]] && [[ -n "$base_input_dir" ]]; then
+                # Get relative path from base directory
+                local relative_dir="${input_realpath#$base_input_dir/}"
+                relative_dir="$(dirname "$relative_dir")"
+                
+                if [[ "$relative_dir" != "." ]]; then
+                    output_file="${OUTPUT_DIR}/${relative_dir}/${name}.${extension}"
+                else
+                    output_file="${OUTPUT_DIR}/${name}.${extension}"
+                fi
+            else
+                output_file="${OUTPUT_DIR}/${name}.${extension}"
+            fi
+        fi
+        
+        # Check if already converted (for counting)
+        if is_converted "$input_file" "$output_file"; then
+            ((skipped++))
+        else
+            # Add to job list for processing
+            job_list+=("$input_file|$output_file")
+        fi
+    done
+    
+    # Process audio files
+    if [[ ${#job_list[@]} -gt 0 ]]; then
+        if [[ "$PARALLEL_JOBS" -gt 1 ]] && [[ "$PARALLEL_CHILD" == "false" ]]; then
+            # Use parallel processing
+            log "Processing ${#job_list[@]} files with $PARALLEL_JOBS parallel jobs..."
+            
+            # Export the wrapper function and variables for parallel
+            export -f process_audio_wrapper
+            export QUALITY CUSTOM_BITRATE OUTPUT_FORMAT CONTAINER_IMAGE VERBOSE DRY_RUN USE_JOURNAL 
+            export JOURNAL_FILE FORCE_RECONVERT PARALLEL_TYPE
+            export CONTAINER_CPUS CONTAINER_MEMORY
+            
+            # Process jobs in parallel
+            local parallel_failed=0
+            
+            if [[ "$PARALLEL_TYPE" == "gnu" ]]; then
+                # GNU parallel syntax
+                printf '%s\n' "${job_list[@]}" | parallel -j "$PARALLEL_JOBS" --colsep '|' \
+                    'if ! process_audio_wrapper "{1}" "{2}"; then exit 1; fi' || parallel_failed=$?
+            else
+                # moreutils parallel - build the command with all our current options
+                local cmd_args=()
+                [[ "$QUALITY" != "high" ]] && cmd_args+=("--quality" "$QUALITY")
+                [[ -n "$CUSTOM_BITRATE" ]] && cmd_args+=("--bitrate" "$CUSTOM_BITRATE")
+                [[ "$OUTPUT_FORMAT" != "mp3" ]] && cmd_args+=("--format" "$OUTPUT_FORMAT")
+                [[ "$OUTPUT_DIR" != "output" ]] && cmd_args+=("--output-dir" "$OUTPUT_DIR")
+                [[ "$VERBOSE" == "true" ]] && cmd_args+=("--verbose")
+                [[ "$DRY_RUN" == "true" ]] && cmd_args+=("--dry-run")
+                [[ "$USE_JOURNAL" == "true" ]] && cmd_args+=("--journal")
+                [[ -n "$JOURNAL_FILE" ]] && [[ "$JOURNAL_FILE" != "./compress_audio_journal.md" ]] && cmd_args+=("--journal-file" "$JOURNAL_FILE")
+                [[ "$FORCE_RECONVERT" == "true" ]] && cmd_args+=("--force-reconvert")
+                [[ -n "$CONTAINER_CPUS" ]] && cmd_args+=("--cpus" "$CONTAINER_CPUS")
+                [[ -n "$CONTAINER_MEMORY" ]] && cmd_args+=("--memory" "$CONTAINER_MEMORY")
+                
+                # Extract input files from job list
+                local input_files=()
+                for job in "${job_list[@]}"; do
+                    IFS='|' read -r input_file output_file <<< "$job"
+                    input_files+=("$input_file")
+                done
+                
+                # Run moreutils parallel
+                debug "Executing moreutils parallel with ${#input_files[@]} files"
+                parallel -j "$PARALLEL_JOBS" "$0" --parallel-child "${cmd_args[@]}" -- "${input_files[@]}" || parallel_failed=$?
+            fi
+                
+            # Count failures
+            if [[ $parallel_failed -ne 0 ]]; then
+                error "Some parallel jobs failed"
+                failed=$parallel_failed
+            fi
+        else
+            # Sequential processing
+            for job in "${job_list[@]}"; do
+                IFS='|' read -r input_file output_file <<< "$job"
+                if ! process_audio "$input_file" "$output_file"; then
+                    ((failed++))
+                fi
+            done
+        fi
+    fi
+    
+    # Summary
+    if [[ ${#input_files[@]} -gt 1 ]]; then
+        local processed=$((${#input_files[@]} - failed - skipped))
+        log "Summary: Processed $processed, Skipped $skipped, Failed $failed (Total: ${#input_files[@]})"
+        if [[ "$USE_JOURNAL" == "true" ]]; then
+            log "Journal file: $JOURNAL_FILE"
+        fi
+    fi
+    
+    # Log final status
+    if [[ "$LOG_TO_FILE" == "true" ]]; then
+        log "Log file: $LOG_FILE"
+        write_log "INFO" "=== Compression session completed ==="
+        write_log "INFO" "Total files: ${#input_files[@]}, Processed: $((${#input_files[@]} - failed - skipped)), Failed: $failed, Skipped: $skipped"
+    fi
+    
+    # Exit with error if any files failed
+    if [[ $failed -gt 0 ]]; then
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"
