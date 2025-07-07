@@ -29,14 +29,28 @@ import XMonad.Config.Xfce
 
 import XMonad.Actions.FloatKeys
 import qualified XMonad.Actions.FlexibleResize as Flex
+import XMonad.Actions.FloatSnap
+import XMonad.Actions.GridSelect
+import XMonad.Actions.CycleWS
+
+import XMonad.Hooks.FadeInactive
+import XMonad.Hooks.FadeWindows
+import XMonad.Hooks.UrgencyHook
+
+import XMonad.Layout.ShowWName
+
+import XMonad.Util.Timer
+import qualified XMonad.Util.ExtensibleState as XS
 
 import System.Environment
 import System.Process
 import System.Posix.Process (forkProcess)
 import Control.Concurrent (forkIO)
+import Control.Monad (unless, forM_, when)
 import Data.IntMap (update)
 import Data.List
 import Data.Char
+import Data.Typeable
 import qualified Data.Map as M
 
 import XMonad.Hooks.ManageHelpers
@@ -112,6 +126,105 @@ catSurface0 = "#313244"
 catBase = "#1e1e2e"
 catMantle = "#181825"
 catCrust = "#11111b"
+
+
+--  ___ ___  _ __  / _(_) __ _ _   _ _ __ __ _| |_(_) ___  _ __  ___ 
+-- / __/ _ \| '_ \| |_| |/ _` | | | | '__/ _` | __| |/ _ \| '_ \/ __|
+-- | (_| (_) | | | |  _| | (_| | |_| | | | (_| | |_| | (_) | | | \__ \
+--  \___\___/|_| |_|_| |_|\__, |\__,_|_|  \__,_|\__|_|\___/|_| |_|___/
+--                        |___/                                      
+
+-- ShowWName configuration for workspace switch animations
+myShowWNameConfig :: SWNConfig
+myShowWNameConfig = def
+    { swn_font = myFont
+    , swn_bgcolor = catMantle
+    , swn_color = catText
+    , swn_fade = 0.8
+    }
+
+-- GridSelect configuration with Catppuccin colors
+myGSConfig :: GSConfig Window
+myGSConfig = def
+    { gs_cellheight = 60
+    , gs_cellwidth = 200
+    , gs_cellpadding = 10
+    , gs_font = myFont
+    , gs_navigate = myGSNavigation
+    , gs_colorizer = myGSColorizer
+    }
+
+-- GridSelect navigation with vim keys
+myGSNavigation :: TwoD a (Maybe a)
+myGSNavigation = defaultNavigation
+
+-- GridSelect colorizer with Catppuccin colors
+myGSColorizer :: Window -> Bool -> X (String, String)
+myGSColorizer w active = do
+    if active
+        then return (catBase, catBlue)
+        else return (catBase, catLavender)
+
+-- GridSelect workspace configuration
+myGSWorkspaceConfig :: GSConfig WorkspaceId
+myGSWorkspaceConfig = def
+    { gs_cellheight = 60
+    , gs_cellwidth = 200
+    , gs_cellpadding = 10
+    , gs_font = myFont
+    , gs_navigate = defaultNavigation
+    }
+
+
+--                                     _   _                 _    
+--  _   _ _ __ __ _  ___ _ __   ___ _| |_| |__   ___   ___ | | __
+-- | | | | '__/ _` |/ _ \ '_ \ / __| | __| '_ \ / _ \ / _ \| |/ /
+-- | |_| | | | (_| |  __/ | | | (__| | |_| | | | (_) | (_) |   < 
+--  \__,_|_|  \__, |\___|_| |_|\___|\__|\__|_|  \___/ \___/|_|\_\
+--            |___/                                              
+
+-- Custom urgency hook configuration
+myUrgencyConfig :: UrgencyConfig
+myUrgencyConfig = def 
+    { suppressWhen = Focused
+    , remindWhen = Every 30
+    }
+
+-- Timer-based border pulsing for urgent windows
+data BorderPulse = BorderPulse deriving (Read, Show, Typeable)
+instance ExtensionClass BorderPulse where
+    initialValue = BorderPulse
+
+-- Function to pulse border color for urgent windows (simplified)
+pulseUrgentBorder :: X ()
+pulseUrgentBorder = return () -- Simplified for now, urgency hook handles border color
+
+
+--   __           _        _                  _   _           
+--  / _| __ _  __| | ___  (_)_ __   __ _  ___| |_(_)_   _____ 
+-- | |_ / _` |/ _` |/ _ \ | | '_ \ / _` |/ __| __| \ \ / / _ \
+-- |  _| (_| | (_| |  __/ | | | | | (_| | (__| |_| |\ V /  __/
+-- |_|  \__,_|\__,_|\___| |_|_| |_|\__,_|\___|\__|_| \_/ \___|
+
+-- Custom fade inactive log hook that uses simple fadeInactiveLogHook
+-- but with a custom query to check window properties
+myFadeInactiveLogHook :: X ()
+myFadeInactiveLogHook = do
+    -- First apply the standard fade
+    fadeInactiveLogHook 0.85
+    -- Then reset opacity for excluded windows
+    withWindowSet $ \ws -> do
+        let allWindows = W.allWindows ws
+        forM_ allWindows $ \w -> do
+            shouldExclude <- runQuery isExcludedFromFade w
+            when shouldExclude $ setOpacity w 1.0
+
+-- Query to check if a window should be excluded from fading
+isExcludedFromFade :: Query Bool
+isExcludedFromFade = do
+    isLibrewolfToolkit <- (className =? "librewolf") <&&> (resource =? "Toolkit")
+    -- isStTerm <- className =? "st-256color"  -- Uncomment to exclude st from fading
+    return isLibrewolfToolkit  -- Add "|| isStTerm" if uncommenting above
 
  
 --                                              _                 _        
@@ -234,6 +347,7 @@ main = do
 
     -- start xmonad
     xmonad 
+        $ withUrgencyHookC BorderUrgencyHook { urgencyBorderColor = catRed } myUrgencyConfig
         $ ewmhFullscreen 
         $ ewmh 
         $ withEasySB (statusBarProp "xmobar" (pure myXmobarPP)) defToggleStrutsKey -- bound to M-b
@@ -243,8 +357,9 @@ main = do
 -- configuration, specifically keybinds
 myConfig = def 
     { modMask = mod4Mask -- rebind mod to super
-    , layoutHook = myLayout -- use custom layout
+    , layoutHook = showWName' myShowWNameConfig myLayout -- use custom layout with workspace names
     , manageHook = myManageHook <+> manageHook def
+    , logHook = myFadeInactiveLogHook -- custom fade inactive with exclusions
     , focusedBorderColor = catBlue
     , normalBorderColor = catSurface0
     , borderWidth = 2
@@ -297,6 +412,27 @@ myConfig = def
     , ("M-M1-l", withFocused $ keysResizeWindow (20,0) (1,0))
     , ("M-M1-k", withFocused $ keysResizeWindow (0,-20) (0,1))
     , ("M-M1-j", withFocused $ keysResizeWindow (0,20) (0,1))
+    
+    -- GridSelect
+    , ("M-g", goToSelected myGSConfig)
+    , ("M-S-g", bringSelected myGSConfig)
+    , ("M-C-g", gridselectWorkspace myGSWorkspaceConfig W.shift)
+    
+    -- FloatSnap (smooth window snapping)
+    , ("M-<Left>", withFocused $ snapMove L Nothing)
+    , ("M-<Right>", withFocused $ snapMove R Nothing)
+    , ("M-<Up>", withFocused $ snapMove U Nothing)
+    , ("M-<Down>", withFocused $ snapMove D Nothing)
+    , ("M-S-<Left>", withFocused $ snapShrink R Nothing)
+    , ("M-S-<Right>", withFocused $ snapGrow R Nothing)
+    , ("M-S-<Up>", withFocused $ snapShrink D Nothing)
+    , ("M-S-<Down>", withFocused $ snapGrow D Nothing)
+    
+    -- Dynamic workspace ordering
+    , ("M-C-<Right>", nextWS)
+    , ("M-C-<Left>", prevWS)
+    , ("M-S-C-<Right>", shiftToNext >> nextWS)
+    , ("M-S-C-<Left>", shiftToPrev >> prevWS)
     ]   
 
 
