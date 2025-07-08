@@ -223,8 +223,9 @@ myFadeInactiveLogHook = do
 isExcludedFromFade :: Query Bool
 isExcludedFromFade = do
     isLibrewolfToolkit <- (className =? "librewolf") <&&> (resource =? "Toolkit")
+    isMpv <- className =? "mpv"
     -- isStTerm <- className =? "st-256color"  -- Uncomment to exclude st from fading
-    return isLibrewolfToolkit  -- Add "|| isStTerm" if uncommenting above
+    return $ isLibrewolfToolkit || isMpv  -- Add "|| isStTerm" if uncommenting above
 
  
 --                                              _                 _        
