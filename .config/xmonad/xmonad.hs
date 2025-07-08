@@ -9,6 +9,7 @@ import Data.Maybe (maybe, fromMaybe)
 import XMonad
 import qualified XMonad.StackSet as W
 import XMonad.Util.EZConfig (additionalKeysP)
+import XMonad.Hooks.ManageHelpers
 import XMonad.Layout.Spacing
 import XMonad.Layout.ThreeColumns
 import XMonad.Layout.Magnifier
@@ -237,7 +238,8 @@ isExcludedFromFade = do
 
 myManageHook :: ManageHook
 myManageHook = composeAll
-    [ isDialog            --> doFloat
+    [ (className =? "librewolf" <&&> resource =? "Toolkit") --> doShift "3" <+> doRectFloat (W.RationalRect 0.6 0.6 0.35 0.35)
+    , isDialog            --> doFloat
     , isFullscreen        --> doFullFloat
     , className =? "Gimp" --> doFloat
     , className =? "Galculator" --> doFloat
