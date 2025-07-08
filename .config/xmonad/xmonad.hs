@@ -207,13 +207,19 @@ pulseUrgentBorder = return () -- Simplified for now, urgency hook handles border
 -- |  _| (_| | (_| |  __/ | | | | | (_| | (__| |_| |\ V /  __/
 -- |_|  \__,_|\__,_|\___| |_|_| |_|\__,_|\___|\__|_| \_/ \___|
 
--- Custom fade inactive log hook that uses simple fadeInactiveLogHook
--- but with a custom query to check window properties
+-- Custom fade log hook that sets focused window to 0.95 opacity
 myFadeInactiveLogHook :: X ()
 myFadeInactiveLogHook = do
-    -- First apply the standard fade
-    fadeInactiveLogHook 0.85
-    -- Then reset opacity for excluded windows
+    -- First apply the standard fade for inactive windows
+    fadeInactiveLogHook 0.80
+    -- Get the focused window and set it to 0.95
+    withWindowSet $ \ws -> do
+        case W.peek ws of
+            Just w -> do
+                shouldExclude <- runQuery isExcludedFromFade w
+                unless shouldExclude $ setOpacity w 0.95
+            Nothing -> return ()
+    -- Reset opacity for excluded windows to 1.0
     withWindowSet $ \ws -> do
         let allWindows = W.allWindows ws
         forM_ allWindows $ \w -> do
