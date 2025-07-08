@@ -1,0 +1,306 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+# Distrobox re-exec logic
+ctr_id: str|None = ""
+if "CONTAINER_ID" in os.environ:
+    ctr_id = os.environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *sys.argv
+    ]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Import non-standard libraries after distrobox check
+try:
+    import yaml
+    import json
+    import asyncio
+    import ipaddress
+    from typing import Dict, List, Optional, Union
+    from quart import Quart, request, jsonify, Response
+except ImportError as e:
+    print(f"Error importing required module: {e}", file=sys.stderr)
+    print("Please ensure yaml and quart are installed: pip install pyyaml quart", file=sys.stderr)
+    sys.exit(1)
+
+# Configuration
+CONFIG_PATH = Path.home() / ".config" / "webhook-cmd.yaml"
+app = Quart(__name__)
+
+# Global config storage
+config = {}
+
+def load_config():
+    """Load configuration from YAML file"""
+    global config
+    if not CONFIG_PATH.exists():
+        print(f"Configuration file not found: {CONFIG_PATH}", file=sys.stderr)
+        print("Creating example configuration...", file=sys.stderr)
+        example_config = {
+            'webhooks': {
+                '/example-webhook': {
+                    'commands': [
+                        'echo "Webhook received: $WEBHOOK_PAYLOAD" >> /tmp/webhook.log',
+                        'echo "Task started at $(date)" | tee /tmp/webhook-status.log'
+                    ],
+                    'description': 'Example webhook endpoint',
+                    'runs_on_hostname': ['hostname1', 'hostname2'],
+                    'whitelist': ['192.168.1.0/24']  # Optional webhook-specific whitelist
+                }
+            },
+            'whitelist': [
+                '127.0.0.1',
+                '::1',
+                '192.168.1.0/24',
+                '10.0.0.0/8'
+            ],
+            'port': 8080,
+            'host': '0.0.0.0'
+        }
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, 'w') as f:
+            yaml.dump(example_config, f, default_flow_style=False)
+        print(f"Example configuration created at: {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
+    
+    with open(CONFIG_PATH, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Validate config
+    if 'webhooks' not in config:
+        config['webhooks'] = {}
+    if 'whitelist' not in config:
+        config['whitelist'] = []
+    if 'port' not in config:
+        config['port'] = 8080
+    if 'host' not in config:
+        config['host'] = '0.0.0.0'
+
+def is_ip_whitelisted(ip_str: str, webhook_whitelist: Optional[List[str]] = None) -> bool:
+    """Check if IP is in whitelist (global and/or webhook-specific)"""
+    # If webhook has its own whitelist, check that first
+    if webhook_whitelist is not None:
+        if not webhook_whitelist:
+            return True  # Empty webhook whitelist means allow all
+        return check_ip_in_list(ip_str, webhook_whitelist)
+    
+    # Otherwise check global whitelist
+    if not config.get('whitelist'):
+        return True  # No global whitelist means allow all
+    
+    return check_ip_in_list(ip_str, config['whitelist'])
+
+def check_ip_in_list(ip_str: str, whitelist: List[str]) -> bool:
+    """Check if IP is in a specific whitelist"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        
+        for allowed in whitelist:
+            try:
+                # Check if it's a network/CIDR
+                if '/' in str(allowed):
+                    network = ipaddress.ip_network(allowed, strict=False)
+                    if ip in network:
+                        return True
+                # Check if it's a single IP
+                else:
+                    if ip == ipaddress.ip_address(allowed):
+                        return True
+            except ValueError:
+                continue
+                
+        return False
+    except ValueError:
+        return False
+
+async def execute_webhook_commands(commands: List[str], payload: str, headers: Dict[str, str]) -> str:
+    """Execute webhook commands in parallel as background tasks"""
+    env = os.environ.copy()
+    env['WEBHOOK_PAYLOAD'] = payload
+    env['WEBHOOK_HEADERS'] = json.dumps(dict(headers))
+    
+    task_id = f"webhook-{os.getpid()}-{int(asyncio.get_event_loop().time() * 1000)}"
+    
+    async def run_command(cmd: str, index: int):
+        """Run a single command as a background task"""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            # Don't wait for completion, just start it
+            asyncio.create_task(proc.communicate())
+            return f"Command {index + 1} started (PID: {proc.pid})"
+        except Exception as e:
+            return f"Command {index + 1} failed to start: {str(e)}"
+    
+    # Start all commands in parallel
+    tasks = [run_command(cmd, i) for i, cmd in enumerate(commands)]
+    results = await asyncio.gather(*tasks)
+    
+    return task_id
+
+def get_client_ip():
+    """Get client IP address from request"""
+    if 'X-Forwarded-For' in request.headers:
+        return request.headers['X-Forwarded-For'].split(',')[0].strip()
+    elif 'X-Real-IP' in request.headers:
+        return request.headers['X-Real-IP']
+    else:
+        return request.remote_addr
+
+@app.before_request
+async def check_global_whitelist():
+    """Check if request IP is in global whitelist"""
+    # Skip whitelist check for index endpoint
+    if request.path == '/':
+        return
+    
+    client_ip = get_client_ip()
+    
+    # Only check global whitelist here
+    if config.get('whitelist') and not is_ip_whitelisted(client_ip):
+        return jsonify({'error': 'Forbidden - IP not in global whitelist'}), 403
+
+@app.route('/', methods=['GET'])
+async def index():
+    """List available webhooks"""
+    current_hostname = os.environ.get('HOSTNAME', '')
+    webhooks = []
+    for path, webhook_config in config.get('webhooks', {}).items():
+        runs_on_hostname = webhook_config.get('runs_on_hostname', [])
+        # Only show webhooks that run on this hostname (or have no restriction)
+        if not runs_on_hostname or current_hostname in runs_on_hostname:
+            webhooks.append({
+                'path': path,
+                'description': webhook_config.get('description', 'No description'),
+                'runs_on_hostname': runs_on_hostname if runs_on_hostname else 'any'
+            })
+    return jsonify({
+        'current_hostname': current_hostname,
+        'webhooks': webhooks
+    })
+
+@app.route('/<path:webhook_path>', methods=['POST', 'GET', 'PUT', 'DELETE', 'PATCH'])
+async def handle_webhook(webhook_path):
+    """Handle webhook requests"""
+    # Normalize path
+    webhook_path = '/' + webhook_path
+    
+    # Check if webhook exists
+    if webhook_path not in config.get('webhooks', {}):
+        return jsonify({'error': 'Webhook not found'}), 404
+    
+    webhook_config = config['webhooks'][webhook_path]
+    
+    # Check webhook-specific whitelist
+    webhook_whitelist = webhook_config.get('whitelist')
+    if webhook_whitelist is not None:
+        client_ip = get_client_ip()
+        if not is_ip_whitelisted(client_ip, webhook_whitelist):
+            return jsonify({'error': 'Forbidden - IP not in webhook whitelist'}), 403
+    
+    # Check hostname restriction
+    runs_on_hostname = webhook_config.get('runs_on_hostname', [])
+    if runs_on_hostname:
+        current_hostname = os.environ.get('HOSTNAME', '')
+        if current_hostname not in runs_on_hostname:
+            return jsonify({'error': f'This webhook does not run on hostname: {current_hostname}'}), 403
+    
+    # Get commands (support both 'command' and 'commands' for backward compatibility)
+    commands = webhook_config.get('commands', [])
+    if not commands and 'command' in webhook_config:
+        commands = [webhook_config['command']]
+    
+    if not commands:
+        return jsonify({'error': 'No commands configured'}), 500
+    
+    # Get payload
+    payload = ""
+    content_type = request.content_type or ""
+    
+    if request.method in ['POST', 'PUT', 'PATCH']:
+        if 'application/json' in content_type:
+            try:
+                data = await request.get_json(force=True)
+                payload = json.dumps(data) if data else ""
+            except:
+                payload = (await request.get_data()).decode('utf-8')
+        elif 'text/' in content_type or not content_type:
+            payload = (await request.get_data()).decode('utf-8')
+        else:
+            # For other content types, pass raw data
+            payload = (await request.get_data()).decode('utf-8', errors='ignore')
+    
+    # Execute commands in parallel
+    task_id = await execute_webhook_commands(
+        commands, 
+        payload, 
+        request.headers
+    )
+    
+    # Return immediately with task ID
+    response = {
+        'success': True,
+        'task_id': task_id,
+        'message': f'Started {len(commands)} command(s) in background'
+    }
+    
+    return jsonify(response), 202  # 202 Accepted for async processing
+
+def main():
+    """Main entry point"""
+    import argparse
+    
+    global CONFIG_PATH
+    
+    parser = argparse.ArgumentParser(description='Webhook command runner')
+    parser.add_argument('--config', type=str, default=str(CONFIG_PATH),
+                        help='Path to configuration file')
+    parser.add_argument('--port', type=int, help='Override port from config')
+    parser.add_argument('--host', type=str, help='Override host from config')
+    parser.add_argument('--reload', action='store_true', help='Enable auto-reload on config changes')
+    
+    args = parser.parse_args()
+    
+    # Override config path if specified
+    CONFIG_PATH = Path(args.config)
+    
+    # Load configuration
+    load_config()
+    
+    # Override host/port if specified
+    host = args.host or config.get('host', '0.0.0.0')
+    port = args.port or config.get('port', 8080)
+    
+    print(f"Starting webhook-cmd server on {host}:{port}")
+    print(f"Configuration file: {CONFIG_PATH}")
+    print(f"Loaded {len(config.get('webhooks', {}))} webhooks")
+    
+    if config.get('whitelist'):
+        print(f"IP whitelist enabled with {len(config['whitelist'])} entries")
+    else:
+        print("WARNING: No IP whitelist configured - accepting requests from all IPs")
+    
+    # Run the app
+    app.run(host=host, port=port, debug=args.reload)
+
+if __name__ == '__main__':
+    main()
