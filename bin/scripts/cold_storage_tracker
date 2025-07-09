@@ -1,0 +1,1701 @@
+#!/usr/bin/python3
+
+from os import environ
+from subprocess import run
+from sys import argv, exit, stdin, stderr
+
+ctr_id: str|None = ""
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    # Check if --debug is in the arguments
+    if "--debug" in argv:
+        print("Re-running the script inside distrobox 'dev'", file=stderr)
+    run(["distrobox", "enter", "dev", "--"] + argv)
+    exit(0)
+
+# Standard library imports - always available
+import argparse
+import asyncio
+import json
+import os
+import sys
+import stat
+import pwd
+import grp
+import uuid
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+import subprocess
+from dataclasses import dataclass, asdict
+from collections import defaultdict
+import hashlib
+
+# Third-party imports - may not be available outside dev container
+try:
+    import asyncpg
+except ImportError as e:
+    if ctr_id == "dev":
+        print(f"Error: asyncpg is required but not installed", file=stderr)
+        print("Please install with: pip install asyncpg", file=stderr)
+        print(f"Import error: {e}", file=stderr)
+    else:
+        print(f"Error importing asyncpg outside of dev container: {e}", file=stderr)
+        print("This should not happen - the script should have been re-executed in dev container", file=stderr)
+    exit(1)
+
+@dataclass
+class FileInfo:
+    path: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+    user: str
+    group: str
+    atime: float
+    mtime: float
+    ctime: float
+    inode: int
+    nlink: int
+    dev: int
+    is_dir: bool
+    is_file: bool
+    is_link: bool
+    link_target: Optional[str]
+    checksum: Optional[str] = None
+
+class ColdStorageTracker:
+    def __init__(self):
+        self.db_host = os.environ.get('POSTGRES_HOST', 'localhost')
+        self.db_port = int(os.environ.get('POSTGRES_PORT', '5432'))
+        self.db_user = os.environ.get('POSTGRES_USER', 'postgres')
+        self.db_pass = os.environ.get('POSTGRES_PASSWORD', 'postgres')
+        self.db_name = 'cold_storage'
+        self.pool = None
+
+    async def init_db(self):
+        self.pool = await asyncpg.create_pool(
+            host=self.db_host,
+            port=self.db_port,
+            user=self.db_user,
+            password=self.db_pass,
+            database=self.db_name,
+            min_size=10,
+            max_size=20
+        )
+
+    async def close_db(self):
+        if self.pool:
+            await self.pool.close()
+
+    async def resolve_uuid(self, uuid_prefix: str, table: str, id_column: str) -> Optional[str]:
+        """Resolve a UUID prefix to a full UUID. Supports full UUIDs or prefix matching."""
+        if len(uuid_prefix) < 8:
+            raise ValueError("UUID prefix must be at least 8 characters")
+        
+        async with self.pool.acquire() as conn:
+            # First try exact match
+            result = await conn.fetchval(
+                f"SELECT {id_column} FROM {table} WHERE {id_column}::text = $1",
+                uuid_prefix
+            )
+            if result:
+                return str(result)
+            
+            # Try prefix match
+            results = await conn.fetch(
+                f"SELECT {id_column} FROM {table} WHERE {id_column}::text LIKE $1",
+                f"{uuid_prefix}%"
+            )
+            
+            if len(results) == 0:
+                return None
+            elif len(results) == 1:
+                return str(results[0][id_column])
+            else:
+                raise ValueError(f"UUID prefix '{uuid_prefix}' matches multiple {table}: " + 
+                               ", ".join(str(r[id_column]) for r in results))
+
+    async def get_file_info(self, filepath: Path) -> Optional[FileInfo]:
+        try:
+            st = filepath.stat(follow_symlinks=False)
+            
+            # Get user and group names
+            try:
+                user = pwd.getpwuid(st.st_uid).pw_name
+            except KeyError:
+                user = str(st.st_uid)
+            
+            try:
+                group = grp.getgrgid(st.st_gid).gr_name
+            except KeyError:
+                group = str(st.st_gid)
+            
+            # Get link target if it's a symlink
+            link_target = None
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    link_target = str(filepath.readlink())
+                except:
+                    link_target = "<broken>"
+            
+            return FileInfo(
+                path=str(filepath),
+                size=st.st_size,
+                mode=st.st_mode,
+                uid=st.st_uid,
+                gid=st.st_gid,
+                user=user,
+                group=group,
+                atime=st.st_atime,
+                mtime=st.st_mtime,
+                ctime=st.st_ctime,
+                inode=st.st_ino,
+                nlink=st.st_nlink,
+                dev=st.st_dev,
+                is_dir=stat.S_ISDIR(st.st_mode),
+                is_file=stat.S_ISREG(st.st_mode),
+                is_link=stat.S_ISLNK(st.st_mode),
+                link_target=link_target
+            )
+        except Exception as e:
+            print(f"Error processing {filepath}: {e}", file=stderr)
+            return None
+
+    async def scan_directory(self, root_path: Path, compute_checksums: bool = False, 
+                           exclude_patterns: List[str] = None) -> List[FileInfo]:
+        files = []
+        
+        # Compile exclusion patterns
+        exclude_regexes = []
+        if exclude_patterns:
+            for pattern in exclude_patterns:
+                # Convert glob patterns to regex
+                # Support basic patterns: *, ?, **/
+                regex_pattern = pattern.replace('.', r'\.')
+                regex_pattern = regex_pattern.replace('**/', '.*/')
+                regex_pattern = regex_pattern.replace('*', '[^/]*')
+                regex_pattern = regex_pattern.replace('?', '[^/]')
+                regex_pattern = f'^{regex_pattern}$'
+                exclude_regexes.append(re.compile(regex_pattern))
+        
+        # Collect all paths first
+        all_paths = []
+        for path in root_path.rglob('*'):
+            # Check exclusions
+            str_path = str(path)
+            excluded = False
+            if exclude_regexes:
+                for regex in exclude_regexes:
+                    if regex.match(str_path) or any(regex.match(str(p)) for p in path.parents):
+                        excluded = True
+                        break
+            
+            if not excluded:
+                all_paths.append(path)
+        
+        # Process in batches asynchronously
+        batch_size = 100
+        for i in range(0, len(all_paths), batch_size):
+            batch = all_paths[i:i+batch_size]
+            tasks = [self.get_file_info(path) for path in batch]
+            results = await asyncio.gather(*tasks)
+            
+            for result in results:
+                if result:
+                    if compute_checksums and result.is_file and result.size < 100 * 1024 * 1024:  # Only checksum files < 100MB
+                        result.checksum = await self.compute_checksum(Path(result.path))
+                    files.append(result)
+        
+        return files
+
+    async def compute_checksum(self, filepath: Path) -> Optional[str]:
+        try:
+            hasher = hashlib.sha256()
+            with open(filepath, 'rb') as f:
+                while chunk := f.read(8192):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except:
+            return None
+
+    async def get_filesystem_info(self, path: str) -> Dict[str, Any]:
+        """Get filesystem information for a given path"""
+        try:
+            # Get mount point and filesystem info
+            df_output = subprocess.check_output(['df', '-T', path], text=True)
+            lines = df_output.strip().split('\n')
+            if len(lines) > 1:
+                parts = lines[1].split()
+                filesystem = parts[0]
+                fs_type = parts[1]
+                total_blocks = int(parts[2]) * 1024  # df shows in 1K blocks
+                used_blocks = int(parts[3]) * 1024
+                available_blocks = int(parts[4]) * 1024
+                mount_point = parts[6]
+                
+                # Get device UUID
+                device_uuid = None
+                try:
+                    # Use findmnt to get the source device and UUID
+                    findmnt_output = subprocess.check_output(
+                        ['findmnt', '-no', 'SOURCE,UUID', mount_point], 
+                        text=True
+                    ).strip()
+                    if findmnt_output:
+                        parts = findmnt_output.split()
+                        if len(parts) >= 2:
+                            device_uuid = parts[1]
+                        elif len(parts) == 1:
+                            # Sometimes UUID is not directly available, try blkid
+                            source_device = parts[0]
+                            blkid_output = subprocess.check_output(
+                                ['blkid', '-s', 'UUID', '-o', 'value', source_device],
+                                text=True
+                            ).strip()
+                            if blkid_output:
+                                device_uuid = blkid_output
+                except:
+                    # Fallback to lsblk
+                    try:
+                        lsblk_output = subprocess.check_output(
+                            ['lsblk', '-no', 'UUID', filesystem],
+                            text=True
+                        ).strip()
+                        if lsblk_output and lsblk_output != 'null':
+                            device_uuid = lsblk_output
+                    except:
+                        pass
+                
+                # Check if encrypted
+                is_encrypted = False
+                
+                # Check for LUKS encryption
+                try:
+                    lsblk_output = subprocess.check_output(['lsblk', '-no', 'TYPE,NAME', '--raw'], text=True)
+                    for line in lsblk_output.strip().split('\n'):
+                        if 'crypt' in line:
+                            is_encrypted = True
+                            break
+                except:
+                    pass
+                
+                # Check for ZFS encryption
+                if fs_type == 'zfs' and not is_encrypted:
+                    try:
+                        # Get ZFS dataset name from mount point
+                        zfs_output = subprocess.check_output(['zfs', 'get', '-H', 'encryption', mount_point], text=True)
+                        if 'encryption' in zfs_output and 'off' not in zfs_output:
+                            is_encrypted = True
+                    except:
+                        pass
+                
+                return {
+                    'filesystem': filesystem,
+                    'fs_type': fs_type,
+                    'total_size': total_blocks,
+                    'used_size': used_blocks,
+                    'free_size': available_blocks,
+                    'mount_point': mount_point,
+                    'device_uuid': device_uuid,
+                    'is_encrypted': is_encrypted
+                }
+        except Exception as e:
+            print(f"Warning: Could not get filesystem info for {path}: {e}", file=sys.stderr)
+            return {
+                'filesystem': 'unknown',
+                'fs_type': 'unknown',
+                'total_size': 0,
+                'used_size': 0,
+                'free_size': 0,
+                'mount_point': path,
+                'is_encrypted': False
+            }
+
+    async def add_device(self, name: str, serial: str, size: str, location: str, info: str, 
+                        path: str, put_into_service: Optional[str] = None) -> str:
+        device_id = str(uuid.uuid4())
+        
+        # Get filesystem info
+        fs_info = await self.get_filesystem_info(path)
+        
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO devices (device_id, name, serial_number, size, location, info, 
+                                   path, filesystem_type, is_encrypted, total_size_bytes,
+                                   free_size_bytes, device_uuid, put_into_service, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            """, device_id, name, serial, size, location, info, path, fs_info['fs_type'],
+                fs_info['is_encrypted'], fs_info['total_size'], fs_info['free_size'],
+                fs_info.get('device_uuid'), put_into_service, datetime.now())
+        return device_id
+
+    async def list_devices(self) -> List[Dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM devices ORDER BY created_at DESC")
+            return [dict(row) for row in rows]
+
+    async def edit_device(self, device_id: str, **kwargs):
+        device_id = await self.resolve_uuid(device_id, 'devices', 'device_id')
+        if not device_id:
+            raise ValueError(f"Device not found: {device_id}")
+            
+        updates = []
+        values = []
+        for i, (key, value) in enumerate(kwargs.items(), 1):
+            if value is not None:
+                updates.append(f"{key} = ${i}")
+                values.append(value)
+        
+        if updates:
+            values.append(device_id)
+            query = f"UPDATE devices SET {', '.join(updates)} WHERE device_id = ${len(values)}"
+            async with self.pool.acquire() as conn:
+                await conn.execute(query, *values)
+
+    async def remove_device(self, device_id: str):
+        device_id = await self.resolve_uuid(device_id, 'devices', 'device_id')
+        if not device_id:
+            raise ValueError(f"Device not found: {device_id}")
+            
+        async with self.pool.acquire() as conn:
+            # Remove all associated data
+            await conn.execute("DELETE FROM file_entries WHERE snapshot_id IN (SELECT snapshot_id FROM snapshots WHERE device_id = $1)", device_id)
+            await conn.execute("DELETE FROM snapshots WHERE device_id = $1", device_id)
+            await conn.execute("DELETE FROM devices WHERE device_id = $1", device_id)
+
+    # Plan management methods
+    async def create_plan(self, name: str, paths: List[str], exclude_patterns: List[str] = None, 
+                         description: str = None) -> str:
+        plan_id = str(uuid.uuid4())
+        
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO backup_plans (plan_id, name, description, paths, exclude_patterns, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, plan_id, name, description, paths, exclude_patterns or [], datetime.now())
+        
+        return plan_id
+
+    async def list_plans(self) -> List[Dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM backup_plans ORDER BY created_at DESC")
+            return [dict(row) for row in rows]
+
+    async def get_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        plan_id = await self.resolve_uuid(plan_id, 'backup_plans', 'plan_id')
+        if not plan_id:
+            return None
+            
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM backup_plans WHERE plan_id = $1", plan_id)
+            return dict(row) if row else None
+
+    async def edit_plan(self, plan_id: str, **kwargs):
+        plan_id = await self.resolve_uuid(plan_id, 'backup_plans', 'plan_id')
+        if not plan_id:
+            raise ValueError(f"Plan not found: {plan_id}")
+            
+        updates = []
+        values = []
+        for i, (key, value) in enumerate(kwargs.items(), 1):
+            if value is not None:
+                updates.append(f"{key} = ${i}")
+                values.append(value)
+        
+        if updates:
+            values.append(plan_id)
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE backup_plans SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE plan_id = ${len(values)}",
+                    *values
+                )
+
+    async def delete_plan(self, plan_id: str):
+        plan_id = await self.resolve_uuid(plan_id, 'backup_plans', 'plan_id')
+        if not plan_id:
+            raise ValueError(f"Plan not found: {plan_id}")
+            
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM backup_plans WHERE plan_id = $1", plan_id)
+
+    async def update_plan_last_run(self, plan_id: str, snapshot_id: str, device_id: str):
+        """Update plan's last run information after a successful snapshot."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE backup_plans 
+                SET last_run_time = CURRENT_TIMESTAMP, 
+                    last_snapshot_id = $2, 
+                    last_device_id = $3,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE plan_id = $1
+            """, plan_id, snapshot_id, device_id)
+
+    async def create_snapshot(self, device_id: str, root_paths: List[str] = None, compute_checksums: bool = False,
+                            plan_id: str = None, exclude_patterns: List[str] = None) -> str:
+        """Create a snapshot with optional plan support and exclusion patterns."""
+        # Resolve device ID
+        device_id = await self.resolve_uuid(device_id, 'devices', 'device_id')
+        if not device_id:
+            raise ValueError(f"Device not found: {device_id}")
+        
+        # If plan_id provided, get plan details
+        if plan_id:
+            plan_id = await self.resolve_uuid(plan_id, 'backup_plans', 'plan_id')
+            if not plan_id:
+                raise ValueError(f"Plan not found: {plan_id}")
+                
+            plan = await self.get_plan(plan_id)
+            if not plan:
+                raise ValueError(f"Plan not found: {plan_id}")
+            
+            # Use plan's paths and exclusions if not overridden
+            if not root_paths:
+                root_paths = plan['paths']
+            if not exclude_patterns:
+                exclude_patterns = plan['exclude_patterns']
+            
+            print(f"Using backup plan: {plan['name']}")
+        
+        # Ensure we have paths to backup
+        if not root_paths:
+            raise ValueError("No paths specified for backup")
+        
+        snapshot_id = str(uuid.uuid4())
+        
+        print(f"Creating snapshot for device {device_id}...")
+        print(f"Scanning directories: {', '.join(root_paths)}")
+        if exclude_patterns:
+            print(f"Excluding patterns: {', '.join(exclude_patterns)}")
+        
+        # Get filesystem info for the first path (assuming all paths are on same device)
+        fs_info = await self.get_filesystem_info(root_paths[0])
+        
+        # Insert snapshot record with free space info
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO snapshots (snapshot_id, device_id, root_path, free_size_bytes, created_at)
+                VALUES ($1, $2, $3, $4, $5)
+            """, snapshot_id, device_id, ','.join(root_paths), fs_info['free_size'], datetime.now())
+        
+        # Scan all directories
+        all_files = []
+        for root_path in root_paths:
+            print(f"Scanning: {root_path}")
+            files = await self.scan_directory(Path(root_path), compute_checksums, exclude_patterns)
+            all_files.extend(files)
+        
+        print(f"Found {len(all_files)} files/directories")
+        
+        # Insert file entries in batches
+        batch_size = 1000
+        total_size = 0
+        async with self.pool.acquire() as conn:
+            for i in range(0, len(all_files), batch_size):
+                batch = all_files[i:i+batch_size]
+                records = []
+                for f in batch:
+                    if f.is_file:
+                        total_size += f.size
+                    records.append((
+                        snapshot_id, f.path, f.size, f.mode, f.uid, f.gid,
+                        f.user, f.group, f.atime, f.mtime, f.ctime,
+                        f.inode, f.nlink, f.dev, f.is_dir, f.is_file,
+                        f.is_link, f.link_target, f.checksum
+                    ))
+                
+                await conn.executemany("""
+                    INSERT INTO file_entries (
+                        snapshot_id, path, size, mode, uid, gid, user_name, group_name,
+                        atime, mtime, ctime, inode, nlink, dev, is_dir, is_file,
+                        is_link, link_target, checksum
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                """, records)
+                print(f"Inserted batch {i//batch_size + 1}/{(len(all_files) + batch_size - 1)//batch_size}")
+        
+        # Update device's last free space
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE devices SET free_size_bytes = $1 
+                WHERE device_id = $2
+            """, fs_info['free_size'], device_id)
+        
+        # Update plan's last run info if using a plan
+        if plan_id:
+            await self.update_plan_last_run(plan_id, snapshot_id, device_id)
+        
+        print(f"Total data size: {self.format_size(total_size)}")
+        print(f"Free space remaining: {self.format_size(fs_info['free_size'])}")
+        
+        return snapshot_id
+
+    async def diff_snapshots(self, snapshot1_id: str, snapshot2_id: str) -> Dict[str, List[Dict]]:
+        # Resolve snapshot IDs
+        snapshot1_id = await self.resolve_uuid(snapshot1_id, 'snapshots', 'snapshot_id')
+        snapshot2_id = await self.resolve_uuid(snapshot2_id, 'snapshots', 'snapshot_id')
+        
+        if not snapshot1_id or not snapshot2_id:
+            raise ValueError("One or both snapshots not found")
+        
+        async with self.pool.acquire() as conn:
+            # Find added files
+            added = await conn.fetch("""
+                SELECT * FROM file_entries
+                WHERE snapshot_id = $1 AND path NOT IN (
+                    SELECT path FROM file_entries WHERE snapshot_id = $2
+                )
+            """, snapshot2_id, snapshot1_id)
+            
+            # Find removed files
+            removed = await conn.fetch("""
+                SELECT * FROM file_entries
+                WHERE snapshot_id = $1 AND path NOT IN (
+                    SELECT path FROM file_entries WHERE snapshot_id = $2
+                )
+            """, snapshot1_id, snapshot2_id)
+            
+            # Find modified files
+            modified = await conn.fetch("""
+                SELECT f1.*, f2.size as new_size, f2.mtime as new_mtime, f2.mode as new_mode,
+                       f2.uid as new_uid, f2.gid as new_gid, f2.checksum as new_checksum
+                FROM file_entries f1
+                JOIN file_entries f2 ON f1.path = f2.path
+                WHERE f1.snapshot_id = $1 AND f2.snapshot_id = $2
+                AND (f1.size != f2.size OR f1.mtime != f2.mtime OR f1.mode != f2.mode
+                     OR f1.uid != f2.uid OR f1.gid != f2.gid
+                     OR COALESCE(f1.checksum, '') != COALESCE(f2.checksum, ''))
+            """, snapshot1_id, snapshot2_id)
+        
+        return {
+            'added': [dict(row) for row in added],
+            'removed': [dict(row) for row in removed],
+            'modified': [dict(row) for row in modified]
+        }
+
+    async def diff_devices(self, device1_id: str, device2_id: str) -> Dict[str, List[Dict]]:
+        # Resolve device IDs
+        device1_id = await self.resolve_uuid(device1_id, 'devices', 'device_id')
+        device2_id = await self.resolve_uuid(device2_id, 'devices', 'device_id')
+        
+        if not device1_id or not device2_id:
+            raise ValueError("One or both devices not found")
+        
+        async with self.pool.acquire() as conn:
+            # Get latest snapshots for each device
+            snap1 = await conn.fetchrow("""
+                SELECT snapshot_id FROM snapshots
+                WHERE device_id = $1
+                ORDER BY created_at DESC LIMIT 1
+            """, device1_id)
+            
+            snap2 = await conn.fetchrow("""
+                SELECT snapshot_id FROM snapshots
+                WHERE device_id = $1
+                ORDER BY created_at DESC LIMIT 1
+            """, device2_id)
+            
+            if not snap1 or not snap2:
+                return {'error': 'One or both devices have no snapshots'}
+            
+            return await self.diff_snapshots(snap1['snapshot_id'], snap2['snapshot_id'])
+
+    async def dump_snapshot(self, snapshot_id: str, output_format: str = 'ls') -> str:
+        # Resolve snapshot ID
+        snapshot_id = await self.resolve_uuid(snapshot_id, 'snapshots', 'snapshot_id')
+        if not snapshot_id:
+            raise ValueError(f"Snapshot not found: {snapshot_id}")
+            
+        async with self.pool.acquire() as conn:
+            files = await conn.fetch("""
+                SELECT * FROM file_entries
+                WHERE snapshot_id = $1
+                ORDER BY path
+            """, snapshot_id)
+        
+        output = []
+        for f in files:
+            if output_format == 'ls':
+                # Format like ls -lAR --author
+                mode_str = self.format_mode(f['mode'])
+                size_str = f"{f['size']:>10}" if not f['is_dir'] else "-"
+                mtime = datetime.fromtimestamp(f['mtime']).strftime('%b %d %H:%M')
+                
+                line = f"{mode_str} {f['nlink']:>3} {f['user_name']:<8} {f['group_name']:<8} {size_str} {mtime} {f['path']}"
+                if f['is_link'] and f['link_target']:
+                    line += f" -> {f['link_target']}"
+                output.append(line)
+            else:  # json
+                output.append(dict(f))
+        
+        if output_format == 'ls':
+            return '\n'.join(output)
+        else:
+            return json.dumps(output, indent=2, default=str)
+
+    def format_mode(self, mode: int) -> str:
+        mode_str = stat.filemode(mode)
+        return mode_str
+
+    async def search_files(self, pattern: str, snapshot_id: Optional[str] = None, 
+                          device_id: Optional[str] = None, use_fzf: bool = False) -> List[Dict]:
+        # Resolve IDs if provided
+        if snapshot_id:
+            snapshot_id = await self.resolve_uuid(snapshot_id, 'snapshots', 'snapshot_id')
+            if not snapshot_id:
+                raise ValueError(f"Snapshot not found: {snapshot_id}")
+        
+        if device_id:
+            device_id = await self.resolve_uuid(device_id, 'devices', 'device_id')
+            if not device_id:
+                raise ValueError(f"Device not found: {device_id}")
+        
+        query_parts = ["SELECT * FROM file_entries WHERE path ILIKE $1"]
+        params = [f'%{pattern}%']
+        param_count = 1
+        
+        if snapshot_id:
+            param_count += 1
+            query_parts.append(f"AND snapshot_id = ${param_count}")
+            params.append(snapshot_id)
+        elif device_id:
+            param_count += 1
+            query_parts.append(f"""AND snapshot_id IN (
+                SELECT snapshot_id FROM snapshots WHERE device_id = ${param_count}
+            )""")
+            params.append(device_id)
+        
+        query = ' '.join(query_parts) + " ORDER BY path"
+        
+        async with self.pool.acquire() as conn:
+            results = await conn.fetch(query, *params)
+        
+        if use_fzf and results:
+            # Format for fzf
+            lines = []
+            for r in results:
+                lines.append(f"{r['path']} | {r['size']} | {datetime.fromtimestamp(r['mtime']).strftime('%Y-%m-%d %H:%M')}")
+            
+            # Run fzf
+            proc = subprocess.run(['fzf', '--multi'], input='\n'.join(lines), 
+                                capture_output=True, text=True)
+            
+            if proc.returncode == 0:
+                selected = proc.stdout.strip().split('\n')
+                selected_paths = [s.split(' | ')[0] for s in selected]
+                return [dict(r) for r in results if r['path'] in selected_paths]
+            else:
+                return []
+        
+        return [dict(r) for r in results]
+
+    async def dry_run_backup(self, device_id: str, root_paths: List[str] = None, output_format: str = 'text', 
+                           output_file: Optional[str] = None, plan_id: str = None,
+                           exclude_patterns: List[str] = None) -> Dict[str, Any]:
+        """Perform a dry-run backup analysis without actually creating a snapshot"""
+        # Resolve device ID
+        device_id = await self.resolve_uuid(device_id, 'devices', 'device_id')
+        if not device_id:
+            raise ValueError(f"Device not found: {device_id}")
+        
+        # If plan_id provided, get plan details
+        if plan_id:
+            plan_id = await self.resolve_uuid(plan_id, 'backup_plans', 'plan_id')
+            if not plan_id:
+                raise ValueError(f"Plan not found: {plan_id}")
+                
+            plan = await self.get_plan(plan_id)
+            if not plan:
+                raise ValueError(f"Plan not found: {plan_id}")
+            
+            # Use plan's paths and exclusions if not overridden
+            if not root_paths:
+                root_paths = plan['paths']
+            if not exclude_patterns:
+                exclude_patterns = plan['exclude_patterns']
+        
+        # Ensure we have paths to analyze
+        if not root_paths:
+            raise ValueError("No paths specified for dry-run")
+        
+        # Get device info and latest snapshot
+        async with self.pool.acquire() as conn:
+            device = await conn.fetchrow("""
+                SELECT * FROM devices WHERE device_id = $1
+            """, device_id)
+            
+            latest_snapshot = await conn.fetchrow("""
+                SELECT snapshot_id, created_at, free_size_bytes FROM snapshots
+                WHERE device_id = $1
+                ORDER BY created_at DESC LIMIT 1
+            """, device_id)
+        
+        if not latest_snapshot:
+            # No previous snapshot, everything would be new
+            current_files = []
+            for root_path in root_paths:
+                files = await self.scan_directory(Path(root_path), exclude_patterns=exclude_patterns)
+                current_files.extend(files)
+            
+            total_size = sum(f.size for f in current_files if f.is_file)
+            
+            analysis = {
+                'device_id': device_id,
+                'root_path': ','.join(root_paths),
+                'latest_snapshot_id': None,
+                'latest_snapshot_date': None,
+                'total_files': len([f for f in current_files if f.is_file]),
+                'total_dirs': len([f for f in current_files if f.is_dir]),
+                'new_files': len([f for f in current_files if f.is_file]),
+                'new_dirs': len([f for f in current_files if f.is_dir]),
+                'modified_files': 0,
+                'deleted_files': 0,
+                'deleted_dirs': 0,
+                'new_size_bytes': total_size,
+                'new_size_human': self.format_size(total_size),
+                'files': {
+                    'new': [{'path': f.path, 'size': f.size} for f in current_files if f.is_file],
+                    'modified': [],
+                    'deleted': []
+                }
+            }
+        else:
+            # Compare with latest snapshot
+            current_files = []
+            for root_path in root_paths:
+                files = await self.scan_directory(Path(root_path), exclude_patterns=exclude_patterns)
+                current_files.extend(files)
+            
+            current_paths = {f.path: f for f in current_files}
+            
+            # Get files from latest snapshot
+            async with self.pool.acquire() as conn:
+                old_files = await conn.fetch("""
+                    SELECT path, size, mtime, is_file, is_dir 
+                    FROM file_entries 
+                    WHERE snapshot_id = $1
+                """, latest_snapshot['snapshot_id'])
+            
+            old_paths = {f['path']: f for f in old_files}
+            
+            # Find new, modified, and deleted files
+            new_files = []
+            modified_files = []
+            new_size = 0
+            
+            for path, file_info in current_paths.items():
+                if path not in old_paths:
+                    if file_info.is_file:
+                        new_files.append({'path': path, 'size': file_info.size})
+                        new_size += file_info.size
+                elif file_info.is_file and old_paths[path]['is_file']:
+                    # Check if modified
+                    if (file_info.size != old_paths[path]['size'] or 
+                        file_info.mtime != old_paths[path]['mtime']):
+                        modified_files.append({
+                            'path': path, 
+                            'old_size': old_paths[path]['size'],
+                            'new_size': file_info.size,
+                            'size_diff': file_info.size - old_paths[path]['size']
+                        })
+                        new_size += file_info.size
+            
+            deleted_files = []
+            for path, old_file in old_paths.items():
+                if path not in current_paths and old_file['is_file']:
+                    deleted_files.append({'path': path, 'size': old_file['size']})
+            
+            analysis = {
+                'device_id': device_id,
+                'root_path': ','.join(root_paths),
+                'latest_snapshot_id': str(latest_snapshot['snapshot_id']),
+                'latest_snapshot_date': latest_snapshot['created_at'].isoformat(),
+                'total_files': len([f for f in current_files if f.is_file]),
+                'total_dirs': len([f for f in current_files if f.is_dir]),
+                'new_files': len(new_files),
+                'new_dirs': len([f for f in current_files if f.is_dir and f.path not in old_paths]),
+                'modified_files': len(modified_files),
+                'deleted_files': len(deleted_files),
+                'deleted_dirs': len([f for f in old_files if f['is_dir'] and f['path'] not in current_paths]),
+                'new_size_bytes': new_size,
+                'new_size_human': self.format_size(new_size),
+                'files': {
+                    'new': new_files,
+                    'modified': modified_files,
+                    'deleted': deleted_files
+                }
+            }
+        
+        # Check backup feasibility
+        fs_info = await self.get_filesystem_info(root_path)
+        current_free_space = fs_info['free_size']
+        
+        # Add device and feasibility info
+        analysis['device_info'] = {
+            'name': device['name'],
+            'device_uuid': device.get('device_uuid'),
+            'filesystem_type': device['filesystem_type'],
+            'is_encrypted': device['is_encrypted'],
+            'current_free_space': current_free_space,
+            'current_free_space_human': self.format_size(current_free_space),
+            'put_into_service': device['put_into_service']
+        }
+        
+        # Calculate if backup is feasible
+        analysis['feasibility'] = {
+            'is_feasible': current_free_space > analysis['new_size_bytes'],
+            'free_after_backup': current_free_space - analysis['new_size_bytes'],
+            'free_after_backup_human': self.format_size(max(0, current_free_space - analysis['new_size_bytes'])),
+            'percentage_used': (analysis['new_size_bytes'] / current_free_space * 100) if current_free_space > 0 else 100
+        }
+        
+        # Add growth rate info if we have previous snapshots
+        if latest_snapshot and latest_snapshot['free_size_bytes']:
+            time_diff = datetime.now() - latest_snapshot['created_at']
+            days_diff = time_diff.days or 1  # Avoid division by zero
+            space_diff = latest_snapshot['free_size_bytes'] - current_free_space
+            
+            analysis['growth_info'] = {
+                'days_since_last_snapshot': days_diff,
+                'space_used_since_last': space_diff,
+                'space_used_since_last_human': self.format_size(space_diff),
+                'daily_growth_rate': space_diff / days_diff,
+                'daily_growth_rate_human': self.format_size(space_diff / days_diff)
+            }
+        
+        # Format output
+        if output_format == 'markdown':
+            output = self.format_dry_run_markdown(analysis)
+        elif output_format == 'json':
+            output = json.dumps(analysis, indent=2, default=str)
+        else:
+            output = self.format_dry_run_text(analysis)
+        
+        # Save to file if requested
+        if output_file:
+            with open(output_file, 'w') as f:
+                f.write(output)
+            print(f"Dry-run analysis saved to: {output_file}")
+        else:
+            print(output)
+        
+        return analysis
+
+    async def simulate_backup(self, device_id: str, root_paths: List[str] = None, 
+                            simulation_name: Optional[str] = None, plan_id: str = None,
+                            exclude_patterns: List[str] = None) -> str:
+        """Perform a simulated backup, storing results in the database"""
+        # First do the analysis
+        analysis = await self.dry_run_backup(device_id, root_paths, output_format='json', 
+                                           plan_id=plan_id, exclude_patterns=exclude_patterns)
+        
+        # Create simulation record
+        simulation_id = str(uuid.uuid4())
+        if not simulation_name:
+            simulation_name = f"Simulation {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        async with self.pool.acquire() as conn:
+            # Create simulations table if it doesn't exist
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS backup_simulations (
+                    simulation_id UUID PRIMARY KEY,
+                    device_id UUID REFERENCES devices(device_id),
+                    simulation_name TEXT NOT NULL,
+                    root_path TEXT NOT NULL,
+                    analysis JSONB NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create index
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_simulations_device 
+                ON backup_simulations(device_id)
+            """)
+            
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_simulations_created 
+                ON backup_simulations(created_at DESC)
+            """)
+            
+            # Insert simulation
+            await conn.execute("""
+                INSERT INTO backup_simulations 
+                (simulation_id, device_id, simulation_name, root_path, analysis)
+                VALUES ($1, $2, $3, $4, $5)
+            """, simulation_id, device_id, simulation_name, analysis['root_path'], json.dumps(analysis))
+        
+        print(f"Simulation saved with ID: {simulation_id}")
+        print(f"Name: {simulation_name}")
+        print(f"\nSummary:")
+        print(f"  New files: {analysis['new_files']}")
+        print(f"  Modified files: {analysis['modified_files']}")
+        print(f"  Deleted files: {analysis['deleted_files']}")
+        print(f"  Data to backup: {analysis['new_size_human']}")
+        
+        return simulation_id
+
+    async def list_simulations(self, device_id: Optional[str] = None, use_fzf: bool = False) -> List[Dict]:
+        """List all simulations, optionally filtered by device"""
+        query = """
+            SELECT s.*, d.name as device_name
+            FROM backup_simulations s
+            JOIN devices d ON s.device_id = d.device_id
+        """
+        params = []
+        
+        if device_id:
+            query += " WHERE s.device_id = $1"
+            params.append(device_id)
+        
+        query += " ORDER BY s.created_at DESC"
+        
+        async with self.pool.acquire() as conn:
+            results = await conn.fetch(query, *params)
+        
+        simulations = []
+        for r in results:
+            analysis = json.loads(r['analysis'])
+            simulations.append({
+                'simulation_id': str(r['simulation_id']),
+                'device_id': str(r['device_id']),
+                'device_name': r['device_name'],
+                'simulation_name': r['simulation_name'],
+                'root_path': r['root_path'],
+                'created_at': r['created_at'],
+                'new_files': analysis['new_files'],
+                'modified_files': analysis['modified_files'],
+                'deleted_files': analysis['deleted_files'],
+                'new_size_human': analysis['new_size_human']
+            })
+        
+        if use_fzf and simulations:
+            lines = []
+            for s in simulations:
+                lines.append(f"{s['simulation_id']} | {s['simulation_name']} | {s['device_name']} | {s['created_at']} | +{s['new_files']} ~{s['modified_files']} -{s['deleted_files']} | {s['new_size_human']}")
+            
+            proc = subprocess.run(['fzf'], input='\n'.join(lines), 
+                                capture_output=True, text=True)
+            
+            if proc.returncode == 0:
+                selected_id = proc.stdout.strip().split(' | ')[0]
+                return [s for s in simulations if s['simulation_id'] == selected_id]
+        
+        return simulations
+
+    async def view_simulation(self, simulation_id: str, output_format: str = 'text') -> None:
+        """View a specific simulation"""
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchrow("""
+                SELECT s.*, d.name as device_name
+                FROM backup_simulations s
+                JOIN devices d ON s.device_id = d.device_id
+                WHERE s.simulation_id = $1
+            """, simulation_id)
+        
+        if not result:
+            print(f"Simulation not found: {simulation_id}")
+            return
+        
+        analysis = json.loads(result['analysis'])
+        analysis['device_name'] = result['device_name']
+        analysis['simulation_name'] = result['simulation_name']
+        analysis['simulation_created'] = result['created_at'].isoformat()
+        
+        if output_format == 'markdown':
+            print(self.format_dry_run_markdown(analysis))
+        elif output_format == 'json':
+            print(json.dumps(analysis, indent=2, default=str))
+        else:
+            print(self.format_dry_run_text(analysis))
+
+    def format_size(self, size_bytes: int) -> str:
+        """Format bytes into human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.2f} PB"
+
+    def format_dry_run_text(self, analysis: Dict[str, Any]) -> str:
+        """Format dry-run analysis as text"""
+        lines = []
+        lines.append("=" * 60)
+        lines.append("COLD STORAGE BACKUP DRY-RUN ANALYSIS")
+        lines.append("=" * 60)
+        
+        # Device info
+        if 'device_info' in analysis:
+            dev_info = analysis['device_info']
+            lines.append(f"Device: {dev_info['name']} ({analysis['device_id']})")
+            lines.append(f"Filesystem: {dev_info['filesystem_type']} {'(encrypted)' if dev_info['is_encrypted'] else ''}")
+            lines.append(f"Free Space: {dev_info['current_free_space_human']}")
+            if dev_info['put_into_service']:
+                lines.append(f"In Service Since: {dev_info['put_into_service']}")
+        elif 'device_name' in analysis:
+            lines.append(f"Device: {analysis['device_name']} ({analysis['device_id']})")
+        else:
+            lines.append(f"Device ID: {analysis['device_id']}")
+        
+        lines.append(f"Root Path: {analysis['root_path']}")
+        
+        if analysis['latest_snapshot_date']:
+            lines.append(f"Latest Snapshot: {analysis['latest_snapshot_date']}")
+        else:
+            lines.append("Latest Snapshot: None (first backup)")
+        
+        if 'simulation_name' in analysis:
+            lines.append(f"Simulation: {analysis['simulation_name']}")
+            lines.append(f"Created: {analysis['simulation_created']}")
+        
+        lines.append("")
+        lines.append("SUMMARY")
+        lines.append("-" * 30)
+        lines.append(f"Total Files: {analysis['total_files']}")
+        lines.append(f"Total Directories: {analysis['total_dirs']}")
+        lines.append("")
+        lines.append(f"New Files: {analysis['new_files']}")
+        lines.append(f"New Directories: {analysis['new_dirs']}")
+        lines.append(f"Modified Files: {analysis['modified_files']}")
+        lines.append(f"Deleted Files: {analysis['deleted_files']}")
+        lines.append(f"Deleted Directories: {analysis['deleted_dirs']}")
+        lines.append("")
+        lines.append(f"Data to Backup: {analysis['new_size_human']} ({analysis['new_size_bytes']} bytes)")
+        
+        # Feasibility check
+        if 'feasibility' in analysis:
+            lines.append("")
+            lines.append("BACKUP FEASIBILITY")
+            lines.append("-" * 30)
+            feas = analysis['feasibility']
+            if feas['is_feasible']:
+                lines.append(f"✓ Backup is FEASIBLE")
+                lines.append(f"  Free space after backup: {feas['free_after_backup_human']}")
+                lines.append(f"  Will use {feas['percentage_used']:.1f}% of available space")
+            else:
+                lines.append(f"✗ Backup is NOT FEASIBLE - INSUFFICIENT SPACE")
+                lines.append(f"  Need: {analysis['new_size_human']}")
+                lines.append(f"  Available: {analysis['device_info']['current_free_space_human']}")
+                lines.append(f"  Shortfall: {self.format_size(analysis['new_size_bytes'] - analysis['device_info']['current_free_space'])}")
+        
+        # Growth rate info
+        if 'growth_info' in analysis:
+            lines.append("")
+            lines.append("GROWTH ANALYSIS")
+            lines.append("-" * 30)
+            growth = analysis['growth_info']
+            lines.append(f"Days since last snapshot: {growth['days_since_last_snapshot']}")
+            lines.append(f"Space used since last: {growth['space_used_since_last_human']}")
+            lines.append(f"Daily growth rate: {growth['daily_growth_rate_human']}/day")
+        
+        # Show sample of changes
+        if analysis['files']['new']:
+            lines.append("")
+            lines.append("NEW FILES (first 10):")
+            for f in analysis['files']['new'][:10]:
+                lines.append(f"  + {f['path']} ({self.format_size(f['size'])})")
+            if len(analysis['files']['new']) > 10:
+                lines.append(f"  ... and {len(analysis['files']['new']) - 10} more")
+        
+        if analysis['files']['modified']:
+            lines.append("")
+            lines.append("MODIFIED FILES (first 10):")
+            for f in analysis['files']['modified'][:10]:
+                size_change = f['size_diff']
+                sign = "+" if size_change >= 0 else ""
+                lines.append(f"  ~ {f['path']} ({sign}{self.format_size(abs(size_change))})")
+            if len(analysis['files']['modified']) > 10:
+                lines.append(f"  ... and {len(analysis['files']['modified']) - 10} more")
+        
+        if analysis['files']['deleted']:
+            lines.append("")
+            lines.append("DELETED FILES (first 10):")
+            for f in analysis['files']['deleted'][:10]:
+                lines.append(f"  - {f['path']} ({self.format_size(f['size'])})")
+            if len(analysis['files']['deleted']) > 10:
+                lines.append(f"  ... and {len(analysis['files']['deleted']) - 10} more")
+        
+        lines.append("")
+        lines.append("=" * 60)
+        
+        return '\n'.join(lines)
+
+    def format_dry_run_markdown(self, analysis: Dict[str, Any]) -> str:
+        """Format dry-run analysis as markdown"""
+        lines = []
+        lines.append("# Cold Storage Backup Dry-Run Analysis")
+        lines.append("")
+        
+        # Metadata section
+        lines.append("## Metadata")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("|-------|-------|")
+        
+        if 'device_info' in analysis:
+            dev_info = analysis['device_info']
+            lines.append(f"| Device | {dev_info['name']} |")
+            lines.append(f"| Filesystem | {dev_info['filesystem_type']} {'🔒' if dev_info['is_encrypted'] else ''} |")
+            lines.append(f"| Current Free Space | {dev_info['current_free_space_human']} |")
+            if dev_info['put_into_service']:
+                lines.append(f"| In Service Since | {dev_info['put_into_service']} |")
+        elif 'device_name' in analysis:
+            lines.append(f"| Device | {analysis['device_name']} |")
+        lines.append(f"| Device ID | `{analysis['device_id']}` |")
+        lines.append(f"| Root Path | `{analysis['root_path']}` |")
+        
+        if analysis['latest_snapshot_date']:
+            lines.append(f"| Latest Snapshot | {analysis['latest_snapshot_date']} |")
+            lines.append(f"| Snapshot ID | `{analysis['latest_snapshot_id']}` |")
+        else:
+            lines.append("| Latest Snapshot | *None (first backup)* |")
+        
+        if 'simulation_name' in analysis:
+            lines.append(f"| Simulation | {analysis['simulation_name']} |")
+            lines.append(f"| Simulation Created | {analysis['simulation_created']} |")
+        
+        lines.append("")
+        
+        # Summary section
+        lines.append("## Summary")
+        lines.append("")
+        lines.append("| Metric | Count |")
+        lines.append("|--------|-------|")
+        lines.append(f"| Total Files | {analysis['total_files']:,} |")
+        lines.append(f"| Total Directories | {analysis['total_dirs']:,} |")
+        lines.append(f"| **New Files** | **{analysis['new_files']:,}** |")
+        lines.append(f"| New Directories | {analysis['new_dirs']:,} |")
+        lines.append(f"| **Modified Files** | **{analysis['modified_files']:,}** |")
+        lines.append(f"| **Deleted Files** | **{analysis['deleted_files']:,}** |")
+        lines.append(f"| Deleted Directories | {analysis['deleted_dirs']:,} |")
+        lines.append("")
+        lines.append(f"**Data to Backup:** `{analysis['new_size_human']}` ({analysis['new_size_bytes']:,} bytes)")
+        lines.append("")
+        
+        # Feasibility section
+        if 'feasibility' in analysis:
+            lines.append("## Backup Feasibility")
+            lines.append("")
+            feas = analysis['feasibility']
+            if feas['is_feasible']:
+                lines.append("✅ **Backup is FEASIBLE**")
+                lines.append("")
+                lines.append("| Metric | Value |")
+                lines.append("|--------|-------|")
+                lines.append(f"| Free space after backup | {feas['free_after_backup_human']} |")
+                lines.append(f"| Space utilization | {feas['percentage_used']:.1f}% |")
+            else:
+                lines.append("❌ **Backup is NOT FEASIBLE - INSUFFICIENT SPACE**")
+                lines.append("")
+                lines.append("| Metric | Value |")
+                lines.append("|--------|-------|")
+                lines.append(f"| Space needed | {analysis['new_size_human']} |")
+                lines.append(f"| Space available | {analysis['device_info']['current_free_space_human']} |")
+                lines.append(f"| Shortfall | {self.format_size(analysis['new_size_bytes'] - analysis['device_info']['current_free_space'])} |")
+            lines.append("")
+        
+        # Growth analysis section
+        if 'growth_info' in analysis:
+            lines.append("## Growth Analysis")
+            lines.append("")
+            lines.append("| Metric | Value |")
+            lines.append("|--------|-------|")
+            growth = analysis['growth_info']
+            lines.append(f"| Days since last snapshot | {growth['days_since_last_snapshot']} |")
+            lines.append(f"| Space used since last | {growth['space_used_since_last_human']} |")
+            lines.append(f"| Daily growth rate | {growth['daily_growth_rate_human']}/day |")
+            lines.append("")
+        
+        # File changes tables
+        if analysis['files']['new']:
+            lines.append("## New Files (Top 20)")
+            lines.append("")
+            lines.append("| Path | Size |")
+            lines.append("|------|------|")
+            for f in analysis['files']['new'][:20]:
+                lines.append(f"| `{f['path']}` | {self.format_size(f['size'])} |")
+            if len(analysis['files']['new']) > 20:
+                lines.append(f"| *...and {len(analysis['files']['new']) - 20} more* | |")
+            lines.append("")
+        
+        if analysis['files']['modified']:
+            lines.append("## Modified Files (Top 20)")
+            lines.append("")
+            lines.append("| Path | Old Size | New Size | Change |")
+            lines.append("|------|----------|----------|--------|")
+            for f in analysis['files']['modified'][:20]:
+                size_change = f['size_diff']
+                sign = "+" if size_change >= 0 else ""
+                lines.append(f"| `{f['path']}` | {self.format_size(f['old_size'])} | {self.format_size(f['new_size'])} | {sign}{self.format_size(abs(size_change))} |")
+            if len(analysis['files']['modified']) > 20:
+                lines.append(f"| *...and {len(analysis['files']['modified']) - 20} more* | | | |")
+            lines.append("")
+        
+        if analysis['files']['deleted']:
+            lines.append("## Deleted Files (Top 20)")
+            lines.append("")
+            lines.append("| Path | Size |")
+            lines.append("|------|------|")
+            for f in analysis['files']['deleted'][:20]:
+                lines.append(f"| `{f['path']}` | {self.format_size(f['size'])} |")
+            if len(analysis['files']['deleted']) > 20:
+                lines.append(f"| *...and {len(analysis['files']['deleted']) - 20} more* | |")
+            lines.append("")
+        
+        return '\n'.join(lines)
+
+async def main():
+    parser = argparse.ArgumentParser(description='Cold Storage Tracker')
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Device commands
+    device_parser = subparsers.add_parser('device', help='Device management')
+    device_sub = device_parser.add_subparsers(dest='device_command')
+    
+    add_device = device_sub.add_parser('add', help='Add a new device')
+    add_device.add_argument('name', help='Device name')
+    add_device.add_argument('path', help='Mount path of the device')
+    add_device.add_argument('--serial', required=True, help='Serial number')
+    add_device.add_argument('--size', required=True, help='Storage size (e.g., 4TB)')
+    add_device.add_argument('--location', required=True, help='Physical location')
+    add_device.add_argument('--info', default='', help='Additional info')
+    add_device.add_argument('--put-into-service', help='Date put into service (YYYY-MM-DD)')
+    
+    list_devices = device_sub.add_parser('list', help='List all devices')
+    list_devices.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    edit_device = device_sub.add_parser('edit', help='Edit device info')
+    edit_device.add_argument('device_id', help='Device ID')
+    edit_device.add_argument('--name', help='New name')
+    edit_device.add_argument('--serial', help='New serial')
+    edit_device.add_argument('--size', help='New size')
+    edit_device.add_argument('--location', help='New location')
+    edit_device.add_argument('--info', help='New info')
+    
+    remove_device = device_sub.add_parser('remove', help='Remove a device')
+    remove_device.add_argument('device_id', help='Device ID')
+    
+    # Plan commands
+    plan_parser = subparsers.add_parser('plan', help='Backup plan management')
+    plan_sub = plan_parser.add_subparsers(dest='plan_command')
+    
+    create_plan = plan_sub.add_parser('create', help='Create a new backup plan')
+    create_plan.add_argument('name', help='Plan name')
+    create_plan.add_argument('paths', nargs='+', help='Paths to backup')
+    create_plan.add_argument('--exclude', nargs='*', help='Exclusion patterns')
+    create_plan.add_argument('--description', help='Plan description')
+    
+    list_plans = plan_sub.add_parser('list', help='List all plans')
+    list_plans.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    view_plan = plan_sub.add_parser('view', help='View plan details')
+    view_plan.add_argument('plan_id', help='Plan ID')
+    
+    edit_plan = plan_sub.add_parser('edit', help='Edit a plan')
+    edit_plan.add_argument('plan_id', help='Plan ID')
+    edit_plan.add_argument('--name', help='New name')
+    edit_plan.add_argument('--paths', nargs='+', help='New paths')
+    edit_plan.add_argument('--exclude', nargs='*', help='New exclusion patterns')
+    edit_plan.add_argument('--description', help='New description')
+    
+    delete_plan = plan_sub.add_parser('delete', help='Delete a plan')
+    delete_plan.add_argument('plan_id', help='Plan ID')
+    
+    # Snapshot commands
+    snapshot_parser = subparsers.add_parser('snapshot', help='Snapshot management')
+    snapshot_sub = snapshot_parser.add_subparsers(dest='snapshot_command')
+    
+    create_snap = snapshot_sub.add_parser('create', help='Create a snapshot')
+    create_snap.add_argument('device_id', help='Device ID')
+    create_snap.add_argument('paths', nargs='*', help='Root paths to snapshot')
+    create_snap.add_argument('--plan', help='Use backup plan')
+    create_snap.add_argument('--exclude', nargs='*', help='Exclusion patterns')
+    create_snap.add_argument('--checksums', action='store_true', help='Compute file checksums')
+    
+    list_snap = snapshot_sub.add_parser('list', help='List snapshots')
+    list_snap.add_argument('--device', help='Filter by device ID')
+    list_snap.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    # Diff commands
+    diff_parser = subparsers.add_parser('diff', help='Compare snapshots or devices')
+    diff_sub = diff_parser.add_subparsers(dest='diff_command')
+    
+    diff_snap = diff_sub.add_parser('snapshots', help='Diff two snapshots')
+    diff_snap.add_argument('snapshot1', help='First snapshot ID')
+    diff_snap.add_argument('snapshot2', help='Second snapshot ID')
+    
+    diff_dev = diff_sub.add_parser('devices', help='Diff latest snapshots of two devices')
+    diff_dev.add_argument('device1', help='First device ID')
+    diff_dev.add_argument('device2', help='Second device ID')
+    
+    # Dump command
+    dump_parser = subparsers.add_parser('dump', help='Dump snapshot contents')
+    dump_parser.add_argument('snapshot_id', help='Snapshot ID')
+    dump_parser.add_argument('--format', choices=['ls', 'json'], default='ls', help='Output format')
+    
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search for files')
+    search_parser.add_argument('pattern', help='Search pattern')
+    search_parser.add_argument('--snapshot', help='Search in specific snapshot')
+    search_parser.add_argument('--device', help='Search in specific device')
+    search_parser.add_argument('--fzf', action='store_true', help='Use fzf for results')
+    
+    # Dry-run command
+    dryrun_parser = subparsers.add_parser('dry-run', help='Perform dry-run backup analysis')
+    dryrun_parser.add_argument('device_id', nargs='?', help='Device ID (optional with --fzf)')
+    dryrun_parser.add_argument('paths', nargs='*', help='Root paths to analyze')
+    dryrun_parser.add_argument('--plan', help='Use backup plan')
+    dryrun_parser.add_argument('--exclude', nargs='*', help='Exclusion patterns')
+    dryrun_parser.add_argument('--markdown', action='store_true', help='Output in markdown format')
+    dryrun_parser.add_argument('--json', action='store_true', help='Output in JSON format')
+    dryrun_parser.add_argument('--output', '-o', help='Save output to file')
+    dryrun_parser.add_argument('--fzf', action='store_true', help='Select device using fzf')
+    
+    # Simulate command
+    simulate_parser = subparsers.add_parser('simulate', help='Simulate backup and store results')
+    simulate_sub = simulate_parser.add_subparsers(dest='simulate_command')
+    
+    sim_create = simulate_sub.add_parser('create', help='Create a new simulation')
+    sim_create.add_argument('device_id', nargs='?', help='Device ID (optional with --fzf)')
+    sim_create.add_argument('paths', nargs='*', help='Root paths to analyze')
+    sim_create.add_argument('--plan', help='Use backup plan')
+    sim_create.add_argument('--exclude', nargs='*', help='Exclusion patterns')
+    sim_create.add_argument('--name', help='Simulation name')
+    sim_create.add_argument('--fzf', action='store_true', help='Select device using fzf')
+    
+    sim_list = simulate_sub.add_parser('list', help='List simulations')
+    sim_list.add_argument('--device', help='Filter by device ID')
+    sim_list.add_argument('--fzf', action='store_true', help='Use fzf for selection')
+    
+    sim_view = simulate_sub.add_parser('view', help='View a simulation')
+    sim_view.add_argument('simulation_id', help='Simulation ID')
+    sim_view.add_argument('--markdown', action='store_true', help='Output in markdown format')
+    sim_view.add_argument('--json', action='store_true', help='Output in JSON format')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    tracker = ColdStorageTracker()
+    await tracker.init_db()
+    
+    try:
+        if args.command == 'device':
+            if args.device_command == 'add':
+                device_id = await tracker.add_device(
+                    args.name, args.serial, args.size, args.location, args.info,
+                    args.path, args.put_into_service
+                )
+                print(f"Added device: {device_id}")
+                
+            elif args.device_command == 'list':
+                devices = await tracker.list_devices()
+                if args.fzf and devices:
+                    lines = []
+                    for d in devices:
+                        lines.append(f"{d['device_id']} | {d['name']} | {d['serial_number']} | {d['location']}")
+                    proc = subprocess.run(['fzf'], input='\n'.join(lines), 
+                                        capture_output=True, text=True)
+                    if proc.returncode == 0:
+                        selected_id = proc.stdout.strip().split(' | ')[0]
+                        selected = [d for d in devices if d['device_id'] == selected_id][0]
+                        print(json.dumps(selected, indent=2, default=str))
+                else:
+                    for d in devices:
+                        print(f"\nDevice ID: {d['device_id']}")
+                        print(f"Name: {d['name']}")
+                        print(f"Serial: {d['serial_number']}")
+                        print(f"Size: {d['size']}")
+                        print(f"Location: {d['location']}")
+                        if d.get('path'):
+                            print(f"Path: {d['path']}")
+                        if d.get('device_uuid'):
+                            print(f"Device UUID: {d['device_uuid']}")
+                        if d.get('filesystem_type'):
+                            print(f"Filesystem: {d['filesystem_type']} {'(encrypted)' if d.get('is_encrypted') else ''}")
+                        if d.get('free_size_bytes') is not None:
+                            print(f"Free Space: {tracker.format_size(d['free_size_bytes'])}")
+                        if d.get('put_into_service'):
+                            print(f"In Service Since: {d['put_into_service']}")
+                        print(f"Info: {d['info']}")
+                        print(f"Created: {d['created_at']}")
+                        
+            elif args.device_command == 'edit':
+                updates = {}
+                if args.name: updates['name'] = args.name
+                if args.serial: updates['serial_number'] = args.serial
+                if args.size: updates['size'] = args.size
+                if args.location: updates['location'] = args.location
+                if args.info: updates['info'] = args.info
+                
+                await tracker.edit_device(args.device_id, **updates)
+                print(f"Updated device: {args.device_id}")
+                
+            elif args.device_command == 'remove':
+                await tracker.remove_device(args.device_id)
+                print(f"Removed device: {args.device_id}")
+                
+        elif args.command == 'plan':
+            if args.plan_command == 'create':
+                plan_id = await tracker.create_plan(
+                    args.name, args.paths, args.exclude, args.description
+                )
+                print(f"Created plan: {plan_id}")
+                
+            elif args.plan_command == 'list':
+                plans = await tracker.list_plans()
+                if args.fzf and plans:
+                    lines = []
+                    for p in plans:
+                        lines.append(f"{p['plan_id']} | {p['name']} | {len(p['paths'])} paths | {p['created_at']}")
+                    proc = subprocess.run(['fzf'], input='\n'.join(lines), 
+                                        capture_output=True, text=True)
+                    if proc.returncode == 0:
+                        selected_id = proc.stdout.strip().split(' | ')[0]
+                        print(selected_id)
+                else:
+                    for p in plans:
+                        print(f"\nPlan ID: {p['plan_id']}")
+                        print(f"Name: {p['name']}")
+                        print(f"Description: {p['description'] or 'N/A'}")
+                        print(f"Paths: {', '.join(p['paths'])}")
+                        if p['exclude_patterns']:
+                            print(f"Exclusions: {', '.join(p['exclude_patterns'])}")
+                        if p['last_run_time']:
+                            print(f"Last Run: {p['last_run_time']}")
+                            print(f"Last Device: {p['last_device_id']}")
+                            print(f"Last Snapshot: {p['last_snapshot_id']}")
+                        print(f"Created: {p['created_at']}")
+                        
+            elif args.plan_command == 'view':
+                plan = await tracker.get_plan(args.plan_id)
+                if plan:
+                    print(json.dumps(plan, indent=2, default=str))
+                else:
+                    print(f"Plan not found: {args.plan_id}")
+                    
+            elif args.plan_command == 'edit':
+                updates = {}
+                if args.name: updates['name'] = args.name
+                if args.paths: updates['paths'] = args.paths
+                if args.exclude is not None: updates['exclude_patterns'] = args.exclude
+                if args.description: updates['description'] = args.description
+                
+                await tracker.edit_plan(args.plan_id, **updates)
+                print(f"Updated plan: {args.plan_id}")
+                
+            elif args.plan_command == 'delete':
+                await tracker.delete_plan(args.plan_id)
+                print(f"Deleted plan: {args.plan_id}")
+                
+        elif args.command == 'snapshot':
+            if args.snapshot_command == 'create':
+                # Validate that we have paths or a plan
+                if not args.paths and not args.plan:
+                    print("Error: Must provide paths or use --plan")
+                    return
+                    
+                snapshot_id = await tracker.create_snapshot(
+                    args.device_id, args.paths or None, args.checksums,
+                    plan_id=args.plan, exclude_patterns=args.exclude
+                )
+                print(f"Created snapshot: {snapshot_id}")
+                
+            elif args.snapshot_command == 'list':
+                async with tracker.pool.acquire() as conn:
+                    query = "SELECT * FROM snapshots"
+                    params = []
+                    if args.device:
+                        query += " WHERE device_id = $1"
+                        params.append(args.device)
+                    query += " ORDER BY created_at DESC"
+                    
+                    snapshots = await conn.fetch(query, *params)
+                    
+                if args.fzf and snapshots:
+                    lines = []
+                    for s in snapshots:
+                        lines.append(f"{s['snapshot_id']} | {s['device_id']} | {s['root_path']} | {s['created_at']}")
+                    proc = subprocess.run(['fzf'], input='\n'.join(lines), 
+                                        capture_output=True, text=True)
+                    if proc.returncode == 0:
+                        selected_id = proc.stdout.strip().split(' | ')[0]
+                        print(selected_id)
+                else:
+                    for s in snapshots:
+                        print(f"\nSnapshot ID: {s['snapshot_id']}")
+                        print(f"Device ID: {s['device_id']}")
+                        print(f"Root Path: {s['root_path']}")
+                        print(f"Created: {s['created_at']}")
+                        
+        elif args.command == 'diff':
+            if args.diff_command == 'snapshots':
+                diff = await tracker.diff_snapshots(args.snapshot1, args.snapshot2)
+            elif args.diff_command == 'devices':
+                diff = await tracker.diff_devices(args.device1, args.device2)
+            
+            if 'error' in diff:
+                print(f"Error: {diff['error']}")
+            else:
+                print(f"\nAdded files: {len(diff['added'])}")
+                for f in diff['added'][:10]:
+                    print(f"  + {f['path']}")
+                if len(diff['added']) > 10:
+                    print(f"  ... and {len(diff['added']) - 10} more")
+                
+                print(f"\nRemoved files: {len(diff['removed'])}")
+                for f in diff['removed'][:10]:
+                    print(f"  - {f['path']}")
+                if len(diff['removed']) > 10:
+                    print(f"  ... and {len(diff['removed']) - 10} more")
+                
+                print(f"\nModified files: {len(diff['modified'])}")
+                for f in diff['modified'][:10]:
+                    changes = []
+                    if f['size'] != f['new_size']:
+                        changes.append(f"size: {f['size']} -> {f['new_size']}")
+                    if f['mtime'] != f['new_mtime']:
+                        changes.append("mtime")
+                    if f['mode'] != f['new_mode']:
+                        changes.append("mode")
+                    if f['uid'] != f['new_uid'] or f['gid'] != f['new_gid']:
+                        changes.append("ownership")
+                    print(f"  * {f['path']} ({', '.join(changes)})")
+                if len(diff['modified']) > 10:
+                    print(f"  ... and {len(diff['modified']) - 10} more")
+                    
+        elif args.command == 'dump':
+            output = await tracker.dump_snapshot(args.snapshot_id, args.format)
+            print(output)
+            
+        elif args.command == 'search':
+            results = await tracker.search_files(
+                args.pattern, args.snapshot, args.device, args.fzf
+            )
+            if not args.fzf:  # fzf mode prints its own output
+                for r in results:
+                    print(f"{r['path']} (size: {r['size']}, modified: {datetime.fromtimestamp(r['mtime'])})")
+                    
+        elif args.command == 'dry-run':
+            device_id = args.device_id
+            
+            # Validate that we have paths or a plan
+            if not args.paths and not args.plan:
+                print("Error: Must provide paths or use --plan")
+                return
+            
+            # If --fzf is used, let user select device
+            if args.fzf:
+                devices = await tracker.list_devices()
+                if not devices:
+                    print("No devices found. Please add a device first.")
+                    return
+                
+                # Format devices for fzf
+                lines = []
+                for d in devices:
+                    lines.append(f"{d['device_id']} | {d['name']} | {d['serial_number']} | {d['size']} | {d['location']}")
+                
+                proc = subprocess.run(['fzf', '--header=Select a device:'], 
+                                    input='\n'.join(lines), 
+                                    capture_output=True, text=True)
+                
+                if proc.returncode != 0:
+                    print("No device selected.")
+                    return
+                
+                device_id = proc.stdout.strip().split(' | ')[0]
+            elif not device_id:
+                print("Error: device_id is required (or use --fzf to select)")
+                return
+            
+            output_format = 'text'
+            if args.markdown:
+                output_format = 'markdown'
+            elif args.json:
+                output_format = 'json'
+            
+            await tracker.dry_run_backup(
+                device_id, args.paths or None, output_format, args.output,
+                plan_id=args.plan, exclude_patterns=args.exclude
+            )
+            
+        elif args.command == 'simulate':
+            if args.simulate_command == 'create':
+                device_id = args.device_id
+                
+                # Validate that we have paths or a plan
+                if not args.paths and not args.plan:
+                    print("Error: Must provide paths or use --plan")
+                    return
+                
+                # If --fzf is used, let user select device
+                if args.fzf:
+                    devices = await tracker.list_devices()
+                    if not devices:
+                        print("No devices found. Please add a device first.")
+                        return
+                    
+                    # Format devices for fzf
+                    lines = []
+                    for d in devices:
+                        lines.append(f"{d['device_id']} | {d['name']} | {d['serial_number']} | {d['size']} | {d['location']}")
+                    
+                    proc = subprocess.run(['fzf', '--header=Select a device:'], 
+                                        input='\n'.join(lines), 
+                                        capture_output=True, text=True)
+                    
+                    if proc.returncode != 0:
+                        print("No device selected.")
+                        return
+                    
+                    device_id = proc.stdout.strip().split(' | ')[0]
+                elif not device_id:
+                    print("Error: device_id is required (or use --fzf to select)")
+                    return
+                
+                await tracker.simulate_backup(
+                    device_id, args.paths or None, args.name,
+                    plan_id=args.plan, exclude_patterns=args.exclude
+                )
+                
+            elif args.simulate_command == 'list':
+                simulations = await tracker.list_simulations(
+                    args.device, args.fzf
+                )
+                if not args.fzf:  # fzf mode prints its own output
+                    for s in simulations:
+                        print(f"\nSimulation ID: {s['simulation_id']}")
+                        print(f"Name: {s['simulation_name']}")
+                        print(f"Device: {s['device_name']}")
+                        print(f"Root Path: {s['root_path']}")
+                        print(f"Created: {s['created_at']}")
+                        print(f"Changes: +{s['new_files']} ~{s['modified_files']} -{s['deleted_files']}")
+                        print(f"Data Size: {s['new_size_human']}")
+                        
+            elif args.simulate_command == 'view':
+                output_format = 'text'
+                if args.markdown:
+                    output_format = 'markdown'
+                elif args.json:
+                    output_format = 'json'
+                
+                await tracker.view_simulation(
+                    args.simulation_id, output_format
+                )
+            
+    finally:
+        await tracker.close_db()
+
+if __name__ == '__main__':
+    asyncio.run(main())

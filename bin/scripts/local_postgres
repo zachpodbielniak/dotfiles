@@ -11,6 +11,7 @@ SYNC_DATABASES=(
     "ai_chats"
     "notes"
     "media"
+    "cold_storage"
     "postgres"  # For pgvector/second_brain_vectors table
 )
 
@@ -411,6 +412,178 @@ init_notes_schema() {
     echo "Notes schema initialized successfully"
 }
 
+# Initialize cold storage schema
+init_cold_storage_schema() {
+    echo "Initializing cold storage schema..."
+    
+    # Create cold_storage database if it doesn't exist
+    if ! database_exists "cold_storage"; then
+        echo "Creating cold_storage database..."
+        execute_sql "CREATE DATABASE cold_storage" "postgres" || return 1
+    fi
+    
+    # Create update trigger function in cold_storage database
+    execute_sql "
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS \$\$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    \$\$ language 'plpgsql';" "cold_storage" || return 1
+    
+    # Create devices table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS devices (
+        device_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(255) NOT NULL,
+        serial_number VARCHAR(255) NOT NULL,
+        size VARCHAR(100),
+        location TEXT,
+        info TEXT,
+        path TEXT,
+        device_uuid VARCHAR(100),
+        filesystem_type VARCHAR(50),
+        is_encrypted BOOLEAN DEFAULT FALSE,
+        total_size_bytes BIGINT,
+        free_size_bytes BIGINT,
+        put_into_service DATE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "cold_storage" || return 1
+    
+    # Create snapshots table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS snapshots (
+        snapshot_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        device_id UUID NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+        root_path TEXT NOT NULL,
+        free_size_bytes BIGINT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "cold_storage" || return 1
+    
+    # Create file_entries table with all stat fields
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS file_entries (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        snapshot_id UUID NOT NULL REFERENCES snapshots(snapshot_id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        size BIGINT NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        user_name VARCHAR(255),
+        group_name VARCHAR(255),
+        atime DOUBLE PRECISION NOT NULL,
+        mtime DOUBLE PRECISION NOT NULL,
+        ctime DOUBLE PRECISION NOT NULL,
+        inode BIGINT NOT NULL,
+        nlink INTEGER NOT NULL,
+        dev BIGINT NOT NULL,
+        is_dir BOOLEAN NOT NULL,
+        is_file BOOLEAN NOT NULL,
+        is_link BOOLEAN NOT NULL,
+        link_target TEXT,
+        checksum VARCHAR(64),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(snapshot_id, path)
+    );" "cold_storage" || return 1
+    
+    # Create indexes
+    echo "Creating indexes..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_devices_name ON devices(name);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_devices_uuid ON devices(device_uuid);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_devices_created ON devices(created_at DESC);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_devices_filesystem ON devices(filesystem_type);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_devices_encrypted ON devices(is_encrypted);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_devices_put_into_service ON devices(put_into_service);" "cold_storage" || return 1
+    
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_snapshots_device ON snapshots(device_id);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_snapshots_created ON snapshots(created_at DESC);" "cold_storage" || return 1
+    
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_file_entries_snapshot ON file_entries(snapshot_id);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_file_entries_path ON file_entries(path);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_file_entries_size ON file_entries(size);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_file_entries_mtime ON file_entries(mtime);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_file_entries_user ON file_entries(user_name);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_file_entries_is_dir ON file_entries(is_dir);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_file_entries_is_file ON file_entries(is_file);" "cold_storage" || return 1
+    
+    # Create triggers
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_devices_updated_at') THEN
+            CREATE TRIGGER update_devices_updated_at 
+            BEFORE UPDATE ON devices
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "cold_storage" || return 1
+    
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_snapshots_updated_at') THEN
+            CREATE TRIGGER update_snapshots_updated_at 
+            BEFORE UPDATE ON snapshots
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "cold_storage" || return 1
+    
+    # Create backup_simulations table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS backup_simulations (
+        simulation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        device_id UUID REFERENCES devices(device_id) ON DELETE CASCADE,
+        simulation_name TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        analysis JSONB NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "cold_storage" || return 1
+    
+    # Create indexes for simulations
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_simulations_device ON backup_simulations(device_id);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_simulations_created ON backup_simulations(created_at DESC);" "cold_storage" || return 1
+    
+    # Create backup_plans table
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS backup_plans (
+        plan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(255) NOT NULL UNIQUE,
+        description TEXT,
+        paths TEXT[] NOT NULL,
+        exclude_patterns TEXT[],
+        last_run_time TIMESTAMP WITH TIME ZONE,
+        last_snapshot_id UUID REFERENCES snapshots(snapshot_id) ON DELETE SET NULL,
+        last_device_id UUID REFERENCES devices(device_id) ON DELETE SET NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );" "cold_storage" || return 1
+    
+    # Create indexes for plans
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_plans_name ON backup_plans(name);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_plans_last_run ON backup_plans(last_run_time DESC);" "cold_storage" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_plans_created ON backup_plans(created_at DESC);" "cold_storage" || return 1
+    
+    # Create trigger for plans
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_backup_plans_updated_at') THEN
+            CREATE TRIGGER update_backup_plans_updated_at 
+            BEFORE UPDATE ON backup_plans
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "cold_storage" || return 1
+    
+    echo "Cold storage schema initialized successfully"
+}
+
 # Initialize media schema (for movies, TV series, music, videos)
 init_media_schema() {
     echo "Initializing media schema..."
@@ -588,6 +761,7 @@ init_all_schemas() {
     init_ai_chats_schema || return 1
     init_notes_schema || return 1
     init_media_schema || return 1
+    init_cold_storage_schema || return 1
     init_second_brain_schema || return 1
     echo "All schemas initialized successfully"
 }
@@ -633,6 +807,17 @@ perform_maintenance() {
             
             # Reindex notes table
             execute_sql "REINDEX TABLE notes;" "$db" || echo "Warning: Failed to reindex notes table"
+            ;;
+        "cold_storage")
+            # Vacuum and analyze cold_storage tables
+            execute_sql "VACUUM ANALYZE devices;" "$db" || echo "Warning: Failed to vacuum devices table"
+            execute_sql "VACUUM ANALYZE snapshots;" "$db" || echo "Warning: Failed to vacuum snapshots table"
+            execute_sql "VACUUM ANALYZE file_entries;" "$db" || echo "Warning: Failed to vacuum file_entries table"
+            
+            # Reindex cold_storage tables
+            execute_sql "REINDEX TABLE devices;" "$db" || echo "Warning: Failed to reindex devices table"
+            execute_sql "REINDEX TABLE snapshots;" "$db" || echo "Warning: Failed to reindex snapshots table"
+            execute_sql "REINDEX TABLE file_entries;" "$db" || echo "Warning: Failed to reindex file_entries table"
             ;;
         "postgres")
             # Vacuum and analyze vector table if it exists
@@ -770,6 +955,47 @@ show_stats() {
             ORDER BY last_modified DESC
             LIMIT 10;" "$db" || return 1
             ;;
+        "cold_storage")
+            echo -e "\nCold Storage Statistics:"
+            execute_sql "
+            SELECT 
+                COUNT(DISTINCT d.device_id) as total_devices,
+                COUNT(DISTINCT s.snapshot_id) as total_snapshots,
+                COUNT(f.id) as total_file_entries,
+                COALESCE(SUM(f.size), 0) as total_tracked_size_bytes,
+                pg_size_pretty(COALESCE(SUM(f.size), 0)) as total_tracked_size
+            FROM devices d
+            LEFT JOIN snapshots s ON d.device_id = s.device_id
+            LEFT JOIN file_entries f ON s.snapshot_id = f.snapshot_id;" "$db" || return 1
+            
+            echo -e "\nDevices Summary:"
+            execute_sql "
+            SELECT 
+                d.name,
+                d.size as device_size,
+                d.location,
+                COUNT(DISTINCT s.snapshot_id) as snapshot_count,
+                MAX(s.created_at) as last_snapshot
+            FROM devices d
+            LEFT JOIN snapshots s ON d.device_id = s.device_id
+            GROUP BY d.device_id, d.name, d.size, d.location
+            ORDER BY d.name;" "$db" || return 1
+            
+            echo -e "\nRecent Snapshots:"
+            execute_sql "
+            SELECT 
+                d.name as device_name,
+                s.root_path,
+                s.created_at,
+                COUNT(f.id) as file_count,
+                pg_size_pretty(COALESCE(SUM(f.size), 0)) as snapshot_size
+            FROM snapshots s
+            JOIN devices d ON s.device_id = d.device_id
+            LEFT JOIN file_entries f ON s.snapshot_id = f.snapshot_id
+            GROUP BY s.snapshot_id, d.name, s.root_path, s.created_at
+            ORDER BY s.created_at DESC
+            LIMIT 10;" "$db" || return 1
+            ;;
         "postgres")
             echo -e "\nVector Database Statistics:"
             execute_sql "
@@ -812,6 +1038,16 @@ show_all_stats() {
         available_dbs+=("notes")
     fi
     
+    # Check for media database
+    if database_exists "media"; then
+        available_dbs+=("media")
+    fi
+    
+    # Check for cold_storage database
+    if database_exists "cold_storage"; then
+        available_dbs+=("cold_storage")
+    fi
+    
     # Check for postgres database (always exists)
     available_dbs+=("postgres")
     
@@ -836,7 +1072,7 @@ show_all_stats() {
         COUNT(*) as total_databases,
         pg_size_pretty(SUM(pg_database_size(datname))) as total_size
     FROM pg_database 
-    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'postgres');" "postgres" || return 1
+    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'media', 'cold_storage', 'postgres');" "postgres" || return 1
     
     echo ""
     echo "Individual database sizes:"
@@ -845,7 +1081,7 @@ show_all_stats() {
         datname as database,
         pg_size_pretty(pg_database_size(datname)) as size
     FROM pg_database 
-    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'postgres')
+    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'media', 'cold_storage', 'postgres')
     ORDER BY pg_database_size(datname) DESC;" "postgres" || return 1
 }
 
@@ -895,6 +1131,27 @@ export_data() {
                 return 1
             }
             ;;
+        "cold_storage")
+            psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
+            SELECT json_agg(row_to_json(t))
+            FROM (
+                SELECT d.*, 
+                       array_agg(
+                           json_build_object(
+                               'snapshot_id', s.snapshot_id,
+                               'root_path', s.root_path,
+                               'created_at', s.created_at,
+                               'file_count', (SELECT COUNT(*) FROM file_entries WHERE snapshot_id = s.snapshot_id)
+                           ) ORDER BY s.created_at DESC
+                       ) as snapshots
+                FROM devices d
+                LEFT JOIN snapshots s ON d.device_id = s.device_id
+                GROUP BY d.device_id
+            ) t;" > "$output_file" || {
+                echo "Error exporting cold_storage" >&2
+                return 1
+            }
+            ;;
         "postgres")
             psql -d "$(get_connection_string "" "" "$db")" -t -A -c "
             SELECT json_agg(row_to_json(t))
@@ -905,7 +1162,7 @@ export_data() {
             ;;
         *)
             echo "Error: Export not implemented for database '$db'" >&2
-            echo "Supported databases: transcriptions, ai_chats, postgres" >&2
+            echo "Supported databases: transcriptions, ai_chats, notes, cold_storage, postgres" >&2
             return 1
             ;;
     esac
@@ -997,6 +1254,14 @@ backup_all_databases() {
     
     if database_exists "notes"; then
         databases+=("notes")
+    fi
+    
+    if database_exists "media"; then
+        databases+=("media")
+    fi
+    
+    if database_exists "cold_storage"; then
+        databases+=("cold_storage")
     fi
     
     # Always include postgres database (for second_brain_vectors)
@@ -1461,6 +1726,37 @@ merge_sync_table() {
                     metadata = EXCLUDED.metadata;" "$db" >/dev/null 2>&1
                 ;;
             
+            "devices")
+                # Merge devices using UUID and updated_at timestamp
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (device_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    serial_number = EXCLUDED.serial_number,
+                    size = EXCLUDED.size,
+                    location = EXCLUDED.location,
+                    info = EXCLUDED.info,
+                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                ;;
+            
+            "snapshots")
+                # Merge snapshots - only insert if not exists (they shouldn't change)
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (snapshot_id) DO NOTHING;" "$db" >/dev/null 2>&1
+                ;;
+            
+            "file_entries")
+                # Merge file entries - only insert if not exists (they shouldn't change)
+                execute_sql "
+                INSERT INTO $table 
+                SELECT * FROM $temp_table
+                ON CONFLICT (snapshot_id, path) DO NOTHING;" "$db" >/dev/null 2>&1
+                ;;
+            
             *)
                 # Generic merge - insert only if not exists
                 execute_sql "
@@ -1731,6 +2027,49 @@ push_sync_table() {
                         metadata = EXCLUDED.metadata;" >/dev/null 2>&1
                 ;;
             
+            "devices")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (device_id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        serial_number = EXCLUDED.serial_number,
+                        size = EXCLUDED.size,
+                        location = EXCLUDED.location,
+                        info = EXCLUDED.info,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                ;;
+            
+            "snapshots")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (snapshot_id) DO NOTHING;" >/dev/null 2>&1
+                ;;
+            
+            "file_entries")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table 
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (snapshot_id, path) DO NOTHING;" >/dev/null 2>&1
+                ;;
+            
             *)
                 PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
                     -h "$target_host" \
@@ -1837,6 +2176,8 @@ sync_databases() {
                     init_notes_schema
                 elif [[ "$db" == "media" ]]; then
                     init_media_schema
+                elif [[ "$db" == "cold_storage" ]]; then
+                    init_cold_storage_schema
                 else
                     execute_sql "CREATE DATABASE $db" "postgres" >/dev/null 2>&1
                 fi
@@ -1856,6 +2197,9 @@ sync_databases() {
                     ;;
                 "media")
                     tables_to_sync=("media" "media_collections" "media_collection_items" "media_watchlist" "media_saved_searches")
+                    ;;
+                "cold_storage")
+                    tables_to_sync=("devices" "snapshots" "file_entries")
                     ;;
                 "postgres")
                     # For postgres db, sync the vector table if it exists
@@ -1995,11 +2339,12 @@ Supports multiple databases: transcriptions, ai_chats, notes, postgres.
 
 COMMANDS:
     setup               Setup database and all schemas (alias for init)
-    init                Initialize all schemas (transcriptions + ai_chats + notes + media + second_brain)
+    init                Initialize all schemas (transcriptions + ai_chats + notes + media + cold_storage + second_brain)
     init-transcripts    Initialize transcriptions schema only
     init-ai             Initialize ai_chats schema only
     init-notes          Initialize notes schema only
     init-media          Initialize media schema only (movies, TV series, music, videos)
+    init-cold-storage   Initialize cold storage schema only (device tracking and file snapshots)
     init-second-brain   Initialize second brain vector schema only
     maintain            Perform maintenance operations (vacuum, reindex, cleanup)
     stats               Show database statistics
@@ -2014,9 +2359,9 @@ OPTIONS:
     -v, --verbose       Enable verbose output
     --debug             Enable debug output (shows detailed error messages)
     -d, --database DB   Specify target database (required for maintain/export/archive/drop)
-                        Available: transcriptions, ai_chats, notes, postgres
+                        Available: transcriptions, ai_chats, notes, media, cold_storage, postgres
                         Optional for stats and backup (shows/backs up all databases if not specified)
-    --all               Backup all databases (transcriptions, ai_chats, notes, postgres)
+    --all               Backup all databases (transcriptions, ai_chats, notes, media, cold_storage, postgres)
     
 ENVIRONMENT VARIABLES:
     LOCAL_DB_HOST             Database host (default: 127.0.0.1)
@@ -2109,7 +2454,7 @@ parse_args() {
                 BACKUP_ALL=true
                 shift
                 ;;
-            setup|init|init-transcripts|init-ai|init-notes|init-media|init-second-brain|maintain|stats|export|archive|backup|sync|drop)
+            setup|init|init-transcripts|init-ai|init-notes|init-media|init-cold-storage|init-second-brain|maintain|stats|export|archive|backup|sync|drop)
                 ACTION="$1"
                 shift
                 break
@@ -2171,6 +2516,9 @@ main() {
             ;;
         init-media)
             init_media_schema
+            ;;
+        init-cold-storage)
+            init_cold_storage_schema
             ;;
         init-second-brain)
             init_second_brain_schema
