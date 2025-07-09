@@ -12,6 +12,7 @@ import XMonad.Util.EZConfig (additionalKeysP)
 import XMonad.Hooks.ManageHelpers
 import XMonad.Layout.Spacing
 import XMonad.Layout.ThreeColumns
+import XMonad.Layout.Roledex
 import XMonad.Layout.Magnifier
 import qualified XMonad.Layout.ToggleLayouts as TGL
 import XMonad.Hooks.EwmhDesktops
@@ -451,7 +452,7 @@ myConfig = def
 myLayout = 
     TGL.toggleLayouts Full
         $ spacingRaw False (Border 10 10 10 10) True (Border 10 10 10 10) True
-        $ tiled ||| Mirror tiled ||| Full ||| threeCol
+        $ tiled ||| Mirror tiled ||| Full ||| threeCol ||| Roledex
     where 
         threeCol = magnifiercz' 1.3 $ ThreeColMid nmaster delta ratio
         tiled = Tall nmaster delta ratio 
