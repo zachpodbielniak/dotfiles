@@ -1,0 +1,294 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from urllib.parse import urlparse
+import traceback
+
+# Gitea server configuration - CHANGE THIS TO YOUR GITEA INSTANCE
+GITEA_SERVER_URL = 'http://localhost:3000'
+
+# Gitea API base URL (constructed from server URL)
+GITEA_API_BASE = f'{GITEA_SERVER_URL}/api/v1'
+
+# Service type mappings
+SERVICE_TYPES = {
+    'github': 'github',
+    'gitlab': 'gitlab',
+    'gitea': 'gitea',
+    'forgejo': 'forgejo',
+    'gogs': 'gogs',
+    'onedev': 'onedev',
+    'gitbucket': 'gitbucket',
+    'codebase': 'codebase'
+}
+
+def debug_log(message, debug=False):
+    """Print debug messages if debug mode is enabled."""
+    if debug:
+        print(f"[DEBUG] {message}", file=sys.stderr)
+
+def run_curl(url, method='GET', data=None, token=None, debug=False):
+    """Run curl command and return response."""
+    cmd = ['curl', '-s']
+    
+    if debug:
+        cmd.extend(['-v'])
+    
+    cmd.extend(['-X', method])
+    
+    if token:
+        cmd.extend(['-H', f'Authorization: token {token}'])
+    
+    if data:
+        cmd.extend(['-H', 'Content-Type: application/json'])
+        cmd.extend(['-d', json.dumps(data)])
+    
+    cmd.append(url)
+    
+    debug_log(f"Running: {' '.join(cmd)}", debug)
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            debug_log(f"Curl failed with code {result.returncode}: {result.stderr}", debug)
+            return None
+        
+        if result.stdout:
+            try:
+                return json.loads(result.stdout)
+            except json.JSONDecodeError:
+                debug_log(f"Failed to parse JSON response: {result.stdout}", debug)
+                return None
+        return {}
+    except Exception as e:
+        debug_log(f"Error running curl: {e}", debug)
+        return None
+
+def detect_service(url, debug=False):
+    """Detect the git service from URL."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname or parsed.path
+    
+    debug_log(f"Detecting service for hostname: {hostname}", debug)
+    
+    if 'github.com' in hostname:
+        return 'github'
+    elif 'gitlab.com' in hostname:
+        return 'gitlab'
+    elif 'gitea' in hostname:
+        return 'gitea'
+    elif 'gogs' in hostname:
+        return 'gogs'
+    elif 'bitbucket' in hostname:
+        return 'gitbucket'
+    elif 'codeberg.org' in hostname:
+        return 'forgejo'
+    
+    return None
+
+def parse_repo_info(url, debug=False):
+    """Extract repo owner and name from URL."""
+    # Remove .git suffix if present
+    url = url.rstrip('.git')
+    
+    # Handle various URL formats
+    patterns = [
+        r'(?:https?://|git@)(?:[^/:]+)[:/]([^/]+)/([^/]+?)(?:\.git)?$',
+        r'(?:ssh://)?git@([^:]+):([^/]+)/([^/]+?)(?:\.git)?$',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            if len(match.groups()) == 3:
+                # SSH format with host
+                owner = match.group(2)
+                repo = match.group(3)
+            else:
+                # HTTPS format
+                owner = match.group(1)
+                repo = match.group(2)
+            
+            debug_log(f"Parsed repo info - owner: {owner}, repo: {repo}", debug)
+            return owner, repo
+    
+    debug_log(f"Failed to parse repo info from URL: {url}", debug)
+    return None, None
+
+def get_organizations(token, debug=False):
+    """Get list of organizations from Gitea."""
+    url = f"{GITEA_API_BASE}/user/orgs"
+    debug_log(f"Fetching organizations from: {url}", debug)
+    
+    response = run_curl(url, token=token, debug=debug)
+    if response is None:
+        return []
+    
+    if isinstance(response, list):
+        org_names = [org.get('username', '') for org in response]
+        debug_log(f"Found organizations: {org_names}", debug)
+        return org_names
+    
+    return []
+
+def create_organization(org_name, token, debug=False):
+    """Create a new organization in Gitea."""
+    url = f"{GITEA_API_BASE}/orgs"
+    data = {
+        'username': org_name,
+        'full_name': org_name,
+        'description': f'Archived repositories under {org_name}',
+        'visibility': 'public'
+    }
+    
+    debug_log(f"Creating organization: {org_name}", debug)
+    response = run_curl(url, method='POST', data=data, token=token, debug=debug)
+    
+    if response and 'id' in response:
+        debug_log(f"Successfully created organization: {org_name}", debug)
+        return True
+    
+    debug_log(f"Failed to create organization: {response}", debug)
+    return False
+
+def migrate_repository(repo_url, service, repo_owner, repo_name, token, debug=False):
+    """Migrate a repository to Gitea."""
+    url = f"{GITEA_API_BASE}/repos/migrate"
+    
+    data = {
+        'clone_addr': repo_url,
+        'repo_name': repo_name,
+        'repo_owner': repo_owner,
+        'service': service,
+        'mirror': True,
+        'private': False,
+        'issues': True,
+        'labels': True,
+        'milestones': True,
+        'pull_requests': True,
+        'releases': True,
+        'wiki': True
+    }
+    
+    debug_log(f"Migrating repository: {repo_url} -> {repo_owner}/{repo_name}", debug)
+    debug_log(f"Migration data: {json.dumps(data, indent=2)}", debug)
+    
+    response = run_curl(url, method='POST', data=data, token=token, debug=debug)
+    
+    if response and 'id' in response:
+        debug_log(f"Successfully migrated repository: {response.get('full_name')}", debug)
+        return True
+    
+    if response and 'message' in response:
+        error_msg = response['message']
+        debug_log(f"Migration failed: {error_msg}", debug)
+        
+        # Check if it's a duplicate error
+        if 'already exists' in error_msg.lower():
+            debug_log("Repository already exists in Gitea", debug)
+            return True  # Consider it a success if already archived
+    
+    debug_log(f"Migration failed with response: {response}", debug)
+    return False
+
+def main():
+    parser = argparse.ArgumentParser(description='Archive remote git repositories to local Gitea instance')
+    parser.add_argument('repo_url', help='URL of the repository to archive')
+    parser.add_argument('--service', choices=list(SERVICE_TYPES.keys()),
+                      help='Git service type (auto-detected if not specified)')
+    parser.add_argument('--org', help='Override organization/owner name')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    
+    args = parser.parse_args()
+    
+    # Check for API token
+    token = os.environ.get('GITEA_TOKEN')
+    if not token:
+        if not args.debug:
+            sys.exit(1)
+        print("Error: GITEA_TOKEN environment variable not set", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        # Detect or validate service type
+        if args.service:
+            service = SERVICE_TYPES[args.service]
+            debug_log(f"Using specified service: {service}", args.debug)
+        else:
+            service = detect_service(args.repo_url, args.debug)
+            if not service:
+                if not args.debug:
+                    print("Error: Cannot detect service type from URL. Please specify with --service", file=sys.stderr)
+                sys.exit(1)
+            debug_log(f"Auto-detected service: {service}", args.debug)
+        
+        # Parse repository information
+        default_owner, repo_name = parse_repo_info(args.repo_url, args.debug)
+        if not repo_name:
+            if not args.debug:
+                print("Error: Cannot parse repository name from URL", file=sys.stderr)
+            sys.exit(1)
+        
+        # Determine repo owner
+        repo_owner = args.org if args.org else default_owner
+        if not repo_owner:
+            if not args.debug:
+                print("Error: Cannot determine repository owner. Please specify with --org", file=sys.stderr)
+            sys.exit(1)
+        
+        debug_log(f"Repository details - Service: {service}, Owner: {repo_owner}, Name: {repo_name}", args.debug)
+        
+        # Check if organization exists
+        orgs = get_organizations(token, args.debug)
+        if repo_owner not in orgs:
+            debug_log(f"Organization '{repo_owner}' not found, creating it", args.debug)
+            if not create_organization(repo_owner, token, args.debug):
+                if not args.debug:
+                    print(f"Error: Failed to create organization: {repo_owner}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            debug_log(f"Organization '{repo_owner}' already exists", args.debug)
+        
+        # Migrate the repository
+        success = migrate_repository(args.repo_url, service, repo_owner, repo_name, token, args.debug)
+        
+        if success:
+            debug_log("Repository archived successfully", args.debug)
+            sys.exit(0)
+        else:
+            if not args.debug:
+                print("Error: Failed to migrate repository", file=sys.stderr)
+            sys.exit(1)
+            
+    except Exception as e:
+        if args.debug:
+            print(f"Error: {e}", file=sys.stderr)
+            traceback.print_exc()
+        else:
+            print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
