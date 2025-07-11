@@ -4,6 +4,7 @@ stow: dep_dirs
     set -euxo pipefail
 
     stow \
+        --ignore=LICENSE \
         --ignore=Justfile \
         --ignore=CLAUDE.md \
         --ignore=tests \
@@ -19,6 +20,7 @@ stow_alt: dep_dirs
     set -euxo pipefail
 
     stow \
+        --ignore=LICENSE \
         --ignore=Justfile \
         --ignore=CLAUDE.md \
         --ignore=tests \
