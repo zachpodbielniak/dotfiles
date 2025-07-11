@@ -207,15 +207,38 @@ def list_repos_for_service(service_url, service, owner, debug=False):
         debug_log(f"Repository listing not implemented for service: {service}", debug)
         return []
 
+def is_user_not_org(service, owner, debug=False):
+    """Check if the owner is a user (not an organization) on the given service."""
+    if service == 'github':
+        # Check GitHub API to determine if it's a user or org
+        url = f"https://api.github.com/users/{owner}"
+        response = run_curl(url, debug=debug)
+        if response and 'type' in response:
+            is_user = response['type'] == 'User'
+            debug_log(f"GitHub {owner} type: {response['type']}, is_user: {is_user}", debug)
+            return is_user
+    elif service == 'gitlab':
+        # For GitLab, check if it's a user by trying the user endpoint
+        url = f"https://gitlab.com/api/v4/users?username={owner}"
+        response = run_curl(url, debug=debug)
+        if response and isinstance(response, list) and len(response) > 0:
+            debug_log(f"GitLab {owner} found as user", debug)
+            return True
+    
+    # Default to treating as org if we can't determine
+    debug_log(f"Could not determine if {owner} is user or org, defaulting to org", debug)
+    return False
+
 def parse_repo_info(url, debug=False):
     """Extract repo owner and name from URL."""
-    # Remove .git suffix if present
-    url = url.rstrip('.git')
+    # Remove .git suffix if present (as a complete suffix, not individual chars)
+    if url.endswith('.git'):
+        url = url[:-4]
     
     # Handle various URL formats
     patterns = [
-        r'(?:https?://|git@)(?:[^/:]+)[:/]([^/]+)/([^/]+?)(?:\.git)?$',
-        r'(?:ssh://)?git@([^:]+):([^/]+)/([^/]+?)(?:\.git)?$',
+        r'(?:https?://|git@)(?:[^/:]+)[:/]([^/]+)/([^/]+)$',
+        r'(?:ssh://)?git@([^:]+):([^/]+)/([^/]+)$',
     ]
     
     for pattern in patterns:
@@ -236,6 +259,18 @@ def parse_repo_info(url, debug=False):
     debug_log(f"Failed to parse repo info from URL: {url}", debug)
     return None, None
 
+def get_current_user(token, debug=False):
+    """Get the current authenticated user from Gitea."""
+    url = f"{GITEA_API_BASE}/user"
+    debug_log(f"Fetching current user from: {url}", debug)
+    
+    response = run_curl(url, token=token, debug=debug)
+    if response and 'username' in response:
+        debug_log(f"Current user: {response['username']}", debug)
+        return response['username']
+    
+    return None
+
 def get_organizations(token, debug=False):
     """Get list of organizations from Gitea."""
     url = f"{GITEA_API_BASE}/user/orgs"
@@ -251,6 +286,34 @@ def get_organizations(token, debug=False):
         return org_names
     
     return []
+
+def check_user_exists(username, token, debug=False):
+    """Check if a user exists in Gitea."""
+    url = f"{GITEA_API_BASE}/users/{username}"
+    debug_log(f"Checking if user exists: {username}", debug)
+    
+    response = run_curl(url, token=token, debug=debug)
+    if response and 'id' in response:
+        debug_log(f"User '{username}' exists in Gitea", debug)
+        return True
+    
+    return False
+
+def owner_exists_in_gitea(owner_name, token, debug=False):
+    """Check if owner exists as either user or organization in Gitea."""
+    # First check if it's an organization
+    orgs = get_organizations(token, debug)
+    if owner_name in orgs:
+        debug_log(f"'{owner_name}' exists as an organization", debug)
+        return True, 'org'
+    
+    # Then check if it's a user
+    if check_user_exists(owner_name, token, debug):
+        debug_log(f"'{owner_name}' exists as a user", debug)
+        return True, 'user'
+    
+    debug_log(f"'{owner_name}' does not exist in Gitea", debug)
+    return False, None
 
 def create_organization(org_name, token, debug=False):
     """Create a new organization in Gitea."""
@@ -416,9 +479,10 @@ def main():
                 
                 debug_log(f"Archiving {repo_owner}/{repo_name} from {repo_url}", args.debug)
                 
-                # Ensure organization exists
-                orgs = get_organizations(token, args.debug)
-                if repo_owner not in orgs:
+                # Check if owner exists as user or org
+                exists, owner_type = owner_exists_in_gitea(repo_owner, token, args.debug)
+                if not exists:
+                    # Owner doesn't exist, create as organization
                     debug_log(f"Creating organization: {repo_owner}", args.debug)
                     if not create_organization(repo_owner, token, args.debug):
                         debug_log(f"Failed to create organization: {repo_owner}", args.debug)
@@ -459,15 +523,16 @@ def main():
             
             debug_log(f"Repository details - Service: {service}, Owner: {repo_owner}, Name: {repo_name}", args.debug)
             
-            # Check if organization exists
-            orgs = get_organizations(token, args.debug)
-            if repo_owner not in orgs:
-                debug_log(f"Organization '{repo_owner}' not found, creating it", args.debug)
+            # Check if owner exists as user or org
+            exists, owner_type = owner_exists_in_gitea(repo_owner, token, args.debug)
+            if not exists:
+                # Owner doesn't exist, create as organization
+                debug_log(f"Owner '{repo_owner}' not found, creating as organization", args.debug)
                 if not create_organization(repo_owner, token, args.debug):
                     print(f"Error: Failed to create organization: {repo_owner}", file=sys.stderr)
                     sys.exit(1)
             else:
-                debug_log(f"Organization '{repo_owner}' already exists", args.debug)
+                debug_log(f"Owner '{repo_owner}' already exists as {owner_type}", args.debug)
             
             # Migrate the repository
             success = migrate_repository(args.url, service, repo_owner, repo_name, token, args.debug)
