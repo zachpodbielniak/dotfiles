@@ -13,6 +13,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Bootstrap dependencies: `just bootstrap`
 
 ## Code Style Guidelines
+- All Scripts (Shell, Python, Perl, Haskell):
+  - Must include AGPLv3 license header immediately after the shebang
+  - License header format:
+    ```
+    # dotfiles - Personal configuration files and scripts
+    # Copyright (C) <year>  Zach Podbielniak
+    #
+    # This program is free software: you can redistribute it and/or modify
+    # it under the terms of the GNU Affero General Public License as published by
+    # the Free Software Foundation, either version 3 of the License, or
+    # (at your option) any later version.
+    #
+    # This program is distributed in the hope that it will be useful,
+    # but WITHOUT ANY WARRANTY; without even the implied warranty of
+    # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    # GNU Affero General Public License for more details.
+    #
+    # You should have received a copy of the GNU Affero General Public License
+    # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+    ```
+  - For Haskell scripts, use `{- ... -}` comment style for the license header
+
 - Shell Scripts:
   - All scripts use bash (`#!/bin/bash`) and often include `set -euo pipefail`
   - Parameter validation for scripts with user input
