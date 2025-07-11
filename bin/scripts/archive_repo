@@ -195,6 +195,74 @@ def list_gitlab_repos(owner, debug=False):
     
     return repos
 
+def list_gitea_repos(base_url, owner, debug=False):
+    """List all repositories for a Gitea/Forgejo/Gogs user/org."""
+    repos = []
+    page = 1
+    per_page = 50
+    
+    while True:
+        # Try user repos first
+        url = f"{base_url}/api/v1/users/{owner}/repos?page={page}&limit={per_page}"
+        debug_log(f"Fetching Gitea repos from: {url}", debug)
+        
+        response = run_curl(url, debug=debug)
+        
+        if response is None or not isinstance(response, list):
+            # Try org repos
+            url = f"{base_url}/api/v1/orgs/{owner}/repos?page={page}&limit={per_page}"
+            debug_log(f"Trying org endpoint: {url}", debug)
+            response = run_curl(url, debug=debug)
+        
+        if response is None or not isinstance(response, list):
+            break
+        
+        if len(response) == 0:
+            break
+        
+        for repo in response:
+            if isinstance(repo, dict) and 'clone_url' in repo:
+                repos.append(repo['clone_url'])
+                debug_log(f"Found repo: {repo['clone_url']}", debug)
+        
+        if len(response) < per_page:
+            break
+        
+        page += 1
+    
+    return repos
+
+def list_codeberg_repos(owner, debug=False):
+    """List all repositories for a Codeberg (Forgejo) user/org."""
+    # Codeberg uses Forgejo, which has the same API as Gitea
+    return list_gitea_repos("https://codeberg.org", owner, debug)
+
+def get_base_url_from_repo_url(url, debug=False):
+    """Extract base URL from a repository URL."""
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    debug_log(f"Extracted base URL: {base_url} from {url}", debug)
+    return base_url
+
+def construct_org_url(repo_url, org_name, service, debug=False):
+    """Construct the organization URL from a repository URL."""
+    parsed = urlparse(repo_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    
+    # For known services, construct the proper org URL
+    if 'github.com' in parsed.netloc:
+        org_url = f"https://github.com/{org_name}"
+    elif 'gitlab.com' in parsed.netloc:
+        org_url = f"https://gitlab.com/{org_name}"
+    elif 'codeberg.org' in parsed.netloc:
+        org_url = f"https://codeberg.org/{org_name}"
+    else:
+        # For other services, construct a generic URL
+        org_url = f"{base_url}/{org_name}"
+    
+    debug_log(f"Constructed org URL: {org_url} for {org_name}", debug)
+    return org_url
+
 def list_repos_for_service(service_url, service, owner, debug=False):
     """List all repositories for a given service and owner."""
     debug_log(f"Listing repos for {service}:{owner}", debug)
@@ -203,6 +271,13 @@ def list_repos_for_service(service_url, service, owner, debug=False):
         return list_github_repos(owner, debug)
     elif service == 'gitlab':
         return list_gitlab_repos(owner, debug)
+    elif service in ['gitea', 'forgejo', 'gogs']:
+        # These all use similar APIs
+        base_url = get_base_url_from_repo_url(service_url, debug)
+        return list_gitea_repos(base_url, owner, debug)
+    elif service == 'forgejo' and 'codeberg.org' in service_url:
+        # Special case for Codeberg
+        return list_codeberg_repos(owner, debug)
     else:
         debug_log(f"Repository listing not implemented for service: {service}", debug)
         return []
@@ -315,15 +390,20 @@ def owner_exists_in_gitea(owner_name, token, debug=False):
     debug_log(f"'{owner_name}' does not exist in Gitea", debug)
     return False, None
 
-def create_organization(org_name, token, debug=False):
+def create_organization(org_name, token, website=None, debug=False):
     """Create a new organization in Gitea."""
     url = f"{GITEA_API_BASE}/orgs"
     data = {
         'username': org_name,
         'full_name': org_name,
-        'description': f'Archived repositories under {org_name}',
+        'description': f'Archived repositories from {org_name}',
         'visibility': 'public'
     }
+    
+    # Add website if provided
+    if website:
+        data['website'] = website
+        debug_log(f"Setting organization website to: {website}", debug)
     
     debug_log(f"Creating organization: {org_name}", debug)
     response = run_curl(url, method='POST', data=data, token=token, debug=debug)
@@ -403,19 +483,33 @@ def main():
   # Archive all repositories from a user/org
   archive_repo https://github.com/torvalds
   archive_repo https://gitlab.com/gitlab-org
+  archive_repo https://codeberg.org/forgejo
+  archive_repo https://gitea.example.com/myorg
+  
+  # Archive multiple URLs in one command (mix of repos and orgs)
+  archive_repo https://github.com/user/project1 https://github.com/org1 https://gitlab.com/user2
+  archive_repo https://github.com/torvalds/linux https://github.com/git/git https://gitlab.com/gitlab-org
   
   # Specify service explicitly
-  archive_repo https://git.example.com/user --service gitlab
+  archive_repo https://git.example.com/user --service gitea
+  archive_repo https://git.example.com/user --service gogs
   
   # Override organization in Gitea
   archive_repo https://github.com/user/repo.git --org my-archives
   
   # Debug mode
   archive_repo https://github.com/user --debug
+
+Supported services for bulk archiving: github, gitlab, gitea, forgejo, gogs, codeberg
+
+Exit codes:
+  0 - All operations succeeded
+  1 - All operations failed
+  2 - Partial success (some succeeded, some failed)
 ''',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('url', help='URL of repository, user, or organization to archive')
+    parser.add_argument('urls', nargs='+', help='URL(s) of repositories, users, or organizations to archive')
     parser.add_argument('--service', choices=list(SERVICE_TYPES.keys()),
                       help='Git service type (auto-detected if not specified)')
     parser.add_argument('--org', help='Override organization/owner name in Gitea')
@@ -432,117 +526,164 @@ def main():
         sys.exit(1)
     
     try:
-        # Detect or validate service type
-        if args.service:
-            service = SERVICE_TYPES[args.service]
-            debug_log(f"Using specified service: {service}", args.debug)
-        else:
-            service = detect_service(args.url, args.debug)
-            if not service:
-                print("Error: Cannot detect service type from URL. Please specify with --service", file=sys.stderr)
-                sys.exit(1)
-            debug_log(f"Auto-detected service: {service}", args.debug)
+        # Track overall statistics
+        total_success = 0
+        total_failed = 0
+        all_failed_items = []
         
-        # Determine if this is an org/user URL or a specific repo
-        if is_org_or_user_url(args.url, args.debug):
-            # Extract owner from URL
-            parsed = urlparse(args.url)
-            owner = parsed.path.strip('/').split('/')[0]
+        # Process each URL
+        for url in args.urls:
+            debug_log(f"\n{'='*60}", args.debug)
+            debug_log(f"Processing URL: {url}", args.debug)
+            debug_log(f"{'='*60}", args.debug)
             
-            if not owner:
-                print("Error: Cannot extract owner from URL", file=sys.stderr)
-                sys.exit(1)
+            # Detect or validate service type for this URL
+            if args.service:
+                service = SERVICE_TYPES[args.service]
+                debug_log(f"Using specified service: {service}", args.debug)
+            else:
+                service = detect_service(url, args.debug)
+                if not service:
+                    print(f"Error: Cannot detect service type from URL: {url}. Please specify with --service", file=sys.stderr)
+                    total_failed += 1
+                    all_failed_items.append(url)
+                    continue
+                debug_log(f"Auto-detected service: {service}", args.debug)
             
-            debug_log(f"Detected org/user URL for: {owner}", args.debug)
-            
-            # List all repositories
-            repo_urls = list_repos_for_service(args.url, service, owner, args.debug)
-            
-            if not repo_urls:
-                print(f"Warning: No repositories found for {owner}", file=sys.stderr)
-                sys.exit(0)
-            
-            debug_log(f"Found {len(repo_urls)} repositories to archive", args.debug)
-            
-            # Archive each repository
-            success_count = 0
-            failed_repos = []
-            
-            for repo_url in repo_urls:
-                default_owner, repo_name = parse_repo_info(repo_url, args.debug)
-                if not repo_name:
-                    debug_log(f"Skipping invalid repo URL: {repo_url}", args.debug)
+            # Determine if this is an org/user URL or a specific repo
+            if is_org_or_user_url(url, args.debug):
+                # Extract owner from URL
+                parsed = urlparse(url)
+                owner = parsed.path.strip('/').split('/')[0]
+                
+                if not owner:
+                    print(f"Error: Cannot extract owner from URL: {url}", file=sys.stderr)
+                    total_failed += 1
+                    all_failed_items.append(url)
                     continue
                 
-                # Determine repo owner for Gitea
-                repo_owner = args.org if args.org else default_owner
+                debug_log(f"Detected org/user URL for: {owner}", args.debug)
                 
-                debug_log(f"Archiving {repo_owner}/{repo_name} from {repo_url}", args.debug)
+                # List all repositories
+                repo_urls = list_repos_for_service(url, service, owner, args.debug)
+                
+                if not repo_urls:
+                    print(f"Warning: No repositories found for {owner}", file=sys.stderr)
+                    continue
+                
+                debug_log(f"Found {len(repo_urls)} repositories to archive", args.debug)
+                
+                # Archive each repository
+                success_count = 0
+                failed_repos = []
+                
+                for repo_url in repo_urls:
+                    default_owner, repo_name = parse_repo_info(repo_url, args.debug)
+                    if not repo_name:
+                        debug_log(f"Skipping invalid repo URL: {repo_url}", args.debug)
+                        continue
+                    
+                    # Determine repo owner for Gitea
+                    repo_owner = args.org if args.org else default_owner
+                    
+                    debug_log(f"Archiving {repo_owner}/{repo_name} from {repo_url}", args.debug)
+                    
+                    # Check if owner exists as user or org
+                    exists, owner_type = owner_exists_in_gitea(repo_owner, token, args.debug)
+                    if not exists:
+                        # Owner doesn't exist, create as organization
+                        org_website = construct_org_url(repo_url, repo_owner, service, args.debug)
+                        debug_log(f"Creating organization: {repo_owner} with website: {org_website}", args.debug)
+                        if not create_organization(repo_owner, token, website=org_website, debug=args.debug):
+                            debug_log(f"Failed to create organization: {repo_owner}", args.debug)
+                            failed_repos.append(repo_url)
+                            continue
+                    
+                    # Migrate the repository
+                    if migrate_repository(repo_url, service, repo_owner, repo_name, token, args.debug):
+                        success_count += 1
+                        debug_log(f"Successfully archived: {repo_owner}/{repo_name}", args.debug)
+                    else:
+                        failed_repos.append(repo_url)
+                        debug_log(f"Failed to archive: {repo_owner}/{repo_name}", args.debug)
+                
+                # Update totals
+                total_success += success_count
+                total_failed += len(failed_repos)
+                all_failed_items.extend(failed_repos)
+                
+                # Report results for this org/user
+                if args.debug:
+                    print(f"\nOrg/User {owner}: {success_count}/{len(repo_urls)} repositories archived successfully", file=sys.stderr)
+                    if failed_repos:
+                        print(f"Failed repositories:", file=sys.stderr)
+                        for repo in failed_repos:
+                            print(f"  - {repo}", file=sys.stderr)
+                
+            else:
+                # Single repository mode
+                # Parse repository information
+                default_owner, repo_name = parse_repo_info(url, args.debug)
+                if not repo_name:
+                    print(f"Error: Cannot parse repository name from URL: {url}", file=sys.stderr)
+                    total_failed += 1
+                    all_failed_items.append(url)
+                    continue
+                
+                # Determine repo owner
+                repo_owner = args.org if args.org else default_owner
+                if not repo_owner:
+                    print(f"Error: Cannot determine repository owner for {url}. Please specify with --org", file=sys.stderr)
+                    total_failed += 1
+                    all_failed_items.append(url)
+                    continue
+                
+                debug_log(f"Repository details - Service: {service}, Owner: {repo_owner}, Name: {repo_name}", args.debug)
                 
                 # Check if owner exists as user or org
                 exists, owner_type = owner_exists_in_gitea(repo_owner, token, args.debug)
                 if not exists:
                     # Owner doesn't exist, create as organization
-                    debug_log(f"Creating organization: {repo_owner}", args.debug)
-                    if not create_organization(repo_owner, token, args.debug):
-                        debug_log(f"Failed to create organization: {repo_owner}", args.debug)
-                        failed_repos.append(repo_url)
+                    org_website = construct_org_url(url, repo_owner, service, args.debug)
+                    debug_log(f"Owner '{repo_owner}' not found, creating as organization with website: {org_website}", args.debug)
+                    if not create_organization(repo_owner, token, website=org_website, debug=args.debug):
+                        print(f"Error: Failed to create organization: {repo_owner}", file=sys.stderr)
+                        total_failed += 1
+                        all_failed_items.append(url)
                         continue
+                else:
+                    debug_log(f"Owner '{repo_owner}' already exists as {owner_type}", args.debug)
                 
                 # Migrate the repository
-                if migrate_repository(repo_url, service, repo_owner, repo_name, token, args.debug):
-                    success_count += 1
-                    debug_log(f"Successfully archived: {repo_owner}/{repo_name}", args.debug)
+                success = migrate_repository(url, service, repo_owner, repo_name, token, args.debug)
+                
+                if success:
+                    debug_log("Repository archived successfully", args.debug)
+                    total_success += 1
                 else:
-                    failed_repos.append(repo_url)
-                    debug_log(f"Failed to archive: {repo_owner}/{repo_name}", args.debug)
-            
-            # Report results
-            if args.debug:
-                print(f"\nArchiving complete: {success_count}/{len(repo_urls)} repositories archived successfully", file=sys.stderr)
-                if failed_repos:
-                    print(f"Failed repositories:", file=sys.stderr)
-                    for repo in failed_repos:
-                        print(f"  - {repo}", file=sys.stderr)
-            
-            sys.exit(0 if success_count > 0 else 1)
-            
+                    print(f"Error: Failed to migrate repository: {url}", file=sys.stderr)
+                    total_failed += 1
+                    all_failed_items.append(url)
+        
+        # Final summary for all URLs
+        if len(args.urls) > 1 or args.debug:
+            print(f"\n{'='*60}", file=sys.stderr)
+            print(f"FINAL SUMMARY", file=sys.stderr)
+            print(f"{'='*60}", file=sys.stderr)
+            print(f"Total repositories archived: {total_success}", file=sys.stderr)
+            print(f"Total failed: {total_failed}", file=sys.stderr)
+            if all_failed_items:
+                print(f"\nFailed items:", file=sys.stderr)
+                for item in all_failed_items:
+                    print(f"  - {item}", file=sys.stderr)
+        
+        # Exit with appropriate code
+        if total_success == 0 and total_failed > 0:
+            sys.exit(1)  # All failed
+        elif total_failed > 0:
+            sys.exit(2)  # Partial success
         else:
-            # Single repository mode
-            # Parse repository information
-            default_owner, repo_name = parse_repo_info(args.url, args.debug)
-            if not repo_name:
-                print("Error: Cannot parse repository name from URL", file=sys.stderr)
-                sys.exit(1)
-            
-            # Determine repo owner
-            repo_owner = args.org if args.org else default_owner
-            if not repo_owner:
-                print("Error: Cannot determine repository owner. Please specify with --org", file=sys.stderr)
-                sys.exit(1)
-            
-            debug_log(f"Repository details - Service: {service}, Owner: {repo_owner}, Name: {repo_name}", args.debug)
-            
-            # Check if owner exists as user or org
-            exists, owner_type = owner_exists_in_gitea(repo_owner, token, args.debug)
-            if not exists:
-                # Owner doesn't exist, create as organization
-                debug_log(f"Owner '{repo_owner}' not found, creating as organization", args.debug)
-                if not create_organization(repo_owner, token, args.debug):
-                    print(f"Error: Failed to create organization: {repo_owner}", file=sys.stderr)
-                    sys.exit(1)
-            else:
-                debug_log(f"Owner '{repo_owner}' already exists as {owner_type}", args.debug)
-            
-            # Migrate the repository
-            success = migrate_repository(args.url, service, repo_owner, repo_name, token, args.debug)
-            
-            if success:
-                debug_log("Repository archived successfully", args.debug)
-                sys.exit(0)
-            else:
-                print("Error: Failed to migrate repository", file=sys.stderr)
-                sys.exit(1)
+            sys.exit(0)  # All succeeded
             
     except Exception as e:
         if args.debug:
