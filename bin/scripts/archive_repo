@@ -25,6 +25,7 @@ import sys
 import time
 from urllib.parse import urlparse
 import traceback
+import select
 
 # Gitea server configuration - CHANGE THIS TO YOUR GITEA INSTANCE
 GITEA_SERVER_URL = 'http://nas-main:3000'
@@ -55,7 +56,11 @@ def debug_log(message, debug=False):
     if debug:
         print(f"[DEBUG] {message}", file=sys.stderr)
 
-def run_curl(url, method='GET', data=None, token=None, debug=False):
+def dry_run_log(message):
+    """Print dry-run messages."""
+    print(f"[DRY-RUN] {message}")
+
+def run_curl(url, method='GET', data=None, token=None, debug=False, dry_run=False):
     """Run curl command and return response."""
     cmd = ['curl', '-s']
     
@@ -74,17 +79,21 @@ def run_curl(url, method='GET', data=None, token=None, debug=False):
     cmd.append(url)
     
     # Create debug command with masked token
-    if debug:
-        debug_cmd = cmd.copy()
-        for i, arg in enumerate(debug_cmd):
-            if i > 0 and debug_cmd[i-1] == '-H' and 'Authorization: token' in arg:
-                # Mask the token in the authorization header
-                token_match = re.search(r'token (.+)', arg)
-                if token_match:
-                    token_val = token_match.group(1)
-                    masked_token = f"{token_val[:4]}...{token_val[-4:]}" if len(token_val) > 8 else "***"
-                    debug_cmd[i] = f'Authorization: token {masked_token}'
-        debug_log(f"Running: {' '.join(debug_cmd)}", debug)
+    debug_cmd = cmd.copy()
+    for i, arg in enumerate(debug_cmd):
+        if i > 0 and debug_cmd[i-1] == '-H' and 'Authorization: token' in arg:
+            # Mask the token in the authorization header
+            token_match = re.search(r'token (.+)', arg)
+            if token_match:
+                token_val = token_match.group(1)
+                masked_token = f"{token_val[:4]}...{token_val[-4:]}" if len(token_val) > 8 else "***"
+                debug_cmd[i] = f'Authorization: token {masked_token}'
+    
+    if dry_run or debug:
+        print(f"[DRY-RUN] Would run: {' '.join(debug_cmd)}")
+    
+    if dry_run:
+        return '{"dry_run": true}'  # Return dummy JSON for dry run
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -421,7 +430,7 @@ def owner_exists_in_gitea(owner_name, token, debug=False):
     debug_log(f"'{owner_name}' does not exist in Gitea", debug)
     return False, None
 
-def create_organization(org_name, token, website=None, debug=False):
+def create_organization(org_name, token, website=None, debug=False, dry_run=False):
     """Create a new organization in Gitea."""
     url = f"{GITEA_API_BASE}/orgs"
     data = {
@@ -436,8 +445,14 @@ def create_organization(org_name, token, website=None, debug=False):
         data['website'] = website
         debug_log(f"Setting organization website to: {website}", debug)
     
+    if dry_run:
+        dry_run_log(f"Would create organization: {org_name}")
+        if website:
+            dry_run_log(f"Would set organization website to: {website}")
+        return True
+    
     debug_log(f"Creating organization: {org_name}", debug)
-    response = run_curl(url, method='POST', data=data, token=token, debug=debug)
+    response = run_curl(url, method='POST', data=data, token=token, debug=debug, dry_run=dry_run)
     
     if response and 'id' in response:
         debug_log(f"Successfully created organization: {org_name}", debug)
@@ -459,7 +474,7 @@ def check_repository_exists(repo_owner, repo_name, token, debug=False):
     
     return False
 
-def migrate_repository(repo_url, service, repo_owner, repo_name, token, debug=False, delay=0):
+def migrate_repository(repo_url, service, repo_owner, repo_name, token, debug=False, delay=0, dry_run=False):
     """Migrate a repository to Gitea."""
     # First check if repository already exists
     if check_repository_exists(repo_owner, repo_name, token, debug):
@@ -495,6 +510,15 @@ def migrate_repository(repo_url, service, repo_owner, repo_name, token, debug=Fa
             data['auth_token'] = gitlab_token
             debug_log("Using GITLAB_TOKEN for authentication", debug)
     
+    if dry_run:
+        dry_run_log(f"Would migrate repository: {repo_url} -> {repo_owner}/{repo_name}")
+        dry_run_log(f"Would create mirror with service type: {service}")
+        if 'auth_token' in data:
+            dry_run_log("Would use authentication token for private repository access")
+        if delay > 0:
+            dry_run_log(f"Would delay {delay} seconds after migration")
+        return True
+    
     debug_log(f"Migrating repository: {repo_url} -> {repo_owner}/{repo_name}", debug)
     # Don't log auth_token in debug output
     debug_data = data.copy()
@@ -502,7 +526,7 @@ def migrate_repository(repo_url, service, repo_owner, repo_name, token, debug=Fa
         debug_data['auth_token'] = '***REDACTED***'
     debug_log(f"Migration data: {json.dumps(debug_data, indent=2)}", debug)
     
-    response = run_curl(url, method='POST', data=data, token=token, debug=debug)
+    response = run_curl(url, method='POST', data=data, token=token, debug=debug, dry_run=dry_run)
     
     if response and 'id' in response:
         debug_log(f"Successfully migrated repository: {response.get('full_name')}", debug)
@@ -775,9 +799,25 @@ def get_all_accessible_github_repos(token, debug=False):
     
     return repos
 
+def has_stdin_data():
+    """Check if there's data available on stdin"""
+    return select.select([sys.stdin], [], [], 0.0)[0]
+
+def read_urls_from_stdin():
+    """Read URLs from stdin, one per line"""
+    urls = []
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if line and not line.startswith('#'):  # Skip empty lines and comments
+                urls.append(line)
+    except KeyboardInterrupt:
+        pass
+    return urls
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Archive remote git repositories to local Gitea instance or delete organizations',
+        description='Archive remote git repositories to local Gitea instance or delete organizations. Can read URLs from stdin.',
         epilog='''Examples:
   # Archive a single repository
   archive_repo https://github.com/user/repo.git
@@ -826,6 +866,13 @@ def main():
   
   # Mirror all private repos from personal accounts
   archive_repo --mirror-personal-repos
+  
+  # Read URLs from stdin
+  cat urls.txt | archive_repo
+  extract_git_links README.md | archive_repo
+  
+  # Combine stdin with command-line URLs
+  echo "https://github.com/git/git" | archive_repo https://github.com/torvalds/linux
   archive_repo --mirror-personal-repos --delay 30 --no-confirm
   
   # Debug mode
@@ -873,6 +920,8 @@ Exit codes:
                       help='Delay in seconds between mirror operations (helps with rate limiting)')
     parser.add_argument('--mirror-personal-repos', action='store_true',
                       help='Mirror all private repos you have access to from accounts in PERSONAL_ACCOUNTS')
+    parser.add_argument('--dry-run', action='store_true',
+                      help='Show what would be done without actually doing it')
     
     args = parser.parse_args()
     
@@ -984,7 +1033,7 @@ Exit codes:
                     website_url = f"{first_repo['base_url']}/{owner}"
                 
                 debug_log(f"Creating organization: {owner} with website: {website_url}", args.debug)
-                if not create_organization(owner, gitea_token, website=website_url, debug=args.debug):
+                if not create_organization(owner, gitea_token, website=website_url, debug=args.debug, dry_run=args.dry_run):
                     print(f"Failed to create organization: {owner}, skipping its repos", file=sys.stderr)
                     failed_repos.extend([r['full_name'] for r in owner_repos])
                     total_failed += len(owner_repos)
@@ -998,7 +1047,7 @@ Exit codes:
                 
                 print(f"[{i+1}/{len(owner_repos)}] Mirroring {owner}/{repo_name} (private: {repo['private']})...", file=sys.stderr)
                 
-                if migrate_repository(clone_url, service, owner, repo_name, gitea_token, args.debug, args.delay):
+                if migrate_repository(clone_url, service, owner, repo_name, gitea_token, args.debug, args.delay, args.dry_run):
                     total_success += 1
                     debug_log(f"Successfully mirrored: {owner}/{repo_name}", args.debug)
                 else:
@@ -1095,7 +1144,7 @@ Exit codes:
                 continue
             
             # Re-mirror the repository
-            if migrate_repository(original_url, service, owner, name, token, args.debug, args.delay):
+            if migrate_repository(original_url, service, owner, name, token, args.debug, args.delay, args.dry_run):
                 fixed_count += 1
                 print(f"  Successfully re-mirrored {owner}/{name}", file=sys.stderr)
             else:
@@ -1270,8 +1319,18 @@ Exit codes:
             print(f"\nError: Failed to delete organization '{org_name}'", file=sys.stderr)
             sys.exit(1)
     
+    # Collect URLs from both stdin and command line
+    all_urls = list(args.urls)  # Copy the command line URLs
+    
+    # Check for stdin data
+    if has_stdin_data():
+        stdin_urls = read_urls_from_stdin()
+        if stdin_urls:
+            debug_log(f"Read {len(stdin_urls)} URLs from stdin", args.debug)
+            all_urls.extend(stdin_urls)
+    
     # Validate that URLs were provided for archive mode
-    if not args.urls:
+    if not all_urls:
         parser.error("No URLs provided. Use --delete-org to delete an organization, --delete-repo to delete a repository, --api-call to make API requests, or provide URLs to archive.")
     
     try:
@@ -1281,7 +1340,7 @@ Exit codes:
         all_failed_items = []
         
         # Process each URL
-        for url in args.urls:
+        for url in all_urls:
             debug_log(f"\n{'='*60}", args.debug)
             debug_log(f"Processing URL: {url}", args.debug)
             debug_log(f"{'='*60}", args.debug)
@@ -1343,13 +1402,13 @@ Exit codes:
                         # Owner doesn't exist, create as organization
                         org_website = construct_org_url(repo_url, repo_owner, service, args.debug)
                         debug_log(f"Creating organization: {repo_owner} with website: {org_website}", args.debug)
-                        if not create_organization(repo_owner, token, website=org_website, debug=args.debug):
+                        if not create_organization(repo_owner, token, website=org_website, debug=args.debug, dry_run=args.dry_run):
                             debug_log(f"Failed to create organization: {repo_owner}", args.debug)
                             failed_repos.append(repo_url)
                             continue
                     
                     # Migrate the repository
-                    if migrate_repository(repo_url, service, repo_owner, repo_name, token, args.debug, args.delay):
+                    if migrate_repository(repo_url, service, repo_owner, repo_name, token, args.debug, args.delay, args.dry_run):
                         success_count += 1
                         debug_log(f"Successfully archived: {repo_owner}/{repo_name}", args.debug)
                     else:
@@ -1395,7 +1454,7 @@ Exit codes:
                     # Owner doesn't exist, create as organization
                     org_website = construct_org_url(url, repo_owner, service, args.debug)
                     debug_log(f"Owner '{repo_owner}' not found, creating as organization with website: {org_website}", args.debug)
-                    if not create_organization(repo_owner, token, website=org_website, debug=args.debug):
+                    if not create_organization(repo_owner, token, website=org_website, debug=args.debug, dry_run=args.dry_run):
                         print(f"Error: Failed to create organization: {repo_owner}", file=sys.stderr)
                         total_failed += 1
                         all_failed_items.append(url)
@@ -1404,7 +1463,7 @@ Exit codes:
                     debug_log(f"Owner '{repo_owner}' already exists as {owner_type}", args.debug)
                 
                 # Migrate the repository
-                success = migrate_repository(url, service, repo_owner, repo_name, token, args.debug, args.delay)
+                success = migrate_repository(url, service, repo_owner, repo_name, token, args.debug, args.delay, args.dry_run)
                 
                 if success:
                     debug_log("Repository archived successfully", args.debug)
