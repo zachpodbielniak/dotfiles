@@ -32,6 +32,12 @@ GITEA_SERVER_URL = 'http://nas-main:3000'
 # Gitea API base URL (constructed from server URL)
 GITEA_API_BASE = f'{GITEA_SERVER_URL}/api/v1'
 
+# Personal account URLs - Add your personal git accounts here
+PERSONAL_ACCOUNTS = [
+    'https://gitlab.com/zachpodbielniak',
+    'https://github.com/zachpodbielniak'
+]
+
 # Service type mappings
 SERVICE_TYPES = {
     'github': 'github',
@@ -67,7 +73,18 @@ def run_curl(url, method='GET', data=None, token=None, debug=False):
     
     cmd.append(url)
     
-    debug_log(f"Running: {' '.join(cmd)}", debug)
+    # Create debug command with masked token
+    if debug:
+        debug_cmd = cmd.copy()
+        for i, arg in enumerate(debug_cmd):
+            if i > 0 and debug_cmd[i-1] == '-H' and 'Authorization: token' in arg:
+                # Mask the token in the authorization header
+                token_match = re.search(r'token (.+)', arg)
+                if token_match:
+                    token_val = token_match.group(1)
+                    masked_token = f"{token_val[:4]}...{token_val[-4:]}" if len(token_val) > 8 else "***"
+                    debug_cmd[i] = f'Authorization: token {masked_token}'
+        debug_log(f"Running: {' '.join(debug_cmd)}", debug)
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -644,6 +661,120 @@ def check_stuck_mirrors_in_org(org_name, token, debug=False):
     
     return stuck_mirrors
 
+def get_all_accessible_gitlab_repos(base_url, token, debug=False):
+    """Get all repositories accessible with GitLab token (including private repos)."""
+    repos = []
+    page = 1
+    per_page = 100
+    
+    while True:
+        # Use membership=true to get all projects the user is a member of
+        url = f"{base_url}/api/v4/projects?membership=true&per_page={per_page}&page={page}"
+        debug_log(f"Fetching accessible GitLab repos from: {url}", debug)
+        
+        # Use curl with authorization header
+        cmd = ['curl', '-s', '-H', f'Authorization: Bearer {token}', url]
+        
+        # Create debug command with masked token
+        if debug:
+            masked_token = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "***"
+            debug_cmd = ['curl', '-s', '-H', f'Authorization: Bearer {masked_token}', url]
+            debug_log(f"Running: {' '.join(debug_cmd)}", debug)
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                debug_log(f"Curl failed: {result.stderr}", debug)
+                break
+            
+            response = json.loads(result.stdout) if result.stdout else []
+        except (json.JSONDecodeError, Exception) as e:
+            debug_log(f"Error fetching GitLab repos: {e}", debug)
+            break
+        
+        if not isinstance(response, list) or len(response) == 0:
+            break
+        
+        for repo in response:
+            if isinstance(repo, dict):
+                repo_info = {
+                    'clone_url': repo.get('http_url_to_repo', ''),
+                    'ssh_url': repo.get('ssh_url_to_repo', ''),
+                    'name': repo.get('path', ''),
+                    'full_name': repo.get('path_with_namespace', ''),
+                    'owner': repo.get('namespace', {}).get('path', ''),
+                    'owner_type': repo.get('namespace', {}).get('kind', 'user'),  # user or group
+                    'private': repo.get('visibility', 'public') == 'private',
+                    'description': repo.get('description', ''),
+                    'web_url': repo.get('web_url', '')
+                }
+                repos.append(repo_info)
+                debug_log(f"Found repo: {repo_info['full_name']} (private: {repo_info['private']})", debug)
+        
+        if len(response) < per_page:
+            break
+        
+        page += 1
+    
+    return repos
+
+def get_all_accessible_github_repos(token, debug=False):
+    """Get all repositories accessible with GitHub token (including private repos and org repos)."""
+    repos = []
+    page = 1
+    per_page = 100
+    
+    # First get user's own repos
+    while True:
+        url = f"https://api.github.com/user/repos?per_page={per_page}&page={page}&type=all"
+        debug_log(f"Fetching accessible GitHub repos from: {url}", debug)
+        
+        # Use curl with authorization header
+        cmd = ['curl', '-s', '-H', f'Authorization: token {token}', url]
+        
+        # Create debug command with masked token
+        if debug:
+            masked_token = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "***"
+            debug_cmd = ['curl', '-s', '-H', f'Authorization: token {masked_token}', url]
+            debug_log(f"Running: {' '.join(debug_cmd)}", debug)
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                debug_log(f"Curl failed: {result.stderr}", debug)
+                break
+            
+            response = json.loads(result.stdout) if result.stdout else []
+        except (json.JSONDecodeError, Exception) as e:
+            debug_log(f"Error fetching GitHub repos: {e}", debug)
+            break
+        
+        if not isinstance(response, list) or len(response) == 0:
+            break
+        
+        for repo in response:
+            if isinstance(repo, dict):
+                repo_info = {
+                    'clone_url': repo.get('clone_url', ''),
+                    'ssh_url': repo.get('ssh_url', ''),
+                    'name': repo.get('name', ''),
+                    'full_name': repo.get('full_name', ''),
+                    'owner': repo.get('owner', {}).get('login', ''),
+                    'owner_type': repo.get('owner', {}).get('type', 'User'),  # User or Organization
+                    'private': repo.get('private', False),
+                    'description': repo.get('description', ''),
+                    'web_url': repo.get('html_url', '')
+                }
+                repos.append(repo_info)
+                debug_log(f"Found repo: {repo_info['full_name']} (private: {repo_info['private']})", debug)
+        
+        if len(response) < per_page:
+            break
+        
+        page += 1
+    
+    return repos
+
 def main():
     parser = argparse.ArgumentParser(
         description='Archive remote git repositories to local Gitea instance or delete organizations',
@@ -693,6 +824,10 @@ def main():
   archive_repo https://github.com/torvalds --delay 120
   archive_repo --check-for-stuck-mirrors-and-fix --delay 60
   
+  # Mirror all private repos from personal accounts
+  archive_repo --mirror-personal-repos
+  archive_repo --mirror-personal-repos --delay 30 --no-confirm
+  
   # Debug mode
   archive_repo https://github.com/user --debug
 
@@ -702,6 +837,9 @@ Environment variables:
   GITEA_TOKEN    - Required: API token for your Gitea instance
   GITHUB_TOKEN   - Optional: GitHub personal access token (helps avoid rate limits)
   GITLAB_TOKEN   - Optional: GitLab personal access token (helps avoid rate limits)
+
+Configuration:
+  Edit PERSONAL_ACCOUNTS in the script to add your personal git accounts for --mirror-personal-repos
 
 Exit codes:
   0 - All operations succeeded
@@ -733,6 +871,8 @@ Exit codes:
                       help='Skip confirmation prompts (use with caution)')
     parser.add_argument('--delay', type=int, default=0, metavar='SECONDS',
                       help='Delay in seconds between mirror operations (helps with rate limiting)')
+    parser.add_argument('--mirror-personal-repos', action='store_true',
+                      help='Mirror all private repos you have access to from accounts in PERSONAL_ACCOUNTS')
     
     args = parser.parse_args()
     
@@ -743,6 +883,149 @@ Exit codes:
             sys.exit(1)
         print("Error: GITEA_TOKEN environment variable not set", file=sys.stderr)
         sys.exit(1)
+    
+    # Handle --mirror-personal-repos
+    if args.mirror_personal_repos:
+        debug_log("Mirroring all accessible personal repositories...", args.debug)
+        
+        if not PERSONAL_ACCOUNTS:
+            print("Error: No personal accounts configured in PERSONAL_ACCOUNTS", file=sys.stderr)
+            print("Edit the script and add your accounts to the PERSONAL_ACCOUNTS list", file=sys.stderr)
+            sys.exit(1)
+        
+        all_repos = []
+        
+        # Process each personal account
+        for account_url in PERSONAL_ACCOUNTS:
+            debug_log(f"\nProcessing personal account: {account_url}", args.debug)
+            
+            # Detect service
+            service = detect_service(account_url, args.debug)
+            if not service:
+                print(f"Warning: Cannot detect service for {account_url}, skipping", file=sys.stderr)
+                continue
+            
+            # Get repositories based on service
+            if service == 'gitlab':
+                gitlab_token = os.environ.get('GITLAB_TOKEN')
+                if not gitlab_token:
+                    print(f"Warning: GITLAB_TOKEN not set, skipping GitLab account {account_url}", file=sys.stderr)
+                    continue
+                
+                parsed = urlparse(account_url)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+                repos = get_all_accessible_gitlab_repos(base_url, gitlab_token, args.debug)
+                
+                # Add service info to each repo
+                for repo in repos:
+                    repo['service'] = service
+                    repo['base_url'] = base_url
+                    all_repos.append(repo)
+                    
+            elif service == 'github':
+                github_token = os.environ.get('GITHUB_TOKEN')
+                if not github_token:
+                    print(f"Warning: GITHUB_TOKEN not set, skipping GitHub account {account_url}", file=sys.stderr)
+                    continue
+                
+                repos = get_all_accessible_github_repos(github_token, args.debug)
+                
+                # Add service info to each repo
+                for repo in repos:
+                    repo['service'] = service
+                    repo['base_url'] = 'https://github.com'
+                    all_repos.append(repo)
+            else:
+                print(f"Warning: Personal repo mirroring not implemented for {service}", file=sys.stderr)
+                continue
+        
+        if not all_repos:
+            print("No accessible repositories found.", file=sys.stderr)
+            sys.exit(0)
+        
+        # Group repos by owner
+        repos_by_owner = {}
+        for repo in all_repos:
+            owner = repo['owner']
+            if owner not in repos_by_owner:
+                repos_by_owner[owner] = []
+            repos_by_owner[owner].append(repo)
+        
+        print(f"\nFound {len(all_repos)} accessible repositories across {len(repos_by_owner)} owners:", file=sys.stderr)
+        for owner, owner_repos in repos_by_owner.items():
+            private_count = sum(1 for r in owner_repos if r['private'])
+            public_count = len(owner_repos) - private_count
+            print(f"  {owner}: {len(owner_repos)} repos ({private_count} private, {public_count} public)", file=sys.stderr)
+        
+        # Confirm before proceeding
+        if not args.no_confirm:
+            response = input("\nProceed with mirroring all repositories? (yes/no): ")
+            if response.lower() != 'yes':
+                print("Operation cancelled.", file=sys.stderr)
+                sys.exit(0)
+        
+        # Mirror all repositories
+        total_success = 0
+        total_failed = 0
+        failed_repos = []
+        
+        for owner, owner_repos in repos_by_owner.items():
+            debug_log(f"\nProcessing repositories for owner: {owner}", args.debug)
+            
+            # Check if owner exists, create if needed
+            gitea_token = token  # token is the GITEA_TOKEN
+            exists, owner_type = owner_exists_in_gitea(owner, gitea_token, args.debug)
+            if not exists:
+                # Determine the website URL based on the first repo's base URL
+                first_repo = owner_repos[0]
+                if first_repo['owner_type'].lower() in ['group', 'organization']:
+                    website_url = f"{first_repo['base_url']}/{owner}"
+                else:
+                    website_url = f"{first_repo['base_url']}/{owner}"
+                
+                debug_log(f"Creating organization: {owner} with website: {website_url}", args.debug)
+                if not create_organization(owner, gitea_token, website=website_url, debug=args.debug):
+                    print(f"Failed to create organization: {owner}, skipping its repos", file=sys.stderr)
+                    failed_repos.extend([r['full_name'] for r in owner_repos])
+                    total_failed += len(owner_repos)
+                    continue
+            
+            # Mirror each repository
+            for i, repo in enumerate(owner_repos):
+                repo_name = repo['name']
+                clone_url = repo['clone_url']
+                service = repo['service']
+                
+                print(f"[{i+1}/{len(owner_repos)}] Mirroring {owner}/{repo_name} (private: {repo['private']})...", file=sys.stderr)
+                
+                if migrate_repository(clone_url, service, owner, repo_name, gitea_token, args.debug, args.delay):
+                    total_success += 1
+                    debug_log(f"Successfully mirrored: {owner}/{repo_name}", args.debug)
+                else:
+                    total_failed += 1
+                    failed_repos.append(f"{owner}/{repo_name}")
+                    print(f"Failed to mirror: {owner}/{repo_name}", file=sys.stderr)
+        
+        # Summary
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"PERSONAL REPOS MIRROR SUMMARY", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
+        print(f"Total repositories processed: {len(all_repos)}", file=sys.stderr)
+        print(f"Successfully mirrored: {total_success}", file=sys.stderr)
+        print(f"Failed: {total_failed}", file=sys.stderr)
+        
+        if failed_repos:
+            print(f"\nFailed repositories:", file=sys.stderr)
+            for repo in failed_repos:
+                print(f"  - {repo}", file=sys.stderr)
+        
+        # Exit with appropriate code
+        if total_success == 0 and total_failed > 0:
+            sys.exit(1)  # All failed
+        elif total_failed > 0:
+            sys.exit(2)  # Partial success
+        else:
+            sys.exit(0)  # All succeeded
     
     # Handle --check-for-stuck-mirrors or --check-for-stuck-mirrors-and-fix
     if args.check_for_stuck_mirrors or args.check_for_stuck_mirrors_and_fix:
