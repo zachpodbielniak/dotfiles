@@ -1,0 +1,481 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Script name and version
+SCRIPT_NAME=$(basename "$0")
+VERSION="1.0.0"
+
+# Default options
+FORMAT="lines"  # lines, spaces, json, yaml
+ORGS=false
+ORGS_ONLY=false
+
+# Function to display usage
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [OPTIONS] [FILE|URL|'-'...]
+
+Extract git repository URLs from files, URLs, or stdin. Supports GitHub, GitLab, 
+Gitea, Forgejo, Gogs, Codeberg, and other git hosting services.
+
+INPUTS:
+    FILE         Local file path to scan for git URLs
+    URL          HTTP/HTTPS URL to fetch and scan (using curl)
+    -            Read from stdin (explicit)
+    (no args)    Read from stdin if available
+
+OPTIONS:
+    -h, --help          Show this help message
+    -v, --version       Show version information
+    -f, --format FORMAT Output format: lines (default), spaces, json, yaml
+    -o, --orgs          Convert repo URLs to org/user URLs where possible
+    -O, --orgs-only     Only output org/user URLs, skip repos without orgs
+
+EXAMPLES:
+    # Extract git URLs from a file
+    $SCRIPT_NAME README.md
+
+    # Extract from multiple files
+    $SCRIPT_NAME *.md *.txt
+
+    # Extract from a URL
+    $SCRIPT_NAME https://github.com/torvalds/linux/blob/master/README
+
+    # Extract from stdin
+    cat project.txt | $SCRIPT_NAME
+
+    # Combine file and stdin
+    echo "https://github.com/git/git" | $SCRIPT_NAME repos.txt -
+
+    # Mix files and URLs
+    $SCRIPT_NAME local-repos.txt https://awesome-go.com/
+
+    # Output space-separated for use with other commands
+    $SCRIPT_NAME --format spaces notes.md | xargs archive_repo
+    
+    # Output as JSON with metadata
+    $SCRIPT_NAME --format json README.md
+    
+    # Output as YAML
+    $SCRIPT_NAME --format yaml project-list.txt
+
+    # Extract organization URLs
+    $SCRIPT_NAME --orgs README.md
+
+    # Extract only organization URLs from a webpage
+    $SCRIPT_NAME --orgs-only https://github.com/trending
+
+SUPPORTED PATTERNS:
+    - https://github.com/user/repo
+    - git@github.com:user/repo.git
+    - ssh://git@gitlab.com/user/repo
+    - git://github.com/user/repo.git
+    - https://gitlab.company.com/team/project.git
+    - https://git.example.com/project.git
+    - And many more git URL formats...
+
+EOF
+}
+
+# Function to show version
+version() {
+    echo "$SCRIPT_NAME version $VERSION"
+}
+
+# Function to extract metadata from URL
+extract_metadata() {
+    local url="$1"
+    local provider=""
+    local org_name=""
+    local repo_name=""
+    local org_url=""
+    local clean_url="${url%.git}"  # Remove trailing .git
+    
+    # Detect provider
+    if [[ "$url" =~ github\.com ]]; then
+        provider="github"
+    elif [[ "$url" =~ gitlab\.com ]]; then
+        provider="gitlab"
+    elif [[ "$url" =~ gitea\.com ]]; then
+        provider="gitea"
+    elif [[ "$url" =~ codeberg\.org ]]; then
+        provider="codeberg"
+    elif [[ "$url" =~ bitbucket\.org ]]; then
+        provider="bitbucket"
+    elif [[ "$url" =~ git\.kernel\.org ]]; then
+        provider="kernel.org"
+    elif [[ "$url" =~ gitlab\. ]]; then
+        provider="gitlab-selfhosted"
+    elif [[ "$url" =~ gitea\. ]]; then
+        provider="gitea-selfhosted"
+    elif [[ "$url" =~ gogs\. ]]; then
+        provider="gogs"
+    elif [[ "$url" =~ forgejo\. ]]; then
+        provider="forgejo"
+    else
+        provider="unknown"
+    fi
+    
+    # Extract org and repo names based on URL format
+    if [[ "$clean_url" =~ ^https?://[^/]+/pub/scm/[^/]+/[^/]+/[^/]+/([^/]+)/([^/]+) ]]; then
+        # kernel.org deep path
+        org_name="${BASH_REMATCH[1]}"
+        repo_name="${BASH_REMATCH[2]}"
+        local host=$(echo "$clean_url" | sed -E 's|^https?://([^/]+).*|\1|')
+        org_url="https://$host/$org_name"
+    elif [[ "$clean_url" =~ ^https?://([^/]+)/([^/]+)/([^/]+) ]]; then
+        # HTTPS format
+        local host="${BASH_REMATCH[1]}"
+        org_name="${BASH_REMATCH[2]}"
+        repo_name="${BASH_REMATCH[3]}"
+        org_url="https://$host/$org_name"
+    elif [[ "$clean_url" =~ ^git@([^:]+):([^/]+)/([^/]+) ]]; then
+        # SSH format
+        local host="${BASH_REMATCH[1]}"
+        org_name="${BASH_REMATCH[2]}"
+        repo_name="${BASH_REMATCH[3]%.git}"
+        org_url="https://$host/$org_name"
+    elif [[ "$clean_url" =~ ^ssh://git@([^/]+)/([^/]+)/([^/]+) ]]; then
+        # SSH URL format
+        local host="${BASH_REMATCH[1]}"
+        org_name="${BASH_REMATCH[2]}"
+        repo_name="${BASH_REMATCH[3]%.git}"
+        org_url="https://$host/$org_name"
+    elif [[ "$clean_url" =~ ^git://([^/]+)/([^/]+)/([^/]+) ]]; then
+        # Git protocol
+        local host="${BASH_REMATCH[1]}"
+        org_name="${BASH_REMATCH[2]}"
+        repo_name="${BASH_REMATCH[3]%.git}"
+        org_url="https://$host/$org_name"
+    fi
+    
+    # Clean up repo name
+    repo_name="${repo_name%.git}"
+    repo_name="${repo_name%/}"
+    
+    # Return as associative array format
+    echo "url=\"$url\""
+    echo "provider=\"$provider\""
+    echo "org_name=\"$org_name\""
+    echo "repo_name=\"$repo_name\""
+    echo "org_url=\"$org_url\""
+}
+
+# Function to extract org/user from URL
+extract_org() {
+    local url="$1"
+    local org=""
+    
+    # Remove trailing .git if present
+    url="${url%.git}"
+    
+    # Special handling for kernel.org and similar deep paths
+    if [[ "$url" =~ ^https?://[^/]+/pub/scm/[^/]+/[^/]+/[^/]+/([^/]+)/ ]]; then
+        # Extract the user/org from deep path structures
+        local user="${BASH_REMATCH[1]}"
+        local host=$(echo "$url" | sed -E 's|^https?://([^/]+).*|\1|')
+        org="https://$host/$user"
+    # Handle different URL formats
+    elif [[ "$url" =~ ^https?://([^/]+)/([^/]+)/([^/]+) ]]; then
+        # HTTPS format: https://github.com/user/repo
+        local host="${BASH_REMATCH[1]}"
+        local user="${BASH_REMATCH[2]}"
+        local repo="${BASH_REMATCH[3]}"
+        
+        # Skip if it looks like an API URL or special path
+        if [[ "$user" == "api" ]] || [[ "$user" == "raw" ]] || [[ "$user" == "gist" ]] || [[ "$user" == "pub" ]]; then
+            return 1
+        fi
+        
+        org="https://$host/$user"
+    elif [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/]+) ]]; then
+        # SSH format: git@github.com:user/repo
+        local host="${BASH_REMATCH[1]}"
+        local user="${BASH_REMATCH[2]}"
+        local repo="${BASH_REMATCH[3]}"
+        org="https://$host/$user"
+    elif [[ "$url" =~ ^ssh://git@([^/]+)/([^/]+)/([^/]+) ]]; then
+        # SSH URL format: ssh://git@gitlab.com/user/repo
+        local host="${BASH_REMATCH[1]}"
+        local user="${BASH_REMATCH[2]}"
+        local repo="${BASH_REMATCH[3]}"
+        org="https://$host/$user"
+    elif [[ "$url" =~ ^git://([^/]+)/([^/]+)/([^/]+) ]]; then
+        # Git protocol: git://github.com/user/repo
+        local host="${BASH_REMATCH[1]}"
+        local user="${BASH_REMATCH[2]}"
+        local repo="${BASH_REMATCH[3]}"
+        org="https://$host/$user"
+    fi
+    
+    if [[ -n "$org" ]]; then
+        echo "$org"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to process a line and extract git URLs
+process_line() {
+    local line="$1"
+    local urls=()
+    
+    # Define patterns for git URLs (order matters - more specific first)
+    local patterns=(
+        # Kernel.org and similar deep path structures (most specific)
+        'https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/pub/scm/[a-zA-Z0-9._~:/?#@!$&'"'"'()*+,;=-]+\.git'
+        
+        # HTTPS URLs with .git extension
+        'https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[a-zA-Z0-9._~:/?#@!$&'"'"'()*+,;=-]+)?\.git'
+        
+        # HTTPS URLs that look like git repos (github, gitlab, gitea, etc)
+        'https?://(github|gitlab|gitea|gogs|forgejo|codeberg|git[a-zA-Z0-9.-]*)\.[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+/?'
+        
+        # SSH URLs (git@host:user/repo format)
+        'git@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}:[a-zA-Z0-9._/-]+(/[a-zA-Z0-9._-]+)?(\.git)?'
+        
+        # SSH URL format (ssh://git@host/user/repo)
+        'ssh://git@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[a-zA-Z0-9._/-]+(/[a-zA-Z0-9._-]+)?(\.git)?'
+        
+        # Git protocol URLs
+        'git://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[a-zA-Z0-9._/-]+(/[a-zA-Z0-9._-]+)?(\.git)?'
+        
+        # GitLab specific patterns (including self-hosted) - must have at least 2 path segments
+        'https?://[a-zA-Z0-9.-]*gitlab[a-zA-Z0-9.-]*/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)*/?'
+    )
+    
+    # Extract URLs using grep -o for each pattern
+    for pattern in "${patterns[@]}"; do
+        while IFS= read -r url; do
+            # Skip if URL is already in array
+            local found=false
+            for existing in "${urls[@]}"; do
+                if [[ "$existing" == "$url" ]]; then
+                    found=true
+                    break
+                fi
+            done
+            if [[ "$found" == false ]]; then
+                urls+=("$url")
+            fi
+        done < <(echo "$line" | grep -oE "$pattern" 2>/dev/null || true)
+    done
+    
+    # Process found URLs
+    for url in "${urls[@]}"; do
+        # Clean up the URL
+        url="${url%/}"  # Remove trailing slash
+        
+        # Skip URLs that are obviously incomplete
+        if [[ "$url" =~ /pub/scm$ ]]; then
+            continue
+        fi
+        
+        # Handle org extraction if requested
+        if [[ "$ORGS" == true ]] || [[ "$ORGS_ONLY" == true ]]; then
+            if org=$(extract_org "$url"); then
+                echo "$org"
+            elif [[ "$ORGS_ONLY" == false ]]; then
+                # Only print the repo URL if not in orgs-only mode
+                echo "$url"
+            fi
+        else
+            echo "$url"
+        fi
+    done
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            version
+            exit 0
+            ;;
+        -f|--format)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --format requires an argument" >&2
+                exit 1
+            fi
+            FORMAT="$2"
+            if [[ ! "$FORMAT" =~ ^(lines|spaces|json|yaml)$ ]]; then
+                echo "Error: Invalid format: $FORMAT. Must be lines, spaces, json, or yaml" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        -o|--orgs)
+            ORGS=true
+            shift
+            ;;
+        -O|--orgs-only)
+            ORGS_ONLY=true
+            ORGS=true  # --orgs-only implies --orgs
+            shift
+            ;;
+        -*)
+            echo "Error: Unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Function to add URL to collection with deduplication
+add_url_to_collection() {
+    local url="$1"
+    if [[ -n "$url" ]]; then
+        found=false
+        for existing in "${all_urls[@]}"; do
+            if [[ "$existing" == "$url" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            all_urls+=("$url")
+        fi
+    fi
+}
+
+# Function to process input source
+process_input() {
+    while IFS= read -r line; do
+        while IFS= read -r url; do
+            add_url_to_collection "$url"
+        done < <(process_line "$line")
+    done
+}
+
+# Collect all URLs
+all_urls=()
+
+# Check if stdin has data (non-blocking check)
+stdin_has_data=false
+if [[ ! -t 0 ]] || [[ -p /dev/stdin ]]; then
+    stdin_has_data=true
+fi
+
+# Process inputs
+if [[ $# -eq 0 ]]; then
+    # No arguments - read only from stdin
+    if [[ "$stdin_has_data" == true ]]; then
+        process_input < /dev/stdin
+    else
+        echo "Error: No input provided. Provide files, URLs, or pipe data to stdin." >&2
+        exit 1
+    fi
+else
+    # Process each argument
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^https?:// ]]; then
+            # It's a URL - fetch with curl
+            if content=$(curl -sL "$arg" 2>/dev/null); then
+                echo "$content" | process_input
+            else
+                echo "Error: Failed to fetch URL: $arg" >&2
+                continue
+            fi
+        elif [[ -f "$arg" ]]; then
+            # It's a file
+            process_input < "$arg"
+        elif [[ "$arg" == "-" ]]; then
+            # Explicit stdin marker
+            if [[ "$stdin_has_data" == true ]]; then
+                process_input < /dev/stdin
+            else
+                echo "Error: No data available on stdin" >&2
+            fi
+        else
+            echo "Error: Not a valid file or URL: $arg" >&2
+            continue
+        fi
+    done
+    
+    # Also process stdin if it has data and wasn't explicitly requested with "-"
+    if [[ "$stdin_has_data" == true ]] && [[ ! " $* " =~ " - " ]]; then
+        process_input < /dev/stdin
+    fi
+fi
+
+# Output results
+if [[ ${#all_urls[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+# Output based on format
+case "$FORMAT" in
+    lines)
+        # Output one URL per line (default)
+        printf '%s\n' "${all_urls[@]}"
+        ;;
+    spaces)
+        # Output all URLs on one line separated by spaces
+        echo "${all_urls[@]}"
+        ;;
+    json)
+        # Output as JSON array with metadata
+        echo "["
+        first=true
+        for url in "${all_urls[@]}"; do
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                echo ","
+            fi
+            echo -n "  {"
+            
+            # Get metadata
+            eval "$(extract_metadata "$url")"
+            
+            # Output JSON object
+            echo -n "\"url\": \"$url\""
+            echo -n ", \"provider\": \"$provider\""
+            echo -n ", \"org_name\": \"$org_name\""
+            echo -n ", \"repo_name\": \"$repo_name\""
+            echo -n ", \"org_url\": \"$org_url\""
+            echo -n "}"
+        done
+        echo
+        echo "]"
+        ;;
+    yaml)
+        # Output as YAML
+        echo "repositories:"
+        for url in "${all_urls[@]}"; do
+            # Get metadata
+            eval "$(extract_metadata "$url")"
+            
+            echo "  - url: \"$url\""
+            echo "    provider: \"$provider\""
+            echo "    org_name: \"$org_name\""
+            echo "    repo_name: \"$repo_name\""
+            echo "    org_url: \"$org_url\""
+        done
+        ;;
+esac
