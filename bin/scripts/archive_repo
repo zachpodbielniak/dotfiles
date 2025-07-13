@@ -26,9 +26,11 @@ import time
 from urllib.parse import urlparse
 import traceback
 import select
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Gitea server configuration - CHANGE THIS TO YOUR GITEA INSTANCE
-GITEA_SERVER_URL = 'http://nas-main:3000'
+GITEA_SERVER_URL = 'https://gitea.podbielniak.com'
 
 # Gitea API base URL (constructed from server URL)
 GITEA_API_BASE = f'{GITEA_SERVER_URL}/api/v1'
@@ -38,6 +40,9 @@ PERSONAL_ACCOUNTS = [
     'https://gitlab.com/zachpodbielniak',
     'https://github.com/zachpodbielniak'
 ]
+
+# Thread-safe printing
+print_lock = threading.Lock()
 
 # Service type mappings
 SERVICE_TYPES = {
@@ -55,11 +60,21 @@ SERVICE_TYPES = {
 def debug_log(message, debug=False):
     """Print debug messages if debug mode is enabled."""
     if debug:
-        print(f"[DEBUG] {message}", file=sys.stderr)
+        with print_lock:
+            print(f"[DEBUG] {message}", file=sys.stderr)
 
 def dry_run_log(message):
     """Print dry-run messages."""
-    print(f"[DRY-RUN] {message}")
+    with print_lock:
+        print(f"[DRY-RUN] {message}")
+
+def safe_print(message, file=None):
+    """Thread-safe print function."""
+    with print_lock:
+        if file:
+            print(message, file=file)
+        else:
+            print(message)
 
 def run_curl(url, method='GET', data=None, token=None, debug=False, dry_run=False):
     """Run curl command and return response."""
@@ -481,6 +496,35 @@ def check_repository_exists(repo_owner, repo_name, token, debug=False, dry_run=F
     
     return False
 
+def migrate_repository_worker(args_tuple):
+    """Worker function for parallel repository migration."""
+    repo_url, service, repo_owner, repo_name, token, debug, delay, dry_run = args_tuple
+    
+    try:
+        # Check if owner exists, create if needed
+        exists, owner_type = owner_exists_in_gitea(repo_owner, token, debug)
+        if not exists:
+            # Owner doesn't exist, create as organization
+            org_website = construct_org_url(repo_url, repo_owner, service, debug)
+            debug_log(f"Creating organization: {repo_owner} with website: {org_website}", debug)
+            if not create_organization(repo_owner, token, website=org_website, debug=debug, dry_run=dry_run):
+                debug_log(f"Failed to create organization: {repo_owner}", debug)
+                return False, repo_url, f"Failed to create organization: {repo_owner}"
+        
+        # Migrate the repository
+        success = migrate_repository(repo_url, service, repo_owner, repo_name, token, debug, delay, dry_run)
+        
+        if success:
+            safe_print(f"✓ Migrated: {repo_owner}/{repo_name}", file=sys.stderr)
+            return True, repo_url, None
+        else:
+            return False, repo_url, f"Migration failed for {repo_owner}/{repo_name}"
+    
+    except Exception as e:
+        error_msg = f"Exception migrating {repo_owner}/{repo_name}: {str(e)}"
+        debug_log(error_msg, debug)
+        return False, repo_url, error_msg
+
 def migrate_repository(repo_url, service, repo_owner, repo_name, token, debug=False, delay=0, dry_run=False):
     """Migrate a repository to Gitea."""
     # First check if repository already exists
@@ -882,6 +926,10 @@ def main():
   # Mirror all private repos from personal accounts
   archive_repo --mirror-personal-repos
   
+  # Use parallel processing for faster archiving
+  archive_repo https://github.com/torvalds --parallel 4
+  archive_repo https://github.com/kubernetes --parallel 8 --delay 5
+  
   # Read URLs from stdin
   cat urls.txt | archive_repo
   extract_git_links README.md | archive_repo
@@ -937,6 +985,8 @@ Exit codes:
                       help='Mirror all private repos you have access to from accounts in PERSONAL_ACCOUNTS')
     parser.add_argument('--dry-run', action='store_true',
                       help='Show what would be done without actually doing it')
+    parser.add_argument('--parallel', type=int, default=1, metavar='N',
+                      help='Number of parallel migration requests (default: 1)')
     
     args = parser.parse_args()
     
@@ -1055,20 +1105,46 @@ Exit codes:
                     continue
             
             # Mirror each repository
-            for i, repo in enumerate(owner_repos):
-                repo_name = repo['name']
-                clone_url = repo['clone_url']
-                service = repo['service']
+            if args.parallel > 1 and len(owner_repos) > 1:
+                # Parallel processing
+                safe_print(f"Processing {len(owner_repos)} repositories for {owner} with {args.parallel} parallel workers...", file=sys.stderr)
                 
-                print(f"[{i+1}/{len(owner_repos)}] Mirroring {owner}/{repo_name} (private: {repo['private']})...", file=sys.stderr)
+                # Prepare work items
+                work_items = []
+                for repo in owner_repos:
+                    work_items.append((repo['clone_url'], repo['service'], owner, repo['name'], 
+                                     gitea_token, args.debug, args.delay, args.dry_run))
                 
-                if migrate_repository(clone_url, service, owner, repo_name, gitea_token, args.debug, args.delay, args.dry_run):
-                    total_success += 1
-                    debug_log(f"Successfully mirrored: {owner}/{repo_name}", args.debug)
-                else:
-                    total_failed += 1
-                    failed_repos.append(f"{owner}/{repo_name}")
-                    print(f"Failed to mirror: {owner}/{repo_name}", file=sys.stderr)
+                # Process in parallel
+                with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+                    future_to_repo = {executor.submit(migrate_repository_worker, item): item[3] for item in work_items}
+                    
+                    for future in as_completed(future_to_repo):
+                        success, _, error_msg = future.result()
+                        if success:
+                            total_success += 1
+                        else:
+                            total_failed += 1
+                            repo_name = future_to_repo[future]
+                            failed_repos.append(f"{owner}/{repo_name}")
+                            if error_msg:
+                                safe_print(f"✗ Failed: {error_msg}", file=sys.stderr)
+            else:
+                # Sequential processing
+                for i, repo in enumerate(owner_repos):
+                    repo_name = repo['name']
+                    clone_url = repo['clone_url']
+                    service = repo['service']
+                    
+                    print(f"[{i+1}/{len(owner_repos)}] Mirroring {owner}/{repo_name} (private: {repo['private']})...", file=sys.stderr)
+                    
+                    if migrate_repository(clone_url, service, owner, repo_name, gitea_token, args.debug, args.delay, args.dry_run):
+                        total_success += 1
+                        debug_log(f"Successfully mirrored: {owner}/{repo_name}", args.debug)
+                    else:
+                        total_failed += 1
+                        failed_repos.append(f"{owner}/{repo_name}")
+                        print(f"Failed to mirror: {owner}/{repo_name}", file=sys.stderr)
         
         # Summary
         print(f"\n{'='*60}", file=sys.stderr)
@@ -1419,6 +1495,9 @@ Exit codes:
         total_failed = 0
         all_failed_items = []
         
+        # Collect all individual repos for potential parallel processing
+        individual_repos = []
+        
         # Process each URL
         for url in all_urls:
             debug_log(f"\n{'='*60}", args.debug)
@@ -1465,35 +1544,67 @@ Exit codes:
                 success_count = 0
                 failed_repos = []
                 
-                for repo_url in repo_urls:
-                    default_owner, repo_name = parse_repo_info(repo_url, args.debug)
-                    if not repo_name:
-                        debug_log(f"Skipping invalid repo URL: {repo_url}", args.debug)
-                        continue
+                if args.parallel > 1:
+                    # Parallel processing
+                    safe_print(f"Processing {len(repo_urls)} repositories with {args.parallel} parallel workers...", file=sys.stderr)
                     
-                    # Determine repo owner for Gitea
-                    repo_owner = args.org if args.org else default_owner
-                    
-                    debug_log(f"Archiving {repo_owner}/{repo_name} from {repo_url}", args.debug)
-                    
-                    # Check if owner exists as user or org
-                    exists, owner_type = owner_exists_in_gitea(repo_owner, token, args.debug)
-                    if not exists:
-                        # Owner doesn't exist, create as organization
-                        org_website = construct_org_url(repo_url, repo_owner, service, args.debug)
-                        debug_log(f"Creating organization: {repo_owner} with website: {org_website}", args.debug)
-                        if not create_organization(repo_owner, token, website=org_website, debug=args.debug, dry_run=args.dry_run):
-                            debug_log(f"Failed to create organization: {repo_owner}", args.debug)
+                    # Prepare work items
+                    work_items = []
+                    for repo_url in repo_urls:
+                        default_owner, repo_name = parse_repo_info(repo_url, args.debug)
+                        if not repo_name:
+                            debug_log(f"Skipping invalid repo URL: {repo_url}", args.debug)
                             failed_repos.append(repo_url)
                             continue
+                        
+                        # Determine repo owner for Gitea
+                        repo_owner = args.org if args.org else default_owner
+                        
+                        work_items.append((repo_url, service, repo_owner, repo_name, token, args.debug, args.delay, args.dry_run))
                     
-                    # Migrate the repository
-                    if migrate_repository(repo_url, service, repo_owner, repo_name, token, args.debug, args.delay, args.dry_run):
-                        success_count += 1
-                        debug_log(f"Successfully archived: {repo_owner}/{repo_name}", args.debug)
-                    else:
-                        failed_repos.append(repo_url)
-                        debug_log(f"Failed to archive: {repo_owner}/{repo_name}", args.debug)
+                    # Process in parallel
+                    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+                        future_to_url = {executor.submit(migrate_repository_worker, item): item[0] for item in work_items}
+                        
+                        for future in as_completed(future_to_url):
+                            success, repo_url, error_msg = future.result()
+                            if success:
+                                success_count += 1
+                            else:
+                                failed_repos.append(repo_url)
+                                if error_msg:
+                                    safe_print(f"✗ Failed: {error_msg}", file=sys.stderr)
+                else:
+                    # Sequential processing (original behavior)
+                    for repo_url in repo_urls:
+                        default_owner, repo_name = parse_repo_info(repo_url, args.debug)
+                        if not repo_name:
+                            debug_log(f"Skipping invalid repo URL: {repo_url}", args.debug)
+                            continue
+                        
+                        # Determine repo owner for Gitea
+                        repo_owner = args.org if args.org else default_owner
+                        
+                        debug_log(f"Archiving {repo_owner}/{repo_name} from {repo_url}", args.debug)
+                        
+                        # Check if owner exists as user or org
+                        exists, owner_type = owner_exists_in_gitea(repo_owner, token, args.debug)
+                        if not exists:
+                            # Owner doesn't exist, create as organization
+                            org_website = construct_org_url(repo_url, repo_owner, service, args.debug)
+                            debug_log(f"Creating organization: {repo_owner} with website: {org_website}", args.debug)
+                            if not create_organization(repo_owner, token, website=org_website, debug=args.debug, dry_run=args.dry_run):
+                                debug_log(f"Failed to create organization: {repo_owner}", args.debug)
+                                failed_repos.append(repo_url)
+                                continue
+                        
+                        # Migrate the repository
+                        if migrate_repository(repo_url, service, repo_owner, repo_name, token, args.debug, args.delay, args.dry_run):
+                            success_count += 1
+                            debug_log(f"Successfully archived: {repo_owner}/{repo_name}", args.debug)
+                        else:
+                            failed_repos.append(repo_url)
+                            debug_log(f"Failed to archive: {repo_owner}/{repo_name}", args.debug)
                 
                 # Update totals
                 total_success += success_count
