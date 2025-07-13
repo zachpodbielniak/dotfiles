@@ -342,7 +342,7 @@ def parse_repo_info(url, debug=False):
     
     # Handle various URL formats
     patterns = [
-        r'(?:https?://|git@)(?:[^/:]+)[:/]([^/]+)/([^/]+)$',
+        r'(?:https?://|git@)(?:[^/:]+(?::\d+)?)[:/]([^/]+)/([^/]+)/?$',
         r'(?:ssh://)?git@([^:]+):([^/]+)/([^/]+)$',
     ]
     
@@ -464,12 +464,16 @@ def create_organization(org_name, token, website=None, debug=False, dry_run=Fals
     debug_log(f"Failed to create organization: {response}", debug)
     return False
 
-def check_repository_exists(repo_owner, repo_name, token, debug=False):
+def check_repository_exists(repo_owner, repo_name, token, debug=False, dry_run=False):
     """Check if a repository already exists in Gitea."""
     url = f"{GITEA_API_BASE}/repos/{repo_owner}/{repo_name}"
     debug_log(f"Checking if repository exists: {repo_owner}/{repo_name}", debug)
     
-    response = run_curl(url, token=token, debug=debug)
+    if dry_run:
+        dry_run_log(f"Would check if repository exists: {repo_owner}/{repo_name}")
+        return True  # Assume exists for dry run
+    
+    response = run_curl(url, token=token, debug=debug, dry_run=dry_run)
     
     if response and 'id' in response:
         debug_log(f"Repository already exists: {repo_owner}/{repo_name}", debug)
@@ -583,12 +587,16 @@ def list_org_repositories(org_name, token, debug=False):
     
     return repos
 
-def delete_repository(owner, repo_name, token, debug=False):
+def delete_repository(owner, repo_name, token, debug=False, dry_run=False):
     """Delete a repository from Gitea."""
     url = f"{GITEA_API_BASE}/repos/{owner}/{repo_name}"
     debug_log(f"Deleting repository: {owner}/{repo_name}", debug)
     
-    response = run_curl(url, method='DELETE', token=token, debug=debug)
+    if dry_run:
+        dry_run_log(f"Would delete repository: {owner}/{repo_name}")
+        return True
+    
+    response = run_curl(url, method='DELETE', token=token, debug=debug, dry_run=dry_run)
     
     # A successful deletion returns 204 No Content (empty response)
     if response is None or response == {}:
@@ -847,6 +855,10 @@ def main():
   archive_repo --delete-repo http://nas-main:3000/torvalds/linux
   archive_repo --delete-repo my-org/my-repo --debug
   
+  # Delete multiple repositories (with stdin)
+  echo -e "torvalds/linux\ngit/git" | archive_repo --delete-repo org/repo
+  cat repos-to-delete.txt | archive_repo --delete-repo first-repo
+  
   # Delete an organization and all its repositories from Gitea
   archive_repo --delete-org torvalds
   archive_repo --delete-org my-archives --debug
@@ -905,8 +917,8 @@ Exit codes:
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--delete-org', metavar='ORG_NAME',
                       help='Delete an organization and all its repositories from Gitea')
-    parser.add_argument('--delete-repo', metavar='REPO',
-                      help='Delete a repository from Gitea (format: org/repo or full URL)')
+    parser.add_argument('--delete-repo', metavar='REPO', nargs='?', const='',
+                      help='Delete repository(ies) from Gitea (format: org/repo or full URL). Can read from stdin.')
     parser.add_argument('--api-call', metavar='ENDPOINT',
                       help='Make a direct API call to Gitea (e.g., /api/v1/user)')
     parser.add_argument('--method', default='GET', choices=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
@@ -1221,38 +1233,103 @@ Exit codes:
         sys.exit(0)
     
     # Handle --delete-repo option
-    if args.delete_repo:
-        repo_arg = args.delete_repo
-        debug_log(f"Delete repository mode: {repo_arg}", args.debug)
+    if args.delete_repo is not None:
+        # Collect repositories to delete from both argument and stdin
+        repos_to_delete = []
         
-        # Parse repository information
-        owner, repo_name = parse_repo_from_delete_arg(repo_arg, args.debug)
+        # Add repository from command line argument (if not empty)
+        if args.delete_repo:
+            repos_to_delete.append(args.delete_repo)
         
-        if not owner or not repo_name:
-            print(f"Error: Invalid repository format: {repo_arg}", file=sys.stderr)
+        # Check for additional repositories from stdin
+        if has_stdin_data():
+            stdin_repos = read_urls_from_stdin()
+            if stdin_repos:
+                debug_log(f"Read {len(stdin_repos)} repository identifiers from stdin", args.debug)
+                repos_to_delete.extend(stdin_repos)
+        
+        if not repos_to_delete:
+            print("Error: No repositories to delete provided", file=sys.stderr)
+            sys.exit(1)
+        
+        debug_log(f"Delete repository mode: {len(repos_to_delete)} repositories", args.debug)
+        
+        # Parse and validate all repositories first
+        parsed_repos = []
+        invalid_repos = []
+        
+        for repo_arg in repos_to_delete:
+            owner, repo_name = parse_repo_from_delete_arg(repo_arg, args.debug)
+            
+            if not owner or not repo_name:
+                debug_log(f"Invalid repository format: {repo_arg}", args.debug)
+                invalid_repos.append(repo_arg)
+                continue
+            
+            # Check if repository exists
+            if not check_repository_exists(owner, repo_name, token, args.debug, dry_run=args.dry_run):
+                debug_log(f"Repository '{owner}/{repo_name}' does not exist in Gitea", args.debug)
+                invalid_repos.append(f"{owner}/{repo_name} (not found)")
+                continue
+            
+            parsed_repos.append((owner, repo_name, repo_arg))
+        
+        if invalid_repos:
+            print(f"Error: Invalid or non-existent repositories:", file=sys.stderr)
+            for repo in invalid_repos:
+                print(f"  - {repo}", file=sys.stderr)
             print("Use format: org/repo or full repository URL", file=sys.stderr)
             sys.exit(1)
         
-        # Check if repository exists
-        if not check_repository_exists(owner, repo_name, token, args.debug):
-            print(f"Error: Repository '{owner}/{repo_name}' does not exist in Gitea", file=sys.stderr)
+        if not parsed_repos:
+            print("Error: No valid repositories to delete", file=sys.stderr)
             sys.exit(1)
         
-        # Confirm deletion
-        print(f"This will permanently delete the repository '{owner}/{repo_name}'.", file=sys.stderr)
-        response = input("Are you sure you want to proceed? (yes/no): ")
+        # Show what will be deleted
+        print(f"This will permanently delete {len(parsed_repos)} repositories:", file=sys.stderr)
+        for owner, repo_name, _ in parsed_repos:
+            print(f"  - {owner}/{repo_name}", file=sys.stderr)
         
-        if response.lower() != 'yes':
-            print("Deletion cancelled.", file=sys.stderr)
+        if args.dry_run:
+            print("[DRY-RUN] Would delete the above repositories", file=sys.stderr)
+            for owner, repo_name, _ in parsed_repos:
+                dry_run_log(f"Would delete repository: {owner}/{repo_name}")
             sys.exit(0)
         
-        # Delete the repository
-        if delete_repository(owner, repo_name, token, args.debug):
-            print(f"Successfully deleted repository '{owner}/{repo_name}'.", file=sys.stderr)
-            sys.exit(0)
-        else:
-            print(f"Error: Failed to delete repository '{owner}/{repo_name}'", file=sys.stderr)
+        # Confirm deletion (unless --no-confirm)
+        if not args.no_confirm:
+            response = input("Are you sure you want to proceed? (yes/no): ")
+            
+            if response.lower() != 'yes':
+                print("Deletion cancelled.", file=sys.stderr)
+                sys.exit(0)
+        
+        # Delete repositories
+        deleted_count = 0
+        failed_repos = []
+        
+        for owner, repo_name, repo_arg in parsed_repos:
+            debug_log(f"Deleting repository: {owner}/{repo_name}", args.debug)
+            
+            if delete_repository(owner, repo_name, token, args.debug, dry_run=args.dry_run):
+                print(f"Successfully deleted repository '{owner}/{repo_name}'.", file=sys.stderr)
+                deleted_count += 1
+            else:
+                print(f"Error: Failed to delete repository '{owner}/{repo_name}'", file=sys.stderr)
+                failed_repos.append(f"{owner}/{repo_name}")
+        
+        # Summary
+        print(f"\nDeletion Summary:", file=sys.stderr)
+        print(f"Successfully deleted: {deleted_count}", file=sys.stderr)
+        print(f"Failed: {len(failed_repos)}", file=sys.stderr)
+        
+        if failed_repos:
+            print("Failed repositories:", file=sys.stderr)
+            for repo in failed_repos:
+                print(f"  - {repo}", file=sys.stderr)
             sys.exit(1)
+        
+        sys.exit(0)
     
     # Handle --delete-org option
     if args.delete_org:
