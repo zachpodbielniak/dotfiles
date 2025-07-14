@@ -1,0 +1,514 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Script name and version
+SCRIPT_NAME=$(basename "$0")
+VERSION="1.0.0"
+
+# Default options
+DELETE=false
+ARCHIVE=""
+KEEP_STRATEGY="oldest"  # oldest, newest, ask
+NO_CONFIRM=false
+DRY_RUN=false
+RECURSIVE=false
+
+# Temporary files for storing checksums
+TMP_DIR=$(mktemp -d)
+CRC32_FILE="${TMP_DIR}/crc32_checksums"
+SHA256_FILE="${TMP_DIR}/sha256_checksums"
+DUPES_FILE="${TMP_DIR}/duplicates"
+
+# Cleanup on exit
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+# Function to display usage
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [OPTIONS] [FILE|DIRECTORY...]
+
+Find duplicate files using CRC32 for initial detection and SHA256 for verification.
+
+FILES can be provided as arguments, via stdin (one per line), or both.
+Without -r/--recursive, only specified files are checked (not directory contents).
+
+OPTIONS:
+    -h, --help          Show this help message
+    -v, --version       Show version information
+    -d, --delete        Delete duplicate files (keeps oldest by default)
+    -a, --archive DIR   Move duplicates to DIR instead of deleting
+    -r, --recursive     Process directories recursively
+    --keep-oldest       Keep oldest file when deleting (default)
+    --keep-newest       Keep newest file when deleting
+    --keep-ask          Ask which file to keep for each duplicate set
+    --no-confirm        Don't ask for confirmation before operations
+    --dry-run          Show what would be done without doing it
+
+EXAMPLES:
+    # Find duplicates in specific files
+    $SCRIPT_NAME file1.txt file2.txt file3.txt
+
+    # Find duplicates recursively in directories
+    $SCRIPT_NAME -r /path/to/dir1 /path/to/dir2
+
+    # Find duplicates from file list
+    find . -name "*.jpg" | $SCRIPT_NAME
+
+    # Delete duplicates, keeping oldest
+    $SCRIPT_NAME -d -r /path/to/photos
+
+    # Archive duplicates for review
+    $SCRIPT_NAME -a /tmp/duplicates -r /path/to/files
+
+    # Interactive mode - ask which to keep
+    $SCRIPT_NAME -d --keep-ask -r /path/to/documents
+
+    # See what would be deleted without actually deleting
+    $SCRIPT_NAME -d --dry-run -r /path/to/media
+
+NOTES:
+    - CRC32 is used for fast initial detection
+    - SHA256 verifies actual duplicates (prevents false positives)
+    - File modification time determines age (oldest/newest)
+    - Symlinks are skipped
+    - Hidden files are included by default
+
+EOF
+}
+
+# Function to show version
+version() {
+    echo "$SCRIPT_NAME version $VERSION"
+}
+
+# Function to print error messages
+error() {
+    echo "Error: $*" >&2
+}
+
+# Function to print debug/dry-run messages
+dry_run_msg() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY-RUN] $*" >&2
+    fi
+}
+
+# Function to get file modification time (seconds since epoch)
+get_file_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+# Function to calculate CRC32 checksum
+calc_crc32() {
+    local file="$1"
+    # Try different CRC32 tools in order of preference
+    if command -v crc32 >/dev/null 2>&1; then
+        crc32 "$file" 2>/dev/null
+    elif command -v cksum >/dev/null 2>&1; then
+        # cksum gives CRC32 in a different format, but we can use it
+        cksum "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v python3 >/dev/null 2>&1; then
+        # Fallback to Python
+        python3 -c "import zlib; print(format(zlib.crc32(open('$file','rb').read()) & 0xffffffff, '08x'))" 2>/dev/null
+    else
+        error "No CRC32 tool available (install crc32, cksum, or python3)"
+        return 1
+    fi
+}
+
+# Function to calculate SHA256 checksum
+calc_sha256() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    else
+        error "No SHA256 tool available (install sha256sum or shasum)"
+        return 1
+    fi
+}
+
+# Function to collect files based on arguments and options
+collect_files() {
+    local files=()
+    
+    # Read from stdin if available
+    if [[ ! -t 0 ]]; then
+        while IFS= read -r file; do
+            if [[ -n "$file" ]]; then
+                files+=("$file")
+            fi
+        done
+    fi
+    
+    # Add command line arguments
+    for arg in "$@"; do
+        files+=("$arg")
+    done
+    
+    # Process collected paths
+    for path in "${files[@]}"; do
+        if [[ -f "$path" ]] && [[ ! -L "$path" ]]; then
+            # It's a regular file (not a symlink)
+            echo "$path"
+        elif [[ -d "$path" ]] && [[ "$RECURSIVE" == true ]]; then
+            # It's a directory and we're in recursive mode
+            find "$path" -type f -print
+        elif [[ -d "$path" ]] && [[ "$RECURSIVE" == false ]]; then
+            # Directory but not recursive - skip with warning
+            echo "Warning: '$path' is a directory. Use -r/--recursive to process its contents." >&2
+        elif [[ ! -e "$path" ]]; then
+            echo "Warning: '$path' does not exist, skipping." >&2
+        fi
+    done | sort -u  # Remove duplicates from the file list
+}
+
+# Function to find duplicates
+find_duplicates() {
+    local total_files=0
+    local crc_matches=0
+    
+    echo "Phase 1: Calculating CRC32 checksums..." >&2
+    
+    # Calculate CRC32 for all files
+    while IFS= read -r file; do
+        if [[ -f "$file" ]] && [[ ! -L "$file" ]]; then
+            if crc=$(calc_crc32 "$file"); then
+                echo "$crc $file" >> "$CRC32_FILE"
+                ((total_files++)) || true
+                dry_run_msg "Would calculate CRC32 for: $file"
+            fi
+        fi
+    done < "${TMP_DIR}/all_files"
+    
+    if [[ "$total_files" -eq 0 ]]; then
+        echo "No files to process." >&2
+        return 0
+    fi
+    
+    echo "Processed $total_files files." >&2
+    
+    # Find CRC32 duplicates
+    echo "Phase 2: Finding CRC32 matches..." >&2
+    
+    # Sort by CRC32 and find duplicates
+    sort "$CRC32_FILE" | while read -r crc file; do
+        echo "$crc"
+    done | uniq -d > "${TMP_DIR}/dup_crcs"
+    
+    # For each duplicate CRC32, verify with SHA256
+    echo "Phase 3: Verifying duplicates with SHA256..." >&2
+    
+    while IFS= read -r dup_crc; do
+        # Get all files with this CRC32
+        grep "^$dup_crc " "$CRC32_FILE" | cut -d' ' -f2- > "${TMP_DIR}/crc_group"
+        
+        # Calculate SHA256 for this group
+        > "${TMP_DIR}/sha_group"
+        while IFS= read -r file; do
+            if sha=$(calc_sha256 "$file"); then
+                echo "$sha $file" >> "${TMP_DIR}/sha_group"
+                ((crc_matches++)) || true
+                dry_run_msg "Would calculate SHA256 for: $file"
+            fi
+        done < "${TMP_DIR}/crc_group"
+        
+        # Find SHA256 duplicates within this CRC group
+        sort "${TMP_DIR}/sha_group" | while read -r sha file; do
+            echo "$sha"
+        done | uniq -d > "${TMP_DIR}/dup_shas"
+        
+        # Output duplicate groups
+        while IFS= read -r dup_sha; do
+            grep "^$dup_sha " "${TMP_DIR}/sha_group" | cut -d' ' -f2- | while IFS= read -r file; do
+                mtime=$(get_file_mtime "$file")
+                echo "$dup_sha $mtime $file"
+            done | sort -k2 -n  # Sort by modification time
+        done < "${TMP_DIR}/dup_shas"
+        
+    done < "${TMP_DIR}/dup_crcs" > "$DUPES_FILE"
+    
+    echo "Verified $crc_matches potential duplicates." >&2
+}
+
+# Function to handle duplicate group
+handle_duplicate_group() {
+    local sha="$1"
+    local -a files=()
+    local -a mtimes=()
+    local keep_index=0
+    local i=0
+    
+    # Read all files in this duplicate group
+    while IFS=' ' read -r file_sha mtime file; do
+        if [[ "$file_sha" == "$sha" ]]; then
+            files+=("$file")
+            mtimes+=("$mtime")
+        fi
+    done < "$DUPES_FILE"
+    
+    # Skip if less than 2 files
+    if [[ ${#files[@]} -lt 2 ]]; then
+        return
+    fi
+    
+    # Print duplicate group
+    echo "Duplicate set (SHA256: $sha):"
+    for i in "${!files[@]}"; do
+        echo "  [$i] ${files[$i]} (modified: $(date -d "@${mtimes[$i]}" 2>/dev/null || date -r "${mtimes[$i]}" 2>/dev/null || echo "unknown"))"
+    done
+    
+    # Determine which file to keep based on strategy
+    case "$KEEP_STRATEGY" in
+        oldest)
+            keep_index=0  # Already sorted by mtime ascending
+            ;;
+        newest)
+            keep_index=$((${#files[@]} - 1))  # Last element
+            ;;
+        ask)
+            if [[ "$DRY_RUN" == false ]]; then
+                echo "Which file would you like to keep? (0-$((${#files[@]} - 1))): "
+                read -r keep_index
+                # Validate input
+                if ! [[ "$keep_index" =~ ^[0-9]+$ ]] || [[ "$keep_index" -ge ${#files[@]} ]]; then
+                    echo "Invalid selection, keeping oldest by default"
+                    keep_index=0
+                fi
+            else
+                echo "[DRY-RUN] Would ask which file to keep"
+                keep_index=0
+            fi
+            ;;
+    esac
+    
+    echo "Keeping: ${files[$keep_index]}"
+    
+    # Handle other files
+    for i in "${!files[@]}"; do
+        if [[ "$i" -ne "$keep_index" ]]; then
+            handle_file "${files[$i]}"
+        fi
+    done
+    echo
+}
+
+# Function to handle a single file (delete or archive)
+handle_file() {
+    local file="$1"
+    
+    if [[ "$DELETE" == true ]]; then
+        # Delete mode
+        if [[ "$DRY_RUN" == true ]]; then
+            dry_run_msg "Would delete: $file"
+            dry_run_msg "Command: rm \"$file\""
+        else
+            if [[ "$NO_CONFIRM" == true ]]; then
+                echo "Deleting: $file"
+                rm "$file"
+            else
+                echo -n "Delete $file? (y/n): "
+                read -r response
+                if [[ "$response" =~ ^[Yy]$ ]]; then
+                    echo "Deleting: $file"
+                    rm "$file"
+                else
+                    echo "Skipped: $file"
+                fi
+            fi
+        fi
+    elif [[ -n "$ARCHIVE" ]]; then
+        # Archive mode
+        local dest_dir="$ARCHIVE"
+        local dest_file="$dest_dir/$(basename "$file")"
+        local counter=1
+        
+        # Handle filename conflicts
+        while [[ -e "$dest_file" ]]; do
+            local base="${file%.*}"
+            local ext="${file##*.}"
+            if [[ "$base" == "$file" ]]; then
+                # No extension
+                dest_file="$dest_dir/$(basename "$file").$counter"
+            else
+                dest_file="$dest_dir/$(basename "$base").$counter.$ext"
+            fi
+            ((counter++)) || true
+        done
+        
+        if [[ "$DRY_RUN" == true ]]; then
+            dry_run_msg "Would archive: $file -> $dest_file"
+            dry_run_msg "Command: mv \"$file\" \"$dest_file\""
+        else
+            if [[ "$NO_CONFIRM" == true ]]; then
+                echo "Archiving: $file -> $dest_file"
+                mv "$file" "$dest_file"
+            else
+                echo -n "Archive $file? (y/n): "
+                read -r response
+                if [[ "$response" =~ ^[Yy]$ ]]; then
+                    echo "Archiving: $file -> $dest_file"
+                    mv "$file" "$dest_file"
+                else
+                    echo "Skipped: $file"
+                fi
+            fi
+        fi
+    fi
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            version
+            exit 0
+            ;;
+        -d|--delete)
+            DELETE=true
+            shift
+            ;;
+        -a|--archive)
+            if [[ $# -lt 2 ]]; then
+                error "--archive requires a directory argument"
+                exit 1
+            fi
+            ARCHIVE="$2"
+            shift 2
+            ;;
+        -r|--recursive)
+            RECURSIVE=true
+            shift
+            ;;
+        --keep-oldest)
+            KEEP_STRATEGY="oldest"
+            shift
+            ;;
+        --keep-newest)
+            KEEP_STRATEGY="newest"
+            shift
+            ;;
+        --keep-ask)
+            KEEP_STRATEGY="ask"
+            shift
+            ;;
+        --no-confirm)
+            NO_CONFIRM=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -*)
+            error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Validate options
+if [[ "$DELETE" == true ]] && [[ -n "$ARCHIVE" ]]; then
+    error "Cannot specify both --delete and --archive"
+    exit 1
+fi
+
+if [[ -n "$ARCHIVE" ]]; then
+    if [[ ! -d "$ARCHIVE" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            dry_run_msg "Would create archive directory: $ARCHIVE"
+        else
+            echo "Creating archive directory: $ARCHIVE" >&2
+            mkdir -p "$ARCHIVE"
+        fi
+    elif [[ ! -w "$ARCHIVE" ]]; then
+        error "Archive directory is not writable: $ARCHIVE"
+        exit 1
+    fi
+fi
+
+# Check for required tools
+if ! command -v crc32 >/dev/null 2>&1 && \
+   ! command -v cksum >/dev/null 2>&1 && \
+   ! command -v python3 >/dev/null 2>&1; then
+    error "No CRC32 tool available. Install one of: crc32, cksum, or python3"
+    exit 1
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1 && \
+   ! command -v shasum >/dev/null 2>&1; then
+    error "No SHA256 tool available. Install sha256sum or shasum"
+    exit 1
+fi
+
+# Main execution
+echo "Collecting files..." >&2
+collect_files "$@" > "${TMP_DIR}/all_files"
+
+# Check if we have any files
+if [[ ! -s "${TMP_DIR}/all_files" ]]; then
+    echo "No files to process." >&2
+    exit 0
+fi
+
+# Find duplicates
+find_duplicates
+
+# Check if we found any duplicates
+if [[ ! -s "$DUPES_FILE" ]]; then
+    echo "No duplicate files found." >&2
+    exit 0
+fi
+
+# Process duplicates if action requested
+if [[ "$DELETE" == true ]] || [[ -n "$ARCHIVE" ]]; then
+    echo >&2
+    echo "Processing duplicates..." >&2
+    
+    # Get unique SHA256 hashes
+    cut -d' ' -f1 "$DUPES_FILE" | sort -u | while IFS= read -r sha; do
+        handle_duplicate_group "$sha"
+    done
+else
+    # Just display duplicates
+    echo >&2
+    echo "Duplicate files found:" >&2
+    
+    current_sha=""
+    while IFS=' ' read -r sha mtime file; do
+        if [[ "$sha" != "$current_sha" ]]; then
+            if [[ -n "$current_sha" ]]; then
+                echo  # Blank line between groups
+            fi
+            current_sha="$sha"
+            echo "Duplicate set (SHA256: $sha):"
+        fi
+        echo "  $file (modified: $(date -d "@$mtime" 2>/dev/null || date -r "$mtime" 2>/dev/null || echo "unknown"))"
+    done < "$DUPES_FILE"
+fi
