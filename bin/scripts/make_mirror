@@ -1,0 +1,566 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Configuration
+MIRROR_ROOT="${HOME}/data/mirror"
+if [[ "${HOSTNAME}" =~ nas-(main|backup) ]]
+then 
+    MIRROR_ROOT="/var/mnt/dpool/software/mirror"
+fi 
+DRY_RUN=false
+SHOW_STATS=false
+CONTINUE_ON_ERROR=true
+FAILED_SYNCS=()
+
+# Arch Linux Configuration
+ARCH_MIRROR="rsync://mirror.rackspace.com/archlinux/"
+# Arch Linux ARM mirror (using CA US mirror which provides rsync)
+ARCH_ARM_MIRROR="rsync://ca.us.mirror.archlinuxarm.org/archlinuxarm/"
+ARCH_REPOS=("core" "extra" "multilib")
+ARCH_ARM_ARCHITECTURES=("aarch64" "armv7h")
+ARCH_ADDITIONAL_REPOS=(
+    # Add custom repos here, format: "repo_name|rsync_url"
+    # Example: "archlinuxcn|rsync://sync.repo.archlinuxcn.org/repo/"
+)
+
+# Fedora Configuration
+FEDORA_MIRROR="rsync://mirrors.kernel.org/fedora/"
+FEDORA_RELEASES=("41" "42" "rawhide")
+FEDORA_COPRS=(
+    # Add COPR repos here, format: "owner/project"
+    # Example: "atim/starship"
+)
+
+# Ubuntu Configuration
+UBUNTU_MIRROR="rsync://archive.ubuntu.com/ubuntu/"
+UBUNTU_RELEASES=("noble" "jammy" "focal")
+UBUNTU_PPAS=(
+    # Add PPA repos here, format: "ppa:owner/name"
+    # Example: "ppa:deadsnakes/ppa"
+)
+
+# FreeBSD Configuration
+# Using German mirror which provides reliable rsync access
+# Alternative: rsync://ftp13.FreeBSD.org/ (may have access restrictions)
+FREEBSD_MIRROR="rsync://ftp4.de.FreeBSD.org/FreeBSD/"
+FREEBSD_RELEASES=("14.3" "14.2" "13.5" "13.4")
+FREEBSD_ARCHITECTURES=("amd64" "arm64")
+
+# F-Droid Configuration
+FDROID_MIRROR="rsync://ftp.lysator.liu.se/pub/fdroid/repo/"
+
+# Common rsync options
+RSYNC_OPTS=(
+    --archive
+    --verbose
+    --hard-links
+    --acls
+    --xattrs
+    --compress
+    --delete
+    --delete-after
+    --delay-updates
+    --links  # Copy symlinks as symlinks
+    --keep-dirlinks  # Treat symlinked dirs on receiver as dirs
+    --progress
+    --timeout=600
+    --contimeout=60
+    --no-motd
+)
+
+# Helper Functions
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+error() {
+    echo "[ERROR] $*" >&2
+}
+
+usage() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Create and maintain software mirrors for various Linux distributions and F-Droid.
+
+OPTIONS:
+    -s, --sync DISTROS     Sync specified distributions (comma-separated)
+                          Available: arch, fedora, ubuntu, freebsd, fdroid, all
+    -d, --dry-run         Show what would be synced without making changes
+    --stats               Show detailed statistics during sync
+    -h, --help            Show this help message
+
+EXAMPLES:
+    $(basename "$0") --sync arch
+    $(basename "$0") --sync arch,fedora --dry-run
+    $(basename "$0") --sync all --stats
+
+MIRROR ROOT: ${MIRROR_ROOT}
+EOF
+}
+
+# Ensure mirror root exists
+ensure_mirror_dir() {
+    local dir="$1"
+    if [[ ! -d "${dir}" ]]; then
+        log "Creating directory: ${dir}"
+        mkdir -p "${dir}"
+    fi
+}
+
+# Sync Arch Linux
+sync_arch() {
+    log "Starting Arch Linux mirror sync..."
+    local arch_dir="${MIRROR_ROOT}/arch"
+    ensure_mirror_dir "${arch_dir}"
+    
+    # For Arch, we need to sync the entire structure at once to preserve symlinks
+    # Syncing individual directories with --delete breaks the mirror
+    log "Syncing entire Arch Linux mirror structure..."
+    local opts=("${RSYNC_OPTS[@]}")
+    [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+    [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+    
+    # Include only the repos we want and the pool
+    opts+=(
+        --include="pool/***"
+        --include="core/***"
+        --include="extra/***"
+        --include="multilib/***"
+        --include="iso/***"
+        --exclude="*"
+    )
+    
+    if ! rsync "${opts[@]}" \
+        "${ARCH_MIRROR}" \
+        "${arch_dir}/"; then
+        error "Failed to sync Arch Linux mirror"
+        FAILED_SYNCS+=("arch:mirror")
+        [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
+    fi
+    
+    # Note: x86_64 repos are synced as part of the main structure above
+    
+    # Sync ARM architectures at same level
+    for arch in "${ARCH_ARM_ARCHITECTURES[@]}"; do
+        local arm_repo_dir="${arch_dir}/${arch}"
+        ensure_mirror_dir "${arm_repo_dir}"
+        
+        log "Syncing Arch ARM ${arch}..."
+        local opts=("${RSYNC_OPTS[@]}")
+        [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+        [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+        
+        if ! rsync "${opts[@]}" \
+            "${ARCH_ARM_MIRROR}${arch}/" \
+            "${arm_repo_dir}/"; then
+            error "Failed to sync Arch ARM ${arch}"
+            FAILED_SYNCS+=("arch:${arch}")
+            [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
+        fi
+    done
+    
+    # Sync additional custom repos
+    for repo_config in "${ARCH_ADDITIONAL_REPOS[@]}"; do
+        IFS='|' read -r repo_name repo_url <<< "${repo_config}"
+        local custom_repo_dir="${arch_dir}/custom/${repo_name}"
+        ensure_mirror_dir "${custom_repo_dir}"
+        
+        log "Syncing custom Arch repo: ${repo_name}..."
+        local opts=("${RSYNC_OPTS[@]}")
+        [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+        [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+        
+        rsync "${opts[@]}" \
+            "${repo_url}" \
+            "${custom_repo_dir}/" || error "Failed to sync custom repo ${repo_name}"
+    done
+    
+    # Note: ISOs are synced as part of the main structure above (iso/*** is included)
+    
+    log "Arch Linux mirror sync completed"
+}
+
+# Sync Fedora
+sync_fedora() {
+    log "Starting Fedora mirror sync..."
+    local fedora_dir="${MIRROR_ROOT}/fedora"
+    ensure_mirror_dir "${fedora_dir}"
+    
+    for release in "${FEDORA_RELEASES[@]}"; do
+        for arch in x86_64 aarch64; do
+            local release_dir="${fedora_dir}/linux/releases/${release}/Everything/${arch}/os"
+            ensure_mirror_dir "${release_dir}"
+            
+            log "Syncing Fedora ${release}/${arch}..."
+            local opts=("${RSYNC_OPTS[@]}")
+            [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+            [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+            
+            rsync "${opts[@]}" \
+                "${FEDORA_MIRROR}linux/releases/${release}/Everything/${arch}/os/" \
+                "${release_dir}/" || error "Failed to sync Fedora ${release}/${arch}"
+        done
+    done
+    
+    # Sync COPR repos
+    for copr in "${FEDORA_COPRS[@]}"; do
+        local copr_dir="${fedora_dir}/coprs/${copr}"
+        ensure_mirror_dir "${copr_dir}"
+        
+        log "Syncing COPR: ${copr}..."
+        # Note: COPR sync would require additional implementation
+        # as COPRs don't have direct rsync access
+        log "COPR sync not yet implemented for: ${copr}"
+    done
+    
+    # Sync latest ISOs including Atomic variants
+    local iso_dir="${fedora_dir}/isos"
+    ensure_mirror_dir "${iso_dir}"
+    
+    # Get latest stable release
+    local latest_release=$(echo "${FEDORA_RELEASES[@]}" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1)
+    
+    if [[ -n "${latest_release}" ]]; then
+        # Sync Workstation ISO
+        for variant in "Workstation" "Server" "Silverblue" "Kinoite" "Sericea" "Onyx"; do
+            for arch in x86_64 aarch64; do
+                local variant_dir="${iso_dir}/${variant}/${arch}"
+                ensure_mirror_dir "${variant_dir}"
+                
+                log "Checking Fedora ${latest_release} ${variant} ${arch} ISO..."
+                local iso_path="linux/releases/${latest_release}/${variant}/${arch}/iso"
+                
+                # Check if this variant/arch combo exists
+                if rsync --list-only "${FEDORA_MIRROR}${iso_path}/" &>/dev/null; then
+                    log "Syncing Fedora ${latest_release} ${variant} ${arch} ISOs..."
+                    local opts=("${RSYNC_OPTS[@]}")
+                    [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+                    [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+                    
+                    # Only sync .iso files and checksums
+                    opts+=(--include="*.iso" --include="*CHECKSUM*" --exclude="*")
+                    
+                    if ! rsync "${opts[@]}" \
+                        "${FEDORA_MIRROR}${iso_path}/" \
+                        "${variant_dir}/"; then
+                        error "Failed to sync Fedora ${variant} ${arch} ISO"
+                        FAILED_SYNCS+=("fedora:iso/${variant}/${arch}")
+                        [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
+                    fi
+                fi
+            done
+        done
+    fi
+    
+    log "Fedora mirror sync completed"
+}
+
+# Sync Ubuntu
+sync_ubuntu() {
+    log "Starting Ubuntu mirror sync..."
+    local ubuntu_dir="${MIRROR_ROOT}/ubuntu"
+    ensure_mirror_dir "${ubuntu_dir}"
+    
+    for release in "${UBUNTU_RELEASES[@]}"; do
+        for arch in amd64 arm64; do
+            local release_dir="${ubuntu_dir}/dists/${release}"
+            ensure_mirror_dir "${release_dir}"
+            
+            log "Syncing Ubuntu ${release}/${arch}..."
+            local opts=("${RSYNC_OPTS[@]}")
+            [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+            [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+            
+            # Sync release files
+            rsync "${opts[@]}" \
+                --include="*${arch}*" \
+                --include="Release*" \
+                --include="Contents-${arch}*" \
+                --exclude="*" \
+                "${UBUNTU_MIRROR}dists/${release}/" \
+                "${release_dir}/" || error "Failed to sync Ubuntu ${release} metadata"
+            
+            # Sync packages
+            local pool_dir="${ubuntu_dir}/pool"
+            ensure_mirror_dir "${pool_dir}"
+            
+            rsync "${opts[@]}" \
+                --include="*_${arch}.deb" \
+                --include="*_all.deb" \
+                --include="*.tar.*" \
+                --include="*.dsc" \
+                --include="*/" \
+                --exclude="*" \
+                "${UBUNTU_MIRROR}pool/" \
+                "${pool_dir}/" || error "Failed to sync Ubuntu pool for ${arch}"
+        done
+    done
+    
+    # Sync PPA repos
+    for ppa in "${UBUNTU_PPAS[@]}"; do
+        local ppa_dir="${ubuntu_dir}/ppas/${ppa#ppa:}"
+        ensure_mirror_dir "${ppa_dir}"
+        
+        log "PPA sync not yet implemented for: ${ppa}"
+    done
+    
+    # Sync latest ISOs
+    local iso_dir="${ubuntu_dir}/isos"
+    ensure_mirror_dir "${iso_dir}"
+    
+    # Get latest LTS release
+    local latest_lts=$(echo "${UBUNTU_RELEASES[@]}" | tr ' ' '\n' | grep -E '^(jammy|noble)$' | tail -1)
+    
+    if [[ -n "${latest_lts}" ]]; then
+        # Map codename to version for ISO paths
+        local version=""
+        case "${latest_lts}" in
+            "noble") version="24.04.1" ;;
+            "jammy") version="22.04.5" ;;
+            "focal") version="20.04.6" ;;
+        esac
+        
+        if [[ -n "${version}" ]]; then
+            local release_dir="${iso_dir}/${version}"
+            ensure_mirror_dir "${release_dir}"
+            
+            for variant in "desktop" "live-server"; do
+                for arch in amd64 arm64; do
+                    local iso_name="ubuntu-${version}-${variant}-${arch}.iso"
+                    local iso_url="http://releases.ubuntu.com/${version}/${iso_name}"
+                    local iso_path="${release_dir}/${iso_name}"
+                    
+                    log "Checking Ubuntu ${version} ${variant} ${arch} ISO..."
+                    
+                    if [[ "${DRY_RUN}" == "true" ]]; then
+                        log "[DRY RUN] Would download: ${iso_url}"
+                        continue
+                    fi
+                    
+                    # Check if ISO exists on server
+                    if curl -s --head "${iso_url}" | head -n 1 | grep -q "200 OK"; then
+                        log "Downloading ${iso_name}..."
+                        
+                        # Download with curl, resuming if partial download exists
+                        if ! curl -C - -L -o "${iso_path}" "${iso_url}"; then
+                            error "Failed to download ${iso_name}"
+                            FAILED_SYNCS+=("ubuntu:iso/${variant}/${arch}")
+                            [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
+                        fi
+                        
+                        # Also download checksum files
+                        for checksum in "SHA256SUMS" "SHA256SUMS.gpg"; do
+                            local checksum_url="http://releases.ubuntu.com/${version}/${checksum}"
+                            local checksum_path="${release_dir}/${checksum}"
+                            
+                            if curl -s --head "${checksum_url}" | head -n 1 | grep -q "200 OK"; then
+                                log "Downloading ${checksum}..."
+                                curl -L -o "${checksum_path}" "${checksum_url}" || \
+                                    error "Failed to download ${checksum}"
+                            fi
+                        done
+                    else
+                        log "ISO not found: ${iso_name} (may not exist for this variant/arch)"
+                    fi
+                done
+            done
+        fi
+    fi
+    
+    log "Ubuntu mirror sync completed"
+}
+
+# Sync FreeBSD
+sync_freebsd() {
+    log "Starting FreeBSD mirror sync..."
+    
+    # Check if FreeBSD mirror is configured
+    if [[ -z "${FREEBSD_MIRROR:-}" ]]; then
+        log "FreeBSD mirror not configured. FreeBSD has limited rsync availability."
+        log "Most FreeBSD mirrors only provide HTTP/FTP access."
+        log "To mirror FreeBSD, you can:"
+        log "  1. Use fetch or wget with HTTP mirrors"
+        log "  2. Find a working rsync mirror and update FREEBSD_MIRROR in the script"
+        log "  3. Use the freebsd-update tool for binary updates"
+        return 0
+    fi
+    
+    local freebsd_dir="${MIRROR_ROOT}/freebsd"
+    ensure_mirror_dir "${freebsd_dir}"
+    
+    for release in "${FREEBSD_RELEASES[@]}"; do
+        for arch in "${FREEBSD_ARCHITECTURES[@]}"; do
+            local release_dir="${freebsd_dir}/releases/${arch}/${release}-RELEASE"
+            ensure_mirror_dir "${release_dir}"
+            
+            log "Syncing FreeBSD ${release}/${arch}..."
+            local opts=("${RSYNC_OPTS[@]}")
+            [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+            [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+            
+            if ! rsync "${opts[@]}" \
+                "${FREEBSD_MIRROR}releases/${arch}/${release}-RELEASE/" \
+                "${release_dir}/"; then
+                error "Failed to sync FreeBSD ${release}/${arch}"
+                FAILED_SYNCS+=("freebsd:${release}/${arch}")
+                [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
+            fi
+        done
+    done
+    
+    # Sync latest ISOs
+    local iso_dir="${freebsd_dir}/isos"
+    ensure_mirror_dir "${iso_dir}"
+    
+    # Get latest release for ISOs
+    local latest_release=$(echo "${FREEBSD_RELEASES[@]}" | tr ' ' '\n' | sort -V | tail -1)
+    
+    if [[ -n "${latest_release}" ]]; then
+        for arch in "${FREEBSD_ARCHITECTURES[@]}"; do
+            local iso_arch_dir="${iso_dir}/${arch}"
+            ensure_mirror_dir "${iso_arch_dir}"
+            
+            log "Syncing FreeBSD ${latest_release} ${arch} ISOs..."
+            local opts=("${RSYNC_OPTS[@]}")
+            [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+            [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+            
+            # Sync ISO images
+            opts+=(--include="*.iso" --include="*.iso.xz" --include="CHECKSUM*" --exclude="*")
+            
+            if ! rsync "${opts[@]}" \
+                "${FREEBSD_MIRROR}releases/ISO-IMAGES/${latest_release}/" \
+                "${iso_arch_dir}/" 2>/dev/null; then
+                # Try alternate path
+                if ! rsync "${opts[@]}" \
+                    "${FREEBSD_MIRROR}releases/${arch}/${latest_release}-RELEASE/" \
+                    "${iso_arch_dir}/"; then
+                    error "Failed to sync FreeBSD ${latest_release} ${arch} ISOs"
+                    FAILED_SYNCS+=("freebsd:iso/${arch}")
+                fi
+            fi
+        done
+    fi
+    
+    log "FreeBSD mirror sync completed"
+}
+
+# Sync F-Droid
+sync_fdroid() {
+    log "Starting F-Droid mirror sync..."
+    local fdroid_dir="${MIRROR_ROOT}/fdroid"
+    ensure_mirror_dir "${fdroid_dir}"
+    
+    log "Syncing F-Droid repository..."
+    local opts=("${RSYNC_OPTS[@]}")
+    [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
+    [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
+    
+    rsync "${opts[@]}" \
+        "${FDROID_MIRROR}" \
+        "${fdroid_dir}/" || error "Failed to sync F-Droid"
+    
+    log "F-Droid mirror sync completed"
+}
+
+# Main function
+main() {
+    local sync_targets=()
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--sync)
+                IFS=',' read -ra sync_targets <<< "$2"
+                shift 2
+                ;;
+            -d|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --stats)
+                SHOW_STATS=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Check if sync targets were specified
+    if [[ ${#sync_targets[@]} -eq 0 ]]; then
+        error "No sync targets specified"
+        usage
+        exit 1
+    fi
+    
+    # Process sync targets
+    for target in "${sync_targets[@]}"; do
+        case "${target}" in
+            arch)
+                sync_arch
+                ;;
+            fedora)
+                sync_fedora
+                ;;
+            ubuntu)
+                sync_ubuntu
+                ;;
+            freebsd)
+                sync_freebsd
+                ;;
+            fdroid)
+                sync_fdroid
+                ;;
+            all)
+                sync_arch
+                sync_fedora
+                sync_ubuntu
+                sync_freebsd
+                sync_fdroid
+                ;;
+            *)
+                error "Unknown sync target: ${target}"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Show summary
+    if [[ ${#FAILED_SYNCS[@]} -gt 0 ]]; then
+        log "Sync completed with errors:"
+        for failed in "${FAILED_SYNCS[@]}"; do
+            log "  - Failed: ${failed}"
+        done
+        exit 1
+    else
+        log "All sync operations completed successfully"
+    fi
+}
+
+# Run main function
+main "$@"
