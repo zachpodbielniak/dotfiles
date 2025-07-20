@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env python3
 
 # dotfiles - Personal configuration files and scripts
 # Copyright (C) 2025  Zach Podbielniak
@@ -16,499 +16,440 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-set -euo pipefail
+import argparse
+import hashlib
+import os
+import sys
+import shutil
+import zlib
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Optional
 
-# Script name and version
-SCRIPT_NAME=$(basename "$0")
-VERSION="1.0.0"
+VERSION = "2.0.0"
 
-# Default options
-DELETE=false
-ARCHIVE=""
-KEEP_STRATEGY="oldest"  # oldest, newest, ask
-NO_CONFIRM=false
-DRY_RUN=false
-RECURSIVE=false
+class DuplicateFinder:
+    def __init__(self, args):
+        self.args = args
+        self.total_files = 0
+        self.initial_matches = 0
+        
+    def get_file_size(self, filepath: Path) -> int:
+        """Get file size in bytes."""
+        try:
+            return filepath.stat().st_size
+        except (OSError, IOError):
+            return 0
+    
+    def get_file_mtime(self, filepath: Path) -> float:
+        """Get file modification time."""
+        try:
+            return filepath.stat().st_mtime
+        except (OSError, IOError):
+            return 0.0
+    
+    def calc_crc32(self, filepath: Path) -> Optional[str]:
+        """Calculate CRC32 checksum of a file."""
+        try:
+            crc = 0
+            with open(filepath, 'rb') as f:
+                while chunk := f.read(65536):  # 64KB chunks
+                    crc = zlib.crc32(chunk, crc)
+            return f"{crc & 0xffffffff:08x}"
+        except (OSError, IOError):
+            return None
+    
+    def calc_sha256(self, filepath: Path) -> Optional[str]:
+        """Calculate SHA256 checksum of a file."""
+        try:
+            sha256_hash = hashlib.sha256()
+            with open(filepath, 'rb') as f:
+                while chunk := f.read(65536):  # 64KB chunks
+                    sha256_hash.update(chunk)
+            return sha256_hash.hexdigest()
+        except (OSError, IOError):
+            return None
+    
+    def collect_files(self, paths: List[str]) -> List[Path]:
+        """Collect all files to process based on arguments and options."""
+        files = []
+        
+        # Read from stdin if available
+        if not sys.stdin.isatty():
+            for line in sys.stdin:
+                line = line.strip()
+                if line:
+                    files.append(Path(line))
+        
+        # Add command line arguments
+        for path_str in paths:
+            path = Path(path_str)
+            if path.is_file() and not path.is_symlink():
+                files.append(path)
+            elif path.is_dir() and self.args.recursive:
+                files.extend(p for p in path.rglob('*') if p.is_file() and not p.is_symlink())
+            elif path.is_dir() and not self.args.recursive:
+                print(f"Warning: '{path}' is a directory. Use -r/--recursive to process its contents.", file=sys.stderr)
+            elif not path.exists():
+                print(f"Warning: '{path}' does not exist, skipping.", file=sys.stderr)
+        
+        # Remove duplicates and sort
+        return sorted(set(files))
+    
+    def find_duplicates_by_size(self, files: List[Path]) -> Dict[str, List[Tuple[Path, float]]]:
+        """Find duplicates using file size first, then SHA256."""
+        print("Phase 1: Calculating file sizes...", file=sys.stderr)
+        
+        # Group files by size
+        size_groups = defaultdict(list)
+        for filepath in files:
+            if filepath.is_file() and not filepath.is_symlink():
+                size = self.get_file_size(filepath)
+                if size > 0:  # Skip empty files
+                    mtime = self.get_file_mtime(filepath)
+                    size_groups[size].append((filepath, mtime))
+                    self.total_files += 1
+                    if self.args.dry_run:
+                        print(f"[DRY-RUN] Would calculate file size for: {filepath}", file=sys.stderr)
+        
+        print(f"Processed {self.total_files} files.", file=sys.stderr)
+        
+        # Find size duplicates (groups with more than one file)
+        size_duplicates = {size: paths for size, paths in size_groups.items() if len(paths) > 1}
+        
+        if not size_duplicates:
+            return {}
+        
+        print("Phase 2: Finding size matches...", file=sys.stderr)
+        print(f"Found {sum(len(paths) for paths in size_duplicates.values())} files with duplicate sizes.", file=sys.stderr)
+        
+        # Calculate SHA256 for files with duplicate sizes
+        print("Phase 3: Verifying duplicates with SHA256...", file=sys.stderr)
+        
+        sha_groups = defaultdict(list)
+        
+        def process_file(filepath_mtime):
+            filepath, mtime = filepath_mtime
+            sha = self.calc_sha256(filepath)
+            if sha:
+                if self.args.dry_run:
+                    print(f"[DRY-RUN] Would calculate SHA256 for: {filepath}", file=sys.stderr)
+                return sha, filepath, mtime
+            return None
+        
+        # Process files in parallel
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = []
+            for paths in size_duplicates.values():
+                for filepath_mtime in paths:
+                    futures.append(executor.submit(process_file, filepath_mtime))
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    sha, filepath, mtime = result
+                    sha_groups[sha].append((filepath, mtime))
+                    self.initial_matches += 1
+        
+        print(f"Verified {self.initial_matches} potential duplicates.", file=sys.stderr)
+        
+        # Return only groups with actual duplicates
+        return {sha: paths for sha, paths in sha_groups.items() if len(paths) > 1}
+    
+    def find_duplicates_by_crc32(self, files: List[Path]) -> Dict[str, List[Tuple[Path, float]]]:
+        """Find duplicates using CRC32 first, then SHA256."""
+        print("Phase 1: Calculating CRC32 checksums...", file=sys.stderr)
+        
+        # Calculate CRC32 for all files
+        crc_groups = defaultdict(list)
+        
+        def process_file_crc(filepath):
+            if filepath.is_file() and not filepath.is_symlink():
+                crc = self.calc_crc32(filepath)
+                if crc:
+                    mtime = self.get_file_mtime(filepath)
+                    if self.args.dry_run:
+                        print(f"[DRY-RUN] Would calculate CRC32 for: {filepath}", file=sys.stderr)
+                    return crc, filepath, mtime
+            return None
+        
+        # Process files in parallel
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = [executor.submit(process_file_crc, filepath) for filepath in files]
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    crc, filepath, mtime = result
+                    crc_groups[crc].append((filepath, mtime))
+                    self.total_files += 1
+        
+        print(f"Processed {self.total_files} files.", file=sys.stderr)
+        
+        # Find CRC32 duplicates
+        crc_duplicates = {crc: paths for crc, paths in crc_groups.items() if len(paths) > 1}
+        
+        if not crc_duplicates:
+            return {}
+        
+        print("Phase 2: Finding CRC32 matches...", file=sys.stderr)
+        print(f"Found {sum(len(paths) for paths in crc_duplicates.values())} files with duplicate CRC32s.", file=sys.stderr)
+        
+        # Verify with SHA256
+        print("Phase 3: Verifying duplicates with SHA256...", file=sys.stderr)
+        
+        sha_groups = defaultdict(list)
+        
+        def process_file_sha(filepath_mtime):
+            filepath, mtime = filepath_mtime
+            sha = self.calc_sha256(filepath)
+            if sha:
+                if self.args.dry_run:
+                    print(f"[DRY-RUN] Would calculate SHA256 for: {filepath}", file=sys.stderr)
+                return sha, filepath, mtime
+            return None
+        
+        # Process files in parallel
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = []
+            for paths in crc_duplicates.values():
+                for filepath_mtime in paths:
+                    futures.append(executor.submit(process_file_sha, filepath_mtime))
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    sha, filepath, mtime = result
+                    sha_groups[sha].append((filepath, mtime))
+                    self.initial_matches += 1
+        
+        print(f"Verified {self.initial_matches} potential duplicates.", file=sys.stderr)
+        
+        # Return only groups with actual duplicates
+        return {sha: paths for sha, paths in sha_groups.items() if len(paths) > 1}
+    
+    def handle_duplicate_group(self, sha: str, files_with_mtime: List[Tuple[Path, float]]):
+        """Handle a group of duplicate files."""
+        if len(files_with_mtime) < 2:
+            return
+        
+        # Sort by modification time (oldest first)
+        files_with_mtime.sort(key=lambda x: x[1])
+        
+        print(f"Duplicate set (SHA256: {sha}):")
+        for i, (filepath, mtime) in enumerate(files_with_mtime):
+            date_str = datetime.fromtimestamp(mtime).strftime("%a %b %d %I:%M:%S %p %Z %Y")
+            print(f"  [{i}] {filepath} (modified: {date_str})")
+        
+        # Determine which file to keep
+        keep_index = 0  # Default to oldest
+        if self.args.keep_strategy == "oldest":
+            keep_index = 0
+        elif self.args.keep_strategy == "newest":
+            keep_index = len(files_with_mtime) - 1
+        elif self.args.keep_strategy == "ask":
+            if not self.args.dry_run:
+                try:
+                    keep_index = int(input(f"Which file would you like to keep? (0-{len(files_with_mtime)-1}): "))
+                    if keep_index < 0 or keep_index >= len(files_with_mtime):
+                        print("Invalid selection, keeping oldest by default")
+                        keep_index = 0
+                except (ValueError, KeyboardInterrupt):
+                    print("Invalid selection, keeping oldest by default")
+                    keep_index = 0
+            else:
+                print("[DRY-RUN] Would ask which file to keep")
+                keep_index = 0
+        
+        keep_file = files_with_mtime[keep_index][0]
+        print(f"Keeping: {keep_file}")
+        
+        # Handle other files
+        for i, (filepath, _) in enumerate(files_with_mtime):
+            if i != keep_index:
+                self.handle_file(filepath)
+        print()
+    
+    def handle_file(self, filepath: Path):
+        """Handle a single file (delete or archive)."""
+        if self.args.delete:
+            if self.args.dry_run:
+                print(f"[DRY-RUN] Would delete: {filepath}", file=sys.stderr)
+                print(f"[DRY-RUN] Command: rm \"{filepath}\"", file=sys.stderr)
+            else:
+                if self.args.no_confirm:
+                    print(f"Deleting: {filepath}")
+                    try:
+                        filepath.unlink()
+                    except OSError as e:
+                        print(f"Error deleting {filepath}: {e}", file=sys.stderr)
+                else:
+                    response = input(f"Delete {filepath}? (y/n): ")
+                    if response.lower().startswith('y'):
+                        print(f"Deleting: {filepath}")
+                        try:
+                            filepath.unlink()
+                        except OSError as e:
+                            print(f"Error deleting {filepath}: {e}", file=sys.stderr)
+                    else:
+                        print(f"Skipped: {filepath}")
+        
+        elif self.args.archive:
+            archive_dir = Path(self.args.archive)
+            dest_file = archive_dir / filepath.name
+            counter = 1
+            
+            # Handle filename conflicts
+            while dest_file.exists():
+                stem = filepath.stem
+                suffix = filepath.suffix
+                if suffix:
+                    dest_file = archive_dir / f"{stem}.{counter}{suffix}"
+                else:
+                    dest_file = archive_dir / f"{filepath.name}.{counter}"
+                counter += 1
+            
+            if self.args.dry_run:
+                print(f"[DRY-RUN] Would archive: {filepath} -> {dest_file}", file=sys.stderr)
+                print(f"[DRY-RUN] Command: mv \"{filepath}\" \"{dest_file}\"", file=sys.stderr)
+            else:
+                if self.args.no_confirm:
+                    print(f"Archiving: {filepath} -> {dest_file}")
+                    try:
+                        shutil.move(str(filepath), str(dest_file))
+                    except OSError as e:
+                        print(f"Error archiving {filepath}: {e}", file=sys.stderr)
+                else:
+                    response = input(f"Archive {filepath}? (y/n): ")
+                    if response.lower().startswith('y'):
+                        print(f"Archiving: {filepath} -> {dest_file}")
+                        try:
+                            shutil.move(str(filepath), str(dest_file))
+                        except OSError as e:
+                            print(f"Error archiving {filepath}: {e}", file=sys.stderr)
+                    else:
+                        print(f"Skipped: {filepath}")
+    
+    def run(self, paths: List[str]):
+        """Main execution function."""
+        print("Collecting files...", file=sys.stderr)
+        files = self.collect_files(paths)
+        
+        if not files:
+            print("No files to process.", file=sys.stderr)
+            return 0
+        
+        # Find duplicates
+        if self.args.crc32_mode:
+            duplicates = self.find_duplicates_by_crc32(files)
+        else:
+            duplicates = self.find_duplicates_by_size(files)
+        
+        if not duplicates:
+            print("No duplicate files found.", file=sys.stderr)
+            return 0
+        
+        # Process duplicates
+        if self.args.delete or self.args.archive:
+            print(file=sys.stderr)
+            print("Processing duplicates...", file=sys.stderr)
+            for sha, files_with_mtime in duplicates.items():
+                self.handle_duplicate_group(sha, files_with_mtime)
+        else:
+            # Just display duplicates
+            print(file=sys.stderr)
+            print("Duplicate files found:", file=sys.stderr)
+            for sha, files_with_mtime in duplicates.items():
+                files_with_mtime.sort(key=lambda x: x[1])  # Sort by mtime
+                print(f"Duplicate set (SHA256: {sha}):")
+                for filepath, mtime in files_with_mtime:
+                    date_str = datetime.fromtimestamp(mtime).strftime("%a %b %d %I:%M:%S %p %Z %Y")
+                    print(f"  {filepath} (modified: {date_str})")
+                print()
+        
+        return 0
 
-# Temporary files for storing checksums
-TMP_DIR=$(mktemp -d)
-CRC32_FILE="${TMP_DIR}/crc32_checksums"
-SHA256_FILE="${TMP_DIR}/sha256_checksums"
-DUPES_FILE="${TMP_DIR}/duplicates"
 
-# Cleanup on exit
-trap 'rm -rf "${TMP_DIR}"' EXIT
-
-# Function to display usage
-usage() {
-    cat << EOF
-Usage: $SCRIPT_NAME [OPTIONS] [FILE|DIRECTORY...]
-
-Find duplicate files using CRC32 for initial detection and SHA256 for verification.
-
-FILES can be provided as arguments, via stdin (one per line), or both.
-Without -r/--recursive, only specified files are checked (not directory contents).
-
-OPTIONS:
-    -h, --help          Show this help message
-    -v, --version       Show version information
-    -d, --delete        Delete duplicate files (keeps oldest by default)
-    -a, --archive DIR   Move duplicates to DIR instead of deleting
-    -r, --recursive     Process directories recursively
-    --keep-oldest       Keep oldest file when deleting (default)
-    --keep-newest       Keep newest file when deleting
-    --keep-ask          Ask which file to keep for each duplicate set
-    --no-confirm        Don't ask for confirmation before operations
-    --dry-run          Show what would be done without doing it
-
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find duplicate files using filesize for initial detection and SHA256 for verification.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 EXAMPLES:
     # Find duplicates in specific files
-    $SCRIPT_NAME file1.txt file2.txt file3.txt
+    find_dupes.py file1.txt file2.txt file3.txt
 
     # Find duplicates recursively in directories
-    $SCRIPT_NAME -r /path/to/dir1 /path/to/dir2
+    find_dupes.py -r /path/to/dir1 /path/to/dir2
 
     # Find duplicates from file list
-    find . -name "*.jpg" | $SCRIPT_NAME
+    find . -name "*.jpg" | find_dupes.py
 
     # Delete duplicates, keeping oldest
-    $SCRIPT_NAME -d -r /path/to/photos
+    find_dupes.py -d -r /path/to/photos
 
     # Archive duplicates for review
-    $SCRIPT_NAME -a /tmp/duplicates -r /path/to/files
+    find_dupes.py -a /tmp/duplicates -r /path/to/files
 
     # Interactive mode - ask which to keep
-    $SCRIPT_NAME -d --keep-ask -r /path/to/documents
+    find_dupes.py -d --keep-ask -r /path/to/documents
 
     # See what would be deleted without actually deleting
-    $SCRIPT_NAME -d --dry-run -r /path/to/media
+    find_dupes.py -d --dry-run -r /path/to/media
 
 NOTES:
-    - CRC32 is used for fast initial detection
+    - Filesize is used for fast initial detection (default)
+    - CRC32 can be used instead with --crc32-mode
     - SHA256 verifies actual duplicates (prevents false positives)
     - File modification time determines age (oldest/newest)
     - Symlinks are skipped
     - Hidden files are included by default
-
-EOF
-}
-
-# Function to show version
-version() {
-    echo "$SCRIPT_NAME version $VERSION"
-}
-
-# Function to print error messages
-error() {
-    echo "Error: $*" >&2
-}
-
-# Function to print debug/dry-run messages
-dry_run_msg() {
-    if [[ "$DRY_RUN" == true ]]; then
-        echo "[DRY-RUN] $*" >&2
-    fi
-}
-
-# Function to get file modification time (seconds since epoch)
-get_file_mtime() {
-    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
-}
-
-# Function to calculate CRC32 checksum
-calc_crc32() {
-    local file="$1"
-    # Try different CRC32 tools in order of preference
-    if command -v crc32 >/dev/null 2>&1; then
-        crc32 "$file" 2>/dev/null
-    elif command -v cksum >/dev/null 2>&1; then
-        # cksum gives CRC32 in a different format, but we can use it
-        cksum "$file" 2>/dev/null | awk '{print $1}'
-    elif command -v python3 >/dev/null 2>&1; then
-        # Fallback to Python
-        python3 -c "import zlib; print(format(zlib.crc32(open('$file','rb').read()) & 0xffffffff, '08x'))" 2>/dev/null
-    else
-        error "No CRC32 tool available (install crc32, cksum, or python3)"
-        return 1
-    fi
-}
-
-# Function to calculate SHA256 checksum
-calc_sha256() {
-    local file="$1"
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$file" 2>/dev/null | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
-    else
-        error "No SHA256 tool available (install sha256sum or shasum)"
-        return 1
-    fi
-}
-
-# Function to collect files based on arguments and options
-collect_files() {
-    local files=()
+    - Uses parallel processing for better performance
+        """
+    )
     
-    # Read from stdin if available
-    if [[ ! -t 0 ]]; then
-        while IFS= read -r file; do
-            if [[ -n "$file" ]]; then
-                files+=("$file")
-            fi
-        done
-    fi
+    parser.add_argument('-v', '--version', action='version', version=f'find_dupes.py version {VERSION}')
+    parser.add_argument('-d', '--delete', action='store_true', help='Delete duplicate files (keeps oldest by default)')
+    parser.add_argument('-a', '--archive', metavar='DIR', help='Move duplicates to DIR instead of deleting')
+    parser.add_argument('-r', '--recursive', action='store_true', help='Process directories recursively')
+    parser.add_argument('--keep-oldest', action='store_const', const='oldest', dest='keep_strategy', default='oldest',
+                        help='Keep oldest file when deleting (default)')
+    parser.add_argument('--keep-newest', action='store_const', const='newest', dest='keep_strategy',
+                        help='Keep newest file when deleting')
+    parser.add_argument('--keep-ask', action='store_const', const='ask', dest='keep_strategy',
+                        help='Ask which file to keep for each duplicate set')
+    parser.add_argument('--no-confirm', action='store_true', help="Don't ask for confirmation before operations")
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be done without doing it')
+    parser.add_argument('--crc32-mode', action='store_true', help='Use CRC32 for initial detection instead of filesize')
+    parser.add_argument('paths', nargs='*', help='Files or directories to process')
     
-    # Add command line arguments
-    for arg in "$@"; do
-        files+=("$arg")
-    done
+    args = parser.parse_args()
     
-    # Process collected paths
-    for path in "${files[@]}"; do
-        if [[ -f "$path" ]] && [[ ! -L "$path" ]]; then
-            # It's a regular file (not a symlink)
-            echo "$path"
-        elif [[ -d "$path" ]] && [[ "$RECURSIVE" == true ]]; then
-            # It's a directory and we're in recursive mode
-            find "$path" -type f -print
-        elif [[ -d "$path" ]] && [[ "$RECURSIVE" == false ]]; then
-            # Directory but not recursive - skip with warning
-            echo "Warning: '$path' is a directory. Use -r/--recursive to process its contents." >&2
-        elif [[ ! -e "$path" ]]; then
-            echo "Warning: '$path' does not exist, skipping." >&2
-        fi
-    done | sort -u  # Remove duplicates from the file list
-}
+    # Validate options
+    if args.delete and args.archive:
+        parser.error("Cannot specify both --delete and --archive")
+    
+    if args.archive:
+        archive_path = Path(args.archive)
+        if not archive_path.exists():
+            if args.dry_run:
+                print(f"[DRY-RUN] Would create archive directory: {archive_path}", file=sys.stderr)
+            else:
+                print(f"Creating archive directory: {archive_path}", file=sys.stderr)
+                try:
+                    archive_path.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    parser.error(f"Cannot create archive directory: {e}")
+        elif not archive_path.is_dir():
+            parser.error(f"Archive path exists but is not a directory: {archive_path}")
+        elif not os.access(archive_path, os.W_OK):
+            parser.error(f"Archive directory is not writable: {archive_path}")
+    
+    finder = DuplicateFinder(args)
+    return finder.run(args.paths)
 
-# Function to find duplicates
-find_duplicates() {
-    local total_files=0
-    local crc_matches=0
-    
-    echo "Phase 1: Calculating CRC32 checksums..." >&2
-    
-    # Calculate CRC32 for all files
-    while IFS= read -r file; do
-        if [[ -f "$file" ]] && [[ ! -L "$file" ]]; then
-            if crc=$(calc_crc32 "$file"); then
-                echo "$crc $file" >> "$CRC32_FILE"
-                ((total_files++)) || true
-                dry_run_msg "Would calculate CRC32 for: $file"
-            fi
-        fi
-    done < "${TMP_DIR}/all_files"
-    
-    if [[ "$total_files" -eq 0 ]]; then
-        echo "No files to process." >&2
-        return 0
-    fi
-    
-    echo "Processed $total_files files." >&2
-    
-    # Find CRC32 duplicates
-    echo "Phase 2: Finding CRC32 matches..." >&2
-    
-    # Sort by CRC32 and find duplicates
-    sort "$CRC32_FILE" | while read -r crc file; do
-        echo "$crc"
-    done | uniq -d > "${TMP_DIR}/dup_crcs"
-    
-    # For each duplicate CRC32, verify with SHA256
-    echo "Phase 3: Verifying duplicates with SHA256..." >&2
-    
-    while IFS= read -r dup_crc; do
-        # Get all files with this CRC32
-        grep "^$dup_crc " "$CRC32_FILE" | cut -d' ' -f2- > "${TMP_DIR}/crc_group"
-        
-        # Calculate SHA256 for this group
-        > "${TMP_DIR}/sha_group"
-        while IFS= read -r file; do
-            if sha=$(calc_sha256 "$file"); then
-                echo "$sha $file" >> "${TMP_DIR}/sha_group"
-                ((crc_matches++)) || true
-                dry_run_msg "Would calculate SHA256 for: $file"
-            fi
-        done < "${TMP_DIR}/crc_group"
-        
-        # Find SHA256 duplicates within this CRC group
-        sort "${TMP_DIR}/sha_group" | while read -r sha file; do
-            echo "$sha"
-        done | uniq -d > "${TMP_DIR}/dup_shas"
-        
-        # Output duplicate groups
-        while IFS= read -r dup_sha; do
-            grep "^$dup_sha " "${TMP_DIR}/sha_group" | cut -d' ' -f2- | while IFS= read -r file; do
-                mtime=$(get_file_mtime "$file")
-                echo "$dup_sha $mtime $file"
-            done | sort -k2 -n  # Sort by modification time
-        done < "${TMP_DIR}/dup_shas"
-        
-    done < "${TMP_DIR}/dup_crcs" > "$DUPES_FILE"
-    
-    echo "Verified $crc_matches potential duplicates." >&2
-}
 
-# Function to handle duplicate group
-handle_duplicate_group() {
-    local sha="$1"
-    local -a files=()
-    local -a mtimes=()
-    local keep_index=0
-    local i=0
-    
-    # Read all files in this duplicate group
-    while IFS=' ' read -r file_sha mtime file; do
-        if [[ "$file_sha" == "$sha" ]]; then
-            files+=("$file")
-            mtimes+=("$mtime")
-        fi
-    done < "$DUPES_FILE"
-    
-    # Skip if less than 2 files
-    if [[ ${#files[@]} -lt 2 ]]; then
-        return
-    fi
-    
-    # Print duplicate group
-    echo "Duplicate set (SHA256: $sha):"
-    for i in "${!files[@]}"; do
-        echo "  [$i] ${files[$i]} (modified: $(date -d "@${mtimes[$i]}" 2>/dev/null || date -r "${mtimes[$i]}" 2>/dev/null || echo "unknown"))"
-    done
-    
-    # Determine which file to keep based on strategy
-    case "$KEEP_STRATEGY" in
-        oldest)
-            keep_index=0  # Already sorted by mtime ascending
-            ;;
-        newest)
-            keep_index=$((${#files[@]} - 1))  # Last element
-            ;;
-        ask)
-            if [[ "$DRY_RUN" == false ]]; then
-                echo "Which file would you like to keep? (0-$((${#files[@]} - 1))): "
-                read -r keep_index
-                # Validate input
-                if ! [[ "$keep_index" =~ ^[0-9]+$ ]] || [[ "$keep_index" -ge ${#files[@]} ]]; then
-                    echo "Invalid selection, keeping oldest by default"
-                    keep_index=0
-                fi
-            else
-                echo "[DRY-RUN] Would ask which file to keep"
-                keep_index=0
-            fi
-            ;;
-    esac
-    
-    echo "Keeping: ${files[$keep_index]}"
-    
-    # Handle other files
-    for i in "${!files[@]}"; do
-        if [[ "$i" -ne "$keep_index" ]]; then
-            handle_file "${files[$i]}"
-        fi
-    done
-    echo
-}
-
-# Function to handle a single file (delete or archive)
-handle_file() {
-    local file="$1"
-    
-    if [[ "$DELETE" == true ]]; then
-        # Delete mode
-        if [[ "$DRY_RUN" == true ]]; then
-            dry_run_msg "Would delete: $file"
-            dry_run_msg "Command: rm \"$file\""
-        else
-            if [[ "$NO_CONFIRM" == true ]]; then
-                echo "Deleting: $file"
-                rm "$file"
-            else
-                echo -n "Delete $file? (y/n): "
-                read -r response
-                if [[ "$response" =~ ^[Yy]$ ]]; then
-                    echo "Deleting: $file"
-                    rm "$file"
-                else
-                    echo "Skipped: $file"
-                fi
-            fi
-        fi
-    elif [[ -n "$ARCHIVE" ]]; then
-        # Archive mode
-        local dest_dir="$ARCHIVE"
-        local dest_file="$dest_dir/$(basename "$file")"
-        local counter=1
-        
-        # Handle filename conflicts
-        while [[ -e "$dest_file" ]]; do
-            local base="${file%.*}"
-            local ext="${file##*.}"
-            if [[ "$base" == "$file" ]]; then
-                # No extension
-                dest_file="$dest_dir/$(basename "$file").$counter"
-            else
-                dest_file="$dest_dir/$(basename "$base").$counter.$ext"
-            fi
-            ((counter++)) || true
-        done
-        
-        if [[ "$DRY_RUN" == true ]]; then
-            dry_run_msg "Would archive: $file -> $dest_file"
-            dry_run_msg "Command: mv \"$file\" \"$dest_file\""
-        else
-            if [[ "$NO_CONFIRM" == true ]]; then
-                echo "Archiving: $file -> $dest_file"
-                mv "$file" "$dest_file"
-            else
-                echo -n "Archive $file? (y/n): "
-                read -r response
-                if [[ "$response" =~ ^[Yy]$ ]]; then
-                    echo "Archiving: $file -> $dest_file"
-                    mv "$file" "$dest_file"
-                else
-                    echo "Skipped: $file"
-                fi
-            fi
-        fi
-    fi
-}
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        -v|--version)
-            version
-            exit 0
-            ;;
-        -d|--delete)
-            DELETE=true
-            shift
-            ;;
-        -a|--archive)
-            if [[ $# -lt 2 ]]; then
-                error "--archive requires a directory argument"
-                exit 1
-            fi
-            ARCHIVE="$2"
-            shift 2
-            ;;
-        -r|--recursive)
-            RECURSIVE=true
-            shift
-            ;;
-        --keep-oldest)
-            KEEP_STRATEGY="oldest"
-            shift
-            ;;
-        --keep-newest)
-            KEEP_STRATEGY="newest"
-            shift
-            ;;
-        --keep-ask)
-            KEEP_STRATEGY="ask"
-            shift
-            ;;
-        --no-confirm)
-            NO_CONFIRM=true
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        -*)
-            error "Unknown option: $1"
-            usage
-            exit 1
-            ;;
-        *)
-            break
-            ;;
-    esac
-done
-
-# Validate options
-if [[ "$DELETE" == true ]] && [[ -n "$ARCHIVE" ]]; then
-    error "Cannot specify both --delete and --archive"
-    exit 1
-fi
-
-if [[ -n "$ARCHIVE" ]]; then
-    if [[ ! -d "$ARCHIVE" ]]; then
-        if [[ "$DRY_RUN" == true ]]; then
-            dry_run_msg "Would create archive directory: $ARCHIVE"
-        else
-            echo "Creating archive directory: $ARCHIVE" >&2
-            mkdir -p "$ARCHIVE"
-        fi
-    elif [[ ! -w "$ARCHIVE" ]]; then
-        error "Archive directory is not writable: $ARCHIVE"
-        exit 1
-    fi
-fi
-
-# Check for required tools
-if ! command -v crc32 >/dev/null 2>&1 && \
-   ! command -v cksum >/dev/null 2>&1 && \
-   ! command -v python3 >/dev/null 2>&1; then
-    error "No CRC32 tool available. Install one of: crc32, cksum, or python3"
-    exit 1
-fi
-
-if ! command -v sha256sum >/dev/null 2>&1 && \
-   ! command -v shasum >/dev/null 2>&1; then
-    error "No SHA256 tool available. Install sha256sum or shasum"
-    exit 1
-fi
-
-# Main execution
-echo "Collecting files..." >&2
-collect_files "$@" > "${TMP_DIR}/all_files"
-
-# Check if we have any files
-if [[ ! -s "${TMP_DIR}/all_files" ]]; then
-    echo "No files to process." >&2
-    exit 0
-fi
-
-# Find duplicates
-find_duplicates
-
-# Check if we found any duplicates
-if [[ ! -s "$DUPES_FILE" ]]; then
-    echo "No duplicate files found." >&2
-    exit 0
-fi
-
-# Process duplicates if action requested
-if [[ "$DELETE" == true ]] || [[ -n "$ARCHIVE" ]]; then
-    echo >&2
-    echo "Processing duplicates..." >&2
-    
-    # Get unique SHA256 hashes
-    cut -d' ' -f1 "$DUPES_FILE" | sort -u | while IFS= read -r sha; do
-        handle_duplicate_group "$sha"
-    done
-else
-    # Just display duplicates
-    echo >&2
-    echo "Duplicate files found:" >&2
-    
-    current_sha=""
-    while IFS=' ' read -r sha mtime file; do
-        if [[ "$sha" != "$current_sha" ]]; then
-            if [[ -n "$current_sha" ]]; then
-                echo  # Blank line between groups
-            fi
-            current_sha="$sha"
-            echo "Duplicate set (SHA256: $sha):"
-        fi
-        echo "  $file (modified: $(date -d "@$mtime" 2>/dev/null || date -r "$mtime" 2>/dev/null || echo "unknown"))"
-    done < "$DUPES_FILE"
-fi
+if __name__ == "__main__":
+    sys.exit(main())
