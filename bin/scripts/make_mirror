@@ -62,6 +62,10 @@ UBUNTU_PPAS=(
 FREEBSD_MIRROR="rsync://ftp4.de.FreeBSD.org/FreeBSD/"
 FREEBSD_RELEASES=("14.3" "14.2" "13.5" "13.4")
 FREEBSD_ARCHITECTURES=("amd64" "arm64")
+# Package syncing options
+FREEBSD_SYNC_PACKAGES=true  # Set to false to skip package syncing (saves significant space/time)
+FREEBSD_PACKAGE_BRANCHES=("quarterly" "latest")  # Which package branches to sync
+FREEBSD_DELETE_ORPHANED=true  # Remove packages that no longer exist upstream (requires lftp)
 
 # AlmaLinux Configuration
 ALMALINUX_MIRROR="rsync://rsync.repo.almalinux.org/almalinux/"
@@ -118,6 +122,10 @@ EXAMPLES:
     $(basename "$0") --sync all --stats
 
 MIRROR ROOT: ${MIRROR_ROOT}
+
+NOTE: FreeBSD package syncing can require 50GB+ per architecture/release.
+      Set FREEBSD_SYNC_PACKAGES=false in the script to disable package syncing.
+      Install 'lftp' for automatic removal of orphaned packages (recommended).
 EOF
 }
 
@@ -437,12 +445,13 @@ sync_freebsd() {
     local freebsd_dir="${MIRROR_ROOT}/freebsd"
     ensure_mirror_dir "${freebsd_dir}"
     
+    # Sync base system releases
     for release in "${FREEBSD_RELEASES[@]}"; do
         for arch in "${FREEBSD_ARCHITECTURES[@]}"; do
             local release_dir="${freebsd_dir}/releases/${arch}/${release}-RELEASE"
             ensure_mirror_dir "${release_dir}"
             
-            log "Syncing FreeBSD ${release}/${arch}..."
+            log "Syncing FreeBSD ${release}/${arch} base system..."
             local opts=("${RSYNC_OPTS[@]}")
             [[ "${DRY_RUN}" == "true" ]] && opts+=(--dry-run)
             [[ "${SHOW_STATS}" == "true" ]] && opts+=(--stats)
@@ -450,12 +459,107 @@ sync_freebsd() {
             if ! rsync "${opts[@]}" \
                 "${FREEBSD_MIRROR}releases/${arch}/${release}-RELEASE/" \
                 "${release_dir}/"; then
-                error "Failed to sync FreeBSD ${release}/${arch}"
+                error "Failed to sync FreeBSD ${release}/${arch} base system"
                 FAILED_SYNCS+=("freebsd:${release}/${arch}")
                 [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
             fi
         done
     done
+    
+    # Sync packages using wget since pkg.freebsd.org doesn't provide rsync
+    if [[ "${FREEBSD_SYNC_PACKAGES}" == "true" ]]; then
+        log "Syncing FreeBSD packages..."
+        local pkg_dir="${freebsd_dir}/packages"
+        ensure_mirror_dir "${pkg_dir}"
+        
+        # FreeBSD package repository structure: https://pkg.freebsd.org/FreeBSD:${version}:${arch}/
+        for release in "${FREEBSD_RELEASES[@]}"; do
+            for arch in "${FREEBSD_ARCHITECTURES[@]}"; do
+                # Convert arch names for package URLs
+                local pkg_arch="${arch}"
+                [[ "${arch}" == "amd64" ]] && pkg_arch="amd64"
+                [[ "${arch}" == "arm64" ]] && pkg_arch="aarch64"
+                
+                # Sync configured package branches
+                for branch in "${FREEBSD_PACKAGE_BRANCHES[@]}"; do
+                local pkg_release_dir="${pkg_dir}/FreeBSD:${release}:${pkg_arch}/${branch}"
+                ensure_mirror_dir "${pkg_release_dir}"
+                
+                log "Syncing FreeBSD ${release}/${arch} packages (${branch})..."
+                
+                if [[ "${DRY_RUN}" == "true" ]]; then
+                    log "[DRY RUN] Would sync packages from https://pkg.freebsd.org/FreeBSD:${release}:${pkg_arch}/${branch}/"
+                    continue
+                fi
+                
+                # Check if the repository exists before attempting to mirror
+                local repo_url="https://pkg.freebsd.org/FreeBSD:${release}:${pkg_arch}/${branch}/"
+                if curl -s --head "${repo_url}" | head -n 1 | grep -q "200 OK"; then
+                    log "Mirroring packages from ${repo_url}..."
+                    
+                    # Try lftp first (better mirroring with delete support), fall back to wget
+                    if command -v lftp >/dev/null 2>&1; then
+                        log "Using lftp for mirroring..."
+                        
+                        # Build lftp mirror command
+                        local lftp_delete_flag=""
+                        if [[ "${FREEBSD_DELETE_ORPHANED}" == "true" ]]; then
+                            lftp_delete_flag="--delete"
+                            log "Will remove orphaned packages (FREEBSD_DELETE_ORPHANED=true)"
+                        else
+                            log "Will NOT remove orphaned packages (FREEBSD_DELETE_ORPHANED=false)"
+                        fi
+                        
+                        # lftp mirror command
+                        if ! lftp -c "
+                            set ssl:verify-certificate false;
+                            set net:timeout 600;
+                            set net:max-retries 3;
+                            open ${repo_url};
+                            mirror ${lftp_delete_flag} --verbose --continue --parallel=4 . '${pkg_release_dir}';
+                        "; then
+                            error "Failed to sync FreeBSD ${release}/${arch} packages (${branch}) with lftp"
+                            FAILED_SYNCS+=("freebsd:packages:${release}/${arch}/${branch}")
+                            [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
+                        fi
+                    else
+                        log "Using wget for mirroring (lftp not available - orphaned files won't be removed)..."
+                        log "Install lftp for automatic cleanup of removed packages: sudo dnf install lftp"
+                        
+                        # Use wget to mirror the package repository
+                        # Note: This will download a lot of data (packages can be 50GB+ per arch/release)
+                        local wget_opts=(
+                            --mirror
+                            --no-parent
+                            --no-host-directories
+                            --cut-dirs=1
+                            --reject="index.html*"
+                            --timestamping
+                            --continue
+                            --timeout=600
+                            --tries=3
+                            --waitretry=10
+                        )
+                        
+                        if ! wget "${wget_opts[@]}" \
+                            --directory-prefix="${pkg_release_dir}" \
+                            "${repo_url}"; then
+                            error "Failed to sync FreeBSD ${release}/${arch} packages (${branch}) with wget"
+                            FAILED_SYNCS+=("freebsd:packages:${release}/${arch}/${branch}")
+                            [[ "${CONTINUE_ON_ERROR}" != "true" ]] && return 1
+                        fi
+                        
+                        log "WARNING: wget doesn't remove orphaned packages. Consider installing lftp for full mirror sync."
+                    fi
+                else
+                    log "Package repository not found: ${repo_url} (may not exist for this release/arch)"
+                fi
+            done
+        done
+    done
+    else
+        log "FreeBSD package syncing disabled (FREEBSD_SYNC_PACKAGES=false)"
+    fi
     
     # Sync latest ISOs
     local iso_dir="${freebsd_dir}/isos"
