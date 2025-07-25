@@ -23,6 +23,9 @@ This script helps schedule multi-session events across multiple locations while 
 attendee conflicts and respecting various constraints like room capacity, presenter availability,
 and time restrictions.
 
+Required sessions (required=true) are automatically assigned to ALL attendees regardless of
+signup preferences. Non-required sessions only include attendees who explicitly signed up.
+
 Author: Simple Schedule Contributors
 License: MIT
 """
@@ -85,7 +88,8 @@ class Session:
     length: int  # minutes
     required: bool
     priority: int  # -20 to 19
-    number_of_sessions: int
+    min_sessions: int  # Minimum number of sessions to schedule
+    max_sessions: int  # Maximum number of sessions to schedule (0 means auto-determine)
     max_per_day: int
     interested_attendees: Set[str]
     maybe_attendees: Set[str]
@@ -343,6 +347,142 @@ def normalize_interest_value(value: Any) -> str:
         return ''
 
 
+def parse_session_count(value: Any, session_name: str) -> Tuple[int, int]:
+    """
+    Parse session count which can be:
+    - Single number: "3" -> (3, 3)
+    - Range: "2-5" -> (2, 5)
+    - Auto-determine: "?" or "0" -> (1, 0) where 0 means unlimited
+    
+    Returns: (min_sessions, max_sessions)
+    """
+    if pd.isna(value):
+        raise ValueError(f"number_of_sessions is required")
+    
+    str_val = str(value).strip()
+    
+    # Check for auto-determine
+    if str_val in ['?', '0']:
+        return (1, 0)  # min 1, max unlimited (auto-determine)
+    
+    # Check for range
+    if '-' in str_val:
+        parts = str_val.split('-')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid range format: '{str_val}'. Use 'min-max' format")
+        
+        try:
+            min_val = int(parts[0].strip())
+            max_val = int(parts[1].strip())
+        except ValueError:
+            raise ValueError(f"Invalid range values: '{str_val}'. Must be integers")
+        
+        if min_val <= 0:
+            raise ValueError(f"Minimum sessions must be > 0, got {min_val}")
+        if max_val < min_val:
+            raise ValueError(f"Maximum sessions ({max_val}) must be >= minimum ({min_val})")
+        
+        return (min_val, max_val)
+    
+    # Single number
+    try:
+        num = int(str_val)
+        if num <= 0:
+            raise ValueError(f"number_of_sessions must be > 0, got {num}")
+        return (num, num)
+    except ValueError:
+        raise ValueError(f"Invalid number_of_sessions value: '{str_val}'")
+
+
+def validate_attendees_delimited(df: pd.DataFrame, sessions_df: pd.DataFrame, delimiter: str) -> Dict[str, Dict[str, str]]:
+    """
+    Validate and parse attendees data in delimited format
+    
+    Expected format:
+        attendee_name | sessions
+        John Doe      | Intro to AI:yes,Workshop A,Panel Discussion:maybe
+        Jane Smith    | Workshop B:yes,Closing Keynote
+    
+    Returns:
+        Dict mapping attendee_name to dict of session_name -> interest_level
+    """
+    debug_log("Validating attendees data (delimited format)")
+    debug_log(f"Using delimiter: '{delimiter}'", 1)
+    
+    if df.empty:
+        raise SchedulingError("Attendees file is empty")
+    
+    if len(df.columns) != 2:
+        raise SchedulingError(
+            "Attendees file in delimited format must have exactly 2 columns: "
+            "attendee_name and sessions"
+        )
+    
+    # Column names
+    attendee_col = df.columns[0]
+    sessions_col = df.columns[1]
+    
+    debug_log(f"Attendee column: {attendee_col}", 1)
+    debug_log(f"Sessions column: {sessions_col}", 1)
+    
+    # Check for duplicate attendee names
+    duplicates = df[attendee_col].duplicated()
+    if duplicates.any():
+        dup_names = df[attendee_col][duplicates].unique()
+        raise SchedulingError(f"Duplicate attendee names found: {', '.join(dup_names)}")
+    
+    # Get valid session names from sessions file
+    valid_sessions = set(sessions_df[sessions_df.columns[0]].values)
+    
+    # Build attendee interest map
+    attendees = {}
+    for _, row in df.iterrows():
+        attendee_name = str(row[attendee_col]).strip()
+        sessions_str = str(row[sessions_col]).strip()
+        interests = {}
+        
+        if sessions_str and not pd.isna(row[sessions_col]):
+            # Parse delimited sessions
+            session_entries = [s.strip() for s in sessions_str.split(delimiter) if s.strip()]
+            
+            for entry in session_entries:
+                # Check if interest level is specified with :suffix
+                if ':' in entry:
+                    parts = entry.split(':', 1)
+                    session_name = parts[0].strip()
+                    interest_suffix = parts[1].strip().lower()
+                    
+                    if interest_suffix in ['yes', 'maybe']:
+                        interest = interest_suffix
+                    else:
+                        # Normalize the suffix
+                        interest = normalize_interest_value(interest_suffix)
+                        if not interest:
+                            debug_log(f"Warning: Unknown interest suffix '{interest_suffix}' for session '{session_name}', treating as 'yes'", 2)
+                            interest = 'yes'
+                else:
+                    # No suffix means definite interest
+                    session_name = entry
+                    interest = 'yes'
+                
+                # Validate session exists
+                if session_name not in valid_sessions:
+                    raise SchedulingError(
+                        f"Session '{session_name}' for attendee '{attendee_name}' not found in sessions file"
+                    )
+                
+                interests[session_name] = interest
+        
+        attendees[attendee_name] = interests
+    
+    debug_log(f"Processed {len(attendees)} attendees", 1)
+    if DEBUG and attendees:
+        sample_attendee = list(attendees.keys())[0]
+        debug_log(f"Sample: {sample_attendee} -> {attendees[sample_attendee]}", 2)
+    
+    return attendees
+
+
 def validate_attendees(df: pd.DataFrame, sessions_df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
     """
     Validate and parse attendees data
@@ -464,26 +604,39 @@ def validate_sessions(df: pd.DataFrame, attendees: Dict[str, Dict[str, str]]) ->
             if priority < -20 or priority > 19:
                 raise ValueError(f"priority must be between -20 and 19, got {priority}")
             
-            number_of_sessions = int(row[col_mapping['number_of_sessions']])
-            if number_of_sessions <= 0:
-                raise ValueError(f"number_of_sessions must be > 0, got {number_of_sessions}")
+            # Parse number_of_sessions (can be range or auto)
+            min_sessions, max_sessions = parse_session_count(
+                row[col_mapping['number_of_sessions']], 
+                name
+            )
             
             max_per_day = int(row[col_mapping['max_per_day']])
             if max_per_day <= 0:
                 raise ValueError(f"max_per_day must be > 0, got {max_per_day}")
-            if max_per_day > number_of_sessions:
-                raise ValueError(f"max_per_day ({max_per_day}) cannot exceed number_of_sessions ({number_of_sessions})")
+            
+            # Validate max_per_day against session counts
+            if max_sessions > 0 and max_per_day > max_sessions:
+                raise ValueError(f"max_per_day ({max_per_day}) cannot exceed max_sessions ({max_sessions})")
+            if max_per_day < min_sessions and min_sessions <= 3:
+                # Only warn if min_sessions is reasonable (<=3)
+                debug_log(f"Warning: max_per_day ({max_per_day}) < min_sessions ({min_sessions}) for '{name}'", 1)
             
             # Find interested attendees
             interested = set()
             maybe = set()
             
-            for attendee, interests in attendees.items():
-                if name in interests:
-                    if interests[name] == 'yes':
-                        interested.add(attendee)
-                    elif interests[name] == 'maybe':
-                        maybe.add(attendee)
+            # If session is required, ALL attendees are interested
+            if required:
+                interested = all_attendee_names.copy()
+                debug_log(f"  Session '{name}' is required - adding all {len(interested)} attendees", 1)
+            else:
+                # Only add those who explicitly signed up
+                for attendee, interests in attendees.items():
+                    if name in interests:
+                        if interests[name] == 'yes':
+                            interested.add(attendee)
+                        elif interests[name] == 'maybe':
+                            maybe.add(attendee)
             
             sessions.append(Session(
                 name=name,
@@ -492,7 +645,8 @@ def validate_sessions(df: pd.DataFrame, attendees: Dict[str, Dict[str, str]]) ->
                 length=length,
                 required=required,
                 priority=priority,
-                number_of_sessions=number_of_sessions,
+                min_sessions=min_sessions,
+                max_sessions=max_sessions,
                 max_per_day=max_per_day,
                 interested_attendees=interested,
                 maybe_attendees=maybe
@@ -744,13 +898,18 @@ class Scheduler:
         time_slots: Dict[int, List[TimeSlot]],
         include_overlaps: bool = False
     ):
-        self.sessions = sorted(sessions, key=lambda s: (s.priority, -len(s.interested_attendees)))
+        # Sort sessions: required first, then by priority (lower number = higher priority), then by number of interested attendees
+        self.sessions = sorted(sessions, key=lambda s: (-s.required, s.priority, -len(s.interested_attendees)))
         self.locations = locations
         self.attendees = attendees
         self.time_slots = time_slots
         self.include_overlaps = include_overlaps
         self.schedule: List[ScheduledSession] = []
         self.unscheduled_sessions: List[Tuple[Session, str]] = []
+        # Track attendees who have already been scheduled for each session name
+        self.scheduled_attendees_by_session: Dict[str, Set[str]] = defaultdict(set)
+        # Track scheduling errors for required sessions
+        self.scheduling_errors: List[str] = []
     
     def is_presenter_available(self, presenter: str, time_slot: TimeSlot) -> bool:
         """Check if presenter is available during time slot"""
@@ -867,6 +1026,12 @@ class Scheduler:
         slots_needed = self.calculate_session_duration_slots(session, slice_duration)
         debug_log(f"  Session needs {slots_needed} time slots ({session.length} minutes)", 2)
         
+        # Collect all possible slots with their conflict scores
+        possible_slots = []
+        
+        # Get available attendees for this session (not already scheduled)
+        available_attendees = session.interested_attendees - self.scheduled_attendees_by_session[session.name]
+        
         # Try each day
         for day in sorted(self.time_slots.keys()):
             debug_log(f"  Day {day + 1}:", 2)
@@ -917,45 +1082,82 @@ class Scheduler:
                         debug_log(f"      ✗ Presenter(s) not available", 5)
                         continue
                     
-                    # Check attendee conflicts
+                    # If no attendees are available (all already scheduled), skip this slot
+                    if not available_attendees:
+                        debug_log(f"      ✗ All interested attendees already scheduled for {session.name}", 5)
+                        continue
+                    
+                    # Check attendee conflicts (only for available attendees)
                     conflicts = self.get_attendee_conflicts(
-                        session.interested_attendees, 
+                        available_attendees, 
                         combined_slot
                     )
                     
-                    # For required sessions, no conflicts allowed
-                    if session.required and conflicts and not self.include_overlaps:
+                    # For required sessions, we should still schedule them even with conflicts
+                    # Only skip if ALL available attendees have conflicts
+                    if session.required and len(conflicts) == len(available_attendees) and not self.include_overlaps:
+                        debug_log(f"      ✗ All available attendees have conflicts for required session", 5)
                         continue
                     
                     # Calculate score (minimize conflicts)
                     score = len(conflicts)
                     
-                    # Schedule the session
-                    scheduled_attendees = session.interested_attendees - conflicts
-                    if self.include_overlaps:
-                        scheduled_attendees = session.interested_attendees
+                    # Add to possible slots
+                    possible_slots.append({
+                        'location': location,
+                        'time_slot': combined_slot,
+                        'conflicts': conflicts,
+                        'score': score,
+                        'day': day
+                    })
                     
-                    # Apply max_attendees limit
-                    if session.max_attendees > 0 and len(scheduled_attendees) > session.max_attendees:
-                        scheduled_attendees = set(list(scheduled_attendees)[:session.max_attendees])
-                    
-                    self.schedule.append(ScheduledSession(
-                        session=session,
-                        location=location,
-                        time_slot=combined_slot,
-                        attendees=scheduled_attendees
-                    ))
-                    
-                    sessions_per_day[session.name][day] = \
-                        sessions_per_day[session.name].get(day, 0) + 1
-                    
-                    debug_log(f"      ✓ Scheduled successfully with {len(scheduled_attendees)} attendees", 5)
-                    if conflicts:
-                        debug_log(f"        Conflicts: {len(conflicts)} attendees", 6)
-                    
-                    return True
+                    debug_log(f"      ✓ Added as possible slot (score={score}, conflicts={len(conflicts)})", 5)
         
-        return False
+        # If no possible slots, return False
+        if not possible_slots:
+            debug_log(f"  ✗ No possible slots found for {session.name} instance {instance_num + 1}", 1)
+            debug_log(f"    Available attendees: {len(available_attendees)}", 2)
+            if len(available_attendees) == 0:
+                debug_log(f"    Reason: All {len(session.interested_attendees)} interested attendees already scheduled", 2)
+            else:
+                debug_log(f"    Check: location capacity, time availability, presenter conflicts", 2)
+            return False
+        
+        # Sort by score (fewest conflicts first), then by day (earlier days first)
+        possible_slots.sort(key=lambda x: (x['score'], x['day']))
+        
+        # Use the best slot (fewest conflicts)
+        best_slot = possible_slots[0]
+        
+        # Schedule the session
+        scheduled_attendees = available_attendees - best_slot['conflicts']
+        if self.include_overlaps:
+            scheduled_attendees = available_attendees
+        
+        # Apply max_attendees limit
+        if session.max_attendees > 0 and len(scheduled_attendees) > session.max_attendees:
+            # Sort attendees to ensure consistent selection
+            sorted_attendees = sorted(list(scheduled_attendees))
+            scheduled_attendees = set(sorted_attendees[:session.max_attendees])
+        
+        self.schedule.append(ScheduledSession(
+            session=session,
+            location=best_slot['location'],
+            time_slot=best_slot['time_slot'],
+            attendees=scheduled_attendees
+        ))
+        
+        # Update tracking of scheduled attendees for this session
+        self.scheduled_attendees_by_session[session.name].update(scheduled_attendees)
+        
+        sessions_per_day[session.name][best_slot['day']] = \
+            sessions_per_day[session.name].get(best_slot['day'], 0) + 1
+        
+        debug_log(f"      ✓ Scheduled successfully with {len(scheduled_attendees)} attendees at {format_time(best_slot['time_slot'].start_time)}", 5)
+        if best_slot['conflicts']:
+            debug_log(f"        Conflicts: {len(best_slot['conflicts'])} attendees", 6)
+        
+        return True
     
     def run(self):
         """Run the scheduling algorithm"""
@@ -971,19 +1173,78 @@ class Scheduler:
             debug_log(f"\nScheduling session: {session.name} (priority={session.priority})")
             scheduled_count = 0
             
-            for i in range(session.number_of_sessions):
-                if self.schedule_session_instance(session, i, sessions_per_day):
+            # Determine target number of sessions
+            if session.max_sessions == 0:
+                # Auto-determine based on attendee count and max_attendees per session
+                if session.max_attendees > 0:
+                    # Calculate how many sessions needed to accommodate all interested attendees
+                    total_interested = len(session.interested_attendees)
+                    sessions_needed = (total_interested + session.max_attendees - 1) // session.max_attendees
+                    target_sessions = max(session.min_sessions, min(sessions_needed, 10))  # Cap at 10 for sanity
+                else:
+                    # No attendee limit, so use min_sessions
+                    target_sessions = session.min_sessions
+                debug_log(f"  Auto-determined target sessions: {target_sessions} (min={session.min_sessions})", 1)
+            else:
+                # Use the specified max as target
+                target_sessions = session.max_sessions
+            
+            # Try to schedule up to target_sessions
+            attempts = 0
+            consecutive_failures = 0
+            
+            while scheduled_count < target_sessions and attempts < target_sessions * 2:
+                if self.schedule_session_instance(session, scheduled_count, sessions_per_day):
                     scheduled_count += 1
+                    consecutive_failures = 0
+                    
+                    # For auto-determine, check if we've scheduled enough
+                    if session.max_sessions == 0:
+                        # Check if all interested attendees have been scheduled
+                        unscheduled = session.interested_attendees - self.scheduled_attendees_by_session[session.name]
+                        if len(unscheduled) == 0:
+                            debug_log(f"  All interested attendees scheduled, stopping at {scheduled_count} sessions", 1)
+                            break
+                        elif session.max_attendees > 0 and len(unscheduled) < session.max_attendees * 0.5:
+                            # Less than half capacity remaining, might not be worth another session
+                            debug_log(f"  Only {len(unscheduled)} attendees remaining, stopping at {scheduled_count} sessions", 1)
+                            break
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        # Stop trying after 3 consecutive failures
+                        debug_log(f"  Stopping after 3 consecutive scheduling failures", 1)
+                        break
+                
+                attempts += 1
+            
+            # Check if we met minimum requirements
+            if scheduled_count < session.min_sessions:
+                # Provide more context about why scheduling failed
+                details = []
+                if len(session.interested_attendees) == 0:
+                    details.append("no attendees signed up")
+                else:
+                    details.append(f"{len(session.interested_attendees)} interested attendees")
+                
+                if len(session.presenters) > 0:
+                    details.append(f"presenter(s): {', '.join(session.presenters)}")
+                
+                details.append(f"{session.length} minutes")
+                
+                if session.required:
+                    self.scheduling_errors.append(
+                        f"Unable to schedule minimum required sessions for '{session.name}'. "
+                        f"Scheduled {scheduled_count} but minimum is {session.min_sessions}. "
+                        f"Details: {', '.join(details)}"
+                    )
                 else:
                     self.unscheduled_sessions.append(
-                        (session, f"Could not find suitable time/location for instance {i + 1}")
+                        (session, f"Could only schedule {scheduled_count} of minimum {session.min_sessions} sessions ({', '.join(details)})")
                     )
-            
-            if scheduled_count == 0 and session.required:
-                raise SchedulingError(
-                    f"Unable to schedule required session '{session.name}'. "
-                    f"Consider relaxing constraints or adding more time/locations."
-                )
+            elif scheduled_count < target_sessions:
+                # Scheduled some but not all target sessions
+                debug_log(f"  Scheduled {scheduled_count} of target {target_sessions} sessions", 1)
 
 
 def format_time(dt: datetime) -> str:
@@ -1173,6 +1434,230 @@ def generate_csv_output(
             writer.writerow(row)
     
     return writer.getvalue()
+
+
+def generate_roster_markdown(
+    schedule: List[ScheduledSession],
+    day_names: List[str]
+) -> str:
+    """Generate markdown roster output with session details"""
+    output = []
+    output.append("# Session Roster\n")
+    
+    # Group sessions by day
+    sessions_by_day = defaultdict(list)
+    for scheduled in schedule:
+        sessions_by_day[scheduled.time_slot.day].append(scheduled)
+    
+    # Sort days and sessions within each day
+    for day in sorted(sessions_by_day.keys()):
+        output.append(f"## {day_names[day]}\n")
+        
+        # Sort sessions by start time
+        day_sessions = sorted(sessions_by_day[day], key=lambda s: s.time_slot.start_time)
+        
+        for scheduled in day_sessions:
+            output.append(f"### {scheduled.session.name}\n")
+            output.append(f"- **Time**: {format_time(scheduled.time_slot.start_time)} - {format_time(scheduled.time_slot.end_time)}")
+            output.append(f"- **Location**: {scheduled.location.name}")
+            output.append(f"- **Duration**: {scheduled.session.length} minutes")
+            
+            if scheduled.session.presenters:
+                output.append(f"- **Presenter(s)**: {', '.join(scheduled.session.presenters)}")
+            
+            output.append(f"- **Attendees** ({len(scheduled.attendees)}):")
+            if scheduled.attendees:
+                # Sort attendees alphabetically
+                for attendee in sorted(scheduled.attendees):
+                    # Check if this is an overlap attendee
+                    if "(overlap)" in str(attendee):
+                        output.append(f"  - {attendee} ⚠️")
+                    else:
+                        output.append(f"  - {attendee}")
+            else:
+                output.append("  - No attendees scheduled")
+            
+            output.append("")  # Empty line between sessions
+    
+    return "\n".join(output)
+
+
+def generate_roster_csv(
+    schedule: List[ScheduledSession],
+    day_names: List[str]
+) -> str:
+    """Generate CSV roster output with session details"""
+    writer = StringWriter()
+    
+    # Write header
+    header = [
+        "Day", "Session", "Start Time", "End Time", "Duration (min)",
+        "Location", "Presenters", "Attendee Count", "Attendees"
+    ]
+    writer.writerow(header)
+    
+    # Sort sessions by day and time
+    sorted_schedule = sorted(
+        schedule,
+        key=lambda s: (s.time_slot.day, s.time_slot.start_time)
+    )
+    
+    for scheduled in sorted_schedule:
+        row = [
+            day_names[scheduled.time_slot.day],
+            scheduled.session.name,
+            format_time(scheduled.time_slot.start_time),
+            format_time(scheduled.time_slot.end_time),
+            scheduled.session.length,
+            scheduled.location.name,
+            "; ".join(scheduled.session.presenters),
+            len(scheduled.attendees),
+            "; ".join(sorted(str(a) for a in scheduled.attendees))
+        ]
+        writer.writerow(row)
+    
+    return writer.getvalue()
+
+
+def generate_roster_xlsx(
+    schedule: List[ScheduledSession],
+    output_file: str,
+    day_names: List[str]
+):
+    """Generate Excel roster output with session details"""
+    if not XLSX_SUPPORT:
+        raise SchedulingError("Excel output requires openpyxl. Install with: pip install openpyxl")
+    
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Session Roster"
+    
+    # Styles
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    day_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    day_font = Font(bold=True, size=12)
+    session_fill = PatternFill(start_color="E7F3FF", end_color="E7F3FF", fill_type="solid")
+    border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    # Write header
+    headers = [
+        "Day", "Session", "Time", "Duration", "Location", 
+        "Presenter(s)", "# Attendees", "Attendee List"
+    ]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    
+    # Group and sort sessions
+    sessions_by_day = defaultdict(list)
+    for scheduled in schedule:
+        sessions_by_day[scheduled.time_slot.day].append(scheduled)
+    
+    row_num = 2
+    for day in sorted(sessions_by_day.keys()):
+        # Day header row
+        ws.merge_cells(f'A{row_num}:H{row_num}')
+        day_cell = ws.cell(row=row_num, column=1, value=day_names[day])
+        day_cell.fill = day_fill
+        day_cell.font = day_font
+        day_cell.alignment = Alignment(horizontal="center", vertical="center")
+        for col in range(1, 9):
+            ws.cell(row=row_num, column=col).border = border
+        row_num += 1
+        
+        # Sort sessions by start time
+        day_sessions = sorted(sessions_by_day[day], key=lambda s: s.time_slot.start_time)
+        
+        for scheduled in day_sessions:
+            time_str = f"{format_time(scheduled.time_slot.start_time)} - {format_time(scheduled.time_slot.end_time)}"
+            duration_str = f"{scheduled.session.length} min"
+            presenters_str = ", ".join(scheduled.session.presenters) if scheduled.session.presenters else "N/A"
+            attendees_str = ", ".join(sorted(str(a) for a in scheduled.attendees)) if scheduled.attendees else "No attendees"
+            
+            # Check for overlaps in attendees
+            has_overlaps = any("(overlap)" in str(a) for a in scheduled.attendees)
+            
+            values = [
+                "",  # Day column (empty for session rows)
+                scheduled.session.name,
+                time_str,
+                duration_str,
+                scheduled.location.name,
+                presenters_str,
+                len(scheduled.attendees),
+                attendees_str
+            ]
+            
+            for col, value in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=col, value=value)
+                if col == 2:  # Session name
+                    cell.fill = session_fill
+                    cell.font = Font(bold=True)
+                cell.alignment = Alignment(
+                    horizontal="left" if col in [2, 6, 8] else "center",
+                    vertical="center",
+                    wrap_text=(col == 8)  # Wrap attendee list
+                )
+                cell.border = border
+                
+                # Add warning color for overlaps
+                if has_overlaps and col == 7:
+                    cell.font = Font(color="FF0000")
+            
+            row_num += 1
+    
+    # Add summary sheet
+    ws_summary = wb.create_sheet(title="Summary")
+    ws_summary.append(["Session Roster Summary"])
+    ws_summary.append([])
+    ws_summary.append(["Total Sessions Scheduled:", len(schedule)])
+    ws_summary.append(["Total Unique Sessions:", len(set(s.session.name for s in schedule))])
+    ws_summary.append([])
+    
+    # Session counts
+    session_counts = defaultdict(int)
+    total_attendees_by_session = defaultdict(set)
+    for scheduled in schedule:
+        session_counts[scheduled.session.name] += 1
+        total_attendees_by_session[scheduled.session.name].update(scheduled.attendees)
+    
+    ws_summary.append(["Session", "Times Scheduled", "Total Unique Attendees"])
+    for session_name in sorted(session_counts.keys()):
+        ws_summary.append([
+            session_name,
+            session_counts[session_name],
+            len(total_attendees_by_session[session_name])
+        ])
+    
+    # Adjust column widths
+    for col in range(1, 9):
+        if col == 8:  # Attendee list column
+            ws.column_dimensions[get_column_letter(col)].width = 50
+        elif col == 2:  # Session name
+            ws.column_dimensions[get_column_letter(col)].width = 30
+        elif col == 6:  # Presenters
+            ws.column_dimensions[get_column_letter(col)].width = 25
+        else:
+            ws.column_dimensions[get_column_letter(col)].width = 15
+    
+    # Set row heights for better readability
+    for row in ws.iter_rows():
+        ws.row_dimensions[row[0].row].height = 20
+    
+    wb.save(output_file)
 
 
 def generate_xlsx_output(
@@ -1372,6 +1857,19 @@ def create_arg_parser():
                    {"day": 1, "time": ["5pm-6pm"], "name": "Closing Reception"}]' \\
       --format xlsx --output "conference_schedule.xlsx"
 
+  # Using delimited sessions format with custom delimiter
+  simple_schedule --attendees attendees_delimited.csv --sessions sessions.csv --locations rooms.csv \\
+      --delimited-sessions --delimiter ";" \\
+      --format md --output schedule.md
+
+  # Generate both schedule and detailed roster
+  simple_schedule --attendees attendees.csv --sessions sessions.csv --locations rooms.csv \\
+      --days 2 --format xlsx --output "schedule.xlsx" --output-roster "roster.xlsx"
+
+  # Debug a failing schedule by dumping partial output
+  simple_schedule --attendees attendees.csv --sessions sessions.csv --locations rooms.csv \\
+      --dump-output --output debug_schedule.md --verbose
+
 Template files are available at:
   /var/home/zach/Documents/notes/03_resources/templates/simple_schedule/
 
@@ -1389,10 +1887,24 @@ For more information, see the documentation at:
     )
     
     parser.add_argument(
+        '--delimited-sessions',
+        action='store_true',
+        help='Use delimited sessions format. Attendees file should have two columns: '
+             'attendee_name and sessions (delimited list of session names with optional :yes/:maybe suffix)'
+    )
+    
+    parser.add_argument(
+        '--delimiter',
+        default=',',
+        help='Delimiter for sessions field when using --delimited-sessions (default: comma)'
+    )
+    
+    parser.add_argument(
         '--sessions',
         required=True,
         help='Path to sessions file (CSV, XLSX, or MD) with columns: session_name, max_attendees, '
-             'presenters, length, required, priority, number_of_sessions, max_per_day'
+             'presenters, length, required, priority, number_of_sessions, max_per_day. '
+             'number_of_sessions can be: single number (3), range (2-5), or auto-determine (? or 0)'
     )
     
     parser.add_argument(
@@ -1451,6 +1963,12 @@ For more information, see the documentation at:
     )
     
     parser.add_argument(
+        '--output-roster',
+        help='Output file path for detailed roster listing sessions with presenters, attendees, location, day and time. '
+             'Uses the same format as --format'
+    )
+    
+    parser.add_argument(
         '--verbose',
         action='store_true',
         help='Show scheduling statistics and unscheduled sessions'
@@ -1460,6 +1978,12 @@ For more information, see the documentation at:
         '--debug',
         action='store_true',
         help='Enable debug output to stderr for troubleshooting'
+    )
+    
+    parser.add_argument(
+        '--dump-output',
+        action='store_true',
+        help='Dump partial schedule output even on failure (useful for debugging failed schedules)'
     )
     
     return parser
@@ -1485,7 +2009,10 @@ def main():
         locations_df = read_input_file(args.locations, "locations")
         
         # Validate and parse data
-        attendees = validate_attendees(attendees_df, sessions_df)
+        if args.delimited_sessions:
+            attendees = validate_attendees_delimited(attendees_df, sessions_df, args.delimiter)
+        else:
+            attendees = validate_attendees(attendees_df, sessions_df)
         sessions = validate_sessions(sessions_df, attendees)
         locations = validate_locations(locations_df)
         
@@ -1516,6 +2043,78 @@ def main():
         scheduler = Scheduler(sessions, locations, attendees, time_slots, args.include_overlaps)
         scheduler.run()
         
+        # Check if there were any critical errors
+        if scheduler.scheduling_errors:
+            if args.dump_output:
+                print("\nERROR: Scheduling failed but --dump-output specified.", file=sys.stderr)
+                print("Dumping partial schedule...\n", file=sys.stderr)
+                
+                # Generate partial output despite errors
+                try:
+                    if args.format == 'md':
+                        output = generate_markdown_output(
+                            scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
+                        )
+                        if args.output:
+                            with open(args.output, 'w') as f:
+                                f.write(output)
+                            print(f"Partial schedule written to {args.output}", file=sys.stderr)
+                        else:
+                            print(output)
+                            
+                    elif args.format == 'csv':
+                        output = generate_csv_output(
+                            scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
+                        )
+                        if args.output:
+                            with open(args.output, 'w') as f:
+                                f.write(output)
+                            print(f"Partial schedule written to {args.output}", file=sys.stderr)
+                        else:
+                            print(output)
+                            
+                    elif args.format == 'xlsx':
+                        if not args.output:
+                            print("ERROR: Excel format requires --output parameter", file=sys.stderr)
+                        else:
+                            generate_xlsx_output(
+                                scheduler.schedule, locations, args.days, time_slots, 
+                                blackouts, slice_duration, args.output, day_names
+                            )
+                            print(f"Partial schedule written to {args.output}", file=sys.stderr)
+                    
+                    # Also generate roster if requested
+                    if args.output_roster:
+                        if args.format == 'md':
+                            roster_output = generate_roster_markdown(scheduler.schedule, day_names)
+                            with open(args.output_roster, 'w') as f:
+                                f.write(roster_output)
+                            print(f"Partial roster written to {args.output_roster}", file=sys.stderr)
+                                
+                        elif args.format == 'csv':
+                            roster_output = generate_roster_csv(scheduler.schedule, day_names)
+                            with open(args.output_roster, 'w') as f:
+                                f.write(roster_output)
+                            print(f"Partial roster written to {args.output_roster}", file=sys.stderr)
+                                
+                        elif args.format == 'xlsx':
+                            generate_roster_xlsx(scheduler.schedule, args.output_roster, day_names)
+                            print(f"Partial roster written to {args.output_roster}", file=sys.stderr)
+                            
+                except Exception as e:
+                    print(f"ERROR while dumping partial output: {e}", file=sys.stderr)
+                
+                # Print the scheduling errors
+                print("\nScheduling errors encountered:", file=sys.stderr)
+                for error in scheduler.scheduling_errors:
+                    print(f"  - {error}", file=sys.stderr)
+                
+                # Still exit with error
+                raise SchedulingError("\n".join(scheduler.scheduling_errors))
+            else:
+                # Normal error handling without dump
+                raise SchedulingError("\n".join(scheduler.scheduling_errors))
+        
         # Generate output
         if args.format == 'md':
             output = generate_markdown_output(
@@ -1545,6 +2144,24 @@ def main():
                 blackouts, slice_duration, args.output, day_names
             )
             print(f"Schedule written to {args.output}")
+        
+        # Generate roster if requested
+        if args.output_roster:
+            if args.format == 'md':
+                roster_output = generate_roster_markdown(scheduler.schedule, day_names)
+                with open(args.output_roster, 'w') as f:
+                    f.write(roster_output)
+                print(f"Roster written to {args.output_roster}")
+                    
+            elif args.format == 'csv':
+                roster_output = generate_roster_csv(scheduler.schedule, day_names)
+                with open(args.output_roster, 'w') as f:
+                    f.write(roster_output)
+                print(f"Roster written to {args.output_roster}")
+                    
+            elif args.format == 'xlsx':
+                generate_roster_xlsx(scheduler.schedule, args.output_roster, day_names)
+                print(f"Roster written to {args.output_roster}")
         
         # Show verbose output
         if args.verbose:
