@@ -896,7 +896,9 @@ class Scheduler:
         locations: List[Location],
         attendees: Dict[str, Dict[str, str]],
         time_slots: Dict[int, List[TimeSlot]],
-        include_overlaps: bool = False
+        include_overlaps: bool = False,
+        no_back_to_back: bool = False,
+        sessions_between: int = 1
     ):
         # Sort sessions: required first, then by priority (lower number = higher priority), then by number of interested attendees
         self.sessions = sorted(sessions, key=lambda s: (-s.required, s.priority, -len(s.interested_attendees)))
@@ -904,6 +906,8 @@ class Scheduler:
         self.attendees = attendees
         self.time_slots = time_slots
         self.include_overlaps = include_overlaps
+        self.no_back_to_back = no_back_to_back
+        self.sessions_between = sessions_between
         self.schedule: List[ScheduledSession] = []
         self.unscheduled_sessions: List[Tuple[Session, str]] = []
         # Track attendees who have already been scheduled for each session name
@@ -934,6 +938,57 @@ class Scheduler:
             if scheduled.time_slot.overlaps_with(time_slot):
                 conflicts.update(scheduled.attendees & attendees)
         return conflicts
+    
+    def violates_back_to_back_constraint(self, session: Session, time_slot: TimeSlot) -> bool:
+        """Check if scheduling this session would violate the no-back-to-back constraint"""
+        if not self.no_back_to_back:
+            return False
+        
+        # Get all scheduled instances of this session on the same day
+        same_day_sessions = []
+        for scheduled in self.schedule:
+            if scheduled.session.name == session.name and scheduled.time_slot.day == time_slot.day:
+                same_day_sessions.append(scheduled)
+        
+        if not same_day_sessions:
+            return False
+        
+        # Sort sessions by start time
+        same_day_sessions.sort(key=lambda s: s.time_slot.start_time)
+        
+        # Check if the new slot would be too close to any existing session
+        for scheduled in same_day_sessions:
+            # Calculate time-based distance
+            if time_slot.start_time < scheduled.time_slot.start_time:
+                # New session would be before this one
+                # Count sessions between
+                sessions_between = 0
+                for other in self.schedule:
+                    if (other.time_slot.day == time_slot.day and 
+                        time_slot.end_time <= other.time_slot.start_time and
+                        other.time_slot.end_time <= scheduled.time_slot.start_time and
+                        other.session.name != session.name):
+                        sessions_between += 1
+                
+                if sessions_between < self.sessions_between:
+                    debug_log(f"      ✗ Violates back-to-back constraint: only {sessions_between} sessions between instances (need {self.sessions_between})", 5)
+                    return True
+            else:
+                # New session would be after this one
+                # Count sessions between
+                sessions_between = 0
+                for other in self.schedule:
+                    if (other.time_slot.day == time_slot.day and 
+                        scheduled.time_slot.end_time <= other.time_slot.start_time and
+                        other.time_slot.end_time <= time_slot.start_time and
+                        other.session.name != session.name):
+                        sessions_between += 1
+                
+                if sessions_between < self.sessions_between:
+                    debug_log(f"      ✗ Violates back-to-back constraint: only {sessions_between} sessions between instances (need {self.sessions_between})", 5)
+                    return True
+        
+        return False
     
     def fits_in_location(self, session: Session, location: Location, time_slot: TimeSlot) -> bool:
         """Check if session fits in location during time slot"""
@@ -1085,6 +1140,10 @@ class Scheduler:
                     # If no attendees are available (all already scheduled), skip this slot
                     if not available_attendees:
                         debug_log(f"      ✗ All interested attendees already scheduled for {session.name}", 5)
+                        continue
+                    
+                    # Check back-to-back constraint
+                    if self.violates_back_to_back_constraint(session, combined_slot):
                         continue
                     
                     # Check attendee conflicts (only for available attendees)
@@ -1250,6 +1309,320 @@ class Scheduler:
 def format_time(dt: datetime) -> str:
     """Format datetime as time string"""
     return dt.strftime("%-I:%M%p").lower()
+
+
+def parse_schedule_file(filepath: str, format_type: str) -> List[Dict[str, Any]]:
+    """Parse a schedule file and extract session information"""
+    schedule_data = []
+    
+    if format_type == 'csv':
+        with open(filepath, 'r') as f:
+            reader = csv.DictReader(f)
+            current_day = None
+            
+            for row in reader:
+                day = row.get('Day', '')
+                time_str = row.get('Time', '')
+                
+                if day:
+                    current_day = day
+                
+                # Parse each location column
+                for location in row.keys():
+                    if location not in ['Day', 'Time'] and row[location] and row[location] != '-' and row[location] != '---':
+                        # Extract session name and count
+                        session_info = row[location]
+                        if '↓' in session_info:
+                            continue  # Skip continuation markers
+                        
+                        match = re.match(r'^(.+?)\s*\((\d+)\)', session_info)
+                        if match:
+                            session_name = match.group(1).strip()
+                            attendee_count = int(match.group(2))
+                            
+                            schedule_data.append({
+                                'day': current_day,
+                                'time': time_str,
+                                'location': location,
+                                'session': session_name,
+                                'attendee_count': attendee_count
+                            })
+                        else:
+                            # Handle sessions without count
+                            schedule_data.append({
+                                'day': current_day,
+                                'time': time_str,
+                                'location': location,
+                                'session': session_info.strip(),
+                                'attendee_count': 0
+                            })
+    
+    elif format_type == 'md':
+        with open(filepath, 'r') as f:
+            content = f.read()
+            
+        current_day = None
+        in_table = False
+        location_columns = []
+        
+        for line in content.split('\n'):
+            if line.startswith('## '):
+                current_day = line[3:].strip()
+                in_table = False
+            elif '|' in line and current_day:
+                cells = [cell.strip() for cell in line.split('|')[1:-1]]
+                
+                if not in_table and cells[0].lower() == 'time':
+                    # Header row
+                    location_columns = cells[1:]
+                    in_table = True
+                elif in_table and len(cells) > 1 and '-' not in cells[0]:
+                    # Data row
+                    time_str = cells[0]
+                    
+                    for i, cell in enumerate(cells[1:]):
+                        if i < len(location_columns) and cell and cell != '-' and '↓' not in cell:
+                            location = location_columns[i]
+                            
+                            match = re.match(r'^(.+?)\s*\((\d+)\)', cell)
+                            if match:
+                                session_name = match.group(1).strip()
+                                attendee_count = int(match.group(2))
+                            else:
+                                session_name = cell.strip()
+                                attendee_count = 0
+                            
+                            schedule_data.append({
+                                'day': current_day,
+                                'time': time_str,
+                                'location': location,
+                                'session': session_name,
+                                'attendee_count': attendee_count
+                            })
+    
+    else:
+        raise SchedulingError(f"Schedule validation not supported for format: {format_type}")
+    
+    return schedule_data
+
+
+def parse_roster_file(filepath: str, format_type: str) -> List[Dict[str, Any]]:
+    """Parse a roster file and extract detailed session information"""
+    roster_data = []
+    
+    if format_type == 'csv':
+        with open(filepath, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                attendees = []
+                if row.get('Attendees'):
+                    attendees = [a.strip() for a in row['Attendees'].split(';') if a.strip()]
+                
+                roster_data.append({
+                    'day': row.get('Day', ''),
+                    'session': row.get('Session', ''),
+                    'start_time': row.get('Start Time', ''),
+                    'end_time': row.get('End Time', ''),
+                    'duration': int(row.get('Duration (min)', 0)),
+                    'location': row.get('Location', ''),
+                    'presenters': [p.strip() for p in row.get('Presenters', '').split(';') if p.strip()],
+                    'attendee_count': int(row.get('Attendee Count', 0)),
+                    'attendees': attendees
+                })
+    
+    elif format_type == 'md':
+        # Parse markdown roster format
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        current_day = None
+        current_session = None
+        
+        for line in content.split('\n'):
+            if line.startswith('## '):
+                current_day = line[3:].strip()
+            elif line.startswith('### '):
+                current_session = {
+                    'day': current_day,
+                    'session': line[4:].strip(),
+                    'attendees': []
+                }
+            elif current_session and line.startswith('- **'):
+                # Parse session details
+                if 'Time:' in line:
+                    time_match = re.search(r'(\d+:\d+[ap]m)\s*-\s*(\d+:\d+[ap]m)', line)
+                    if time_match:
+                        current_session['start_time'] = time_match.group(1)
+                        current_session['end_time'] = time_match.group(2)
+                elif 'Location:' in line:
+                    current_session['location'] = line.split(':', 1)[1].strip()
+                elif 'Duration:' in line:
+                    duration_match = re.search(r'(\d+)\s*minutes', line)
+                    if duration_match:
+                        current_session['duration'] = int(duration_match.group(1))
+                elif 'Presenter(s):' in line:
+                    presenters_str = line.split(':', 1)[1].strip()
+                    current_session['presenters'] = [p.strip() for p in presenters_str.split(',')]
+                elif 'Attendees' in line:
+                    count_match = re.search(r'\((\d+)\)', line)
+                    if count_match:
+                        current_session['attendee_count'] = int(count_match.group(1))
+            elif current_session and line.strip().startswith('- ') and not line.startswith('- **'):
+                # Attendee line
+                attendee = line.strip()[2:].replace(' ⚠️', '').strip()
+                if attendee and attendee != 'No attendees scheduled':
+                    current_session['attendees'].append(attendee)
+            elif line.strip() == '' and current_session:
+                # End of session
+                roster_data.append(current_session)
+                current_session = None
+    
+    else:
+        raise SchedulingError(f"Roster validation not supported for format: {format_type}")
+    
+    return roster_data
+
+
+def validate_schedule(
+    schedule_data: List[Dict[str, Any]],
+    roster_data: List[Dict[str, Any]],
+    sessions: List[Session],
+    locations: List[Location],
+    attendees: Dict[str, Dict[str, str]],
+    days: int,
+    day_names: List[str]
+) -> Tuple[List[str], List[str]]:
+    """
+    Validate a schedule against constraints
+    
+    Returns: (errors, warnings)
+    """
+    errors = []
+    warnings = []
+    
+    # Build lookup structures
+    sessions_by_name = {s.name: s for s in sessions}
+    locations_by_name = {l.name: l for l in locations}
+    
+    # Track scheduled instances per session
+    session_instance_count = defaultdict(int)
+    attendees_per_session = defaultdict(set)
+    presenter_schedule = defaultdict(list)
+    location_schedule = defaultdict(list)
+    
+    # If we have roster data, use it for more detailed validation
+    if roster_data:
+        for entry in roster_data:
+            session_name = entry['session']
+            session_instance_count[session_name] += 1
+            
+            # Track attendees
+            for attendee in entry.get('attendees', []):
+                attendees_per_session[session_name].add(attendee)
+            
+            # Track presenter conflicts
+            for presenter in entry.get('presenters', []):
+                presenter_schedule[presenter].append({
+                    'session': session_name,
+                    'day': entry['day'],
+                    'start': entry.get('start_time', ''),
+                    'end': entry.get('end_time', '')
+                })
+            
+            # Track location usage
+            location = entry.get('location', '')
+            if location:
+                location_schedule[location].append({
+                    'session': session_name,
+                    'day': entry['day'],
+                    'start': entry.get('start_time', ''),
+                    'end': entry.get('end_time', '')
+                })
+    else:
+        # Use schedule data for basic validation
+        for entry in schedule_data:
+            session_instance_count[entry['session']] += 1
+    
+    # Validate session constraints
+    for session in sessions:
+        instances = session_instance_count.get(session.name, 0)
+        
+        # Check minimum sessions
+        if instances < session.min_sessions:
+            if session.required:
+                errors.append(f"Required session '{session.name}' has {instances} instances but minimum is {session.min_sessions}")
+            else:
+                warnings.append(f"Session '{session.name}' has {instances} instances but minimum is {session.min_sessions}")
+        
+        # Check maximum sessions
+        if session.max_sessions > 0 and instances > session.max_sessions:
+            errors.append(f"Session '{session.name}' has {instances} instances but maximum is {session.max_sessions}")
+        
+        # Check if required sessions cover all attendees
+        if session.required:
+            scheduled_attendees = attendees_per_session.get(session.name, set())
+            all_attendees = set(attendees.keys())
+            missing = all_attendees - scheduled_attendees
+            
+            if missing:
+                errors.append(f"Required session '{session.name}' missing {len(missing)} attendees: {sorted(list(missing))[:5]}...")
+    
+    # Validate no duplicate attendees per session
+    for session_name, session_attendees in attendees_per_session.items():
+        if len(session_attendees) < len([a for entry in roster_data if entry['session'] == session_name for a in entry.get('attendees', [])]):
+            errors.append(f"Session '{session_name}' has duplicate attendee assignments")
+    
+    # Validate location capacity
+    if roster_data:
+        for entry in roster_data:
+            location_name = entry.get('location', '')
+            if location_name in locations_by_name:
+                location = locations_by_name[location_name]
+                attendee_count = entry.get('attendee_count', 0)
+                
+                if attendee_count > location.hard_limit:
+                    errors.append(
+                        f"Session '{entry['session']}' on {entry['day']} has {attendee_count} attendees "
+                        f"but {location_name} hard limit is {location.hard_limit}"
+                    )
+                elif attendee_count > location.soft_limit:
+                    warnings.append(
+                        f"Session '{entry['session']}' on {entry['day']} has {attendee_count} attendees "
+                        f"exceeding {location_name} soft limit of {location.soft_limit}"
+                    )
+    
+    # Validate presenter conflicts
+    for presenter, schedule in presenter_schedule.items():
+        # Sort by day and time
+        schedule.sort(key=lambda x: (x['day'], x['start']))
+        
+        # Check for overlaps
+        for i in range(len(schedule) - 1):
+            curr = schedule[i]
+            next_item = schedule[i + 1]
+            
+            if curr['day'] == next_item['day']:
+                # Simple check: if start times are the same, it's a conflict
+                if curr['start'] == next_item['start']:
+                    errors.append(
+                        f"Presenter '{presenter}' has conflicting sessions: "
+                        f"'{curr['session']}' and '{next_item['session']}' on {curr['day']} at {curr['start']}"
+                    )
+    
+    # Validate all interested attendees are scheduled
+    for session in sessions:
+        if not session.required:  # Required sessions already checked above
+            scheduled = attendees_per_session.get(session.name, set())
+            interested = session.interested_attendees
+            unscheduled = interested - scheduled
+            
+            if unscheduled:
+                warnings.append(
+                    f"Session '{session.name}' has {len(unscheduled)} interested attendees not scheduled: "
+                    f"{sorted(list(unscheduled))[:5]}..."
+                )
+    
+    return errors, warnings
 
 
 def generate_markdown_output(
@@ -1870,6 +2243,10 @@ def create_arg_parser():
   simple_schedule --attendees attendees.csv --sessions sessions.csv --locations rooms.csv \\
       --dump-output --output debug_schedule.md --verbose
 
+  # Validate an existing schedule
+  simple_schedule --validate --attendees attendees.csv --sessions sessions.csv --locations rooms.csv \\
+      --schedule generated_schedule.csv --roster generated_roster.csv --format csv
+
 Template files are available at:
   /var/home/zach/Documents/notes/03_resources/templates/simple_schedule/
 
@@ -1951,10 +2328,22 @@ For more information, see the documentation at:
     )
     
     parser.add_argument(
+        '--no-back-to-back',
+        action='store_true',
+        help='Prevent the same session from being scheduled consecutively (back-to-back)'
+    )
+    
+    parser.add_argument(
+        '--sessions-between',
+        type=int,
+        default=1,
+        help='Number of other sessions required between instances of the same session (default: 1, used with --no-back-to-back)'
+    )
+    
+    parser.add_argument(
         '--format',
-        choices=['md', 'csv', 'xlsx'],
         default='md',
-        help='Output format (default: md)'
+        help='Output format(s), comma-separated for multiple (default: md). Options: md, csv, xlsx'
     )
     
     parser.add_argument(
@@ -1986,6 +2375,23 @@ For more information, see the documentation at:
         help='Dump partial schedule output even on failure (useful for debugging failed schedules)'
     )
     
+    # Validation mode arguments
+    parser.add_argument(
+        '--validate',
+        action='store_true',
+        help='Validate an existing schedule against constraints instead of generating a new one'
+    )
+    
+    parser.add_argument(
+        '--schedule',
+        help='Path to schedule file to validate (required with --validate)'
+    )
+    
+    parser.add_argument(
+        '--roster',
+        help='Path to roster file to validate (optional with --validate, provides more detailed validation)'
+    )
+    
     return parser
 
 
@@ -2003,6 +2409,90 @@ def main():
         debug_log(f"Arguments: {vars(args)}")
     
     try:
+        # Check if we're in validation mode
+        if args.validate:
+            if not args.schedule:
+                raise SchedulingError("--schedule is required when using --validate")
+            
+            # Read input files for constraints
+            attendees_df = read_input_file(args.attendees, "attendees")
+            sessions_df = read_input_file(args.sessions, "sessions")
+            locations_df = read_input_file(args.locations, "locations")
+            
+            # Validate and parse data
+            if args.delimited_sessions:
+                attendees = validate_attendees_delimited(attendees_df, sessions_df, args.delimiter)
+            else:
+                attendees = validate_attendees(attendees_df, sessions_df)
+            sessions = validate_sessions(sessions_df, attendees)
+            locations = validate_locations(locations_df)
+            
+            # Parse day names if provided
+            day_names = parse_day_names(args.day_names, args.days) if args.day_names else [f"Day {i+1}" for i in range(args.days)]
+            
+            # Parse schedule and roster files
+            # For validation, use the first format specified
+            validation_format = args.format.split(',')[0].strip().lower()
+            schedule_data = parse_schedule_file(args.schedule, validation_format)
+            roster_data = []
+            if args.roster:
+                roster_data = parse_roster_file(args.roster, validation_format)
+            
+            # Validate the schedule
+            errors, warnings = validate_schedule(
+                schedule_data, roster_data, sessions, locations, 
+                attendees, args.days, day_names
+            )
+            
+            # Print validation results
+            print("=== SCHEDULE VALIDATION REPORT ===\n")
+            
+            if not errors and not warnings:
+                print("✓ Schedule is valid! All constraints are satisfied.")
+            else:
+                if errors:
+                    print(f"ERRORS ({len(errors)}):")
+                    for error in errors:
+                        print(f"  ✗ {error}")
+                    print()
+                
+                if warnings:
+                    print(f"WARNINGS ({len(warnings)}):")
+                    for warning in warnings:
+                        print(f"  ⚠ {warning}")
+                    print()
+                
+                # Summary statistics
+                print("\n=== SUMMARY ===")
+                session_count = defaultdict(int)
+                attendee_assignments = defaultdict(set)
+                
+                if roster_data:
+                    for entry in roster_data:
+                        session_count[entry['session']] += 1
+                        for attendee in entry.get('attendees', []):
+                            attendee_assignments[attendee].add(entry['session'])
+                else:
+                    for entry in schedule_data:
+                        session_count[entry['session']] += 1
+                
+                print(f"Total unique sessions: {len(session_count)}")
+                print(f"Total session instances: {sum(session_count.values())}")
+                if roster_data:
+                    print(f"Total unique attendees scheduled: {len(attendee_assignments)}")
+                    if len(attendee_assignments) > 0:
+                        avg_sessions = sum(len(s) for s in attendee_assignments.values()) / len(attendee_assignments)
+                        print(f"Average sessions per attendee: {avg_sessions:.1f}")
+                    else:
+                        print(f"Average sessions per attendee: 0.0 (no attendees scheduled)")
+                
+                # Exit with error if validation failed
+                if errors:
+                    sys.exit(1)
+            
+            return
+        
+        # Normal scheduling mode
         # Read input files
         attendees_df = read_input_file(args.attendees, "attendees")
         sessions_df = read_input_file(args.sessions, "sessions")
@@ -2040,7 +2530,10 @@ def main():
             )
         
         # Run scheduler
-        scheduler = Scheduler(sessions, locations, attendees, time_slots, args.include_overlaps)
+        scheduler = Scheduler(
+            sessions, locations, attendees, time_slots, 
+            args.include_overlaps, args.no_back_to_back, args.sessions_between
+        )
         scheduler.run()
         
         # Check if there were any critical errors
@@ -2115,53 +2608,82 @@ def main():
                 # Normal error handling without dump
                 raise SchedulingError("\n".join(scheduler.scheduling_errors))
         
+        # Parse output formats
+        formats = [f.strip().lower() for f in args.format.split(',')]
+        valid_formats = ['md', 'csv', 'xlsx']
+        for fmt in formats:
+            if fmt not in valid_formats:
+                raise SchedulingError(f"Invalid format '{fmt}'. Valid formats: {', '.join(valid_formats)}")
+        
         # Generate output
-        if args.format == 'md':
-            output = generate_markdown_output(
-                scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
-            )
-            if args.output:
-                with open(args.output, 'w') as f:
-                    f.write(output)
+        for fmt in formats:
+            # Determine output file name
+            if args.output and len(formats) > 1:
+                # Multiple formats: append extension
+                base_output = args.output.rsplit('.', 1)[0] if '.' in args.output else args.output
+                output_file = f"{base_output}.{fmt}"
             else:
-                print(output)
-                
-        elif args.format == 'csv':
-            output = generate_csv_output(
-                scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
-            )
-            if args.output:
-                with open(args.output, 'w') as f:
-                    f.write(output)
-            else:
-                print(output)
-                
-        elif args.format == 'xlsx':
-            if not args.output:
-                raise SchedulingError("Excel format requires --output parameter")
-            generate_xlsx_output(
-                scheduler.schedule, locations, args.days, time_slots, 
-                blackouts, slice_duration, args.output, day_names
-            )
-            print(f"Schedule written to {args.output}")
+                output_file = args.output
+            
+            if fmt == 'md':
+                output = generate_markdown_output(
+                    scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
+                )
+                if output_file:
+                    with open(output_file, 'w') as f:
+                        f.write(output)
+                    if len(formats) > 1:
+                        print(f"Markdown schedule written to {output_file}")
+                else:
+                    print(output)
+                    
+            elif fmt == 'csv':
+                output = generate_csv_output(
+                    scheduler.schedule, locations, args.days, time_slots, blackouts, slice_duration, day_names
+                )
+                if output_file:
+                    with open(output_file, 'w') as f:
+                        f.write(output)
+                    if len(formats) > 1:
+                        print(f"CSV schedule written to {output_file}")
+                else:
+                    print(output)
+                    
+            elif fmt == 'xlsx':
+                if not output_file:
+                    raise SchedulingError("Excel format requires --output parameter")
+                generate_xlsx_output(
+                    scheduler.schedule, locations, args.days, time_slots, 
+                    blackouts, slice_duration, output_file, day_names
+                )
+                print(f"Excel schedule written to {output_file}")
         
         # Generate roster if requested
         if args.output_roster:
-            if args.format == 'md':
-                roster_output = generate_roster_markdown(scheduler.schedule, day_names)
-                with open(args.output_roster, 'w') as f:
-                    f.write(roster_output)
-                print(f"Roster written to {args.output_roster}")
-                    
-            elif args.format == 'csv':
-                roster_output = generate_roster_csv(scheduler.schedule, day_names)
-                with open(args.output_roster, 'w') as f:
-                    f.write(roster_output)
-                print(f"Roster written to {args.output_roster}")
-                    
-            elif args.format == 'xlsx':
-                generate_roster_xlsx(scheduler.schedule, args.output_roster, day_names)
-                print(f"Roster written to {args.output_roster}")
+            for fmt in formats:
+                # Determine roster file name
+                if len(formats) > 1:
+                    # Multiple formats: append extension
+                    base_roster = args.output_roster.rsplit('.', 1)[0] if '.' in args.output_roster else args.output_roster
+                    roster_file = f"{base_roster}.{fmt}"
+                else:
+                    roster_file = args.output_roster
+                
+                if fmt == 'md':
+                    roster_output = generate_roster_markdown(scheduler.schedule, day_names)
+                    with open(roster_file, 'w') as f:
+                        f.write(roster_output)
+                    print(f"Markdown roster written to {roster_file}")
+                        
+                elif fmt == 'csv':
+                    roster_output = generate_roster_csv(scheduler.schedule, day_names)
+                    with open(roster_file, 'w') as f:
+                        f.write(roster_output)
+                    print(f"CSV roster written to {roster_file}")
+                        
+                elif fmt == 'xlsx':
+                    generate_roster_xlsx(scheduler.schedule, roster_file, day_names)
+                    print(f"Excel roster written to {roster_file}")
         
         # Show verbose output
         if args.verbose:
