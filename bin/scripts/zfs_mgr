@@ -23,6 +23,7 @@ RETENTION_DAYS=14
 DEBUG=false
 DRY_RUN=false
 SSH_SUDO=false
+FORCE_SEND=false
 SEND_HOSTS_OVERRIDE=""
 
 # Datasets to snapshot (add new datasets here)
@@ -124,6 +125,7 @@ OPTIONS:
     -d, --debug            Enable debug logging
     -n, --dry-run          Show what would be done without executing
     -s, --ssh-sudo         Use sudo for remote ZFS commands
+    --force-send           Force resend by destroying current remote snapshot first
     --send-hosts HOSTS     Override remote targets (comma-separated: user@host:pool,user@host2:pool2)
     -h, --help             Show this help message
 
@@ -138,6 +140,7 @@ EXAMPLES:
     $(basename "$0") --dry-run all              # Show what 'all' would do
     $(basename "$0") --debug --retention 7 all  # Run all with 7-day retention and debug
     $(basename "$0") --ssh-sudo send            # Send to remotes using sudo
+    $(basename "$0") --force-send send          # Force resend by destroying remote snapshots
     $(basename "$0") --send-hosts "user@host1:pool1,user@host2:pool2" send  # Override targets
     $(basename "$0") cleanup                     # Clean old snapshots
     $(basename "$0") send                        # Send to remotes
@@ -294,15 +297,62 @@ send_to_remote() {
             
             local send_cmd
             if [[ -n "${latest_common}" ]]; then
-                log_info "Incremental send from ${latest_common} to ${current_snapshot}"
-                if [[ "${remote_target}" == *":"* ]]; then
-                    local ssh_target="${remote_target%:*}"
-                    local remote_pool="${remote_target#*:}"
-                    local ssh_recv_cmd
-                    ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset}")
-                    send_cmd="zfs send -w -R -I '${latest_common}' '${current_snapshot}' | ${ssh_recv_cmd}"
+                # Check if remote is already up-to-date
+                if [[ "${latest_common}" == "${current_snapshot}" ]]; then
+                    if [[ "${FORCE_SEND}" == "true" ]]; then
+                        log_info "Force send enabled: destroying remote snapshot ${current_snapshot} to resend"
+                        if [[ "${remote_target}" == *":"* ]]; then
+                            local ssh_target="${remote_target%:*}"
+                            local remote_pool="${remote_target#*:}"
+                            local destroy_cmd
+                            destroy_cmd=$(ssh_command "${ssh_target}" "zfs destroy -r ${remote_pool}/${dataset}@$(echo ${current_snapshot} | cut -d'@' -f2)")
+                            if ! execute_command "${destroy_cmd}"; then
+                                log_error "Failed to destroy remote snapshot for force send"
+                                continue
+                            fi
+                        else
+                            if ! execute_command "zfs destroy -r ${remote_target}/${dataset}@$(echo ${current_snapshot} | cut -d'@' -f2)"; then
+                                log_error "Failed to destroy remote snapshot for force send"
+                                continue
+                            fi
+                        fi
+                        # After destroying, we need to find the new latest common snapshot
+                        if [[ "${DRY_RUN}" == "true" ]]; then
+                            # In dry-run mode, simulate finding the previous snapshot
+                            log_info "[DRY-RUN] Would find previous common snapshot after destroy"
+                            latest_common=""  # Simulate no common snapshots for demonstration
+                        else
+                            latest_common=$(get_latest_snapshot "${dataset}" "${dataset}" "${remote_target}")
+                        fi
+                        if [[ -z "${latest_common}" ]]; then
+                            log_info "No common snapshots after force destroy, will do initial send"
+                        fi
+                    else
+                        log_info "Remote ${remote_target}/${dataset} is already up-to-date with ${current_snapshot}"
+                        continue
+                    fi
+                fi
+                
+                if [[ -n "${latest_common}" ]]; then
+                    if [[ "${remote_target}" == *":"* ]]; then
+                        local ssh_target="${remote_target%:*}"
+                        local remote_pool="${remote_target#*:}"
+                        local ssh_recv_cmd
+                        ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset}")
+                        send_cmd="zfs send -w -R -I '${latest_common}' '${current_snapshot}' | ${ssh_recv_cmd}"
+                    else
+                        send_cmd="zfs send -w -R -I '${latest_common}' '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset}'"
+                    fi
                 else
-                    send_cmd="zfs send -w -R -I '${latest_common}' '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset}'"
+                    if [[ "${remote_target}" == *":"* ]]; then
+                        local ssh_target="${remote_target%:*}"
+                        local remote_pool="${remote_target#*:}"
+                        local ssh_recv_cmd
+                        ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset}")
+                        send_cmd="zfs send -w -R '${current_snapshot}' | ${ssh_recv_cmd}"
+                    else
+                        send_cmd="zfs send -w -R '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset}'"
+                    fi
                 fi
             else
                 log_info "Initial send of ${current_snapshot}"
@@ -383,6 +433,10 @@ while [[ $# -gt 0 ]]; do
             SSH_SUDO=true
             shift
             ;;
+        --force-send)
+            FORCE_SEND=true
+            shift
+            ;;
         --send-hosts)
             SEND_HOSTS_OVERRIDE="$2"
             shift 2
@@ -429,7 +483,7 @@ if ! zfs list "${POOL_NAME}" >/dev/null 2>&1; then
 fi
 
 log_debug "Starting zfs_mgr with command: ${COMMAND}"
-log_debug "Configuration: pool=${POOL_NAME}, retention=${RETENTION_DAYS}, debug=${DEBUG}, dry_run=${DRY_RUN}, ssh_sudo=${SSH_SUDO}, send_hosts_override=${SEND_HOSTS_OVERRIDE}"
+log_debug "Configuration: pool=${POOL_NAME}, retention=${RETENTION_DAYS}, debug=${DEBUG}, dry_run=${DRY_RUN}, ssh_sudo=${SSH_SUDO}, force_send=${FORCE_SEND}, send_hosts_override=${SEND_HOSTS_OVERRIDE}"
 
 # Execute command
 case "${COMMAND}" in
