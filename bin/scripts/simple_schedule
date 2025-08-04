@@ -25,9 +25,6 @@ and time restrictions.
 
 Required sessions (required=true) are automatically assigned to ALL attendees regardless of
 signup preferences. Non-required sessions only include attendees who explicitly signed up.
-
-Author: Simple Schedule Contributors
-License: MIT
 """
 
 import argparse
@@ -93,6 +90,8 @@ class Session:
     max_per_day: int
     interested_attendees: Set[str]
     maybe_attendees: Set[str]
+    blacklist_days: Optional[Set[int]] = None  # Days this session cannot be scheduled on
+    blacklist_times: Optional[List[Tuple[datetime, datetime]]] = None  # Time ranges this session cannot be scheduled during
 
 
 @dataclass
@@ -118,6 +117,18 @@ class TimeSlot:
             return False
         return (self.start_time < other.end_time and 
                 self.end_time > other.start_time)
+    
+    def overlaps_with_time_range(self, start: datetime, end: datetime) -> bool:
+        """Check if this time slot overlaps with a time range (ignoring day)"""
+        # Extract just the time portions for comparison
+        slot_start_time = self.start_time.time()
+        slot_end_time = self.end_time.time()
+        range_start_time = start.time()
+        range_end_time = end.time()
+        
+        # Check for overlap
+        return (slot_start_time < range_end_time and 
+                slot_end_time > range_start_time)
 
 
 @dataclass
@@ -577,6 +588,14 @@ def validate_sessions(df: pd.DataFrame, attendees: Dict[str, Dict[str, str]]) ->
             f"Expected columns: {', '.join(required_cols)}"
         )
     
+    # Check for optional columns
+    optional_cols = ['blacklist_days', 'blacklist_time']
+    for opt_col in optional_cols:
+        for i, df_col in enumerate(df_cols_lower):
+            if opt_col.lower() == df_col:
+                col_mapping[opt_col] = df.columns[i]
+                break
+    
     sessions = []
     all_attendee_names = set(attendees.keys())
     
@@ -590,7 +609,11 @@ def validate_sessions(df: pd.DataFrame, attendees: Dict[str, Dict[str, str]]) ->
             
             # Parse presenters
             presenters_str = str(row[col_mapping['presenters']]).strip()
-            presenters = [p.strip() for p in presenters_str.split(',') if p.strip()]
+            # Handle empty/nan values properly
+            if pd.isna(row[col_mapping['presenters']]) or presenters_str.lower() == 'nan' or not presenters_str:
+                presenters = []
+            else:
+                presenters = [p.strip() for p in presenters_str.split(',') if p.strip()]
             
             length = int(row[col_mapping['length']])
             if length <= 0:
@@ -621,6 +644,50 @@ def validate_sessions(df: pd.DataFrame, attendees: Dict[str, Dict[str, str]]) ->
                 # Only warn if min_sessions is reasonable (<=3)
                 debug_log(f"Warning: max_per_day ({max_per_day}) < min_sessions ({min_sessions}) for '{name}'", 1)
             
+            # Parse blacklist_days if column exists
+            blacklist_days = None
+            if 'blacklist_days' in col_mapping:
+                blacklist_str = str(row[col_mapping['blacklist_days']]).strip()
+                if blacklist_str and not pd.isna(row[col_mapping['blacklist_days']]):
+                    # Handle special values: '-1' or '?' means no blacklist
+                    if blacklist_str in ['-1', '?']:
+                        blacklist_days = None
+                    else:
+                        try:
+                            # Parse CSV string of day indices (0-based)
+                            blacklist_days = set()
+                            for day_str in blacklist_str.split(','):
+                                day_str = day_str.strip()
+                                if day_str:
+                                    day_num = int(day_str)
+                                    if day_num < 0:
+                                        # Negative values (except -1) are invalid
+                                        raise ValueError(f"Day index must be >= 0 or -1/'?', got {day_num}")
+                                    blacklist_days.add(day_num)
+                        except ValueError as e:
+                            raise ValueError(f"Invalid blacklist_days format: {e}")
+            
+            # Parse blacklist_time if column exists
+            blacklist_times = None
+            if 'blacklist_time' in col_mapping:
+                blacklist_time_str = str(row[col_mapping['blacklist_time']]).strip()
+                if blacklist_time_str and not pd.isna(row[col_mapping['blacklist_time']]):
+                    # Handle special values: '-1', '?', or '0' means no blacklist
+                    if blacklist_time_str in ['-1', '?', '0']:
+                        blacklist_times = None
+                    else:
+                        try:
+                            # Parse CSV string of time ranges like "9am-11am,1pm-2pm"
+                            blacklist_times = []
+                            for time_range_str in blacklist_time_str.split(','):
+                                time_range_str = time_range_str.strip()
+                                if time_range_str:
+                                    # Parse each time range
+                                    start_time, end_time = parse_time_range(time_range_str)
+                                    blacklist_times.append((start_time, end_time))
+                        except (ValueError, Exception) as e:
+                            raise ValueError(f"Invalid blacklist_time format '{blacklist_time_str}': {e}")
+            
             # Find interested attendees
             interested = set()
             maybe = set()
@@ -649,7 +716,9 @@ def validate_sessions(df: pd.DataFrame, attendees: Dict[str, Dict[str, str]]) ->
                 max_sessions=max_sessions,
                 max_per_day=max_per_day,
                 interested_attendees=interested,
-                maybe_attendees=maybe
+                maybe_attendees=maybe,
+                blacklist_days=blacklist_days,
+                blacklist_times=blacklist_times
             ))
             
         except ValueError as e:
@@ -898,7 +967,8 @@ class Scheduler:
         time_slots: Dict[int, List[TimeSlot]],
         include_overlaps: bool = False,
         no_back_to_back: bool = False,
-        sessions_between: int = 1
+        sessions_between: int = 1,
+        minimum_session_size: int = 1
     ):
         # Sort sessions: required first, then by priority (lower number = higher priority), then by number of interested attendees
         self.sessions = sorted(sessions, key=lambda s: (-s.required, s.priority, -len(s.interested_attendees)))
@@ -908,6 +978,7 @@ class Scheduler:
         self.include_overlaps = include_overlaps
         self.no_back_to_back = no_back_to_back
         self.sessions_between = sessions_between
+        self.minimum_session_size = minimum_session_size
         self.schedule: List[ScheduledSession] = []
         self.unscheduled_sessions: List[Tuple[Session, str]] = []
         # Track attendees who have already been scheduled for each session name
@@ -1091,6 +1162,11 @@ class Scheduler:
         for day in sorted(self.time_slots.keys()):
             debug_log(f"  Day {day + 1}:", 2)
             
+            # Check if this day is blacklisted for this session
+            if session.blacklist_days and day in session.blacklist_days:
+                debug_log(f"    ✗ Day {day} is blacklisted for this session", 3)
+                continue
+            
             # Check max_per_day constraint
             if sessions_per_day[session.name].get(day, 0) >= session.max_per_day:
                 debug_log(f"    ✗ Already scheduled {sessions_per_day[session.name].get(day, 0)} sessions (max: {session.max_per_day})", 3)
@@ -1118,6 +1194,17 @@ class Scheduler:
                     
                     debug_log(f"      Time slot: {format_time(combined_slot.start_time)}-{format_time(combined_slot.end_time)}", 4)
                     
+                    # Check if this time slot is blacklisted for this session
+                    if session.blacklist_times:
+                        time_blacklisted = False
+                        for blacklist_start, blacklist_end in session.blacklist_times:
+                            if combined_slot.overlaps_with_time_range(blacklist_start, blacklist_end):
+                                debug_log(f"      ✗ Time slot overlaps with blacklisted time {format_time(blacklist_start)}-{format_time(blacklist_end)}", 5)
+                                time_blacklisted = True
+                                break
+                        if time_blacklisted:
+                            continue
+                    
                     # Check if session fits in location
                     if not self.fits_in_location(session, location, combined_slot):
                         debug_log(f"      ✗ Session doesn't fit in location (capacity or time)", 5)
@@ -1140,6 +1227,11 @@ class Scheduler:
                     # If no attendees are available (all already scheduled), skip this slot
                     if not available_attendees:
                         debug_log(f"      ✗ All interested attendees already scheduled for {session.name}", 5)
+                        continue
+                    
+                    # Check if we have enough attendees for minimum session size
+                    if len(available_attendees) < self.minimum_session_size:
+                        debug_log(f"      ✗ Only {len(available_attendees)} available attendees, less than minimum {self.minimum_session_size}", 5)
                         continue
                     
                     # Check back-to-back constraint
@@ -1193,6 +1285,11 @@ class Scheduler:
         if self.include_overlaps:
             scheduled_attendees = available_attendees
         
+        # Check minimum session size before applying max limit
+        if len(scheduled_attendees) < self.minimum_session_size:
+            debug_log(f"      ✗ Only {len(scheduled_attendees)} attendees available, less than minimum {self.minimum_session_size}", 2)
+            return False
+        
         # Apply max_attendees limit
         if session.max_attendees > 0 and len(scheduled_attendees) > session.max_attendees:
             # Sort attendees to ensure consistent selection
@@ -1239,11 +1336,16 @@ class Scheduler:
                     # Calculate how many sessions needed to accommodate all interested attendees
                     total_interested = len(session.interested_attendees)
                     sessions_needed = (total_interested + session.max_attendees - 1) // session.max_attendees
-                    target_sessions = max(session.min_sessions, min(sessions_needed, 10))  # Cap at 10 for sanity
+                    # Increase cap to 20 sessions for better coverage, can schedule more if needed
+                    target_sessions = max(session.min_sessions, min(sessions_needed, 20))
                 else:
-                    # No attendee limit, so use min_sessions
-                    target_sessions = session.min_sessions
-                debug_log(f"  Auto-determined target sessions: {target_sessions} (min={session.min_sessions})", 1)
+                    # No attendee limit, try to accommodate everyone (cap at reasonable number)
+                    # Base on total interested attendees and assume reasonable group size
+                    total_interested = len(session.interested_attendees)
+                    estimated_group_size = min(20, total_interested)  # Assume groups of up to 20
+                    sessions_needed = (total_interested + estimated_group_size - 1) // estimated_group_size
+                    target_sessions = max(session.min_sessions, min(sessions_needed, 20))
+                debug_log(f"  Auto-determined target sessions: {target_sessions} (min={session.min_sessions}, interested={len(session.interested_attendees)})", 1)
             else:
                 # Use the specified max as target
                 target_sessions = session.max_sessions
@@ -1251,29 +1353,61 @@ class Scheduler:
             # Try to schedule up to target_sessions
             attempts = 0
             consecutive_failures = 0
+            max_attempts = max(target_sessions * 3, 50)  # More attempts for auto-determine
             
-            while scheduled_count < target_sessions and attempts < target_sessions * 2:
+            # For auto-determine, keep trying as long as attendees remain unscheduled
+            continue_scheduling = True
+            while continue_scheduling and attempts < max_attempts:
                 if self.schedule_session_instance(session, scheduled_count, sessions_per_day):
                     scheduled_count += 1
                     consecutive_failures = 0
                     
-                    # For auto-determine, check if we've scheduled enough
+                    # Check if we should continue scheduling
                     if session.max_sessions == 0:
-                        # Check if all interested attendees have been scheduled
+                        # Auto-determine mode: keep going until all attendees scheduled or no more slots
                         unscheduled = session.interested_attendees - self.scheduled_attendees_by_session[session.name]
                         if len(unscheduled) == 0:
                             debug_log(f"  All interested attendees scheduled, stopping at {scheduled_count} sessions", 1)
-                            break
-                        elif session.max_attendees > 0 and len(unscheduled) < session.max_attendees * 0.5:
-                            # Less than half capacity remaining, might not be worth another session
-                            debug_log(f"  Only {len(unscheduled)} attendees remaining, stopping at {scheduled_count} sessions", 1)
-                            break
+                            continue_scheduling = False
+                        elif len(unscheduled) < self.minimum_session_size:
+                            debug_log(f"  Only {len(unscheduled)} attendees remaining (less than minimum {self.minimum_session_size}), stopping at {scheduled_count} sessions", 1)
+                            continue_scheduling = False
+                        elif scheduled_count >= 30:  # Absolute maximum to prevent infinite loops
+                            debug_log(f"  Reached maximum of 30 sessions, stopping with {len(unscheduled)} unscheduled", 1)
+                            continue_scheduling = False
+                        else:
+                            # Keep going - there are still enough unscheduled attendees
+                            debug_log(f"  {len(unscheduled)} attendees still unscheduled, continuing (session {scheduled_count})", 2)
+                    else:
+                        # Fixed number mode: stop when we reach the target
+                        if scheduled_count >= target_sessions:
+                            continue_scheduling = False
                 else:
                     consecutive_failures += 1
-                    if consecutive_failures >= 3:
-                        # Stop trying after 3 consecutive failures
-                        debug_log(f"  Stopping after 3 consecutive scheduling failures", 1)
-                        break
+                    # For auto-determine, be more persistent if attendees remain unscheduled
+                    if session.max_sessions == 0:
+                        unscheduled = session.interested_attendees - self.scheduled_attendees_by_session[session.name]
+                        # Give up after more attempts if in auto-determine mode and people are unscheduled
+                        # But be VERY persistent if we haven't scheduled minimum sessions yet
+                        if scheduled_count < session.min_sessions:
+                            failure_threshold = 20  # Very persistent for minimum sessions
+                        elif len(unscheduled) > 0:
+                            failure_threshold = 15  # Persistent if people remain unscheduled
+                        else:
+                            failure_threshold = 3  # Can stop quickly if everyone is scheduled
+                            
+                        if consecutive_failures >= failure_threshold:
+                            debug_log(f"  Stopping after {failure_threshold} consecutive scheduling failures", 1)
+                            if len(unscheduled) > 0:
+                                debug_log(f"  WARNING: {len(unscheduled)} attendees remain unscheduled for {session.name}", 1)
+                            continue_scheduling = False
+                    else:
+                        # For fixed number of sessions, check if we've met the target
+                        if scheduled_count >= target_sessions:
+                            continue_scheduling = False
+                        elif consecutive_failures >= 5:  # A bit more persistent
+                            debug_log(f"  Stopping after 5 consecutive scheduling failures", 1)
+                            continue_scheduling = False
                 
                 attempts += 1
             
@@ -1565,7 +1699,11 @@ def validate_schedule(
             missing = all_attendees - scheduled_attendees
             
             if missing:
-                errors.append(f"Required session '{session.name}' missing {len(missing)} attendees: {sorted(list(missing))[:5]}...")
+                missing_list = sorted(list(missing))
+                if len(missing_list) <= 10:
+                    errors.append(f"Required session '{session.name}' missing {len(missing)} attendees: {missing_list}")
+                else:
+                    errors.append(f"Required session '{session.name}' missing {len(missing)} attendees: {missing_list[:10]}... (and {len(missing_list) - 10} more)")
     
     # Validate no duplicate attendees per session
     for session_name, session_attendees in attendees_per_session.items():
@@ -1617,10 +1755,17 @@ def validate_schedule(
             unscheduled = interested - scheduled
             
             if unscheduled:
-                warnings.append(
-                    f"Session '{session.name}' has {len(unscheduled)} interested attendees not scheduled: "
-                    f"{sorted(list(unscheduled))[:5]}..."
-                )
+                unscheduled_list = sorted(list(unscheduled))
+                if len(unscheduled_list) <= 10:
+                    warnings.append(
+                        f"Session '{session.name}' has {len(unscheduled)} interested attendees not scheduled: "
+                        f"{unscheduled_list}"
+                    )
+                else:
+                    warnings.append(
+                        f"Session '{session.name}' has {len(unscheduled)} interested attendees not scheduled: "
+                        f"{unscheduled_list[:10]}... (and {len(unscheduled_list) - 10} more)"
+                    )
     
     return errors, warnings
 
@@ -2281,6 +2426,8 @@ For more information, see the documentation at:
         required=True,
         help='Path to sessions file (CSV, XLSX, or MD) with columns: session_name, max_attendees, '
              'presenters, length, required, priority, number_of_sessions, max_per_day. '
+             'Optional: blacklist_days (CSV of day indices 0-based, or -1/? for no blacklist), '
+             'blacklist_time (CSV of time ranges like "9am-11am,1pm-2pm" or -1/?/0 for no blacklist). '
              'number_of_sessions can be: single number (3), range (2-5), or auto-determine (? or 0)'
     )
     
@@ -2338,6 +2485,13 @@ For more information, see the documentation at:
         type=int,
         default=1,
         help='Number of other sessions required between instances of the same session (default: 1, used with --no-back-to-back)'
+    )
+    
+    parser.add_argument(
+        '--minimum-session-size',
+        type=int,
+        default=1,
+        help='Minimum number of attendees per session (default: 1). Sessions with fewer attendees will not be created.'
     )
     
     parser.add_argument(
@@ -2532,7 +2686,8 @@ def main():
         # Run scheduler
         scheduler = Scheduler(
             sessions, locations, attendees, time_slots, 
-            args.include_overlaps, args.no_back_to_back, args.sessions_between
+            args.include_overlaps, args.no_back_to_back, args.sessions_between,
+            args.minimum_session_size
         )
         scheduler.run()
         
