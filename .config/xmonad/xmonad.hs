@@ -285,6 +285,7 @@ myManageHook = composeAll
     , className =? "Wine-Programs" --> doFloat
     , className =? "Lutris" --> doFloat
     , className =? "Heroic" --> doFloat
+    , className =? "re.sonny.Junction" --> doFloat
     , resource  =? "Dialog" --> doFloat
     , resource  =? "dialog" --> doFloat
     , title     =? "Mozilla Firefox" --> doFloat
@@ -557,7 +558,7 @@ lockAndSuspend =  do
 -- restart xmonad with a recompile
 restartXmonad :: X ()
 restartXmonad = do 
-    spawn "xmonad --recompile; killall -9 picom; killall -9 xmobar; xmonad --restart"
+    spawn "xmonad --recompile; killall -9 picom trayer xmobar; xmonad --restart"
  
 
 --  _          _                    __                  _   _                 
