@@ -26,6 +26,7 @@ SSH_SUDO=false
 FORCE_SEND=false
 REMOTE_CLEANUP=false
 SEND_HOSTS_OVERRIDE=""
+DATASETS_OVERRIDE=""
 
 # Datasets to snapshot (add new datasets here)
 SNAPSHOT_DATASETS=(
@@ -107,6 +108,22 @@ get_effective_remote_targets() {
     fi
 }
 
+get_effective_datasets() {
+    local operation_type="$1"  # "snapshot" or "send"
+    
+    if [[ -n "${DATASETS_OVERRIDE}" ]]; then
+        # Convert comma-separated string to array
+        IFS=',' read -ra datasets <<< "${DATASETS_OVERRIDE}"
+        printf '%s\n' "${datasets[@]}"
+    else
+        if [[ "${operation_type}" == "send" ]]; then
+            printf '%s\n' "${SEND_DATASETS[@]}"
+        else
+            printf '%s\n' "${SNAPSHOT_DATASETS[@]}"
+        fi
+    fi
+}
+
 show_usage() {
     cat << EOF
 Usage: $(basename "$0") [OPTIONS] COMMAND
@@ -129,6 +146,7 @@ OPTIONS:
     --force-send           Force resend by destroying current remote snapshot first
     --remote-cleanup       Also cleanup old snapshots on remote hosts
     --send-hosts HOSTS     Override remote targets (comma-separated: user@host:pool,user@host2:pool2)
+    --datasets DATASETS    Override datasets to operate on (comma-separated: dataset1,dataset2)
     -h, --help             Show this help message
 
 CONFIGURATION:
@@ -145,6 +163,8 @@ EXAMPLES:
     $(basename "$0") --force-send send          # Force resend by destroying remote snapshots
     $(basename "$0") --remote-cleanup cleanup   # Clean local and remote snapshots
     $(basename "$0") --send-hosts "user@host1:pool1,user@host2:pool2" send  # Override targets
+    $(basename "$0") --datasets "app_data,media" snapshot                  # Snapshot only specific datasets
+    $(basename "$0") --datasets "home" send                               # Send only home dataset
     $(basename "$0") cleanup                     # Clean old snapshots
     $(basename "$0") send                        # Send to remotes
 EOF
@@ -168,9 +188,16 @@ get_cutoff_date() {
 }
 
 create_snapshots() {
-    log_info "Creating recursive snapshots for ${#SNAPSHOT_DATASETS[@]} datasets"
+    local effective_datasets
+    mapfile -t effective_datasets < <(get_effective_datasets "snapshot")
     
-    for dataset in "${SNAPSHOT_DATASETS[@]}"; do
+    if [[ -n "${DATASETS_OVERRIDE}" ]]; then
+        log_info "Creating recursive snapshots for ${#effective_datasets[@]} override datasets: ${DATASETS_OVERRIDE}"
+    else
+        log_info "Creating recursive snapshots for ${#effective_datasets[@]} configured datasets"
+    fi
+    
+    for dataset in "${effective_datasets[@]}"; do
         local snapshot_name
         snapshot_name=$(get_snapshot_name "${dataset}")
         
@@ -190,9 +217,17 @@ cleanup_old_snapshots() {
     local cutoff_date
     cutoff_date=$(get_cutoff_date "${RETENTION_DAYS}")
     
-    log_info "Cleaning up snapshots older than ${RETENTION_DAYS} days (before ${cutoff_date})"
+    local effective_datasets
+    mapfile -t effective_datasets < <(get_effective_datasets "snapshot")
     
-    for dataset in "${SNAPSHOT_DATASETS[@]}"; do
+    if [[ -n "${DATASETS_OVERRIDE}" ]]; then
+        log_info "Cleaning up snapshots for ${#effective_datasets[@]} override datasets: ${DATASETS_OVERRIDE}"
+    else
+        log_info "Cleaning up snapshots for ${#effective_datasets[@]} configured datasets"
+    fi
+    log_info "Removing snapshots older than ${RETENTION_DAYS} days (before ${cutoff_date})"
+    
+    for dataset in "${effective_datasets[@]}"; do
         log_debug "Checking snapshots for dataset: ${POOL_NAME}/${dataset}"
         
         local snapshots
@@ -240,7 +275,10 @@ remote_cleanup_old_snapshots() {
     for remote_target in "${effective_targets[@]}"; do
         log_info "Processing remote target: ${remote_target}"
         
-        for dataset in "${SEND_DATASETS[@]}"; do
+        local effective_datasets
+        mapfile -t effective_datasets < <(get_effective_datasets "send")
+        
+        for dataset in "${effective_datasets[@]}"; do
             log_debug "Checking remote snapshots for dataset: ${dataset}"
             
             local remote_snapshots
@@ -352,7 +390,10 @@ send_to_remote() {
     for remote_target in "${effective_targets[@]}"; do
         log_info "Processing remote target: ${remote_target}"
         
-        for dataset in "${SEND_DATASETS[@]}"; do
+        local effective_datasets
+        mapfile -t effective_datasets < <(get_effective_datasets "send")
+        
+        for dataset in "${effective_datasets[@]}"; do
             local current_snapshot
             current_snapshot=$(get_snapshot_name "${dataset}")
             
@@ -451,9 +492,16 @@ send_to_remote() {
 }
 
 list_snapshots() {
-    log_info "Listing snapshots for configured datasets"
+    local effective_datasets
+    mapfile -t effective_datasets < <(get_effective_datasets "snapshot")
     
-    for dataset in "${SNAPSHOT_DATASETS[@]}"; do
+    if [[ -n "${DATASETS_OVERRIDE}" ]]; then
+        log_info "Listing snapshots for ${#effective_datasets[@]} override datasets: ${DATASETS_OVERRIDE}"
+    else
+        log_info "Listing snapshots for ${#effective_datasets[@]} configured datasets"
+    fi
+    
+    for dataset in "${effective_datasets[@]}"; do
         echo ""
         echo "=== ${POOL_NAME}/${dataset} ==="
         if ! zfs list -t snapshot -o name,creation,used "${POOL_NAME}/${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$"; then
@@ -475,7 +523,10 @@ show_status() {
     
     echo ""
     echo "=== Latest Snapshots ==="
-    for dataset in "${SNAPSHOT_DATASETS[@]}"; do
+    local effective_datasets
+    mapfile -t effective_datasets < <(get_effective_datasets "snapshot")
+    
+    for dataset in "${effective_datasets[@]}"; do
         local latest
         latest=$(zfs list -H -t snapshot -o name,creation -S creation "${POOL_NAME}/${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" | head -1 || echo "None")
         echo "${dataset}: ${latest}"
@@ -515,6 +566,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --send-hosts)
             SEND_HOSTS_OVERRIDE="$2"
+            shift 2
+            ;;
+        --datasets)
+            DATASETS_OVERRIDE="$2"
             shift 2
             ;;
         -h|--help)
@@ -559,7 +614,7 @@ if ! zfs list "${POOL_NAME}" >/dev/null 2>&1; then
 fi
 
 log_debug "Starting zfs_mgr with command: ${COMMAND}"
-log_debug "Configuration: pool=${POOL_NAME}, retention=${RETENTION_DAYS}, debug=${DEBUG}, dry_run=${DRY_RUN}, ssh_sudo=${SSH_SUDO}, force_send=${FORCE_SEND}, remote_cleanup=${REMOTE_CLEANUP}, send_hosts_override=${SEND_HOSTS_OVERRIDE}"
+log_debug "Configuration: pool=${POOL_NAME}, retention=${RETENTION_DAYS}, debug=${DEBUG}, dry_run=${DRY_RUN}, ssh_sudo=${SSH_SUDO}, force_send=${FORCE_SEND}, remote_cleanup=${REMOTE_CLEANUP}, send_hosts_override=${SEND_HOSTS_OVERRIDE}, datasets_override=${DATASETS_OVERRIDE}"
 
 # Execute command
 case "${COMMAND}" in
