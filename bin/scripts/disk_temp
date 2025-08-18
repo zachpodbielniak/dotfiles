@@ -1,0 +1,171 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Function to display usage
+usage() {
+    echo "Usage: $(basename "$0") [-h|--help] [-a|--all] [-s|--sudo]"
+    echo ""
+    echo "Display disk temperatures and historical maximums using smartctl"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help    Show this help message"
+    echo "  -a, --all     Show all disks including those without temperature data"
+    echo "  -s, --sudo    Use sudo for smartctl commands (instead of running whole script as root)"
+    exit 0
+}
+
+# Parse arguments
+SHOW_ALL=false
+USE_SUDO=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            usage
+            ;;
+        -a|--all)
+            SHOW_ALL=true
+            shift
+            ;;
+        -s|--sudo)
+            USE_SUDO=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            ;;
+    esac
+done
+
+# Set smartctl command with or without sudo
+if [[ "$USE_SUDO" == "true" ]]; then
+    USE_SUDO_PREFIX="sudo"
+else
+    USE_SUDO_PREFIX=""
+fi
+
+# Check if running with sufficient privileges (only if not using sudo flag)
+if [[ "$USE_SUDO" == "false" ]] && [[ $EUID -ne 0 ]]; then
+    echo "This script requires root privileges to access SMART data."
+    echo "Please run with sudo: sudo $(basename "$0")"
+    echo "Or use the -s/--sudo flag: $(basename "$0") -s"
+    exit 1
+fi
+
+# Check if smartctl is installed
+if ! command -v smartctl &> /dev/null; then
+    echo "Error: smartctl is not installed. Please install smartmontools package." >&2
+    exit 1
+fi
+
+# Header
+printf "%-12s %-20s %-12s %-12s %s\n" "Device" "Serial Number" "Current °C" "Maximum °C" "Model"
+printf "%s\n" "$(printf '%.0s-' {1..100})"
+
+# Get list of block devices
+# Use lsblk to get all disk devices (exclude zram)
+while IFS= read -r device; do
+    [[ -e "$device" ]] || continue
+    
+    # Get SMART data
+    if [[ -n "$USE_SUDO_PREFIX" ]]; then
+        smart_output=$(sudo smartctl -a "$device" 2>/dev/null) || true
+    else  
+        smart_output=$(smartctl -a "$device" 2>/dev/null) || true
+    fi
+    
+    # Skip empty output
+    [[ -z "$smart_output" ]] && continue
+    
+    # Skip if no SMART support
+    if echo "$smart_output" | grep -q "SMART support is: Unavailable"; then
+        if [[ "$SHOW_ALL" == "true" ]]; then
+            printf "%-12s %-20s %-12s %-12s %-40s\n" "$device" "N/A" "N/A" "N/A" "SMART unavailable"
+        fi
+        continue
+    fi
+    
+    # Extract serial number
+    serial=$(echo "$smart_output" | grep -i "Serial Number:" | awk '{print $3}' | head -1)
+    [[ -z "$serial" ]] && serial="Unknown"
+    
+    # Extract model
+    model=$(echo "$smart_output" | grep -i "Device Model:\|Model Number:" | sed 's/.*: *//' | head -1)
+    [[ -z "$model" ]] && model="Unknown"
+    
+    # Truncate model if too long
+    if [[ ${#model} -gt 40 ]]; then
+        model="${model:0:37}..."
+    fi
+    
+    # Extract temperatures based on device type
+    current_temp=""
+    max_temp=""
+    
+    if [[ "$device" == /dev/nvme* ]]; then
+        # NVMe devices
+        current_temp=$(echo "$smart_output" | grep -i "^Temperature:" | awk '{print $2}')
+        # For NVMe, we typically don't have a max temp in the standard output
+        # Use the highest sensor reading as an approximation
+        max_temp=$(echo "$smart_output" | grep -i "Temperature Sensor" | awk '{print $4}' | sort -rn | head -1)
+        # If still empty, leave it blank
+        [[ -z "$max_temp" ]] && max_temp=""
+    else
+        # SATA/SAS devices
+        # Try different temperature attribute IDs (194 is common, 190 for some drives)
+        temp_line=$(echo "$smart_output" | grep -E "^194 |^190 " | head -1)
+        if [[ -n "$temp_line" ]]; then
+            current_temp=$(echo "$temp_line" | awk '{print $10}')
+            # Extract max from Min/Max field at the end (e.g., "(Min/Max 29/30)")
+            max_temp=$(echo "$temp_line" | grep -oE '\([^)]*\)' | grep -oE '[0-9]+' | tail -1)
+        fi
+        
+        # Alternative temperature format
+        if [[ -z "$current_temp" ]]; then
+            current_temp=$(echo "$smart_output" | grep -i "Current.*Temperature:" | grep -oE "[0-9]+" | head -1)
+        fi
+        if [[ -z "$max_temp" ]]; then
+            max_temp=$(echo "$smart_output" | grep -i "Lifetime.*Max.*Temp\|Highest.*Temp" | grep -oE "[0-9]+" | head -1)
+        fi
+    fi
+    
+    
+    # Display results
+    if [[ -n "$current_temp" ]] || [[ "$SHOW_ALL" == "true" ]]; then
+        [[ -z "$current_temp" ]] && current_temp="N/A"
+        [[ -z "$max_temp" ]] && max_temp="N/A"
+        
+        # Color code temperatures
+        temp_display="$current_temp"
+        if [[ "$current_temp" != "N/A" ]]; then
+            if [[ "$current_temp" -ge 60 ]]; then
+                temp_display="\033[31m$current_temp\033[0m"  # Red for hot
+            elif [[ "$current_temp" -ge 50 ]]; then
+                temp_display="\033[33m$current_temp\033[0m"  # Yellow for warm
+            else
+                temp_display="\033[32m$current_temp\033[0m"  # Green for cool
+            fi
+        fi
+        
+        printf "%-12s %-20s %-20b %-11s %s\n" "$device" "$serial" "$temp_display" "$max_temp" "$model"
+    fi
+done < <(lsblk -d -n -o NAME,TYPE | grep disk | grep -v zram | awk '{print "/dev/"$1}')
+
+echo ""
+printf "Temperature colors: \033[32m<50°C\033[0m \033[33m50-59°C\033[0m \033[31m≥60°C\033[0m\n"
