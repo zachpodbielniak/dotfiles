@@ -234,8 +234,9 @@ isExcludedFromFade = do
     isMpv <- className =? "mpv"
     isChromium <- className =? "Org.chromium.Chromium"
     isXrdp <- className =? "xfreerdp"
+    isZoom <- className =? "zoom"
     -- isStTerm <- className =? "st-256color"  -- Uncomment to exclude st from fading
-    return $ isLibrewolfToolkit || isMpv || isChromium || isXrdp  -- Add "|| isStTerm" if uncommenting above
+    return $ isLibrewolfToolkit || isMpv || isChromium || isXrdp || isZoom  -- Add "|| isStTerm" if uncommenting above
 
  
 --                                              _                 _        
