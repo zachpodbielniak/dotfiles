@@ -1,0 +1,216 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Default directory
+DEFAULT_DIR="/var/home/zach/data/mnt/nas/software/games/install/"
+NAS_DIR="/var/mnt/dpool/software/games/install/"
+
+# Function to display help
+show_help() {
+    cat << EOF
+find_gog_dupes - Find and analyze duplicate GOG game installations
+
+USAGE:
+    find_gog_dupes [OPTIONS]
+
+OPTIONS:
+    -h, --help          Show this help message and exit
+    --not-latest        List all versions except the latest for each game
+    --simple            Output only directory names, one per line (for scripting)
+
+    Options can be combined (e.g., --simple --not-latest)
+
+DESCRIPTION:
+    This script scans a directory for GOG game installations that follow the
+    naming pattern: <game_name>_gog_(<version_number>)
+
+    It automatically detects the correct directory based on hostname:
+    - For NAS machines (hostname starting with 'nas-'): /var/mnt/dpool/software/games/install/
+    - For other machines: /var/home/zach/data/mnt/nas/software/games/install/
+
+    For games with multiple versions, it shows:
+    - Total number of versions
+    - Oldest version (lowest number)
+    - Newest version (highest number)
+    - All versions (default) or all except latest (--not-latest)
+
+    Use --simple for machine-readable output (directory paths only, one per line).
+    Options can be combined for flexible output.
+
+EXAMPLES:
+    find_gog_dupes                       # List all versions for all games
+    find_gog_dupes --not-latest          # List only older versions
+    find_gog_dupes --simple              # Output directory names only
+    find_gog_dupes --simple --not-latest # Simple output, exclude latest
+    find_gog_dupes --simple --not-latest | xargs -I {} rm -rf "{}"  # Remove old versions
+    find_gog_dupes --simple --not-latest | xargs -p -I {} rm -rf "{}"  # Confirm each deletion
+    find_gog_dupes -h                    # Show this help
+
+    WARNING: The xargs rm examples will permanently delete directories.
+             Always test with 'echo' first: ... | xargs -I {} echo "Would remove: {}"
+
+EOF
+}
+
+# Parse arguments
+NOT_LATEST=false
+SIMPLE=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --not-latest)
+            NOT_LATEST=true
+            shift
+            ;;
+        --simple)
+            SIMPLE=true
+            shift
+            ;;
+        *)
+            echo "Error: Unknown option '$1'"
+            echo "Use -h or --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Determine directory based on hostname
+HOSTNAME=$(hostname)
+if [[ "$HOSTNAME" == nas-* ]]; then
+    TARGET_DIR="$NAS_DIR"
+else
+    TARGET_DIR="$DEFAULT_DIR"
+fi
+
+# Check if directory exists
+if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "Error: Directory $TARGET_DIR does not exist"
+    exit 1
+fi
+
+# Find all directories matching the pattern *_gog_(<decimal_number>)
+declare -A game_groups
+declare -A game_versions
+
+while IFS= read -r -d '' dir; do
+    dirname=$(basename "$dir")
+
+    # Check if it matches the pattern
+    if [[ "$dirname" =~ ^(.+)_gog_\(([0-9]+)\)$ ]]; then
+        base_name="${BASH_REMATCH[1]}"
+        version="${BASH_REMATCH[2]}"
+
+        # Store in associative arrays
+        if [[ -z "${game_groups[$base_name]:-}" ]]; then
+            game_groups["$base_name"]="$dir"
+        else
+            game_groups["$base_name"]="${game_groups[$base_name]}|$dir"
+        fi
+
+        # Track versions for each game
+        if [[ -z "${game_versions[$base_name]:-}" ]]; then
+            game_versions["$base_name"]="$version:$dir"
+        else
+            game_versions["$base_name"]="${game_versions[$base_name]}|$version:$dir"
+        fi
+    fi
+done < <(find "$TARGET_DIR" -maxdepth 1 -type d -print0)
+
+# Process each game group
+for game in "${!game_groups[@]}"; do
+    # Split versions and find min/max
+    IFS='|' read -ra version_entries <<< "${game_versions[$game]}"
+
+    # Find oldest (lowest number) and newest (highest number)
+    oldest_version=""
+    oldest_dir=""
+    newest_version=""
+    newest_dir=""
+
+    for entry in "${version_entries[@]}"; do
+        IFS=':' read -r version dir <<< "$entry"
+
+        if [[ -z "$oldest_version" ]] || [[ "$version" -lt "$oldest_version" ]]; then
+            oldest_version="$version"
+            oldest_dir="$dir"
+        fi
+
+        if [[ -z "$newest_version" ]] || [[ "$version" -gt "$newest_version" ]]; then
+            newest_version="$version"
+            newest_dir="$dir"
+        fi
+    done
+
+    # Count total versions
+    version_count=$(echo "${game_versions[$game]}" | tr '|' '\n' | wc -l)
+
+    if [[ "$version_count" -gt 1 ]]; then
+        if [[ "$SIMPLE" == true ]]; then
+            # Simple mode: output directory names only
+            if [[ "$NOT_LATEST" == true ]]; then
+                # List all except the latest
+                for entry in "${version_entries[@]}"; do
+                    IFS=':' read -r version dir <<< "$entry"
+                    if [[ "$version" != "$newest_version" ]]; then
+                        echo "$dir"
+                    fi
+                done
+            else
+                # List all versions
+                for entry in "${version_entries[@]}"; do
+                    IFS=':' read -r version dir <<< "$entry"
+                    echo "$dir"
+                done
+            fi
+        else
+            # Normal mode: detailed output
+            echo "Game: $game"
+            echo "  Total versions: $version_count"
+            echo "  Oldest: $(basename "$oldest_dir") (version $oldest_version)"
+            echo "  Newest: $(basename "$newest_dir") (version $newest_version)"
+
+            if [[ "$NOT_LATEST" == true ]]; then
+                # List all except the latest
+                for entry in "${version_entries[@]}"; do
+                    IFS=':' read -r version dir <<< "$entry"
+                    if [[ "$version" != "$newest_version" ]]; then
+                        echo "  Older version: $(basename "$dir") (version $version)"
+                    fi
+                done
+            else
+                # List all versions
+                for entry in "${version_entries[@]}"; do
+                    IFS=':' read -r version dir <<< "$entry"
+                    echo "  Version: $(basename "$dir") (version $version)"
+                done
+            fi
+            echo ""
+        fi
+    fi
+done
+
+if [[ ${#game_groups[@]} -eq 0 ]]; then
+    if [[ "$SIMPLE" != true ]]; then
+        echo "No GOG game directories found in $TARGET_DIR"
+    fi
+fi
