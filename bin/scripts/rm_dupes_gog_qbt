@@ -1,0 +1,260 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Function to display help
+show_help() {
+    cat << EOF
+rm_dupes_gog_qbt - Remove duplicate GOG game torrents from qBittorrent
+
+USAGE:
+    rm_dupes_gog_qbt [OPTIONS]
+
+DESCRIPTION:
+    This script identifies duplicate GOG game torrents in qBittorrent and removes
+    the older versions, keeping only the latest version of each game.
+
+    By default, it prompts for confirmation before removing torrents. Use --no-prompt
+    to skip confirmation, or --dry-run to see what would be done without removing.
+    Use --verbose to see detailed output of all commands executed.
+
+    It works by:
+    1. Getting list of GOG torrents from qBittorrent
+    2. Finding duplicates using find_gog_dupes
+    3. Removing older versions while keeping the latest (or oldest with --keep-oldest)
+
+OPTIONS:
+    -h, --help          Show this help message and exit
+    --dry-run           Show what would be done without actually removing torrents
+    --keep-oldest       Keep oldest version instead of newest (default: keep newest)
+    --verbose           Show detailed output of commands executed
+    --no-prompt         Skip confirmation prompt before removing torrents
+
+EXAMPLES:
+    rm_dupes_gog_qbt                    # Remove duplicate GOG torrents (with confirmation)
+    rm_dupes_gog_qbt --dry-run          # Show what would be removed
+    rm_dupes_gog_qbt --keep-oldest      # Keep oldest instead of newest
+    rm_dupes_gog_qbt --no-prompt        # Remove without confirmation prompt
+    rm_dupes_gog_qbt --dry-run --verbose # Show detailed command outputs
+
+REQUIREMENTS:
+    - qbt command (qBittorrent CLI)
+    - jq command for JSON processing
+    - find_gog_dupes script in PATH
+
+EOF
+}
+
+# Parse arguments
+DRY_RUN=false
+KEEP_OLDEST=false
+VERBOSE=false
+NO_PROMPT=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --keep-oldest)
+            KEEP_OLDEST=true
+            shift
+            ;;
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --no-prompt)
+            NO_PROMPT=true
+            shift
+            ;;
+        *)
+            echo "Error: Unknown option '$1'"
+            echo "Use -h or --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Check if required commands are available
+if ! command -v qbt &> /dev/null; then
+    echo "Error: qbt command not found. Please install qBittorrent CLI."
+    exit 1
+fi
+
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq command not found. Please install jq."
+    exit 1
+fi
+
+if ! command -v find_gog_dupes &> /dev/null; then
+    echo "Error: find_gog_dupes script not found in PATH."
+    exit 1
+fi
+
+if [[ "$DRY_RUN" == true || "$VERBOSE" == true ]]; then
+    echo "=== COMMANDS EXECUTED ==="
+    echo "1. Getting list of GOG torrents:"
+    echo "   qbt torrent list --filter seeding,completed --tag gog-games --output json"
+    echo
+fi
+
+# Get the JSON data from qBittorrent
+JSON_DATA=$(qbt torrent list --filter seeding,completed --tag gog-games --output json)
+
+if [[ "$VERBOSE" == true ]]; then
+    echo "   Output: $(echo "$JSON_DATA" | jq length 2>/dev/null || echo "invalid JSON") torrents found"
+    echo
+fi
+
+if [[ -z "$JSON_DATA" || "$JSON_DATA" == "[]" ]]; then
+    echo "No GOG torrents found."
+    exit 0
+fi
+
+# Create temporary files for processing
+temp_json=$(mktemp)
+temp_names=$(mktemp)
+temp_hashes=$(mktemp)
+
+# Save JSON data to temp file
+echo "$JSON_DATA" > "$temp_json"
+
+# Extract names and hashes
+jq -r '.[] | "\(.name)\t\(.hash)"' "$temp_json" > "$temp_names"
+
+if [[ ! -s "$temp_names" ]]; then
+    echo "No valid GOG torrent names found."
+    rm -f "$temp_json" "$temp_names" "$temp_hashes"
+    exit 0
+fi
+
+# Extract just the names for duplicate detection
+cut -f1 "$temp_names" > "$temp_hashes"
+
+# Find duplicates using find_gog_dupes
+if [[ "$DRY_RUN" == true || "$VERBOSE" == true ]]; then
+    echo "2. Finding duplicates:"
+    if [[ "$KEEP_OLDEST" == true ]]; then
+        echo "   cat <torrents> | find_gog_dupes --stdin --simple"
+    else
+        echo "   cat <torrents> | find_gog_dupes --stdin --simple --not-latest"
+    fi
+fi
+
+# Capture both the output and the command for verbose mode
+if [[ "$KEEP_OLDEST" == true ]]; then
+    # Keep oldest, remove newer versions
+    DUPLICATE_NAMES=$(cat "$temp_hashes" | find_gog_dupes --stdin --simple 2>/dev/null)
+else
+    # Keep newest, remove older versions (default)
+    DUPLICATE_NAMES=$(cat "$temp_hashes" | find_gog_dupes --stdin --simple --not-latest 2>/dev/null)
+fi
+
+if [[ "$VERBOSE" == true ]]; then
+    duplicate_count=$(echo -n "$DUPLICATE_NAMES" | grep -c '^' 2>/dev/null || echo "0")
+    echo "   Output: $duplicate_count duplicate torrents found"
+    if [[ -n "$DUPLICATE_NAMES" ]]; then
+        echo "   Duplicates:"
+        echo "$DUPLICATE_NAMES" | sed 's/^/     /'
+    fi
+    echo
+fi
+
+
+
+if [[ -z "$DUPLICATE_NAMES" ]]; then
+    echo "No duplicate GOG torrents found."
+    rm -f "$temp_json" "$temp_names" "$temp_hashes"
+    exit 0
+fi
+
+echo "Found duplicate torrents to remove:"
+echo "$DUPLICATE_NAMES"
+echo
+
+# Create associative array to map names to hashes
+declare -A name_to_hash
+while IFS=$'\t' read -r name hash; do
+    if [[ -n "$name" && -n "$hash" ]]; then
+        name_to_hash["$name"]="$hash"
+    fi
+done < "$temp_names"
+
+# Collect hashes of duplicates to remove
+hashes_to_remove=()
+while IFS= read -r duplicate_name; do
+    if [[ -n "$duplicate_name" && -n "${name_to_hash[$duplicate_name]:-}" ]]; then
+        hashes_to_remove+=("${name_to_hash[$duplicate_name]}")
+        echo "Will remove: $duplicate_name (hash: ${name_to_hash[$duplicate_name]})"
+    fi
+done <<< "$DUPLICATE_NAMES"
+
+# Clean up temp files
+rm -f "$temp_json" "$temp_names" "$temp_hashes"
+
+if [[ ${#hashes_to_remove[@]} -eq 0 ]]; then
+    echo "No matching hashes found for duplicate torrents."
+    exit 0
+fi
+
+echo
+echo "Summary: ${#hashes_to_remove[@]} duplicate torrent(s) will be removed."
+
+# Join hashes with commas for the command
+hashes_csv=$(IFS=,; echo "${hashes_to_remove[*]}")
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo "=== DRY RUN RESULTS ==="
+    echo "3. Removal command that would be executed:"
+    echo "   qbt torrent remove --hashes $hashes_csv"
+    echo
+    echo "Individual commands:"
+    for hash in "${hashes_to_remove[@]}"; do
+        echo "   qbt torrent remove --hashes $hash"
+    done
+    echo
+    echo "NOTE: No torrents were actually removed (--dry-run mode)"
+else
+    if [[ "$NO_PROMPT" != true ]]; then
+        echo "About to remove ${#hashes_to_remove[@]} duplicate torrent(s)."
+        echo "Command: qbt torrent remove --hashes $hashes_csv"
+        echo
+        read -p "Continue with removal? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            exit 0
+        fi
+    fi
+
+    if [[ "$VERBOSE" == true ]]; then
+        echo "3. Executing removal:"
+        echo "   qbt torrent remove --hashes $hashes_csv"
+    fi
+
+    echo "Removing duplicate torrents..."
+    qbt torrent remove --hashes "$hashes_csv"
+    echo "Successfully removed ${#hashes_to_remove[@]} duplicate torrent(s)."
+fi
