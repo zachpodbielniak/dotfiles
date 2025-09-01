@@ -1,0 +1,381 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Function to display help
+show_help() {
+    cat << EOF
+run_smart_tests - Run SMART tests on storage drives
+
+USAGE:
+    run_smart_tests [OPTIONS]
+
+DESCRIPTION:
+    This script runs SMART tests on all detected storage drives. It can run
+    short or long tests, with or without captive mode, and can check test status.
+
+    Drives are automatically detected from /dev/disk/by-id/ for ATA, NVMe-CT,
+    and NVMe-WD devices.
+
+OPTIONS:
+    -h, --help          Show this help message and exit
+    --dry-run           Show what would be done without running commands
+    --captive           Use captive mode for SMART tests (blocks until complete)
+    --status            Check status of running/completed SMART tests (shows device paths)
+    --list-disks        List all detected storage drives
+    --smart-data        Output SMART data (-a) for all drives to stdout
+    --smart-data-extended  Output extended SMART data (-x) for all drives to stdout
+    --exclude PATTERN   Exclude drives matching PATTERN (can be used multiple times)
+    -t TYPE             Test type: short or long (default: short)
+
+EXAMPLES:
+    run_smart_tests                     # Run short tests (non-captive)
+    run_smart_tests --captive           # Run short tests in captive mode
+    run_smart_tests -t long             # Run long tests
+    run_smart_tests --dry-run           # Show what would be done
+    run_smart_tests --status            # Check test status on all drives (with device paths)
+    run_smart_tests --list-disks        # List all detected drives
+    run_smart_tests --smart-data        # Output SMART data for all drives
+    run_smart_tests --smart-data-extended  # Output extended SMART data
+    run_smart_tests --exclude nvme      # Exclude all NVMe drives
+    run_smart_tests --exclude ST3000 --status  # Check status excluding 3TB drives
+
+REQUIREMENTS:
+    - smartctl command (smartmontools package)
+    - sudo access for running SMART tests
+
+EOF
+}
+
+log_info() {
+    echo "[INFO] $@"
+}
+
+log_error() {
+    echo "[ERROR] $@"
+}
+
+# Function to check if a drive should be excluded
+should_exclude_drive() {
+    local drive="$1"
+
+    # If no exclude patterns, don't exclude
+    if [[ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    # Check if drive matches any exclude pattern
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        if [[ "$drive" == *"$pattern"* ]]; then
+            return 0  # Should exclude
+        fi
+    done
+
+    return 1  # Don't exclude
+}
+
+# Function to list all detected disks
+list_disks() {
+    log_info "Listing all detected storage drives..."
+    echo
+
+    # Print table header
+    printf "%-60s %-15s %-10s\n" "Drive Path" "Type" "Size"
+    printf "%-60s %-15s %-10s\n" "$(printf '%.0s-' {1..60})" "$(printf '%.0s-' {1..15})" "$(printf '%.0s-' {1..10})"
+
+    for drive in $drives; do
+        # Check if drive should be excluded
+        if should_exclude_drive "$drive"; then
+            continue
+        fi
+
+        local drive_path="/dev/disk/by-id/${drive}"
+
+        # Determine drive type
+        local drive_type="Unknown"
+        if [[ "$drive" == ata-* ]]; then
+            drive_type="ATA"
+        elif [[ "$drive" == nvme-* ]]; then
+            drive_type="NVMe"
+        fi
+
+        # Size detection disabled for now to ensure all drives show up
+        local drive_size="TBD"
+
+        printf "%-60s %-15s %-10s\n" "$drive_path" "$drive_type" "$drive_size"
+    done
+
+    echo
+    log_info "Total drives found: $(echo "$drives" | wc -w)"
+}
+
+# Function to check SMART test status
+check_status() {
+    log_info "Checking SMART test status on all drives..."
+    echo
+
+    # Print table header
+    printf "%-50s %-15s %-20s\n" "Drive ID" "Device" "Status"
+    printf "%-50s %-15s %-20s\n" "$(printf '%.0s-' {1..50})" "$(printf '%.0s-' {1..15})" "$(printf '%.0s-' {1..20})"
+
+    for drive in $drives; do
+        # Check if drive should be excluded
+        if should_exclude_drive "$drive"; then
+            continue
+        fi
+
+        local drive_path="/dev/disk/by-id/${drive}"
+        local device_path=$(readlink -f "$drive_path" 2>/dev/null || echo "N/A")
+
+        if [[ "$DRY_RUN" == true ]]; then
+            printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "DRY RUN: would check status"
+        else
+            # Get the SMART output and check for self-test status
+            local smart_output=$(sudo smartctl -a "$drive_path" 2>/dev/null)
+            local smartctl_exit=$?
+
+            if [[ $smartctl_exit -eq 0 && -n "$smart_output" ]]; then
+                local self_test_status=$(echo "$smart_output" | grep -i "Self-test status" | head -1)
+                local ata_self_test_status=$(echo "$smart_output" | grep -i "execution status" | head -1)
+
+                if [[ -n "$self_test_status" ]]; then
+                    # NVMe style status
+                    if [[ "$self_test_status" == *"No self-test in progress"* ]]; then
+                        printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "no test running"
+                    elif [[ "$self_test_status" == *"in progress"* ]]; then
+                        # Extract percentage if available
+                        local percentage=$(echo "$self_test_status" | grep -o "[0-9]\+%" | head -1)
+                        if [[ -n "$percentage" ]]; then
+                            printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "Running ($percentage)"
+                        else
+                            printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "Running"
+                        fi
+                    else
+                        # Other status (completed, failed, etc.)
+                        local status_short=$(echo "$self_test_status" | sed 's/Self-test status: //' | cut -d' ' -f1-3)
+                        printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "$status_short"
+                    fi
+                elif [[ -n "$ata_self_test_status" ]]; then
+                    # ATA style status - parse the numeric value and text
+                    local status_value=$(echo "$ata_self_test_status" | sed 's/.*( *\([0-9]\+\) *).*/\1/')
+                    local status_text=$(echo "$ata_self_test_status" | sed 's/.*) //' | cut -d'.' -f1)
+
+                    if [[ -n "$status_value" && "$status_value" =~ ^[0-9]+$ ]]; then
+                        if [[ $status_value -ge 240 && $status_value -le 254 ]]; then
+                            # Test in progress: percentage remaining = status - 240
+                            local percentage=$((status_value - 240))
+                            printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "Running (${percentage}%)"
+                        elif [[ $status_value -eq 0 ]]; then
+                            printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "no test running"
+                        elif [[ $status_value -ge 1 && $status_value -le 239 ]]; then
+                            # Test completed - show the status text
+                            if [[ "$status_text" == *"completed"* ]]; then
+                                printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "completed"
+                            else
+                                printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "$status_text"
+                            fi
+                        else
+                            printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "status: $status_value"
+                        fi
+                    else
+                        printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "No status available"
+                    fi
+                else
+                    printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "No status available"
+                fi
+            else
+                printf "%-50s %-15s %-20s\n" "$drive" "${device_path##*/}" "Unable to query"
+            fi
+        fi
+    done
+
+    echo
+}
+
+# Function to get SMART data for all drives
+get_smart_data() {
+    local smart_command="$1"
+    local mode_name="$2"
+
+    log_info "Getting $mode_name data for all drives..."
+    echo
+
+    for drive in $drives; do
+        # Check if drive should be excluded
+        if should_exclude_drive "$drive"; then
+            continue
+        fi
+
+        local drive_path="/dev/disk/by-id/${drive}"
+
+        echo "=== $drive_path ==="
+        if [[ "$DRY_RUN" == true ]]; then
+            echo "DRY RUN: would run: sudo $smart_command $drive_path"
+        else
+            if sudo $smart_command "$drive_path" 2>/dev/null; then
+                : # Command succeeded, output already shown
+            else
+                echo "ERROR: Failed to get SMART data for $drive_path"
+            fi
+        fi
+        echo
+    done
+}
+
+# Function to run SMART tests
+run_tests() {
+    local captive_flag=""
+    if [[ "$CAPTIVE" == true ]]; then
+        captive_flag="--captive"
+    fi
+
+    log_info "Running $TEST_TYPE SMART tests on ${CAPTIVE:+captive }mode..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "DRY RUN MODE - No actual tests will be executed"
+    fi
+    echo
+
+    for drive in $drives; do
+        # Check if drive should be excluded
+        if should_exclude_drive "$drive"; then
+            continue
+        fi
+
+        local section_split="----------------------------------------"
+        local drive_path="/dev/disk/by-id/${drive}"
+        local test_command="smartctl -t $TEST_TYPE $captive_flag $drive_path"
+
+        echo "Drive: $drive_path"
+        echo "$section_split"
+
+        if [[ "$DRY_RUN" == true ]]; then
+            log_info "would run: sudo $test_command"
+        else
+            log_info "Running: sudo $test_command"
+            if sudo $test_command; then
+                log_info "Test started successfully"
+            else
+                log_error "Failed to start test on $drive_path"
+            fi
+        fi
+
+        echo "$section_split"
+        echo
+    done
+}
+
+# Default values
+DRY_RUN=false
+CAPTIVE=false
+TEST_TYPE="short"
+STATUS_MODE=false
+LIST_MODE=false
+SMART_DATA_MODE=false
+SMART_DATA_EXTENDED_MODE=false
+EXCLUDE_PATTERNS=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --captive)
+            CAPTIVE=true
+            shift
+            ;;
+        --status)
+            STATUS_MODE=true
+            shift
+            ;;
+        --list-disks)
+            LIST_MODE=true
+            shift
+            ;;
+        --smart-data)
+            SMART_DATA_MODE=true
+            shift
+            ;;
+        --smart-data-extended)
+            SMART_DATA_EXTENDED_MODE=true
+            shift
+            ;;
+        --exclude)
+            if [[ $# -lt 2 ]]; then
+                log_error "Option --exclude requires an argument"
+                exit 1
+            fi
+            EXCLUDE_PATTERNS+=("$2")
+            shift 2
+            ;;
+        -t)
+            if [[ $# -lt 2 ]]; then
+                log_error "Option -t requires an argument (short or long)"
+                exit 1
+            fi
+            case "$2" in
+                short|long)
+                    TEST_TYPE="$2"
+                    ;;
+                *)
+                    log_error "Invalid test type '$2'. Use 'short' or 'long'"
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        *)
+            log_error "Unknown option '$1'"
+            echo "Use -h or --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Check if smartctl is available
+if ! command -v smartctl &> /dev/null; then
+    log_error "smartctl command not found. Please install smartmontools."
+    exit 1
+fi
+
+# Find drives
+drives=$(ls -l /dev/disk/by-id/ 2>/dev/null | grep -iP "(ata|nvme-CT|nvme-WD)" | grep -v part | grep -vP "_1" | awk '{ print $9 }' | sort -u | tr '\n' ' ')
+
+if [[ -z "$drives" ]]; then
+    log_error "No suitable drives found in /dev/disk/by-id/"
+    exit 1
+fi
+
+# Main execution
+if [[ "$LIST_MODE" == true ]]; then
+    list_disks
+elif [[ "$STATUS_MODE" == true ]]; then
+    check_status
+elif [[ "$SMART_DATA_MODE" == true ]]; then
+    get_smart_data "smartctl -a" "SMART"
+elif [[ "$SMART_DATA_EXTENDED_MODE" == true ]]; then
+    get_smart_data "smartctl -x" "SMART Extended"
+else
+    run_tests
+fi
