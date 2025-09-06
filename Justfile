@@ -1,6 +1,6 @@
 # normal stow operation
 stow: dep_dirs
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euxo pipefail
 
     stow \
@@ -16,7 +16,7 @@ stow: dep_dirs
 
 # modified stow operation for other devices
 stow_alt: dep_dirs
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euxo pipefail
 
     stow \
@@ -33,7 +33,7 @@ stow_alt: dep_dirs
 
 # unstow
 unstow:
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euxo pipefail
 
     stow -D .
@@ -41,7 +41,7 @@ unstow:
 
 # dry-run
 dry: dep_dirs
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euxo pipefail
 
     stow --ignore=Justfile --simulate -v .
@@ -49,7 +49,7 @@ dry: dep_dirs
 
 # test on the whole repo
 test:
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euxo pipefail
 
     qtile check
@@ -57,7 +57,7 @@ test:
 
 # create depedendent dirs so we don't end up symlinking the dirs here
 dep_dirs:
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euxo pipefail
 
     mkdir -p $HOME/bin 
@@ -79,7 +79,7 @@ dep_dirs:
 
 # install deps
 bootstrap:
-    #!/bin/bash
+    #!/usr/bin/env bash
     set -euxo pipefail 
     
     if [[ -f "${HOME}/.config/.dotfiles_init" ]]
@@ -96,7 +96,7 @@ bootstrap:
 
 # create git-worktree
 tree branch="" parent="master":
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euo pipefail 
     
     mkdir -p ./trees
@@ -105,7 +105,7 @@ tree branch="" parent="master":
 
 # remove git-worktree and optionally delete branch with it
 rm_tree branch="" rm_branch="false":
-    #!/bin/bash 
+    #!/usr/bin/env bash 
     set -euo pipefail 
     
     git worktree remove "./trees/{{branch}}"
