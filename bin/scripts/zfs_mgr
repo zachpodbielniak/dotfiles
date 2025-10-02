@@ -163,7 +163,7 @@ CONFIGURATION:
     Remote targets: ${REMOTE_TARGETS[*]}
     Local send targets: ${!LOCAL_SEND_TARGETS[*]} -> ${LOCAL_SEND_TARGETS[*]}
 
-EXAMPLES:
+ EXAMPLES:
     $(basename "$0") snapshot                    # Create snapshots
     $(basename "$0") --dry-run all              # Show what 'all' would do
     $(basename "$0") --debug --retention 7 all  # Run all with 7-day retention and debug
@@ -173,6 +173,7 @@ EXAMPLES:
     $(basename "$0") --send-hosts "user@host1:pool1,user@host2:pool2" send  # Override targets
     $(basename "$0") --datasets "dpool/app_data,dpool/media" snapshot     # Snapshot only specific datasets
     $(basename "$0") --datasets "dpool/home" send                         # Send only home dataset
+    $(basename "$0") --datasets "dpool/vms" cleanup                      # Clean only VM snapshots
     $(basename "$0") local_send                  # Send between local pools
     $(basename "$0") --dry-run local_send        # Show what local_send would do
     $(basename "$0") --local-sudo local_send     # Use sudo for local ZFS commands
@@ -223,9 +224,10 @@ create_snapshots() {
             # Get all child datasets under this dataset
             local all_datasets
             if all_datasets=$(zfs list -H -r -o name "${dataset}" 2>/dev/null); then
-                while IFS= read -r child_dataset; do
-                    if [[ -n "${child_dataset}" ]]; then
-                        local child_snapshot="${child_dataset}@$(date '+%Y-%m-%d')"
+                    while IFS= read -r child_dataset; do
+                        if [[ -n "${child_dataset}" ]]; then
+                            local child_snapshot
+                            child_snapshot="${child_dataset}@$(date '+%Y-%m-%d')"
                         
                         if zfs list "${child_snapshot}" >/dev/null 2>&1; then
                             log_debug "Snapshot ${child_snapshot} already exists"
@@ -336,12 +338,36 @@ cleanup_old_snapshots() {
         done <<< "${snapshots}"
     done
     
-    # Also cleanup local send source and target datasets
+    # Also cleanup local send source and target datasets (only if not using dataset override, or if override includes related datasets)
     if [[ ${#LOCAL_SEND_TARGETS[@]} -gt 0 ]]; then
-        log_info "Cleaning up snapshots for local send datasets"
-        
-        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
-            local target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+        local should_cleanup_local_send=false
+
+        if [[ -z "${DATASETS_OVERRIDE}" ]]; then
+            # No override specified, cleanup all local send datasets
+            should_cleanup_local_send=true
+        else
+            # Check if any effective datasets are local send sources or targets
+            for dataset in "${effective_datasets[@]}"; do
+                # Check if dataset is a local send source
+                if [[ " ${!LOCAL_SEND_TARGETS[*]} " =~ ${dataset} ]]; then
+                    should_cleanup_local_send=true
+                    break
+                fi
+                # Check if dataset is a local send target
+                for target_dataset in "${LOCAL_SEND_TARGETS[@]}"; do
+                    if [[ "${target_dataset}" == "${dataset}" ]]; then
+                        should_cleanup_local_send=true
+                        break 2
+                    fi
+                done
+            done
+        fi
+
+        if [[ "${should_cleanup_local_send}" == "true" ]]; then
+            log_info "Cleaning up snapshots for local send datasets"
+
+            for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+                local target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
             
             # Cleanup source dataset snapshots
             log_debug "Checking snapshots for local send source dataset: ${source_dataset}"
@@ -396,6 +422,7 @@ cleanup_old_snapshots() {
                 done <<< "${snapshots}"
             fi
         done
+        fi
     fi
 }
 
@@ -625,13 +652,15 @@ send_to_remote() {
                             local ssh_target="${remote_target%:*}"
                             local remote_pool="${remote_target#*:}"
                             local destroy_cmd
-                            destroy_cmd=$(ssh_command "${ssh_target}" "zfs destroy -r ${remote_pool}/${dataset_name}@$(echo ${current_snapshot} | cut -d'@' -f2)")
+                            snapshot_suffix=$(echo "${current_snapshot}" | cut -d'@' -f2)
+                            destroy_cmd=$(ssh_command "${ssh_target}" "zfs destroy -r ${remote_pool}/${dataset_name}@${snapshot_suffix}")
                             if ! execute_command "${destroy_cmd}"; then
                                 log_error "Failed to destroy remote snapshot for force send"
                                 continue
                             fi
                         else
-                            if ! execute_command "zfs destroy -r ${remote_target}/${dataset_name}@$(echo ${current_snapshot} | cut -d'@' -f2)"; then
+                            snapshot_suffix=$(echo "${current_snapshot}" | cut -d'@' -f2)
+                            if ! execute_command "zfs destroy -r ${remote_target}/${dataset_name}@${snapshot_suffix}"; then
                                 log_error "Failed to destroy remote snapshot for force send"
                                 continue
                             fi
@@ -825,18 +854,18 @@ show_status() {
     local pools_to_check=()
     for dataset in "${SNAPSHOT_DATASETS[@]}" "${SEND_DATASETS[@]}"; do
         local pool="${dataset%%/*}"
-        if [[ ! " ${pools_to_check[*]} " =~ " ${pool} " ]]; then
+        if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
             pools_to_check+=("${pool}")
         fi
     done
     for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
         local pool="${source_dataset%%/*}"
-        if [[ ! " ${pools_to_check[*]} " =~ " ${pool} " ]]; then
+        if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
             pools_to_check+=("${pool}")
         fi
         local target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
         pool="${target_dataset%%/*}"
-        if [[ ! " ${pools_to_check[*]} " =~ " ${pool} " ]]; then
+        if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
             pools_to_check+=("${pool}")
         fi
     done
@@ -924,27 +953,106 @@ fi
 missing_pools=()
 pools_to_check=()
 
-# Collect all pools from configuration
-for dataset in "${SNAPSHOT_DATASETS[@]}" "${SEND_DATASETS[@]}"; do
-    pool="${dataset%%/*}"
-    if [[ ! " ${pools_to_check[*]} " =~ " ${pool} " ]]; then
-        pools_to_check+=("${pool}")
-    fi
-done
+# Determine which pools are actually needed based on command and overrides
+case "${COMMAND}" in
+    snapshot|cleanup)
+        # For snapshot/cleanup operations, check pools from effective snapshot datasets
+        effective_snapshot_datasets=()
+        mapfile -t effective_snapshot_datasets < <(get_effective_datasets "snapshot")
+        for dataset in "${effective_snapshot_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    send)
+        # For send operations, check pools from effective send datasets
+        effective_send_datasets=()
+        mapfile -t effective_send_datasets < <(get_effective_datasets "send")
+        for dataset in "${effective_send_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    all)
+        # For all operations, check pools from both effective snapshot and send datasets
+        effective_snapshot_datasets=()
+        mapfile -t effective_snapshot_datasets < <(get_effective_datasets "snapshot")
+        for dataset in "${effective_snapshot_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        effective_send_datasets=()
+        mapfile -t effective_send_datasets < <(get_effective_datasets "send")
+        for dataset in "${effective_send_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    local_send)
+        # For local_send, check pools from LOCAL_SEND_TARGETS
+        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+            pool="${source_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+            target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+            pool="${target_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    list|status)
+        # For list/status, check all configured pools
+        for dataset in "${SNAPSHOT_DATASETS[@]}" "${SEND_DATASETS[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+            pool="${source_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+            target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+            pool="${target_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    *)
+        # For unknown commands, check all configured pools
+        for dataset in "${SNAPSHOT_DATASETS[@]}" "${SEND_DATASETS[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+            pool="${source_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+            target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+            pool="${target_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+esac
 
-for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
-    pool="${source_dataset%%/*}"
-    if [[ ! " ${pools_to_check[*]} " =~ " ${pool} " ]]; then
-        pools_to_check+=("${pool}")
-    fi
-    target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
-    pool="${target_dataset%%/*}"
-    if [[ ! " ${pools_to_check[*]} " =~ " ${pool} " ]]; then
-        pools_to_check+=("${pool}")
-    fi
-done
-
-# Check each pool
+# Check each required pool
 for pool in "${pools_to_check[@]}"; do
     if ! zfs list "${pool}" >/dev/null 2>&1; then
         missing_pools+=("${pool}")
