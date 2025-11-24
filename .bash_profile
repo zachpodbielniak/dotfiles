@@ -7,10 +7,10 @@ if [ -f ~/.bashrc ]; then . ~/.bashrc; fi
 if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
 
 # Theme
-if [[ "${HOSTNAME}" == "lt-zach" ]] || [[ "${HOSTNAME}" == "hacbook" ]]
-then
-    export GTK_THEME=WhiteSur-Dark
-fi
+# if [[ "${HOSTNAME}" == "lt-zach" ]] || [[ "${HOSTNAME}" == "hacbook" ]]
+# then
+#     export GTK_THEME=WhiteSur-Dark
+# fi
 
 export XMODIFIERS=@im=ibus
 export GTK_IM_MODULE=ibus
