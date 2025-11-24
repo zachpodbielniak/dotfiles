@@ -60,6 +60,7 @@ _path_prepend \
     "/nix/var/nix/profiles/default/bin" \
     "${HOME}/perl5/bin" \
     "${HOME}/bin" \
+    "${HOME}/bin/starship" \
     "${HOME}/.cabal/bin" \
     "${HOME}/.nimble/bin" \
     "${HOME}/bin/nim/bin" \
@@ -221,15 +222,6 @@ bind -x '"\C-o":fopen_file'
 bind -x '"\C-n":fopen_note'
 
 
-# Starship
-if command -v starship &>/dev/null
-then 
-    eval "$(starship init bash)"
-else
-    [[ -f "${HOME}/bin/starship/starship" ]] && eval "$(${HOME}/bin/starship/starship init bash)"
-fi
-
-
 # I manually set this in the path functions above
 # PATH="${HOME}/perl5/bin${PATH:+:${PATH}}"; export PATH;
 PERL5LIB="${HOME}/perl5/lib/perl5${PERL5LIB:+:${PERL5LIB}}"; export PERL5LIB;
@@ -237,3 +229,13 @@ PERL_LOCAL_LIB_ROOT="${HOME}/perl5${PERL_LOCAL_LIB_ROOT:+:${PERL_LOCAL_LIB_ROOT}
 PERL_MB_OPT="--install_base \"${HOME}/perl5\""; export PERL_MB_OPT;
 PERL_MM_OPT="INSTALL_BASE=${HOME}/perl5"; export PERL_MM_OPT;
 
+
+# Starship
+# Use system starship instead of the custom binary to avoid PS0 issues
+if [[ -f "$HOME/bin/starship/starship" ]]
+then
+    eval "$($HOME/bin/starship/starship init bash)"
+elif command -v starship &>/dev/null
+then
+    eval "$(starship init bash)"
+fi
