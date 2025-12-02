@@ -66,6 +66,9 @@ CONTAINER_CPUS=""
 CONTAINER_MEMORY=""
 RECURSIVE=false
 INPUT_FORMAT_FILTER=""
+PROCESS_MISSING=false
+PROCESS_EXISTING=false
+NO_CONFIRM=false
 
 # Logging configuration
 LOG_FILE="./compress_audio.log"
@@ -135,6 +138,9 @@ OPTIONS:
     --parallel N               Process N files in parallel (default: 1)
     --cpus N                   Limit CPU usage per container (e.g., 2, 1.5)
     --memory SIZE              Limit memory usage per container (e.g., 4096m, 4g)
+    --process-missing          Only process files not already in output directory
+    --process-existing         Only process files that already exist in output directory
+    -y, --no-confirm           Automatically overwrite existing output files (ffmpeg -y)
 
 EXAMPLES:
     # Basic compression to MP3 (320 kbps)
@@ -166,6 +172,18 @@ EXAMPLES:
 
     # Process with resource limits
     compress_audio --cpus 2 --memory 4g --parallel 2 *.wav
+
+    # Only process audio files missing from output directory
+    compress_audio --process-missing -o /path/to/output *.wav
+
+    # Only reprocess audio files already in output directory
+    compress_audio --process-existing -o /path/to/output *.mp3
+
+    # Automatically overwrite existing files without prompts
+    compress_audio -y --process-existing input.wav
+
+    # Parallel processing with selective filters
+    compress_audio --parallel 2 --process-missing -y -o /path/to/output *.wav
 
 QUALITY GUIDE:
     MP3:
@@ -622,6 +640,18 @@ parse_args() {
                 CONTAINER_MEMORY="$2"
                 shift 2
                 ;;
+            --process-missing)
+                PROCESS_MISSING=true
+                shift
+                ;;
+            --process-existing)
+                PROCESS_EXISTING=true
+                shift
+                ;;
+            -y|--no-confirm)
+                NO_CONFIRM=true
+                shift
+                ;;
             -*)
                 error "Unknown option: $1"
                 show_help
@@ -654,6 +684,12 @@ parse_args() {
         error "Cannot use --output-file with recursive mode"
         exit 1
     fi
+
+    # Check for conflicting process options
+    if [[ "$PROCESS_MISSING" == "true" ]] && [[ "$PROCESS_EXISTING" == "true" ]]; then
+        error "Cannot use both --process-missing and --process-existing together"
+        exit 1
+    fi
 }
 
 # Build FFmpeg command arguments
@@ -663,7 +699,12 @@ build_ffmpeg_args() {
     local input_dir="$3"
     local output_dir="$4"
     local args=()
-    
+
+    # Add -y flag if no confirmation needed (overwrite output files)
+    if [[ "$NO_CONFIRM" == "true" ]]; then
+        args+=("-y")
+    fi
+
     # Determine input path in container
     local input_basename
     input_basename="$(basename "$input_file")"
@@ -947,6 +988,27 @@ main() {
             fi
         fi
         
+        # Apply process-missing and process-existing filters
+        if [[ "$PROCESS_MISSING" == "true" ]]; then
+            # Only process files that don't exist in output directory
+            if [[ -f "$output_file" ]]; then
+                debug "Skipping (output file exists, --process-missing active): $output_file"
+                # ((skipped++)) returns 0 when incrementing from 0, causing 'set -e' to exit
+                # '|| true' prevents script exit on zero exit code
+                ((skipped++)) || true
+                continue
+            fi
+        elif [[ "$PROCESS_EXISTING" == "true" ]]; then
+            # Only process files that already exist in output directory
+            if [[ ! -f "$output_file" ]]; then
+                debug "Skipping (output file missing, --process-existing active): $output_file"
+                # ((skipped++)) returns 0 when incrementing from 0, causing 'set -e' to exit
+                # '|| true' prevents script exit on zero exit code
+                ((skipped++)) || true
+                continue
+            fi
+        fi
+
         # Check if already converted (for counting)
         if is_converted "$input_file" "$output_file"; then
             ((skipped++))
@@ -964,9 +1026,10 @@ main() {
             
             # Export the wrapper function and variables for parallel
             export -f process_audio_wrapper
-            export QUALITY CUSTOM_BITRATE OUTPUT_FORMAT CONTAINER_IMAGE VERBOSE DRY_RUN USE_JOURNAL 
+            export QUALITY CUSTOM_BITRATE OUTPUT_FORMAT CONTAINER_IMAGE VERBOSE DRY_RUN USE_JOURNAL
             export JOURNAL_FILE FORCE_RECONVERT PARALLEL_TYPE
             export CONTAINER_CPUS CONTAINER_MEMORY
+            export PROCESS_MISSING PROCESS_EXISTING NO_CONFIRM
             
             # Process jobs in parallel
             local parallel_failed=0
@@ -989,7 +1052,10 @@ main() {
                 [[ "$FORCE_RECONVERT" == "true" ]] && cmd_args+=("--force-reconvert")
                 [[ -n "$CONTAINER_CPUS" ]] && cmd_args+=("--cpus" "$CONTAINER_CPUS")
                 [[ -n "$CONTAINER_MEMORY" ]] && cmd_args+=("--memory" "$CONTAINER_MEMORY")
-                
+                [[ "$PROCESS_MISSING" == "true" ]] && cmd_args+=("--process-missing")
+                [[ "$PROCESS_EXISTING" == "true" ]] && cmd_args+=("--process-existing")
+                [[ "$NO_CONFIRM" == "true" ]] && cmd_args+=("-y")
+
                 # Extract input files from job list
                 local input_files=()
                 for job in "${job_list[@]}"; do
