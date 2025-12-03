@@ -165,6 +165,72 @@ MODEL_PROVIDERS = {
     "r1-1776": "perpy",
 }
 
+# Centralized model limits (context_window, max_output_tokens)
+CENTRALIZED_MODEL_LIMITS = {
+    # Claude models
+    "claude-sonnet-4-5": (1_000_000, 16_000),
+    "claude-opus-4-5": (200_000, 64_000),
+    "claude-haiku-4-5": (200_000, 8_192),
+    "claude-opus-4-1": (200_000, 32_000),
+    "claude-sonnet-4": (200_000, 64_000),
+    "claude-opus-4": (200_000, 32_000),
+    "claude-sonnet-4-20250514": (200_000, 64_000),
+    "claude-opus-4-20250514": (200_000, 32_000),
+
+    # OpenAI models
+    "gpt-5": (128_000, 16_384),
+    "gpt-5-thinking": (128_000, 16_384),
+    "gpt-5-thinking-pro": (128_000, 16_384),
+    "gpt-5-codex": (128_000, 16_384),
+    "gpt-4.1": (1_000_000, 32_768),
+    "gpt-4.1-nano": (1_000_000, 32_768),
+    "o4-mini": (128_000, 16_384),
+    "o3-mini": (128_000, 16_384),
+    "gpt-oss-120b": (4_096, 2_048),
+    "gpt-oss-20b": (4_096, 2_048),
+    "gpt-4o": (128_000, 16_384),
+    "gpt-4-turbo": (128_000, 4_096),
+    "gpt-4": (8_192, 4_096),
+    "gpt-4-32k": (32_768, 4_096),
+    "gpt-4o-mini": (128_000, 16_384),
+    "gpt-3.5-turbo": (16_385, 4_096),
+
+    # Gemini models
+    "gemini-3-pro": (1_048_576, 65_536),
+    "gemini-3-pro-image-preview": (1_048_576, 65_536),
+    "gemini-2.5-pro": (1_048_576, 65_536),
+    "gemini-2.5-flash": (1_048_576, 65_536),
+    "gemini-2.5-flash-lite": (1_048_576, 65_536),
+    "gemini-2.5-flash-live": (128_000, 8_000),
+    "gemini-2.5-computer-use": (1_048_576, 65_536),
+    "gemini-2.0-flash": (1_048_576, 8_192),
+    "gemini-1.5-flash": (1_048_576, 8_192),
+    "gemini-1.5-pro": (1_048_576, 65_536),
+
+    # Grok models
+    "grok-4-1-fast-reasoning": (256_000, 4_096),
+    "grok-4-1-fast-non-reasoning": (256_000, 4_096),
+    "grok-4": (256_000, 4_096),
+    "grok-4-heavy": (256_000, 4_096),
+    "grok-3": (1_000_000, 4_096),
+    "grok-3-mini": (1_000_000, 4_096),
+
+    # Perplexity models
+    "sonar-pro": (200_000, 8_000),
+    "sonar": (128_000, 4_000),
+    "sonar-deep-research": (200_000, 16_000),
+    "sonar-reasoning-pro": (200_000, 16_000),
+    "reasoning-pro": (128_000, 8_000),
+    "r1-1776": (256_000, 32_000),
+
+    # Default fallback
+    "default": (128_000, 4_096),
+}
+
+def get_model_limits(model_name):
+    """Get context window and max output for a model."""
+    return CENTRALIZED_MODEL_LIMITS.get(model_name, CENTRALIZED_MODEL_LIMITS["default"])
+
 def get_provider_for_model(model):
     """Get the provider for a given model, or return 'ollampy' as default for unknown models."""
     return MODEL_PROVIDERS.get(model, "ollampy")
@@ -3010,7 +3076,16 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                                help="Specific models to profile")
     advanced_group.add_argument("--profile-show-output", action="store_true",
                                help="Show model outputs in performance table")
-    
+
+    # ━━━ CHUNKING OPTIONS ━━━
+    chunking_group = parser.add_argument_group("🔗 Chunking Options (for large inputs)")
+    chunking_group.add_argument("--enable-chunking", action="store_true",
+                               help="Enable automatic chunking for prompts exceeding model token limits")
+    chunking_group.add_argument("--max-chunk-size", type=int, metavar="TOKENS",
+                               help="Maximum tokens per chunk (enables chunking automatically, default: 90%% of model limit)")
+    chunking_group.add_argument("--summarize-context-chunks", action="store_true",
+                               help="Pre-summarize context and include in all chunks (more coherent but higher cost)")
+
     return parser.parse_args()
 
 def run_provider_command(provider, args, model=None, iteration=None, stdin_input=None):
@@ -5125,23 +5200,127 @@ def main():
     
     # Combine all parts
     full_prompt = "\n".join(combined_parts) if combined_parts else ""
-    
+
     # Store original prompt for --prompt flag
     args.original_prompt = args.prompt
-    
+
+    # ━━━ CHUNKING LOGIC ━━━
+    # Check if chunking should be enabled and prompt is too large
+    should_chunk = args.enable_chunking or args.max_chunk_size
+
+    if should_chunk and not args.repl and full_prompt and args.times == 1:
+        # Count tokens in full prompt
+        full_prompt_tokens = count_tokens(full_prompt, args.debug)
+
+        # Get model limits
+        models_to_check = [m.strip() for m in args.model.split(",") if m.strip()]
+        first_model = models_to_check[0] if models_to_check else args.model
+        context_window, max_output = get_model_limits(first_model)
+
+        # Determine token threshold
+        if args.max_chunk_size:
+            threshold = args.max_chunk_size
+        else:
+            threshold = int(context_window * 0.9)
+
+        # Check if prompt exceeds threshold
+        if full_prompt_tokens > threshold:
+            if args.debug:
+                print(f"Debug: Prompt ({full_prompt_tokens} tokens) exceeds threshold ({threshold} tokens), enabling chunking", file=sys.stderr)
+
+            # Disable incompatible features
+            if args.times and args.times > 1:
+                print("Warning: --times not supported with chunking, using times=1", file=sys.stderr)
+                args.times = 1
+
+            if "," in args.model:
+                print("Warning: Multiple models not fully supported with chunking, using first model only", file=sys.stderr)
+                args.model = args.model.split(",")[0]
+
+            # Force no-streaming
+            args.no_streaming = True
+
+            # Separate context from content
+            context_text = ""
+            content_only = full_prompt
+
+            if context_chats:
+                # Extract context portion
+                context_text = format_context_for_prompt(context_chats)
+                content_only = full_prompt[len(context_text):].strip()
+
+            # Get provider
+            if args.provider:
+                provider = args.provider
+            else:
+                provider = get_provider_for_model(args.model)
+
+            # Process with chunking
+            try:
+                final_response, chunk_metadata = process_with_chunking(
+                    full_prompt, context_text, content_only, provider, args.model,
+                    args, args.debug
+                )
+
+                # Save transaction if not disabled
+                if not args.no_preserve:
+                    end_time = time.time()
+                    metadata = {
+                        'chunking_enabled': True,
+                        'num_chunks': len([m for m in chunk_metadata if 'chunk' in m]),
+                        'chunk_metadata': chunk_metadata
+                    }
+
+                    db_metadata = {
+                        'request_timestamp': datetime.fromtimestamp(start_time),
+                        'response_timestamp': datetime.fromtimestamp(end_time),
+                        'duration_ms': int((end_time - start_time) * 1000),
+                        'extra_metadata': metadata,
+                        'source': 'aipy_chunked'
+                    }
+
+                    if not args.dry_run:
+                        store_chat_in_db(
+                            prompt=full_prompt,
+                            response=final_response,
+                            provider=provider,
+                            model=args.model,
+                            tags=tags,
+                            metadata=db_metadata,
+                            context_uuid=args.context_id if hasattr(args, 'context_id') else None,
+                            debug=args.debug
+                        )
+
+                # Output final response
+                if args.render and RICH_AVAILABLE:
+                    render_markdown(final_response)
+                else:
+                    print(final_response)
+
+                if args.show_id:
+                    print(f"Chat ID: {args.context_id if hasattr(args, 'context_id') else 'N/A'}", file=sys.stderr)
+
+                sys.exit(0)
+            except Exception as e:
+                print(f"Error during chunked processing: {e}", file=sys.stderr)
+                if args.debug:
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                sys.exit(1)
+
     # Parse tags if provided
     tags = []
     if args.tags:
         tags = [tag.strip() for tag in args.tags.split(',') if tag.strip()]
-    
+
     # Automatically add 'follow-up' tag when using context
     if args.context_ids:
         if 'follow-up' not in tags:
             tags.append('follow-up')
-    
+
     # Convert back to None if empty for consistency
     tags = tags if tags else None
-    
+
     # Parse models (can be comma-separated)
     models = [m.strip() for m in args.model.split(",") if m.strip()]
     
@@ -5408,6 +5587,281 @@ def main():
                 show_id=args.show_id,
                 context_name=getattr(args, 'name', None)
             )
+
+# ============================================================================
+# CHUNKING SYSTEM FOR LARGE INPUTS
+# ============================================================================
+
+def count_tokens(text, debug=False):
+    """Count tokens using token_count script, fallback to estimation."""
+    try:
+        result = subprocess.run(
+            ['token_count', '--simple', '--only-sum'],
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception as e:
+        if debug:
+            print(f"Warning: Token counting failed ({e}), using estimation", file=sys.stderr)
+
+    # Fallback to 4 chars per token
+    return len(text) // 4
+
+def detect_content_type(text):
+    """Detect if content is markdown, code, or plain text."""
+    # Markdown: Has headers (# ## ###)
+    if re.search(r'^#{1,6}\s+.+$', text, re.MULTILINE):
+        return 'markdown'
+
+    # Code: Has function/class definitions, lots of brackets
+    code_indicators = [
+        r'^(def|class|function|public|private|async)\s+\w+',
+        r'^\s*(if|for|while|return|import|from)\s+',
+        r'\{.*\}',
+    ]
+    if any(re.search(pattern, text, re.MULTILINE) for pattern in code_indicators):
+        return 'code'
+
+    return 'text'
+
+def split_content_semantically(text, max_tokens, content_type, debug=False):
+    """Split content on semantic boundaries."""
+
+    if content_type == 'markdown':
+        # Split hierarchy: headers → paragraphs → sentences
+        splitters = [
+            (r'\n#{1,6}\s+', 'headers'),
+            (r'\n\n+', 'paragraphs'),
+            (r'[.!?]\s+', 'sentences'),
+        ]
+    elif content_type == 'code':
+        # Split on function/class boundaries → empty lines
+        splitters = [
+            (r'\n(def|class|function|public|private|async)\s+', 'functions'),
+            (r'\n\n+', 'empty_lines'),
+            (r'\n', 'lines'),
+        ]
+    else:  # plain text
+        splitters = [
+            (r'\n\n+', 'paragraphs'),
+            (r'[.!?]\s+', 'sentences'),
+            (r'\s+', 'words'),
+        ]
+
+    chunks = []
+    current_chunk = ""
+
+    for pattern, level in splitters:
+        parts = re.split(pattern, text)
+
+        for part in parts:
+            candidate = current_chunk + part
+            candidate_tokens = count_tokens(candidate, debug)
+
+            if candidate_tokens <= max_tokens:
+                current_chunk = candidate
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = part
+
+        if current_chunk and count_tokens(current_chunk, debug) <= max_tokens:
+            break  # Successfully split at this level
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    if debug:
+        print(f"Debug: Split into {len(chunks)} chunks using {content_type} strategy", file=sys.stderr)
+
+    return chunks
+
+def summarize_context(context_text, max_tokens=10000, provider="claudpy", model="claude-sonnet-4-5", debug=False):
+    """Summarize conversation context to fit within token budget."""
+    current_tokens = count_tokens(context_text, debug)
+
+    if current_tokens <= max_tokens:
+        return context_text  # No summarization needed
+
+    if debug:
+        print(f"Debug: Summarizing context ({current_tokens} → {max_tokens} tokens)", file=sys.stderr)
+
+    summary_prompt = f"""Summarize the following conversation context into approximately {max_tokens} tokens while preserving:
+1. Key facts, decisions, and conclusions
+2. Important technical details
+3. User preferences and requirements
+4. Conversation flow and logic
+
+Context to summarize:
+{context_text}
+
+Provide a concise summary below:"""
+
+    # Call provider to generate summary
+    cmd = [provider, "--model", model, "--no-streaming", "--no-preserve"]
+
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        summary, _ = proc.communicate(input=summary_prompt, timeout=120)
+
+        if proc.returncode == 0:
+            summary_tokens = count_tokens(summary, debug)
+            if debug:
+                print(f"Debug: Context summarized to {summary_tokens} tokens", file=sys.stderr)
+            return summary.strip()
+    except Exception as e:
+        if debug:
+            print(f"Warning: Context summarization failed ({e}), using truncation", file=sys.stderr)
+
+    # Fallback: truncate to max_tokens
+    target_chars = max_tokens * 4
+    return context_text[:target_chars] + "\n\n[... context truncated ...]"
+
+def process_with_chunking(full_prompt, context_text, content_only, provider, model, args, debug=False):
+    """Process large prompt using map-reduce chunking."""
+
+    # Get model limits
+    context_window, max_output = get_model_limits(model)
+    usable_tokens = int(context_window * 0.9)
+
+    if debug:
+        print(f"Debug: Chunking enabled", file=sys.stderr)
+        print(f"Debug:   Model: {model} (context: {context_window}, output: {max_output})", file=sys.stderr)
+
+    # Determine token budgets
+    chunk_overhead = 500
+
+    if args.summarize_context and context_text:
+        # Summarize context for all chunks
+        context_summary = summarize_context(context_text, max_tokens=10000,
+                                           provider=provider, model=model, debug=debug)
+        context_tokens = count_tokens(context_summary, debug)
+        chunk_budget = usable_tokens - context_tokens - max_output - chunk_overhead
+        context_for_chunks = context_summary
+    else:
+        # Full context in first chunk only
+        context_tokens = count_tokens(context_text, debug) if context_text else 0
+        first_chunk_budget = usable_tokens - context_tokens - max_output - chunk_overhead
+        subsequent_chunk_budget = usable_tokens - max_output - chunk_overhead
+        chunk_budget = subsequent_chunk_budget  # Use smaller for splitting
+        context_for_chunks = None
+
+    # Detect content type and split
+    content_type = detect_content_type(content_only)
+    chunks = split_content_semantically(content_only, chunk_budget, content_type, debug)
+
+    if debug:
+        print(f"Debug: Split content into {len(chunks)} chunks", file=sys.stderr)
+        for i, chunk in enumerate(chunks, 1):
+            chunk_tokens = count_tokens(chunk, debug)
+            print(f"Debug:   Chunk {i}: {chunk_tokens} tokens", file=sys.stderr)
+
+    # Process each chunk
+    chunk_responses = []
+    chunk_metadata = []
+
+    for i, chunk in enumerate(chunks, 1):
+        if debug:
+            print(f"Debug: Processing chunk {i}/{len(chunks)}...", file=sys.stderr)
+
+        # Build chunk prompt
+        if i == 1 and not args.summarize_context and context_text:
+            chunk_prompt = context_text + f"\n\n=== CONTENT CHUNK {i}/{len(chunks)} ===\n\n{chunk}"
+        elif context_for_chunks:
+            chunk_prompt = context_for_chunks + f"\n\n=== CONTENT CHUNK {i}/{len(chunks)} ===\n\n{chunk}"
+        else:
+            chunk_prompt = f"=== CONTENT CHUNK {i}/{len(chunks)} ===\n\n{chunk}"
+
+        # Process chunk (call provider)
+        cmd = [provider, "--model", model, "--no-streaming", "--no-preserve"]
+
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+            response, stderr = proc.communicate(input=chunk_prompt, timeout=300)
+
+            if proc.returncode == 0:
+                chunk_responses.append(response.strip())
+                chunk_metadata.append({
+                    "chunk": i,
+                    "error": False,
+                    "tokens_input": count_tokens(chunk_prompt, debug),
+                    "tokens_output": count_tokens(response, debug)
+                })
+            else:
+                error_msg = f"[Chunk {i} processing failed: {stderr[:200]}]"
+                chunk_responses.append(error_msg)
+                chunk_metadata.append({"chunk": i, "error": True, "error_msg": stderr.strip()[:200]})
+                if debug:
+                    print(f"Warning: Chunk {i} failed: {stderr[:200]}", file=sys.stderr)
+        except Exception as e:
+            error_msg = f"[Chunk {i} processing error: {str(e)[:100]}]"
+            chunk_responses.append(error_msg)
+            chunk_metadata.append({"chunk": i, "error": True, "error_msg": str(e)[:100]})
+            if debug:
+                print(f"Warning: Chunk {i} error: {e}", file=sys.stderr)
+
+    # Check if too many chunks failed
+    failed_chunks = sum(1 for m in chunk_metadata if m.get("error"))
+    if len(chunks) > 0 and failed_chunks / len(chunks) > 0.5:
+        print(f"Error: {failed_chunks}/{len(chunks)} chunks failed, aborting summary", file=sys.stderr)
+        return "\n\n".join(chunk_responses), chunk_metadata
+
+    # Generate map-reduce summary
+    if debug:
+        print(f"Debug: Generating final summary...", file=sys.stderr)
+
+    summary_prompt = ""
+
+    if context_text:
+        summary_prompt += context_text + "\n\n"
+
+    summary_prompt += f"""I received responses to {len(chunks)} chunks of a larger query.
+Please provide a cohesive, unified response that:
+1. Synthesizes information from all chunks
+2. Eliminates redundancy
+3. Maintains logical flow
+4. Provides a complete answer to the original question
+
+"""
+
+    for i, response in enumerate(chunk_responses, 1):
+        summary_prompt += f"\n=== RESPONSE TO CHUNK {i}/{len(chunks)} ===\n{response}\n"
+
+    summary_prompt += "\nPlease provide the final unified response below:"
+
+    # Call provider for summary
+    cmd = [provider, "--model", model, "--no-streaming", "--no-preserve"]
+
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        final_response, _ = proc.communicate(input=summary_prompt, timeout=300)
+
+        if proc.returncode == 0:
+            summary_metadata = {
+                "tokens_input": count_tokens(summary_prompt, debug),
+                "tokens_output": count_tokens(final_response, debug)
+            }
+            chunk_metadata.append({"summary_call": summary_metadata})
+
+            if debug:
+                total_input = sum(m.get("tokens_input", 0) for m in chunk_metadata if "chunk" in m or "summary_call" in m)
+                total_output = sum(m.get("tokens_output", 0) for m in chunk_metadata if "chunk" in m or "summary_call" in m)
+                print(f"Debug: Total tokens: input={total_input}, output={total_output}", file=sys.stderr)
+
+            return final_response.strip(), chunk_metadata
+    except Exception as e:
+        if debug:
+            print(f"Warning: Summary generation failed ({e}), returning concatenated chunks", file=sys.stderr)
+
+    # Fallback: concatenate chunk responses
+    return "\n\n".join(chunk_responses), chunk_metadata
 
 if __name__ == "__main__":
     main()
