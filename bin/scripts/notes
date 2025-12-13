@@ -34,7 +34,9 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
 import stat
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -467,24 +469,50 @@ def fzf_select_note(results, notes_dir, show_content=False):
     if not results:
         print("No notes found.")
         return None
-    
+
     # Format results for fzf
     fzf_input = []
     for i, note in enumerate(results):
         modified = note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'
-        line = f"{i:3d} | {note['id']:>6} | {note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}"
-        if show_content and note.get('snippet'):
-            # Add content snippet on next line, indented
-            snippet = note['snippet'].replace('\n', ' ').strip()[:80]
-            if snippet:
-                line += f"\n          {snippet}..."
+        line = f"{i:3d} | {note['id'][:8]} | {note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}"
         fzf_input.append(line)
-    
-    # Run fzf with multi-line support if showing content
-    fzf_args = ['fzf', '--ansi', '--no-sort', '--reverse', '--tiebreak=index']
-    if show_content:
-        fzf_args.extend(['--multi-line', '--no-mouse'])
-    
+
+    # Create preview script to show note content
+    # The notes_dir is escaped to handle spaces and special chars
+    preview_script = f"""#!/bin/bash
+# Extract the file path from the last field of the display line
+display_line="${{1}}"
+relative_path=$(echo "$display_line" | awk -F ' | ' '{{print $NF}}')
+
+# Build the full path
+notes_dir={shlex.quote(notes_dir)}
+full_path="$notes_dir/$relative_path"
+
+if [ -f "$full_path" ]; then
+    bat --theme='Catppuccin Mocha' --style=numbers "$full_path" 2>/dev/null || head -50 "$full_path"
+else
+    echo "File not found: $full_path"
+fi
+"""
+
+    # Write preview script to temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+        f.write(preview_script)
+        preview_file = f.name
+
+    os.chmod(preview_file, 0o755)
+
+    # Run fzf with preview
+    fzf_args = [
+        'fzf',
+        '--ansi',
+        '--no-sort',
+        '--reverse',
+        '--tiebreak=index',
+        '--preview', f'{preview_file} {{}}',
+        '--preview-window', 'down:50%:wrap'
+    ]
+
     try:
         proc = subprocess.Popen(
             fzf_args,
@@ -493,7 +521,7 @@ def fzf_select_note(results, notes_dir, show_content=False):
             text=True
         )
         stdout, _ = proc.communicate('\n'.join(fzf_input))
-        
+
         if proc.returncode == 0 and stdout.strip():
             # Extract index from selected line
             selected_index = int(stdout.strip().split('|')[0].strip())
@@ -501,7 +529,13 @@ def fzf_select_note(results, notes_dir, show_content=False):
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Error: fzf not found. Install fzf to use interactive selection.")
         return None
-    
+    finally:
+        # Clean up preview script
+        try:
+            os.unlink(preview_file)
+        except:
+            pass
+
     return None
 
 def open_note_in_editor(note_path, notes_dir):
