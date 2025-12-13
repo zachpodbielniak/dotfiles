@@ -263,9 +263,38 @@ def extract_user_prompt(full_prompt):
             user_prompt_start = context_end + len(end_context_marker)
             user_prompt = full_prompt[user_prompt_start:].strip()
             return user_prompt
-    
+
     # If no context found, return the original prompt
     return full_prompt
+
+def load_preferences(debug=False):
+    """Load personal preferences from the standard location.
+
+    Returns the content of the preferences file, or None if not found/readable.
+    Uses ${HOME} for path expansion.
+    """
+    prefs_path = os.path.expandvars("${HOME}/Documents/notes/02_areas/personal/ai/ai_personal_preferences.md")
+
+    if debug:
+        print(f"Debug: Attempting to load preferences from: {prefs_path}", file=sys.stderr)
+
+    try:
+        if not os.path.exists(prefs_path):
+            if debug:
+                print(f"Debug: Preferences file not found at {prefs_path}", file=sys.stderr)
+            return None
+
+        with open(prefs_path, 'r') as f:
+            content = f.read()
+
+        if debug:
+            print(f"Debug: Successfully loaded preferences ({len(content)} bytes)", file=sys.stderr)
+
+        return content
+    except IOError as e:
+        if debug:
+            print(f"Debug: Error reading preferences file: {e}", file=sys.stderr)
+        return None
 
 def store_chat_in_db(prompt, response, provider, model, metadata=None, tags=None, context_ids=None, context_id=None, debug=False, dry_run=False, show_id=False, auto_name=False, context_name=None):
     """Store chat interaction in the database with context_uuid support."""
@@ -3006,6 +3035,8 @@ Supported Providers: Claude, Grok, Gemini, OpenAI, Ollama, Perplexity
   aipy -L                                  # List all available models
   aipy --search "*" --limit 20            # Show recent 20 conversations
   aipy --view 3740590a --json             # Output in JSON format
+  aipy -P "Your question"                 # Include personal preferences with request
+  aipy --preferences --model gpt-4o "Complex analysis"  # Use preferences with specific model
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                            WORKFLOW EXAMPLES
@@ -3177,11 +3208,13 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
     
     # ━━━ ADVANCED OPTIONS ━━━
     advanced_group = parser.add_argument_group("⚙️  Advanced Options")
+    advanced_group.add_argument("-P", "--preferences", "--about-me", dest="preferences", action="store_true",
+                               help="Auto-include your personal preferences/system prompt from ${HOME}/Documents/notes/02_areas/personal/ai/ai_personal_preferences.md")
     advanced_group.add_argument("--personality", metavar="ROLE",
                                help="Set AI personality/role")
     advanced_group.add_argument("--emojis", nargs="?", const="light", choices=["light", "heavy"],
                                help="Encourage emoji usage in responses. 'light' (default) uses emojis sparingly, 'heavy' uses them frequently.")
-    advanced_group.add_argument("--enhance-emojis", action="store_true", 
+    advanced_group.add_argument("--enhance-emojis", action="store_true",
                                help="Post-process the response to add appropriate emojis using a secondary AI call.")
     advanced_group.add_argument("--no-preserve", action="store_true",
                                help="Don't save chat transaction to database or files")
@@ -5309,12 +5342,21 @@ def main():
     
     # Combine all input sources like grokpy does
     combined_parts = []
-    
-    # Add context from previous chats first
+
+    # Add preferences first if requested
+    if args.preferences:
+        prefs_content = load_preferences(debug=args.debug)
+        if prefs_content:
+            combined_parts.append(prefs_content)
+        else:
+            if args.debug:
+                print("Debug: Preferences file not loaded", file=sys.stderr)
+
+    # Add context from previous chats
     if context_chats:
         context_text = format_context_for_prompt(context_chats)
         combined_parts.append(context_text)
-    
+
     # Add file contents if any
     if args.files:
         for file_path in args.files:
@@ -5324,19 +5366,19 @@ def main():
                     combined_parts.append(f"=== File: {file_path} ===\n{file_content}\n")
             except IOError as e:
                 print(f"Warning: Could not read file {file_path}: {e}", file=sys.stderr)
-    
+
     # Add --prompt flag content if provided
     if args.prompt_flag:
         combined_parts.append(args.prompt_flag)
-    
+
     # Add positional prompt if provided
     if args.prompt:
         combined_parts.append(args.prompt)
-    
+
     # Add stdin content if any
     if stdin_data:
         combined_parts.append(stdin_data)
-    
+
     # Combine all parts
     full_prompt = "\n".join(combined_parts) if combined_parts else ""
 
@@ -5379,14 +5421,26 @@ def main():
             # Force no-streaming
             args.no_streaming = True
 
-            # Separate context from content
+            # Separate preferences and context from content
+            preferences_text = ""
             context_text = ""
             content_only = full_prompt
+
+            # Extract preferences if present
+            if args.preferences:
+                prefs_content = load_preferences(debug=args.debug)
+                if prefs_content:
+                    preferences_text = prefs_content
+                    # Remove preferences from content_only
+                    if content_only.startswith(preferences_text):
+                        content_only = content_only[len(preferences_text):].strip()
 
             if context_chats:
                 # Extract context portion
                 context_text = format_context_for_prompt(context_chats)
-                content_only = full_prompt[len(context_text):].strip()
+                # Remove context from content_only if present
+                if content_only.startswith(context_text):
+                    content_only = content_only[len(context_text):].strip()
 
             # Get provider
             if args.provider:
@@ -5398,7 +5452,7 @@ def main():
             try:
                 final_response, chunk_metadata = process_with_chunking(
                     full_prompt, context_text, content_only, provider, args.model,
-                    args, args.debug
+                    args, args.debug, preferences_text
                 )
 
                 # Save transaction if not disabled
@@ -5861,7 +5915,7 @@ Provide a concise summary below:"""
     target_chars = max_tokens * 4
     return context_text[:target_chars] + "\n\n[... context truncated ...]"
 
-def process_with_chunking(full_prompt, context_text, content_only, provider, model, args, debug=False):
+def process_with_chunking(full_prompt, context_text, content_only, provider, model, args, debug=False, preferences_text=""):
     """Process large prompt using map-reduce chunking."""
 
     # Get model limits
@@ -5909,12 +5963,15 @@ def process_with_chunking(full_prompt, context_text, content_only, provider, mod
             print(f"Debug: Processing chunk {i}/{len(chunks)}...", file=sys.stderr)
 
         # Build chunk prompt
+        chunk_parts = []
+        if preferences_text:
+            chunk_parts.append(preferences_text)
         if i == 1 and not args.summarize_context and context_text:
-            chunk_prompt = context_text + f"\n\n=== CONTENT CHUNK {i}/{len(chunks)} ===\n\n{chunk}"
+            chunk_parts.append(context_text)
         elif context_for_chunks:
-            chunk_prompt = context_for_chunks + f"\n\n=== CONTENT CHUNK {i}/{len(chunks)} ===\n\n{chunk}"
-        else:
-            chunk_prompt = f"=== CONTENT CHUNK {i}/{len(chunks)} ===\n\n{chunk}"
+            chunk_parts.append(context_for_chunks)
+        chunk_parts.append(f"=== CONTENT CHUNK {i}/{len(chunks)} ===\n\n{chunk}")
+        chunk_prompt = "\n\n".join(chunk_parts)
 
         # Process chunk (call provider)
         cmd = [provider, "--model", model, "--no-streaming", "--no-preserve"]
@@ -5956,6 +6013,9 @@ def process_with_chunking(full_prompt, context_text, content_only, provider, mod
         print(f"Debug: Generating final summary...", file=sys.stderr)
 
     summary_prompt = ""
+
+    if preferences_text:
+        summary_prompt += preferences_text + "\n\n"
 
     if context_text:
         summary_prompt += context_text + "\n\n"
