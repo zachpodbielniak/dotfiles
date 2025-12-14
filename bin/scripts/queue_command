@@ -1,0 +1,961 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# ==============================================================================
+# queue_command - Generic Redis-based Command Queueing System
+# ==============================================================================
+# Author: Zach
+# Version: 2.1 (Python rewrite with redis-py and PyYAML)
+# Location: ~/.dotfiles/bin/scripts/queue_command
+#
+# Description:
+# A generic Redis-based command queueing system that allows arbitrary shell
+# commands to be queued and executed by worker processes. Supports whitelist-
+# based security validation and trust-all mode for trusted environments.
+#
+# Features:
+# - Enqueue arbitrary commands with -- separator
+# - Worker mode to process queued commands
+# - Whitelist-based command validation (CSV or YAML config)
+# - Trust-all option to bypass validation
+# - Queue status display
+# - Job retry logic and dead-letter queue
+#
+# Dependencies:
+# - Redis server (running on local machine or remote)
+# - redis-py (pip install redis)
+# - PyYAML (pip install PyYAML)
+#
+# Usage: See --help or run with -h
+# ==============================================================================
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id: str = os.environ.get("CONTAINER_ID", "")
+no_dbox_check: str = os.environ.get("NO_DBOX_CHECK", "").lower()
+if no_dbox_check not in ("1", "true") and ctr_id != "dev":
+    cmd: list[str] = ["distrobox", "enter", "dev", "--", *sys.argv]
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+# Now import everything else inside the dev container
+import base64
+import signal
+import socket
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import redis
+import yaml
+
+
+# ==============================================================================
+# Configuration
+# ==============================================================================
+
+@dataclass
+class Config:
+    """Configuration for queue_command."""
+    mode: str = "enqueue"
+    redis_host: str = "127.0.0.1"
+    redis_port: int = 6379
+    trust_all: bool = False
+    trusted_commands_csv: str = ""
+    config_file: str = ""
+    max_retries: int = 3
+    command_to_queue: str = ""
+    jobs_filter: str = "all"
+    cancel_job_id: str = ""
+
+    @property
+    def redis_url(self) -> str:
+        return f"{self.redis_host}:{self.redis_port}"
+
+
+DEFAULT_CONFIG_PATH: Path = Path.home() / ".config" / "queue_command" / "trusted.yaml"
+QUEUE_PREFIX: str = "qc"
+
+
+# ==============================================================================
+# Logging Functions
+# ==============================================================================
+
+def log(message: str) -> None:
+    """Log an informational message with timestamp."""
+    timestamp: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
+def error(message: str) -> None:
+    """Log an error message with timestamp to stderr."""
+    timestamp: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] ERROR: {message}", file=sys.stderr)
+
+
+def warn(message: str) -> None:
+    """Log a warning message with timestamp to stderr."""
+    timestamp: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] WARN: {message}", file=sys.stderr)
+
+
+# ==============================================================================
+# Redis Client Wrapper
+# ==============================================================================
+
+class RedisClient:
+    """
+    Redis client wrapper using the official redis-py library.
+    Provides a consistent interface for all Redis operations.
+    """
+
+    def __init__(self, host: str, port: int, timeout: float = 5.0):
+        self.host: str = host
+        self.port: int = port
+        self.timeout: float = timeout
+        self._client: Optional[redis.Redis] = None
+
+    def _get_client(self) -> redis.Redis:
+        """Get or create Redis client connection."""
+        if self._client is None:
+            self._client = redis.Redis(
+                host=self.host,
+                port=self.port,
+                socket_timeout=self.timeout,
+                socket_connect_timeout=self.timeout,
+                decode_responses=True
+            )
+        return self._client
+
+    def ping(self) -> bool:
+        """Check if Redis is reachable."""
+        try:
+            return self._get_client().ping()
+        except (redis.ConnectionError, redis.TimeoutError):
+            return False
+
+    def hset(self, key: str, field: str, value: str) -> None:
+        """Set a hash field."""
+        self._get_client().hset(key, field, value)
+
+    def hget(self, key: str, field: str) -> Optional[str]:
+        """Get a hash field value."""
+        return self._get_client().hget(key, field)
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        """Get all hash fields as a dictionary."""
+        return self._get_client().hgetall(key)
+
+    def hincrby(self, key: str, field: str, increment: int) -> int:
+        """Increment a hash field by integer."""
+        return self._get_client().hincrby(key, field, increment)
+
+    def rpush(self, key: str, value: str) -> None:
+        """Push value to right of list."""
+        self._get_client().rpush(key, value)
+
+    def blpop(self, key: str, timeout_sec: int) -> Optional[str]:
+        """
+        Blocking left pop from list.
+        Returns the value or None if timeout.
+        """
+        result = self._get_client().blpop(key, timeout=timeout_sec)
+        if result is None:
+            return None
+        # blpop returns (key, value) tuple
+        return result[1]
+
+    def sadd(self, key: str, member: str) -> None:
+        """Add member to set."""
+        self._get_client().sadd(key, member)
+
+    def srem(self, key: str, member: str) -> None:
+        """Remove member from set."""
+        self._get_client().srem(key, member)
+
+    def scard(self, key: str) -> int:
+        """Get set cardinality."""
+        return self._get_client().scard(key)
+
+    def expire(self, key: str, seconds: int) -> None:
+        """Set key expiration."""
+        self._get_client().expire(key, seconds)
+
+    def hdel(self, key: str, field: str) -> None:
+        """Delete hash field."""
+        self._get_client().hdel(key, field)
+
+    def smembers(self, key: str) -> set[str]:
+        """Get all members of a set."""
+        return self._get_client().smembers(key)
+
+    def lrem(self, key: str, count: int, value: str) -> int:
+        """Remove elements from a list."""
+        return self._get_client().lrem(key, count, value)
+
+    def delete(self, key: str) -> None:
+        """Delete a key."""
+        self._get_client().delete(key)
+
+    def close(self) -> None:
+        """Close the Redis connection."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+
+# ==============================================================================
+# Security Functions
+# ==============================================================================
+
+def load_trusted_commands_from_yaml(config_path: Path) -> list[str]:
+    """Load trusted commands from a YAML config file using PyYAML."""
+    if not config_path.exists():
+        return []
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        if data is None:
+            return []
+
+        trusted: list = data.get("trusted_commands", [])
+        if isinstance(trusted, list):
+            return [str(cmd).strip() for cmd in trusted if cmd]
+    except (yaml.YAMLError, IOError, OSError) as e:
+        warn(f"Failed to parse YAML config {config_path}: {e}")
+
+    return []
+
+
+def load_trusted_commands(config: Config) -> list[str]:
+    """
+    Load trusted commands from various sources.
+    Priority order:
+    1. --trust-all flag (returns empty list, checked separately)
+    2. --trusted-commands CLI argument (CSV list)
+    3. --config FILE (custom YAML config)
+    4. ~/.config/queue_command/trusted.yaml (default config)
+    """
+    if config.trust_all:
+        return []
+
+    # Priority 1: CLI CSV
+    if config.trusted_commands_csv:
+        return [
+            cmd.strip()
+            for cmd in config.trusted_commands_csv.split(",")
+            if cmd.strip()
+        ]
+
+    # Priority 2: Custom config file
+    if config.config_file:
+        custom_path: Path = Path(config.config_file)
+        if custom_path.exists():
+            commands: list[str] = load_trusted_commands_from_yaml(custom_path)
+            if commands:
+                return commands
+
+    # Priority 3: Default config
+    if DEFAULT_CONFIG_PATH.exists():
+        commands = load_trusted_commands_from_yaml(DEFAULT_CONFIG_PATH)
+        if commands:
+            return commands
+
+    return []
+
+
+def is_command_trusted(command: str, config: Config) -> bool:
+    """Check if a command is in the trusted whitelist."""
+    if config.trust_all:
+        return True
+
+    cmd_name: str = command.split()[0] if command.split() else ""
+    trusted_commands: list[str] = load_trusted_commands(config)
+
+    if not trusted_commands:
+        return False
+
+    return cmd_name in trusted_commands
+
+
+# ==============================================================================
+# Job ID Generation
+# ==============================================================================
+
+def generate_job_id() -> str:
+    """Generate a unique job ID."""
+    timestamp: str = datetime.now().strftime("%Y%m%d%H%M%S")
+    random_bytes: bytes = os.urandom(6)
+    random_str: str = base64.b64encode(random_bytes).decode("ascii")[:8]
+    random_str = random_str.replace("/", "x").replace("+", "y").replace("=", "")
+    return f"{timestamp}_{random_str}"
+
+
+def get_utc_timestamp() -> str:
+    """Get current UTC timestamp in ISO format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ==============================================================================
+# Enqueue Function
+# ==============================================================================
+
+def enqueue_command(config: Config, redis_client: RedisClient) -> Optional[str]:
+    """Enqueue a command for later execution."""
+    if not redis_client.ping():
+        error(f"Cannot connect to Redis at {config.redis_url}")
+        error("Ensure Redis is running at that address")
+        return None
+
+    if not config.command_to_queue:
+        error("No command specified (missing -- separator?)")
+        return None
+
+    job_id: str = generate_job_id()
+    job_key: str = f"{QUEUE_PREFIX}:job:{job_id}"
+
+    # Store metadata
+    redis_client.hset(job_key, "id", job_id)
+    redis_client.hset(job_key, "command", config.command_to_queue)
+    redis_client.hset(job_key, "status", "queued")
+    redis_client.hset(job_key, "created_at", get_utc_timestamp())
+    redis_client.hset(job_key, "retry_count", "0")
+    redis_client.hset(job_key, "max_retries", str(config.max_retries))
+
+    # Add to status set
+    redis_client.sadd(f"{QUEUE_PREFIX}:status:queued", job_id)
+
+    # Enqueue
+    redis_client.rpush(f"{QUEUE_PREFIX}:queue", job_id)
+
+    log(f"Enqueued: {config.command_to_queue} (Job ID: {job_id})")
+    print(job_id)
+    return job_id
+
+
+# ==============================================================================
+# Worker Functions
+# ==============================================================================
+
+class Worker:
+    """Worker process to handle queued commands."""
+
+    def __init__(self, config: Config, redis_client: RedisClient):
+        self.config: Config = config
+        self.redis: RedisClient = redis_client
+        self.worker_pid: int = os.getpid()
+        self.running: bool = True
+
+    def start(self) -> None:
+        """Start the worker main loop."""
+        if not self.redis.ping():
+            error(f"Cannot connect to Redis at {self.config.redis_url}")
+            error("Ensure Redis is running at that address")
+            sys.exit(1)
+
+        # Validate trusted commands configuration
+        if not self.config.trust_all:
+            trusted_cmds: list[str] = load_trusted_commands(self.config)
+            if not trusted_cmds:
+                error("No trusted commands configured")
+                error("Use --trusted-commands, --config, or create ~/.config/queue_command/trusted.yaml")
+                error("Or use --trust-all to bypass validation (not recommended)")
+                sys.exit(1)
+
+        # Register worker
+        hostname: str = socket.gethostname()
+        worker_info: str = f"{hostname}:{get_utc_timestamp()}:active"
+        self.redis.hset(f"{QUEUE_PREFIX}:workers", str(self.worker_pid), worker_info)
+
+        log(f"Worker started (PID: {self.worker_pid})")
+
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._shutdown_handler)
+        signal.signal(signal.SIGTERM, self._shutdown_handler)
+
+        # Main worker loop
+        while self.running:
+            try:
+                # Block for 5 seconds waiting for a job
+                job_id: Optional[str] = self.redis.blpop(f"{QUEUE_PREFIX}:queue", 5)
+
+                if job_id is None:
+                    continue
+
+                log(f"Processing job: {job_id}")
+                self._process_job(job_id)
+
+            except KeyboardInterrupt:
+                break
+            except redis.ConnectionError as e:
+                error(f"Redis connection error: {e}")
+                time.sleep(1)
+            except Exception as e:
+                error(f"Worker error: {e}")
+                time.sleep(1)
+
+        self._cleanup()
+
+    def _shutdown_handler(self, signum: int, frame) -> None:
+        """Handle shutdown signals gracefully."""
+        self.running = False
+
+    def _cleanup(self) -> None:
+        """Clean up worker registration on shutdown."""
+        try:
+            self.redis.hdel(f"{QUEUE_PREFIX}:workers", str(self.worker_pid))
+        except Exception:
+            pass
+        log("Worker shutdown")
+
+    def _process_job(self, job_id: str) -> None:
+        """Process a single job from the queue."""
+        job_key: str = f"{QUEUE_PREFIX}:job:{job_id}"
+
+        # Update status
+        self.redis.srem(f"{QUEUE_PREFIX}:status:queued", job_id)
+        self.redis.sadd(f"{QUEUE_PREFIX}:status:processing", job_id)
+        self.redis.hset(job_key, "status", "processing")
+        self.redis.hset(job_key, "started_at", get_utc_timestamp())
+        self.redis.hset(job_key, "worker_pid", str(self.worker_pid))
+
+        # Retrieve command
+        command: Optional[str] = self.redis.hget(job_key, "command")
+
+        if not command:
+            self._handle_failure(job_id, "Command not found in job metadata")
+            return
+
+        # Validate command if not in trust-all mode
+        if not self.config.trust_all and not is_command_trusted(command, self.config):
+            self._handle_rejection(job_id, f"Command not in whitelist: {command}")
+            return
+
+        # Execute command
+        stdout, stderr, exit_code = self._execute_command(command)
+
+        if exit_code == 0:
+            self._handle_success(job_id, stdout, stderr)
+        else:
+            self._handle_failure(job_id, f"Command failed with exit code {exit_code}")
+
+    def _execute_command(self, command: str) -> tuple[str, str, int]:
+        """Execute a command and capture output."""
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            # Truncate output to 1000 chars
+            stdout: str = result.stdout[:1000] if result.stdout else ""
+            stderr: str = result.stderr[:1000] if result.stderr else ""
+            return stdout, stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return "", "Command timed out after 5 minutes", 124
+        except Exception as e:
+            return "", str(e), 1
+
+    def _handle_success(self, job_id: str, stdout: str, stderr: str) -> None:
+        """Handle successful job completion."""
+        job_key: str = f"{QUEUE_PREFIX}:job:{job_id}"
+
+        self.redis.hset(job_key, "status", "completed")
+        self.redis.hset(job_key, "completed_at", get_utc_timestamp())
+        self.redis.hset(job_key, "exit_code", "0")
+
+        if stdout:
+            self.redis.hset(job_key, "stdout", stdout)
+        if stderr:
+            self.redis.hset(job_key, "stderr", stderr)
+
+        self.redis.srem(f"{QUEUE_PREFIX}:status:processing", job_id)
+        self.redis.sadd(f"{QUEUE_PREFIX}:status:completed", job_id)
+        self.redis.expire(job_key, 604800)  # Expire after 7 days
+
+        log(f"Job completed: {job_id}")
+
+    def _handle_rejection(self, job_id: str, error_msg: str) -> None:
+        """Handle job rejection (command not in whitelist)."""
+        job_key: str = f"{QUEUE_PREFIX}:job:{job_id}"
+
+        self.redis.hset(job_key, "status", "rejected")
+        self.redis.hset(job_key, "completed_at", get_utc_timestamp())
+        self.redis.hset(job_key, "error_message", error_msg)
+
+        self.redis.srem(f"{QUEUE_PREFIX}:status:processing", job_id)
+        self.redis.sadd(f"{QUEUE_PREFIX}:status:dead", job_id)
+        self.redis.rpush(f"{QUEUE_PREFIX}:dlq", job_id)
+        self.redis.expire(job_key, 2592000)  # Expire after 30 days
+
+        error(f"Job rejected: {job_id} - {error_msg}")
+
+    def _handle_failure(self, job_id: str, error_msg: str) -> None:
+        """Handle job failure with retry logic."""
+        job_key: str = f"{QUEUE_PREFIX}:job:{job_id}"
+
+        # Increment retry count
+        retry_count: int = self.redis.hincrby(job_key, "retry_count", 1)
+        max_retries_str: Optional[str] = self.redis.hget(job_key, "max_retries")
+        max_retries: int = int(max_retries_str) if max_retries_str else 3
+
+        self.redis.hset(job_key, "error_message", error_msg)
+
+        if retry_count < max_retries:
+            # Retry
+            warn(f"Job {job_id} failed (attempt {retry_count}/{max_retries}) - retrying...")
+            self.redis.hset(job_key, "status", "queued")
+            self.redis.srem(f"{QUEUE_PREFIX}:status:processing", job_id)
+            self.redis.sadd(f"{QUEUE_PREFIX}:status:queued", job_id)
+            self.redis.rpush(f"{QUEUE_PREFIX}:queue", job_id)
+        else:
+            # Dead letter queue
+            error(f"Job {job_id} permanently failed after {max_retries} attempts")
+            self.redis.hset(job_key, "status", "dead")
+            self.redis.hset(job_key, "completed_at", get_utc_timestamp())
+            self.redis.srem(f"{QUEUE_PREFIX}:status:processing", job_id)
+            self.redis.sadd(f"{QUEUE_PREFIX}:status:dead", job_id)
+            self.redis.rpush(f"{QUEUE_PREFIX}:dlq", job_id)
+            self.redis.expire(job_key, 2592000)  # Expire after 30 days
+
+
+# ==============================================================================
+# Queue Status Display
+# ==============================================================================
+
+def show_queue_status(config: Config, redis_client: RedisClient) -> bool:
+    """Display queue statistics and active workers."""
+    if not redis_client.ping():
+        error(f"Cannot connect to Redis at {config.redis_url}")
+        return False
+
+    print("==========================================")
+    print("queue_command Queue Status")
+    print("==========================================")
+    print("")
+    print("Job Counts:")
+    print(f"  Queued:     {redis_client.scard(f'{QUEUE_PREFIX}:status:queued')}")
+    print(f"  Processing: {redis_client.scard(f'{QUEUE_PREFIX}:status:processing')}")
+    print(f"  Completed:  {redis_client.scard(f'{QUEUE_PREFIX}:status:completed')}")
+    print(f"  Dead:       {redis_client.scard(f'{QUEUE_PREFIX}:status:dead')}")
+    print("")
+    print("Active Workers:")
+
+    workers_data: dict[str, str] = redis_client.hgetall(f"{QUEUE_PREFIX}:workers")
+    if workers_data:
+        for pid, info in workers_data.items():
+            print(f"  PID {pid}: {info}")
+    else:
+        print("  None")
+
+    print("==========================================")
+    return True
+
+
+def show_jobs(config: Config, redis_client: RedisClient, status_filter: str = "all") -> bool:
+    """Display jobs with their commands."""
+    if not redis_client.ping():
+        error(f"Cannot connect to Redis at {config.redis_url}")
+        return False
+
+    statuses: list[str] = []
+    if status_filter == "all":
+        statuses = ["queued", "processing", "completed", "dead"]
+    else:
+        statuses = [s.strip() for s in status_filter.split(",")]
+
+    print("==========================================")
+    print("queue_command Job List")
+    print("==========================================")
+
+    total_jobs: int = 0
+    for status in statuses:
+        job_ids: set[str] = redis_client.smembers(f"{QUEUE_PREFIX}:status:{status}")
+        if not job_ids:
+            continue
+
+        print(f"\n[{status.upper()}] ({len(job_ids)} jobs)")
+        print("-" * 40)
+
+        for job_id in sorted(job_ids):
+            job_key: str = f"{QUEUE_PREFIX}:job:{job_id}"
+            command: Optional[str] = redis_client.hget(job_key, "command")
+            created_at: Optional[str] = redis_client.hget(job_key, "created_at")
+
+            # Truncate command for display
+            cmd_display: str = command[:60] + "..." if command and len(command) > 60 else (command or "<no command>")
+
+            print(f"  {job_id}")
+            print(f"    cmd: {cmd_display}")
+            if created_at:
+                print(f"    created: {created_at}")
+
+            # Show error message for dead/rejected jobs
+            if status == "dead":
+                error_msg: Optional[str] = redis_client.hget(job_key, "error_message")
+                if error_msg:
+                    err_display: str = error_msg[:50] + "..." if len(error_msg) > 50 else error_msg
+                    print(f"    error: {err_display}")
+
+            total_jobs += 1
+
+    if total_jobs == 0:
+        print("\nNo jobs found.")
+
+    print("\n==========================================")
+    return True
+
+
+def cancel_job(config: Config, redis_client: RedisClient, job_id: str) -> bool:
+    """Cancel a job by removing it from queue and cleaning up."""
+    if not redis_client.ping():
+        error(f"Cannot connect to Redis at {config.redis_url}")
+        return False
+
+    job_key: str = f"{QUEUE_PREFIX}:job:{job_id}"
+
+    # Check if job exists
+    command: Optional[str] = redis_client.hget(job_key, "command")
+    if not command:
+        error(f"Job not found: {job_id}")
+        return False
+
+    status: Optional[str] = redis_client.hget(job_key, "status")
+
+    # Remove from queue list
+    removed: int = redis_client.lrem(f"{QUEUE_PREFIX}:queue", 0, job_id)
+
+    # Remove from all status sets
+    for s in ["queued", "processing", "completed", "dead"]:
+        redis_client.srem(f"{QUEUE_PREFIX}:status:{s}", job_id)
+
+    # Remove from dead letter queue if present
+    redis_client.lrem(f"{QUEUE_PREFIX}:dlq", 0, job_id)
+
+    # Delete the job hash
+    redis_client.delete(job_key)
+
+    log(f"Cancelled job: {job_id} (was {status}, cmd: {command[:50]}{'...' if len(command) > 50 else ''})")
+    return True
+
+
+# ==============================================================================
+# Help and License
+# ==============================================================================
+
+HELP_TEXT: str = """queue_command - Generic Redis-based command queueing system
+
+USAGE:
+    queue_command [OPTIONS] -- <command> [args...]
+
+DESCRIPTION:
+    Queue arbitrary shell commands for asynchronous execution by worker processes.
+    Commands are stored in Redis and processed by workers in FIFO order.
+
+ENQUEUE MODE (default):
+    Queue a command for later execution:
+    queue_command -- echo "hello world"
+    queue_command -- find /tmp -name "*.log" -delete
+
+WORKER MODE:
+    Start a worker to process queued commands:
+    queue_command --worker --trusted-commands echo,ls,find
+
+    With YAML config file:
+    queue_command --worker --config ~/my-trusted.yaml
+
+    Trust all commands (use with caution):
+    queue_command --worker --trust-all
+
+QUEUE STATUS:
+    Display queue statistics and active workers:
+    queue_command --queue
+
+LIST JOBS:
+    List all jobs with their commands:
+    queue_command --jobs
+
+    Filter by status (queued, processing, completed, dead):
+    queue_command --jobs queued
+    queue_command --jobs queued,processing
+
+CANCEL JOB:
+    Cancel/remove a job by ID:
+    queue_command --cancel <job_id>
+
+OPTIONS:
+    -h, --help                  Show this help message
+    --license                   Show AGPLv3 license information
+    --redis URL                 Redis connection URL (default: 127.0.0.1:6379)
+                                Example: --redis redis.example.com:6379
+
+WORKER OPTIONS:
+    --worker                    Run in worker mode (process queued commands)
+    --trusted-commands CSV      Comma-separated list of trusted command names
+                                Example: --trusted-commands echo,ls,find,grep
+    --config FILE               YAML config file with trusted commands
+                                Default: ~/.config/queue_command/trusted.yaml
+    --trust-all                 Bypass validation, trust all commands
+                                Use with caution in trusted environments only
+
+SECURITY:
+    Command validation uses a whitelist model:
+    1. Extract the first token (command name) from the full command string
+    2. Check against trusted commands list
+    3. Reject if command is not in whitelist
+
+    Whitelist sources (in priority order):
+    1. --trust-all flag (highest priority, no validation)
+    2. --trusted-commands CLI argument (CSV list)
+    3. --config FILE (custom YAML config)
+    4. ~/.config/queue_command/trusted.yaml (default config)
+    5. If none specified: REJECT ALL (fail-safe default)
+
+YAML CONFIG FORMAT:
+    Create ~/.config/queue_command/trusted.yaml:
+
+    trusted_commands:
+      - echo
+      - ls
+      - find
+      - grep
+      - cat
+      - wc
+
+EXAMPLES:
+    # Enqueue commands
+    queue_command -- echo "hello world"
+    queue_command -- ls -la /tmp
+    queue_command -- find /var/log -name "*.log" -mtime +7 -delete
+
+    # With custom Redis instance
+    queue_command --redis redis.internal:6379 -- echo test
+
+    # Worker with CSV whitelist
+    queue_command --worker --trusted-commands echo,ls,find,cat
+
+    # Worker with YAML config
+    queue_command --worker --config ~/my-trusted.yaml
+
+    # Worker with default config (~/.config/queue_command/trusted.yaml)
+    queue_command --worker
+
+    # Worker that trusts all commands
+    queue_command --worker --trust-all
+
+    # Check queue status
+    queue_command --queue
+
+    # Multiple workers in parallel
+    terminal1: queue_command --worker --trusted-commands echo,ls
+    terminal2: queue_command --worker --trusted-commands echo,ls
+
+ENVIRONMENT:
+    REDIS_URL can be set via environment variable instead of --redis flag
+"""
+
+LICENSE_TEXT: str = """dotfiles - Personal configuration files and scripts
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+
+# ==============================================================================
+# Argument Parsing
+# ==============================================================================
+
+def parse_args(args: list[str]) -> Config:
+    """Parse command-line arguments."""
+    config: Config = Config()
+
+    # Check for environment variable
+    env_redis: str = os.environ.get("REDIS_URL", "")
+    if env_redis:
+        if ":" in env_redis:
+            config.redis_host = env_redis.split(":")[0]
+            try:
+                config.redis_port = int(env_redis.split(":")[1])
+            except ValueError:
+                pass
+        else:
+            config.redis_host = env_redis
+
+    # Find the -- separator
+    separator_idx: int = -1
+    for i, arg in enumerate(args):
+        if arg == "--":
+            separator_idx = i
+            break
+
+    # Arguments before --
+    pre_args: list[str] = args[:separator_idx] if separator_idx >= 0 else args
+    # Command after --
+    post_args: list[str] = args[separator_idx + 1:] if separator_idx >= 0 else []
+
+    if post_args:
+        config.command_to_queue = " ".join(post_args)
+
+    # Parse pre-args
+    i: int = 0
+    while i < len(pre_args):
+        arg: str = pre_args[i]
+
+        if arg in ("-h", "--help"):
+            print(HELP_TEXT)
+            sys.exit(0)
+
+        elif arg == "--license":
+            print(LICENSE_TEXT)
+            sys.exit(0)
+
+        elif arg == "--redis":
+            if i + 1 >= len(pre_args):
+                error("Option --redis requires an argument")
+                sys.exit(1)
+            i += 1
+            redis_url: str = pre_args[i]
+            if ":" in redis_url:
+                config.redis_host = redis_url.split(":")[0]
+                try:
+                    config.redis_port = int(redis_url.split(":")[1])
+                except ValueError:
+                    error(f"Invalid port in Redis URL: {redis_url}")
+                    sys.exit(1)
+            else:
+                config.redis_host = redis_url
+
+        elif arg == "--worker":
+            config.mode = "worker"
+
+        elif arg == "--queue":
+            config.mode = "queue-status"
+
+        elif arg == "--jobs":
+            config.mode = "list-jobs"
+            # Check if next arg is a filter (not starting with -)
+            if i + 1 < len(pre_args) and not pre_args[i + 1].startswith("-"):
+                i += 1
+                config.jobs_filter = pre_args[i]
+
+        elif arg == "--cancel":
+            config.mode = "cancel-job"
+            if i + 1 >= len(pre_args):
+                error("Option --cancel requires a job ID")
+                sys.exit(1)
+            i += 1
+            config.cancel_job_id = pre_args[i]
+
+        elif arg == "--trust-all":
+            config.trust_all = True
+
+        elif arg == "--trusted-commands":
+            if i + 1 >= len(pre_args):
+                error("Option --trusted-commands requires an argument")
+                sys.exit(1)
+            i += 1
+            config.trusted_commands_csv = pre_args[i]
+
+        elif arg == "--config":
+            if i + 1 >= len(pre_args):
+                error("Option --config requires an argument")
+                sys.exit(1)
+            i += 1
+            config.config_file = pre_args[i]
+
+        elif arg.startswith("-"):
+            error(f"Unknown option: {arg}")
+            print(HELP_TEXT)
+            sys.exit(1)
+
+        else:
+            error(f"Unexpected argument: {arg}")
+            error("Use '--' separator before command")
+            print(HELP_TEXT)
+            sys.exit(1)
+
+        i += 1
+
+    return config
+
+
+# ==============================================================================
+# Main Entry Point
+# ==============================================================================
+
+def main() -> None:
+    """Main entry point."""
+    if len(sys.argv) < 2:
+        error("No arguments provided")
+        print(HELP_TEXT)
+        sys.exit(1)
+
+    config: Config = parse_args(sys.argv[1:])
+    redis_client: RedisClient = RedisClient(config.redis_host, config.redis_port)
+
+    try:
+        if config.mode == "enqueue":
+            result: Optional[str] = enqueue_command(config, redis_client)
+            if result is None:
+                sys.exit(1)
+
+        elif config.mode == "worker":
+            worker: Worker = Worker(config, redis_client)
+            worker.start()
+
+        elif config.mode == "queue-status":
+            if not show_queue_status(config, redis_client):
+                sys.exit(1)
+
+        elif config.mode == "list-jobs":
+            if not show_jobs(config, redis_client, config.jobs_filter):
+                sys.exit(1)
+
+        elif config.mode == "cancel-job":
+            if not cancel_job(config, redis_client, config.cancel_job_id):
+                sys.exit(1)
+
+        else:
+            error(f"Unknown mode: {config.mode}")
+            sys.exit(1)
+    finally:
+        redis_client.close()
+
+
+if __name__ == "__main__":
+    main()
