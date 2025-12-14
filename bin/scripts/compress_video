@@ -98,6 +98,12 @@ LOG_LEVEL="INFO"  # DEBUG, INFO, WARN, ERROR
 LOG_TO_FILE=true
 LOG_TO_STDERR=true
 
+# Queue mode (normal | enqueue | worker | queue-status)
+MODE="normal"
+
+# Redis connection URL
+REDIS_URL="127.0.0.1:6379"
+
 # Quality presets (CRF values)
 declare -A QUALITY_PRESETS=(
     ["low"]="28"
@@ -130,6 +136,93 @@ declare -A AUDIO_CODEC_MAP=(
     ["mp3"]="libmp3lame"
     ["copy"]="copy"
 )
+
+# ==============================================================================
+# Redis Queue Functions (RESP protocol via netcat)
+# ==============================================================================
+
+# Redis RESP protocol communication using RESP (Redis Serialization Protocol)
+redis_cmd() {
+    local cmd_array=("$@")
+    local resp_cmd="*${#cmd_array[@]}\r\n"
+
+    for arg in "${cmd_array[@]}"; do
+        resp_cmd+="\$${#arg}\r\n${arg}\r\n"
+    done
+
+    local redis_host="${REDIS_URL%:*}"
+    local redis_port="${REDIS_URL#*:}"
+    printf "%b" "$resp_cmd" | nc -w 2 "$redis_host" "$redis_port" 2>/dev/null | tail -1
+}
+
+# Helper: Check Redis connection
+redis_check_connection() {
+    local redis_host="${REDIS_URL%:*}"
+    local redis_port="${REDIS_URL#*:}"
+    if ! printf '*1\r\n$4\r\nPING\r\n' | nc -w 1 "$redis_host" "$redis_port" 2>/dev/null | grep -q "PONG"; then
+        return 1
+    fi
+    return 0
+}
+
+# Helper: Hash set (HSET)
+redis_hset() {
+    redis_cmd "HSET" "$1" "$2" "$3" >/dev/null
+}
+
+# Helper: Hash get (HGET)
+redis_hget() {
+    local result=$(redis_cmd "HGET" "$1" "$2")
+    echo "$result" | grep -oP '(?<=\$)[^\\r]*' || echo ""
+}
+
+# Helper: Right push (RPUSH)
+redis_rpush() {
+    redis_cmd "RPUSH" "$1" "$2" >/dev/null
+}
+
+# Helper: Blocking left pop (BLPOP) with timeout
+redis_blpop() {
+    local result=$(printf "*3\r\n\$5\r\nBLPOP\r\n\$${#1}\r\n$1\r\n\$${#2}\r\n$2\r\n" | nc -w $((${2} + 2)) 127.0.0.1 6379 2>/dev/null)
+    echo "$result" | tail -1 | grep -oP '(?<=\$)[^\\r]*' || echo ""
+}
+
+# Helper: Set add (SADD)
+redis_sadd() {
+    redis_cmd "SADD" "$1" "$2" >/dev/null
+}
+
+# Helper: Set remove (SREM)
+redis_srem() {
+    redis_cmd "SREM" "$1" "$2" >/dev/null
+}
+
+# Helper: Set cardinality (SCARD)
+redis_scard() {
+    local result=$(redis_cmd "SCARD" "$1")
+    echo "$result" | grep -oP '[0-9]+' | head -1 || echo "0"
+}
+
+# Helper: Increment hash field (HINCRBY)
+redis_hincrby() {
+    local result=$(redis_cmd "HINCRBY" "$1" "$2" "$3")
+    echo "$result" | grep -oP '[0-9]+' | head -1 || echo "0"
+}
+
+# Helper: Hash getall
+redis_hgetall() {
+    redis_cmd "HGETALL" "$1"
+}
+
+# Helper: Expire key
+redis_expire() {
+    redis_cmd "EXPIRE" "$1" "$2" >/dev/null
+}
+
+# Generate unique job ID
+generate_job_id() {
+    echo "$(date +%Y%m%d%H%M%S)_$(head -c 8 /dev/urandom | base64 | tr -d '/+=' | head -c 8)"
+}
 
 # Show help message
 show_help() {
@@ -184,12 +277,35 @@ OPTIONS:
     --process-existing         Only process files that already exist in output directory
     -y, --no-confirm           Automatically overwrite existing output files (ffmpeg -y)
 
+QUEUE MANAGEMENT (Redis-based async processing):
+    --enqueue                   Add jobs to Redis queue instead of processing
+    --worker                    Run as worker, processing jobs from queue
+    --queue                     Show current queue status and job information
+    --redis URL                 Redis connection URL (default: 127.0.0.1:6379)
+
 EXAMPLES:
     # Basic compression with defaults (H.265, medium quality)
     compress_video input.mp4
 
     # High quality H.264 compression
     compress_video -q high -v h264 input.mp4
+
+    # Redis Queue Examples:
+    # Enqueue files to be processed asynchronously
+    compress_video --enqueue --quality high *.mp4
+
+    # Start a worker to process queued jobs
+    compress_video --worker
+
+    # Check queue status
+    compress_video --queue
+
+    # Enqueue with all options preserved
+    compress_video --enqueue --no-hwaccel --crf 26 --output-dir ./output video.mkv
+
+    # Use custom Redis instance
+    compress_video --redis redis.example.com:6379 --enqueue *.mp4
+    compress_video --redis redis.example.com:6379 --worker
 
     # Custom CRF with specific output
     compress_video -c 20 -O compressed.mkv input.mp4
@@ -775,6 +891,22 @@ parse_args() {
             -h|--help)
                 show_help
                 exit 0
+                ;;
+            --enqueue)
+                MODE="enqueue"
+                shift
+                ;;
+            --worker)
+                MODE="worker"
+                shift
+                ;;
+            --queue)
+                MODE="queue-status"
+                shift
+                ;;
+            --redis)
+                REDIS_URL="$2"
+                shift 2
                 ;;
             -q|--quality)
                 QUALITY="$2"
@@ -1622,6 +1754,295 @@ copy_to_tv_series_library() {
     fi
 }
 
+# ==============================================================================
+# Queue Mode Functions (Redis-based job queue)
+# ==============================================================================
+
+# Enqueue jobs to Redis queue
+enqueue_jobs() {
+    # Check Redis connection
+    if ! redis_check_connection; then
+        error "Cannot connect to Redis at $REDIS_URL"
+        error "Ensure Redis is running at that address"
+        exit 1
+    fi
+
+    local prefix="cv"
+    log "Enqueueing ${#INPUT_FILES[@]} jobs..."
+
+    for input_file in "${INPUT_FILES[@]}"; do
+        [[ ! -f "$input_file" ]] && { error "Not found: $input_file"; continue; }
+
+        # Determine output file
+        local output_file
+        if [[ -n "${OUTPUT_FILE:-}" ]]; then
+            output_file="$OUTPUT_FILE"
+        else
+            local basename="$(basename "$input_file")"
+            local name="${basename%.*}"
+            output_file="${OUTPUT_DIR}/${name}.${OUTPUT_FORMAT}"
+        fi
+
+        # Generate job ID
+        local job_id="$(generate_job_id)"
+        local job_key="${prefix}:job:${job_id}"
+
+        # Store metadata
+        redis_hset "$job_key" "id" "$job_id"
+        redis_hset "$job_key" "input_file" "$(realpath "$input_file")"
+        redis_hset "$job_key" "output_file" "$(realpath "$output_file")"
+        redis_hset "$job_key" "status" "queued"
+        redis_hset "$job_key" "created_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        redis_hset "$job_key" "retry_count" "0"
+        redis_hset "$job_key" "max_retries" "3"
+
+        # Serialize all job options
+        serialize_job_options "$job_key"
+
+        # Add to status set
+        redis_sadd "${prefix}:status:queued" "$job_id"
+
+        # Enqueue
+        redis_rpush "${prefix}:queue" "$job_id"
+
+        log "Enqueued: $(basename "$input_file") (Job ID: $job_id)"
+    done
+
+    log "Successfully enqueued ${#INPUT_FILES[@]} jobs"
+}
+
+# Serialize all job options to Redis
+serialize_job_options() {
+    local job_key="$1"
+
+    # Common options
+    redis_hset "$job_key" "quality" "$QUALITY"
+    redis_hset "$job_key" "output_format" "$OUTPUT_FORMAT"
+    redis_hset "$job_key" "output_dir" "$OUTPUT_DIR"
+    [[ -n "$CONTAINER_CPUS" ]] && redis_hset "$job_key" "cpus" "$CONTAINER_CPUS"
+    [[ -n "$CONTAINER_MEMORY" ]] && redis_hset "$job_key" "memory" "$CONTAINER_MEMORY"
+    [[ "$NO_CONFIRM" == "true" ]] && redis_hset "$job_key" "no_confirm" "true"
+    [[ "$VERBOSE" == "true" ]] && redis_hset "$job_key" "verbose" "true"
+    [[ "$DRY_RUN" == "true" ]] && redis_hset "$job_key" "dry_run" "true"
+
+    # Video-specific options
+    redis_hset "$job_key" "video_codec" "$VIDEO_CODEC"
+    redis_hset "$job_key" "audio_codec" "$AUDIO_CODEC"
+    [[ -n "$CUSTOM_CRF" ]] && redis_hset "$job_key" "custom_crf" "$CUSTOM_CRF"
+    [[ -n "$CUSTOM_QP" ]] && redis_hset "$job_key" "custom_qp" "$CUSTOM_QP"
+    redis_hset "$job_key" "hwaccel_mode" "$USE_HWACCEL"
+    [[ "$PREFER_VULKAN" == "true" ]] && redis_hset "$job_key" "prefer_vulkan" "true"
+    [[ "$PREFER_SOFTWARE" == "true" ]] && redis_hset "$job_key" "prefer_software" "true"
+    [[ "$AUTO_QUALITY" == "true" ]] && redis_hset "$job_key" "auto_quality" "true"
+    [[ "$NO_SUBTITLES" == "true" ]] && redis_hset "$job_key" "no_subtitles" "true"
+    [[ -n "${RESOLUTION:-}" ]] && redis_hset "$job_key" "resolution" "$RESOLUTION"
+    [[ -n "${BITRATE:-}" ]] && redis_hset "$job_key" "bitrate" "$BITRATE"
+    [[ -n "${FFMPEG_PRESET:-}" ]] && redis_hset "$job_key" "ffmpeg_preset" "$FFMPEG_PRESET"
+
+    # Media library options
+    [[ "$IS_MOVIE" == "true" ]] && redis_hset "$job_key" "is_movie" "true"
+    [[ "$IS_TV_SERIES" == "true" ]] && redis_hset "$job_key" "is_tv_series" "true"
+    [[ "$IS_VIDEO" == "true" ]] && redis_hset "$job_key" "is_video" "true"
+    [[ -n "$MEDIA_TAGS" ]] && redis_hset "$job_key" "media_tags" "$MEDIA_TAGS"
+    [[ "$NO_DB" == "true" ]] && redis_hset "$job_key" "no_db" "true"
+    [[ "$FORCE_RECONVERT" == "true" ]] && redis_hset "$job_key" "force_reconvert" "true"
+}
+
+# Worker main loop
+worker_main() {
+    local prefix="cv"
+    local worker_pid="$$"
+
+    # Check Redis connection
+    if ! redis_check_connection; then
+        error "Cannot connect to Redis at $REDIS_URL"
+        error "Ensure Redis is running at that address"
+        exit 1
+    fi
+
+    # Register worker
+    redis_hset "${prefix}:workers" "$worker_pid" "$(hostname):$(date -u +%Y-%m-%dT%H:%M:%SZ):active"
+
+    log "Worker started (PID: $worker_pid)"
+
+    # Trap for graceful shutdown
+    trap 'redis_cmd "HDEL" "${prefix}:workers" "$worker_pid" >/dev/null 2>&1; log "Worker shutdown"; exit 0' SIGINT SIGTERM
+
+    # Main worker loop
+    while true; do
+        # Block for 5 seconds waiting for a job
+        local job_id=$(redis_blpop "${prefix}:queue" 5)
+
+        # Check if we got a job
+        [[ -z "$job_id" ]] || [[ "$job_id" == "(nil)" ]] && continue
+
+        log "Processing job: $job_id"
+        process_job_from_queue "$prefix" "$job_id"
+    done
+}
+
+# Process a single job from the queue
+process_job_from_queue() {
+    local prefix="$1"
+    local job_id="$2"
+    local job_key="${prefix}:job:${job_id}"
+
+    # Update status
+    redis_srem "${prefix}:status:queued" "$job_id"
+    redis_sadd "${prefix}:status:processing" "$job_id"
+    redis_hset "$job_key" "status" "processing"
+    redis_hset "$job_key" "started_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    redis_hset "$job_key" "worker_pid" "$$"
+
+    # Retrieve job data
+    local input_file=$(redis_hget "$job_key" "input_file")
+    local output_file=$(redis_hget "$job_key" "output_file")
+
+    # Validate
+    if [[ ! -f "$input_file" ]]; then
+        handle_job_failure "$prefix" "$job_id" "Input file not found: $input_file"
+        return 1
+    fi
+
+    # Restore all options from Redis
+    restore_job_options "$job_key"
+
+    # Call existing process function
+    if process_video "$input_file" "$output_file"; then
+        handle_job_success "$prefix" "$job_id"
+    else
+        handle_job_failure "$prefix" "$job_id" "Video processing failed"
+    fi
+}
+
+# Restore job options from Redis
+restore_job_options() {
+    local job_key="$1"
+
+    # Common options
+    local q=$(redis_hget "$job_key" "quality")
+    [[ -n "$q" ]] && QUALITY="$q"
+    local f=$(redis_hget "$job_key" "output_format")
+    [[ -n "$f" ]] && OUTPUT_FORMAT="$f"
+    local d=$(redis_hget "$job_key" "output_dir")
+    [[ -n "$d" ]] && OUTPUT_DIR="$d"
+    CONTAINER_CPUS=$(redis_hget "$job_key" "cpus")
+    CONTAINER_MEMORY=$(redis_hget "$job_key" "memory")
+    NO_CONFIRM=$([ "$(redis_hget "$job_key" "no_confirm")" == "true" ] && echo "true" || echo "false")
+    VERBOSE=$([ "$(redis_hget "$job_key" "verbose")" == "true" ] && echo "true" || echo "false")
+    DRY_RUN=$([ "$(redis_hget "$job_key" "dry_run")" == "true" ] && echo "true" || echo "false")
+
+    # Video options
+    local vc=$(redis_hget "$job_key" "video_codec")
+    [[ -n "$vc" ]] && VIDEO_CODEC="$vc"
+    local ac=$(redis_hget "$job_key" "audio_codec")
+    [[ -n "$ac" ]] && AUDIO_CODEC="$ac"
+    CUSTOM_CRF=$(redis_hget "$job_key" "custom_crf")
+    CUSTOM_QP=$(redis_hget "$job_key" "custom_qp")
+    local hw=$(redis_hget "$job_key" "hwaccel_mode")
+    [[ -n "$hw" ]] && USE_HWACCEL="$hw"
+    PREFER_VULKAN=$([ "$(redis_hget "$job_key" "prefer_vulkan")" == "true" ] && echo "true" || echo "false")
+    PREFER_SOFTWARE=$([ "$(redis_hget "$job_key" "prefer_software")" == "true" ] && echo "true" || echo "false")
+    AUTO_QUALITY=$([ "$(redis_hget "$job_key" "auto_quality")" == "true" ] && echo "true" || echo "false")
+    NO_SUBTITLES=$([ "$(redis_hget "$job_key" "no_subtitles")" == "true" ] && echo "true" || echo "false")
+    RESOLUTION=$(redis_hget "$job_key" "resolution")
+    BITRATE=$(redis_hget "$job_key" "bitrate")
+    FFMPEG_PRESET=$(redis_hget "$job_key" "ffmpeg_preset")
+
+    # Media library options
+    IS_MOVIE=$([ "$(redis_hget "$job_key" "is_movie")" == "true" ] && echo "true" || echo "false")
+    IS_TV_SERIES=$([ "$(redis_hget "$job_key" "is_tv_series")" == "true" ] && echo "true" || echo "false")
+    IS_VIDEO=$([ "$(redis_hget "$job_key" "is_video")" == "true" ] && echo "true" || echo "false")
+    MEDIA_TAGS=$(redis_hget "$job_key" "media_tags")
+    NO_DB=$([ "$(redis_hget "$job_key" "no_db")" == "true" ] && echo "true" || echo "false")
+    FORCE_RECONVERT=$([ "$(redis_hget "$job_key" "force_reconvert")" == "true" ] && echo "true" || echo "false")
+}
+
+# Handle successful job completion
+handle_job_success() {
+    local prefix="$1"
+    local job_id="$2"
+    local job_key="${prefix}:job:${job_id}"
+
+    redis_hset "$job_key" "status" "completed"
+    redis_hset "$job_key" "completed_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    redis_srem "${prefix}:status:processing" "$job_id"
+    redis_sadd "${prefix}:status:completed" "$job_id"
+    redis_expire "$job_key" 604800  # Expire after 7 days
+
+    log "Job completed: $job_id"
+}
+
+# Handle job failure with retry logic
+handle_job_failure() {
+    local prefix="$1"
+    local job_id="$2"
+    local error_msg="$3"
+    local job_key="${prefix}:job:${job_id}"
+
+    # Increment retry count atomically
+    local retry_count=$(redis_hincrby "$job_key" "retry_count" 1)
+    local max_retries=$(redis_hget "$job_key" "max_retries")
+
+    [[ -z "$max_retries" ]] && max_retries=3
+
+    redis_hset "$job_key" "error_message" "$error_msg"
+
+    if [[ $retry_count -lt $max_retries ]]; then
+        # Retry
+        warn "Job $job_id failed (attempt $retry_count/$max_retries) - retrying..."
+        redis_hset "$job_key" "status" "queued"
+        redis_srem "${prefix}:status:processing" "$job_id"
+        redis_sadd "${prefix}:status:queued" "$job_id"
+        redis_rpush "${prefix}:queue" "$job_id"
+    else
+        # Dead letter queue
+        error "Job $job_id permanently failed after $max_retries attempts"
+        redis_hset "$job_key" "status" "dead"
+        redis_hset "$job_key" "completed_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        redis_srem "${prefix}:status:processing" "$job_id"
+        redis_sadd "${prefix}:status:dead" "$job_id"
+        redis_rpush "${prefix}:dlq" "$job_id"
+        redis_expire "$job_key" 2592000  # Expire after 30 days
+    fi
+}
+
+# Show queue status
+show_queue_status() {
+    local prefix="cv"
+
+    # Check Redis connection
+    if ! redis_check_connection; then
+        error "Cannot connect to Redis at $REDIS_URL"
+        return 1
+    fi
+
+    echo "=========================================="
+    echo "compress_video Queue Status"
+    echo "=========================================="
+    echo ""
+    echo "Job Counts:"
+    echo "  Queued:     $(redis_scard "${prefix}:status:queued")"
+    echo "  Processing: $(redis_scard "${prefix}:status:processing")"
+    echo "  Completed:  $(redis_scard "${prefix}:status:completed")"
+    echo "  Failed:     $(redis_scard "${prefix}:status:failed")"
+    echo "  Dead:       $(redis_scard "${prefix}:status:dead")"
+    echo ""
+    echo "Active Workers:"
+    local workers_exist=false
+    local workers=$(redis_hgetall "${prefix}:workers" 2>/dev/null)
+    if [[ -n "$workers" ]]; then
+        workers_exist=true
+        echo "$workers" | while read -r line; do
+            if [[ ! "$line" =~ ^[*0-9] ]]; then
+                echo "  $line"
+            fi
+        done
+    fi
+    [[ "$workers_exist" == "false" ]] && echo "  None"
+    echo "=========================================="
+}
+
 # Export function for parallel to use
 export -f process_video log error warn debug write_log is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library add_to_media_db get_video_resolution get_auto_quality
 
@@ -1643,13 +2064,25 @@ process_video_wrapper() {
 # Main function
 main() {
     parse_args "$@"
-    
+
     # Initialize logging
     init_logging "$@"
-    
+
+    # Handle queue modes
+    if [[ "$MODE" == "enqueue" ]]; then
+        enqueue_jobs
+        exit $?
+    elif [[ "$MODE" == "worker" ]]; then
+        worker_main
+        exit $?
+    elif [[ "$MODE" == "queue-status" ]]; then
+        show_queue_status
+        exit $?
+    fi
+
     # Initialize journal if enabled
     init_journal
-    
+
     # Create output directory if it doesn't exist
     if [[ -z "${OUTPUT_FILE:-}" ]] && [[ "$DRY_RUN" == "false" ]]; then
         mkdir -p "$OUTPUT_DIR"
