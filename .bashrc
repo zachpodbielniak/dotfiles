@@ -139,6 +139,8 @@ alias k="kubectl"
 alias fcd='cd $(find * -type d | fzf)'
 alias y="yazi"
 alias sv="source venv/bin/activate"
+alias c2b="clip2brain"
+alias c2ba="clip2brain --audio"
 
 alias cdd="cd ${HOME}/.dotfiles"
 alias cdp="cd ${HOME}/Source/Projects"
