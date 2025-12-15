@@ -1,0 +1,509 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# ==============================================================================
+# clip2brain - Clipboard to Second Brain Ingest
+# ==============================================================================
+# Ingests clipboard content into the second brain knowledge management system.
+# Supports both Xorg and Wayland display servers, FreeBSD compatibility,
+# audio note recording/transcription, and interactive PARA location selection.
+# ==============================================================================
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_GENERAL_ERROR=1
+readonly EXIT_USAGE_ERROR=2
+readonly EXIT_FILE_NOT_FOUND=3
+readonly EXIT_MISSING_DEP=4
+readonly EXIT_CLIPBOARD_EMPTY=5
+
+# Defaults
+PARA_CATEGORY="inbox"
+SUBCATEGORY=""
+USE_FZF=false
+EDIT_MODE=false
+AUDIO_MODE=false
+AUDIO_FILE=""
+TAGS=""
+NAME_SEED=""
+DEBUG_MODE=false
+CLIPBOARD_CMD=""
+
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+debug_print () {
+    if [[ "${DEBUG_MODE}" == true ]]
+    then
+        printf "[DEBUG] %s\n" "${1}" >&2
+    fi
+}
+
+error_exit () {
+    local exit_code="${1}"
+    local message="${2}"
+    printf "Error: %s\n" "${message}" >&2
+    exit "${exit_code}"
+}
+
+show_help () {
+    cat << EOF
+Usage: ${SCRIPT_NAME} [OPTIONS] [PARA_CATEGORY]
+
+Ingest clipboard content into the second brain knowledge management system.
+
+Options:
+    -h, --help              Show this help message
+    --license               Show license information
+    -v, --version           Show version
+
+    -p, --para CATEGORY     PARA category (inbox, project, area, resource, archive)
+                            Default: inbox
+    -c, --category PATH     Subcategory path (e.g., "personal" or "technical/linux")
+    -f, --fzf               Interactive PARA location selection using fzf
+
+    -e, --edit              Edit content before writing to file
+
+    --audio                 Record audio note and transcribe
+    --audio-file FILE       Transcribe existing audio file instead of recording
+
+    --tags TAGS             CSV list of tags to apply to the content
+    --name-seed NAME        Use NAME as seed for filename
+
+    -d, --debug             Enable debug output
+
+Platform Support:
+    - Linux (Wayland): Uses wl-paste from wl-clipboard
+    - Linux (X11): Uses xclip
+    - FreeBSD: Uses xclip (X11 only)
+
+Examples:
+    # Basic usage - clipboard to inbox
+    ${SCRIPT_NAME}
+
+    # Clipboard to specific PARA category
+    ${SCRIPT_NAME} --para project
+    ${SCRIPT_NAME} --para area --category "work/meetings"
+
+    # Interactive location selection
+    ${SCRIPT_NAME} --fzf
+
+    # Record audio note
+    ${SCRIPT_NAME} --audio --para inbox
+
+    # Transcribe existing audio
+    ${SCRIPT_NAME} --audio-file recording.ogg --para area
+
+    # Edit before saving with custom tags
+    ${SCRIPT_NAME} --edit --tags "meeting,important"
+
+    # Shorthand for PARA category (positional argument)
+    ${SCRIPT_NAME} project
+EOF
+}
+
+show_license () {
+    cat << 'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+show_version () {
+    printf "%s version %s\n" "${SCRIPT_NAME}" "${VERSION}"
+}
+
+# ==============================================================================
+# Session Detection
+# ==============================================================================
+
+detect_clipboard_command () {
+    # Detect display server and set appropriate clipboard command
+    # Priority: Wayland > X11 > FreeBSD fallback
+
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]] || [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]
+    then
+        debug_print "Detected Wayland session"
+        CLIPBOARD_CMD="wl-paste"
+    elif [[ -n "${DISPLAY:-}" ]] || [[ "${XDG_SESSION_TYPE:-}" == "x11" ]]
+    then
+        debug_print "Detected X11 session"
+        CLIPBOARD_CMD="xclip -selection clipboard -o"
+    elif [[ "$(uname -s)" == "FreeBSD" ]]
+    then
+        debug_print "Detected FreeBSD, assuming X11"
+        CLIPBOARD_CMD="xclip -selection clipboard -o"
+    else
+        error_exit "${EXIT_GENERAL_ERROR}" "Unable to detect display server. Set XDG_SESSION_TYPE or ensure DISPLAY/WAYLAND_DISPLAY is set."
+    fi
+}
+
+# ==============================================================================
+# Dependency Checking
+# ==============================================================================
+
+check_dependencies () {
+    # sbi is always required
+    if ! command -v sbi &>/dev/null
+    then
+        error_exit "${EXIT_MISSING_DEP}" "sbi is not installed or not in PATH"
+    fi
+
+    # Check clipboard tool based on detected session
+    detect_clipboard_command
+
+    local clipboard_tool
+    clipboard_tool=$(echo "${CLIPBOARD_CMD}" | awk '{print $1}')
+
+    if ! command -v "${clipboard_tool}" &>/dev/null
+    then
+        if [[ "${clipboard_tool}" == "wl-paste" ]]
+        then
+            error_exit "${EXIT_MISSING_DEP}" "wl-paste is required for Wayland clipboard access. Install wl-clipboard."
+        else
+            error_exit "${EXIT_MISSING_DEP}" "xclip is required for X11 clipboard access. Install xclip."
+        fi
+    fi
+
+    # Check fzf if needed
+    if [[ "${USE_FZF}" == true ]]
+    then
+        if ! command -v fzf &>/dev/null
+        then
+            error_exit "${EXIT_MISSING_DEP}" "fzf is required for --fzf mode"
+        fi
+    fi
+
+    # Check audio dependencies if needed
+    if [[ "${AUDIO_MODE}" == true ]]
+    then
+        if ! command -v transcribe_audio &>/dev/null
+        then
+            error_exit "${EXIT_MISSING_DEP}" "transcribe_audio is required for audio note mode"
+        fi
+
+        if [[ -z "${AUDIO_FILE}" ]]
+        then
+            if ! command -v record_audio &>/dev/null
+            then
+                error_exit "${EXIT_MISSING_DEP}" "record_audio is required for recording audio notes"
+            fi
+        fi
+    fi
+}
+
+# ==============================================================================
+# FZF Location Selection
+# ==============================================================================
+
+fzf_select_location () {
+    # Get directory list from sbi and select via fzf (fsbi pattern)
+    local input
+    local prefixes="00_inbox 01_projects 02_areas 03_resources 04_archives"
+    local prefix=""
+    local remainder=""
+
+    input="$(sbi -f -l 2>&1 | grep -vP "\ " | fzf)"
+    if [[ $? -ne 0 ]]
+    then
+        debug_print "FZF selection cancelled"
+        exit "${EXIT_SUCCESS}"
+    fi
+
+    # Parse input to extract PARA prefix and category
+    for p in ${prefixes}
+    do
+        if [[ "${input}" == "${p}/"* ]]
+        then
+            prefix="${p}/"
+            remainder="${input#${prefix}}"
+            break
+        fi
+    done
+
+    SUBCATEGORY="${remainder}"
+
+    # Extract PARA name from prefix
+    if [[ -z "${SUBCATEGORY}" ]]
+    then
+        # No subcategory - just PARA prefix
+        # prefix is like "00_inbox/" -> extract "inbox"
+        PARA_CATEGORY="${prefix:3:-1}"
+    else
+        # Has subcategory
+        # prefix is like "00_inbox/" -> extract "inbox"
+        PARA_CATEGORY="${prefix:3:-1}"
+    fi
+
+    debug_print "FZF selected: para=${PARA_CATEGORY}, category=${SUBCATEGORY}"
+}
+
+# ==============================================================================
+# Audio Note Processing
+# ==============================================================================
+
+process_audio_note () {
+    local audio_file="${1:-}"
+    local transcription=""
+    local record_exit_code=0
+
+    if [[ -z "${audio_file}" ]]
+    then
+        # Record new audio
+        audio_file="${HOME}/Documents/recordings/$(date +'%Y-%m-%d_%H-%M-%S').ogg"
+        mkdir -p "$(dirname "${audio_file}")"
+
+        printf "Recording audio... Press 'q' to stop\n" >&2
+
+        # Run record_audio in a subshell with its own process group so signals don't propagate
+        # Use --default to record from microphone instead of system audio (dummy.monitor)
+        (
+            # Create new process group
+            set -m
+            record_audio --default "${audio_file}"
+        ) || record_exit_code=$?
+
+        # Exit code 130 = stopped with Ctrl+C (expected), 0 = normal exit
+        if [[ ${record_exit_code} -ne 0 ]] && [[ ${record_exit_code} -ne 130 ]]
+        then
+            error_exit "${EXIT_GENERAL_ERROR}" "Recording failed with exit code ${record_exit_code}"
+        fi
+
+        # Verify the file was created
+        if [[ ! -f "${audio_file}" ]]
+        then
+            error_exit "${EXIT_GENERAL_ERROR}" "Recording failed - no audio file created"
+        fi
+
+        printf "Recording saved to: %s\n" "${audio_file}" >&2
+    else
+        # Use provided audio file
+        if [[ ! -f "${audio_file}" ]]
+        then
+            error_exit "${EXIT_FILE_NOT_FOUND}" "Audio file not found: ${audio_file}"
+        fi
+    fi
+
+    printf "Transcribing audio...\n" >&2
+
+    # Transcribe with audio_note,note tags
+    # Capture stdout to extract the transcription ID
+    local transcribe_output=""
+    local transcription_id=""
+    local txt_file="${audio_file}.txt"
+
+    transcribe_output=$(transcribe_audio "${audio_file}" --tags "audio_note,note" 2>&1 || true)
+
+    # Extract transcription ID from output
+    transcription_id=$(echo "${transcribe_output}" | grep -oP 'Transcription ID: \K[a-f0-9-]+' || true)
+
+    # Read the actual transcription from the .txt file
+    if [[ -f "${txt_file}" ]]
+    then
+        transcription=$(cat "${txt_file}")
+    fi
+
+    if [[ -z "${transcription}" ]]
+    then
+        error_exit "${EXIT_GENERAL_ERROR}" "Transcription failed or produced empty result"
+    fi
+
+    # Output with transcription ID if available
+    if [[ -n "${transcription_id}" ]]
+    then
+        printf "Transcription ID: %s\n\n%s" "${transcription_id}" "${transcription}"
+    else
+        printf "%s" "${transcription}"
+    fi
+}
+
+# ==============================================================================
+# Argument Parsing
+# ==============================================================================
+
+parse_arguments () {
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                show_help
+                exit "${EXIT_SUCCESS}"
+                ;;
+            --license)
+                show_license
+                exit "${EXIT_SUCCESS}"
+                ;;
+            -v|--version)
+                show_version
+                exit "${EXIT_SUCCESS}"
+                ;;
+            -p|--para)
+                if [[ -z "${2:-}" ]]
+                then
+                    error_exit "${EXIT_USAGE_ERROR}" "--para requires an argument"
+                fi
+                PARA_CATEGORY="${2}"
+                shift 2
+                ;;
+            -c|--category)
+                if [[ -z "${2:-}" ]]
+                then
+                    error_exit "${EXIT_USAGE_ERROR}" "--category requires an argument"
+                fi
+                SUBCATEGORY="${2}"
+                shift 2
+                ;;
+            -f|--fzf)
+                USE_FZF=true
+                shift
+                ;;
+            -e|--edit)
+                EDIT_MODE=true
+                shift
+                ;;
+            --audio)
+                AUDIO_MODE=true
+                shift
+                ;;
+            --audio-file)
+                if [[ -z "${2:-}" ]]
+                then
+                    error_exit "${EXIT_USAGE_ERROR}" "--audio-file requires a path"
+                fi
+                AUDIO_MODE=true
+                AUDIO_FILE="${2}"
+                shift 2
+                ;;
+            --tags)
+                if [[ -z "${2:-}" ]]
+                then
+                    error_exit "${EXIT_USAGE_ERROR}" "--tags requires an argument"
+                fi
+                TAGS="${2}"
+                shift 2
+                ;;
+            --name-seed)
+                if [[ -z "${2:-}" ]]
+                then
+                    error_exit "${EXIT_USAGE_ERROR}" "--name-seed requires an argument"
+                fi
+                NAME_SEED="${2}"
+                shift 2
+                ;;
+            -d|--debug)
+                DEBUG_MODE=true
+                shift
+                ;;
+            -*)
+                error_exit "${EXIT_USAGE_ERROR}" "Unknown option: ${1}. Use --help for usage."
+                ;;
+            *)
+                # Positional argument: treat as PARA shorthand
+                PARA_CATEGORY="${1}"
+                shift
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+main () {
+    parse_arguments "${@}"
+    check_dependencies
+
+    # Build sbi arguments
+    local sbi_args=()
+
+    # Handle FZF mode (overrides --para and --category)
+    if [[ "${USE_FZF}" == true ]]
+    then
+        fzf_select_location
+    fi
+
+    sbi_args+=("--para" "${PARA_CATEGORY}")
+
+    if [[ -n "${SUBCATEGORY}" ]]
+    then
+        sbi_args+=("--category" "${SUBCATEGORY}")
+    fi
+
+    # Always use --no-summary for clipboard content
+    sbi_args+=("--no-summary")
+
+    if [[ "${EDIT_MODE}" == true ]]
+    then
+        sbi_args+=("--edit")
+    fi
+
+    if [[ -n "${TAGS}" ]]
+    then
+        sbi_args+=("--tags" "${TAGS}")
+    fi
+
+    if [[ -n "${NAME_SEED}" ]]
+    then
+        sbi_args+=("--name-seed" "${NAME_SEED}")
+    fi
+
+    debug_print "sbi args: ${sbi_args[*]}"
+
+    # Get content based on mode
+    local content=""
+
+    if [[ "${AUDIO_MODE}" == true ]]
+    then
+        content=$(process_audio_note "${AUDIO_FILE}")
+    else
+        # Text clipboard mode
+        content=$(eval "${CLIPBOARD_CMD}" 2>/dev/null || true)
+
+        if [[ -z "${content}" ]]
+        then
+            error_exit "${EXIT_CLIPBOARD_EMPTY}" "Clipboard is empty"
+        fi
+    fi
+
+    debug_print "Content length: ${#content} characters"
+
+    # Pipe content to sbi
+    printf "%s" "${content}" | sbi "${sbi_args[@]}"
+}
+
+main "${@}"
