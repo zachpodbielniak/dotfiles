@@ -2468,6 +2468,172 @@ def get_last_chat_context(debug=False):
             print(f"Error during last chat context lookup: {e}", file=sys.stderr)
         return None
 
+def get_last_uuids(debug=False):
+    """Get the last chat UUID and last context UUID that were used."""
+    if not DB_AVAILABLE:
+        if debug:
+            print("Error: Database dependencies not available", file=sys.stderr)
+        return None, None
+
+    if not check_db_available(debug):
+        if debug:
+            print("Error: Could not connect to AI chats database", file=sys.stderr)
+        return None, None
+
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Get the most recent chat's UUID and context_uuid
+        cursor.execute("""
+            SELECT a.id as chat_uuid, a.context_uuid
+            FROM ai_chats a
+            ORDER BY a.request_timestamp DESC
+            LIMIT 1
+        """)
+
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if not result:
+            if debug:
+                print("No previous chats found in database", file=sys.stderr)
+            return None, None
+
+        chat_uuid = str(result['chat_uuid'])
+        context_uuid = str(result['context_uuid'])
+
+        if debug:
+            print(f"Found last chat UUID: {chat_uuid}, context UUID: {context_uuid}", file=sys.stderr)
+
+        return chat_uuid, context_uuid
+
+    except psycopg2.Error as e:
+        if debug:
+            print(f"Error getting last UUIDs: {e}", file=sys.stderr)
+        return None, None
+    except Exception as e:
+        if debug:
+            print(f"Error during last UUIDs lookup: {e}", file=sys.stderr)
+        return None, None
+
+def convert_to_markdown(args, debug=False):
+    """Convert given content (from --prompt, -f files, or stdin) to well-organized markdown."""
+    # Collect content from prompt, files, and stdin
+    content_parts = []
+
+    # Check for stdin data
+    stdin_data = ""
+    if not sys.stdin.isatty() or sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+        try:
+            stdin_data = sys.stdin.read()
+        except:
+            pass  # If reading fails, continue without stdin data
+
+    # Add content from --prompt if provided
+    if args.prompt_flag:
+        content_parts.append(args.prompt_flag)
+
+    # Add content from files if provided
+    if args.files:
+        for file_path in args.files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+                    content_parts.append(f"# From: {file_path}\n\n{file_content}")
+            except Exception as e:
+                if debug:
+                    print(f"Error reading file {file_path}: {e}", file=sys.stderr)
+                continue
+
+    # Add positional prompt if provided
+    if args.prompt:
+        content_parts.append(args.prompt)
+
+    # Add stdin content if provided
+    if stdin_data:
+        content_parts.append(stdin_data)
+
+    if not content_parts:
+        print("Error: No content provided. Use --prompt, -f, or pipe content via stdin.", file=sys.stderr)
+        sys.exit(1)
+
+    # Combine all content
+    combined_content = "\n\n".join(content_parts)
+
+    # Create a prompt for the AI to organize this as markdown
+    conversion_prompt = f"""Please convert the following content into well-organized, properly formatted markdown.
+Structure it logically with appropriate headings, lists, code blocks, and other markdown elements as needed.
+Preserve all information and code snippets exactly as they are.
+Respond only with the markdown content, no explanations or markdown code fences.
+
+Content to convert:
+{combined_content}"""
+
+    if debug:
+        print(f"Converting content to markdown using model: {args.model}", file=sys.stderr)
+
+    # Get the provider
+    provider = args.provider or MODEL_PROVIDERS.get(args.model, "claudpy")
+
+    # Build the provider command with all options
+    cmd = [provider, "--model", args.model, "--no-streaming"]
+
+    # Add emoji arguments if provided
+    if args.emojis:
+        cmd.extend(["--emojis", args.emojis])
+    if args.enhance_emojis:
+        cmd.append("--enhance-emojis")
+
+    # Run the provider command
+    try:
+        result = subprocess.run(
+            cmd,
+            input=conversion_prompt,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        # Output the markdown if we have it, filtering out provider error messages
+        if result.stdout:
+            # Filter out lines that are provider errors (like token counting errors)
+            lines = result.stdout.split('\n')
+            filtered_lines = []
+            for line in lines:
+                # Skip lines that are clearly provider error messages but aren't markdown content
+                if line.startswith("Error:") and "not defined" in line:
+                    continue
+                filtered_lines.append(line)
+
+            # Rejoin and output, preserving the original structure
+            output = '\n'.join(filtered_lines)
+            # Remove trailing newlines that may have been added by filtering
+            print(output.rstrip() + '\n' if output.rstrip() else '', end='')
+
+        if result.returncode != 0:
+            if not result.stdout:
+                # Only exit with error if we have no output
+                print(f"Error: Provider returned error code {result.returncode}", file=sys.stderr)
+                if result.stderr:
+                    print("Provider stderr:", file=sys.stderr)
+                    print(result.stderr, file=sys.stderr)
+                sys.exit(1)
+            elif debug:
+                # If we have output but also got an error, just warn in debug mode
+                print(f"Debug: Provider returned error code {result.returncode} but output was generated", file=sys.stderr)
+                if result.stderr:
+                    print("Provider stderr:", file=sys.stderr)
+                    print(result.stderr, file=sys.stderr)
+
+    except subprocess.TimeoutExpired:
+        print("Error: Markdown conversion timed out", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error during markdown conversion: {e}", file=sys.stderr)
+        sys.exit(1)
+
 def auto_generate_context_name(context_uuid, model, prompt, response, debug=False):
     """Automatically generate a name for a context based on the first chat."""
     if not DB_AVAILABLE:
@@ -3091,6 +3257,8 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                           help="Generate text embeddings")
     gen_group.add_argument("--regen", action="store_true",
                           help="Regenerate/enhance existing images")
+    gen_group.add_argument("--to-markdown", action="store_true",
+                          help="Convert the given content to well-organized markdown")
     gen_group.add_argument("--output", metavar="FILE",
                           help="Output filename for generated content")
     gen_group.add_argument("--size", metavar="SIZE",
@@ -3191,6 +3359,12 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
                              help="Show usage summary after execution")
     output_group.add_argument("--show-id", action="store_true",
                              help="Display UUID of newly created chat")
+    output_group.add_argument("--last-uuid", action="store_true",
+                             help="Show the last context UUID and last chat UUID that were used")
+    output_group.add_argument("--last-context-uuid", action="store_true",
+                             help="Show only the last context UUID")
+    output_group.add_argument("--last-chat-uuid", action="store_true",
+                             help="Show only the last chat UUID")
     output_group.add_argument("--debug", action="store_true",
                              help="Enable detailed debug output")
     output_group.add_argument("--dry-run", action="store_true",
@@ -5168,6 +5342,28 @@ def main():
         suggestion = generate_helper_suggestion(args)
         print(suggestion)
         sys.exit(0)
+
+    # Handle --last-uuid, --last-context-uuid, --last-chat-uuid modes
+    if args.last_uuid or args.last_context_uuid or args.last_chat_uuid:
+        chat_uuid, context_uuid = get_last_uuids(debug=args.debug)
+        if not chat_uuid or not context_uuid:
+            if args.debug:
+                print("No previous chats found", file=sys.stderr)
+            sys.exit(1)
+
+        if args.last_uuid:
+            print(f"context: {context_uuid}")
+            print(f"chat: {chat_uuid}")
+        elif args.last_context_uuid:
+            print(context_uuid)
+        elif args.last_chat_uuid:
+            print(chat_uuid)
+        return
+
+    # Handle --to-markdown mode
+    if args.to_markdown:
+        convert_to_markdown(args, debug=args.debug)
+        return
 
     # Handle database operations first
     if args.search:
