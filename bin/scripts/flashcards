@@ -1,0 +1,1343 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+flashcards - Generate and review flashcards from your notes
+
+Uses AI to generate flashcards from recently modified notes,
+stores them in PostgreSQL, and provides interactive review.
+"""
+
+import os
+import subprocess
+import sys
+
+# Container check for distrobox - do this BEFORE any other imports
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+if not no_dbox_check and ctr_id != "dev":
+	cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+	subprocess.run(cmd)
+	sys.exit(0)
+
+# Now import everything else inside the dev container
+import argparse
+import json
+import random
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+try:
+	import psycopg2
+	from psycopg2.extras import RealDictCursor
+except ImportError:
+	print("Error: psycopg2 required. Install with: pip install psycopg2-binary", file=sys.stderr)
+	sys.exit(1)
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DEFAULT_DAYS: int = 7
+DEFAULT_MAX_CARDS: int = 20
+DEFAULT_PARALLEL: int = 1
+DEFAULT_CARDS_PER_NOTE: int = 5
+
+NOTES_DIR: Path = Path.home() / "Documents" / "notes"
+
+# Database configuration
+DB_HOST: str = os.environ.get("FLASHCARDS_DB_HOST", "127.0.0.1")
+DB_PORT: int = int(os.environ.get("FLASHCARDS_DB_PORT", "5432"))
+DB_NAME: str = os.environ.get("FLASHCARDS_DB_NAME", "flashcards")
+DB_USER: str = os.environ.get("FLASHCARDS_DB_USER", "postgres")
+DB_PASSWORD: str = os.environ.get("FLASHCARDS_DB_PASSWORD", "")
+
+# Notes database (for querying recent notes)
+NOTES_DB_HOST: str = os.environ.get("NOTES_DB_HOST", "127.0.0.1")
+NOTES_DB_PORT: int = int(os.environ.get("NOTES_DB_PORT", "5432"))
+NOTES_DB_NAME: str = os.environ.get("NOTES_DB_NAME", "notes")
+NOTES_DB_USER: str = os.environ.get("NOTES_DB_USER", "postgres")
+NOTES_DB_PASSWORD: str = os.environ.get("NOTES_DB_PASSWORD", "")
+
+LICENSE_TEXT: str = """
+flashcards - Generate and review flashcards from your notes
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+""".strip()
+
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
+
+@dataclass
+class Flashcard:
+	"""Represents a flashcard stored in the database."""
+	id: str
+	note_path: str
+	question: str
+	answer: str
+	topic: Optional[str] = None
+	note_uuid: Optional[str] = None
+	difficulty: int = 2
+	times_reviewed: int = 0
+	times_correct: int = 0
+	last_reviewed: Optional[datetime] = None
+	next_review: Optional[datetime] = None
+	note_mtime: Optional[datetime] = None
+	created_at: Optional[datetime] = None
+	updated_at: Optional[datetime] = None
+
+
+@dataclass
+class Note:
+	"""Represents a note from the notes database."""
+	id: str
+	path: str
+	para: str
+	category: str
+	content: str
+	updated_at: datetime
+
+
+# ============================================================================
+# DATABASE FUNCTIONS
+# ============================================================================
+
+def get_flashcards_connection():
+	"""Get connection to flashcards database."""
+	conn_params: Dict[str, Any] = {
+		"host": DB_HOST,
+		"port": DB_PORT,
+		"dbname": DB_NAME,
+		"user": DB_USER,
+	}
+	if DB_PASSWORD:
+		conn_params["password"] = DB_PASSWORD
+	return psycopg2.connect(**conn_params)
+
+
+def get_notes_connection():
+	"""Get connection to notes database."""
+	conn_params: Dict[str, Any] = {
+		"host": NOTES_DB_HOST,
+		"port": NOTES_DB_PORT,
+		"dbname": NOTES_DB_NAME,
+		"user": NOTES_DB_USER,
+	}
+	if NOTES_DB_PASSWORD:
+		conn_params["password"] = NOTES_DB_PASSWORD
+	return psycopg2.connect(**conn_params)
+
+
+def get_recent_notes(days: int, para: Optional[str] = None) -> List[Note]:
+	"""Query notes modified in the last N days."""
+	query: str = """
+		SELECT id::text, path, para, category, content, last_modified
+		FROM notes
+		WHERE last_modified > NOW() - INTERVAL '1 day' * %s
+	"""
+	params: List[Any] = [days]
+
+	if para:
+		query += " AND para = %s"
+		params.append(para)
+
+	query += " ORDER BY last_modified DESC"
+
+	notes: List[Note] = []
+	with get_notes_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(query, params)
+			for row in cur.fetchall():
+				notes.append(Note(
+					id=row["id"],
+					path=row["path"],
+					para=row["para"],
+					category=row["category"] or "",
+					content=row["content"] or "",
+					updated_at=row["last_modified"],
+				))
+	return notes
+
+
+def get_flashcards_for_note(note_path: str) -> List[Flashcard]:
+	"""Get all flashcards for a specific note."""
+	query: str = """
+		SELECT id::text, note_path, note_uuid::text, question, answer, topic,
+		       difficulty, times_reviewed, times_correct, last_reviewed,
+		       next_review, note_mtime, created_at, updated_at
+		FROM flashcards
+		WHERE note_path = %s
+		ORDER BY created_at
+	"""
+	cards: List[Flashcard] = []
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(query, (note_path,))
+			for row in cur.fetchall():
+				cards.append(Flashcard(**row))
+	return cards
+
+
+def get_latest_flashcard_mtime(note_path: str) -> Optional[datetime]:
+	"""Get the note_mtime of the most recent flashcard for a note."""
+	query: str = """
+		SELECT MAX(note_mtime) as latest_mtime
+		FROM flashcards
+		WHERE note_path = %s
+	"""
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(query, (note_path,))
+			row = cur.fetchone()
+			if row and row["latest_mtime"]:
+				return row["latest_mtime"]
+	return None
+
+
+def delete_flashcards_for_note(note_path: str) -> int:
+	"""Delete all flashcards for a note. Returns count deleted."""
+	query: str = "DELETE FROM flashcards WHERE note_path = %s"
+	with get_flashcards_connection() as conn:
+		with conn.cursor() as cur:
+			cur.execute(query, (note_path,))
+			count: int = cur.rowcount
+		conn.commit()
+	return count
+
+
+def insert_flashcards(note_path: str, note_uuid: Optional[str], note_mtime: datetime, cards: List[Dict[str, str]]) -> int:
+	"""Insert new flashcards for a note. Returns count inserted."""
+	if not cards:
+		return 0
+
+	query: str = """
+		INSERT INTO flashcards (note_path, note_uuid, note_mtime, topic, question, answer)
+		VALUES (%s, %s, %s, %s, %s, %s)
+	"""
+
+	with get_flashcards_connection() as conn:
+		with conn.cursor() as cur:
+			for card in cards:
+				cur.execute(query, (
+					note_path,
+					note_uuid,
+					note_mtime,
+					card.get("topic"),
+					card["question"],
+					card["answer"],
+				))
+		conn.commit()
+
+	return len(cards)
+
+
+PARA_PREFIX_MAP: Dict[str, str] = {
+	"inbox": "00_inbox",
+	"projects": "01_projects",
+	"areas": "02_areas",
+	"resources": "03_resources",
+	"archives": "04_archives",
+}
+
+
+def get_review_cards(
+	max_cards: int,
+	difficulty: Optional[int] = None,
+	topic: Optional[str] = None,
+	due_only: bool = False,
+	note_path: Optional[str] = None,
+	para: Optional[str] = None,
+) -> List[Flashcard]:
+	"""Get flashcards for review, shuffled.
+
+	Args:
+		max_cards: Maximum number of cards to return
+		difficulty: Filter by difficulty (1=easy, 2=medium, 3=hard)
+		topic: Filter by path segment (e.g., 'repos/dotfiles' matches paths containing it)
+		due_only: Only return cards due for review
+		note_path: Filter by exact note path
+		para: Filter by PARA category (inbox, projects, areas, resources, archives)
+	"""
+	conditions: List[str] = []
+	params: List[Any] = []
+
+	if difficulty is not None:
+		conditions.append("difficulty = %s")
+		params.append(difficulty)
+
+	if para:
+		# Map para name to directory prefix
+		prefix: str = PARA_PREFIX_MAP.get(para, para)
+		conditions.append("note_path LIKE %s")
+		params.append(f"{prefix}/%")
+
+	if topic:
+		# Filter by path segment (e.g., 'repos/dotfiles' matches '02_areas/repos/dotfiles/aipy.md')
+		conditions.append("note_path LIKE %s")
+		params.append(f"%/{topic}/%")
+
+	if due_only:
+		conditions.append("(next_review IS NULL OR next_review <= NOW())")
+
+	if note_path:
+		conditions.append("note_path = %s")
+		params.append(note_path)
+
+	where_clause: str = ""
+	if conditions:
+		where_clause = "WHERE " + " AND ".join(conditions)
+
+	query: str = f"""
+		SELECT id::text, note_path, note_uuid::text, question, answer, topic,
+		       difficulty, times_reviewed, times_correct, last_reviewed,
+		       next_review, note_mtime, created_at, updated_at
+		FROM flashcards
+		{where_clause}
+	"""
+
+	cards: List[Flashcard] = []
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(query, params)
+			for row in cur.fetchall():
+				cards.append(Flashcard(**row))
+
+	# Shuffle and limit
+	random.shuffle(cards)
+	return cards[:max_cards]
+
+
+def update_card_after_review(card_id: str, user_difficulty: int) -> None:
+	"""Update card statistics after review."""
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(
+				"SELECT times_reviewed, times_correct, difficulty FROM flashcards WHERE id = %s",
+				(card_id,)
+			)
+			row = cur.fetchone()
+			if not row:
+				return
+
+			times_reviewed: int = row["times_reviewed"] + 1
+			# Consider "easy" as correct for spaced repetition
+			times_correct: int = row["times_correct"] + (1 if user_difficulty == 1 else 0)
+
+			# Calculate next review date
+			next_review: datetime = calculate_next_review(user_difficulty, times_correct)
+
+			cur.execute("""
+				UPDATE flashcards
+				SET times_reviewed = %s,
+				    times_correct = %s,
+				    difficulty = %s,
+				    last_reviewed = NOW(),
+				    next_review = %s
+				WHERE id = %s
+			""", (times_reviewed, times_correct, user_difficulty, next_review, card_id))
+
+		conn.commit()
+
+
+def get_card_by_id(card_id: str) -> Optional[Flashcard]:
+	"""Get a single flashcard by ID (supports partial UUID)."""
+	query: str = """
+		SELECT id::text, note_path, note_uuid::text, question, answer, topic,
+		       difficulty, times_reviewed, times_correct, last_reviewed,
+		       next_review, note_mtime, created_at, updated_at
+		FROM flashcards
+		WHERE id::text LIKE %s
+		LIMIT 1
+	"""
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(query, (f"{card_id}%",))
+			row = cur.fetchone()
+			if row:
+				return Flashcard(**row)
+	return None
+
+
+def update_card(card_id: str, question: Optional[str] = None, answer: Optional[str] = None,
+                topic: Optional[str] = None, difficulty: Optional[int] = None) -> bool:
+	"""Update a card's fields. Returns True if card was found and updated."""
+	updates: List[str] = []
+	params: List[Any] = []
+
+	if question is not None:
+		updates.append("question = %s")
+		params.append(question)
+	if answer is not None:
+		updates.append("answer = %s")
+		params.append(answer)
+	if topic is not None:
+		updates.append("topic = %s")
+		params.append(topic)
+	if difficulty is not None:
+		updates.append("difficulty = %s")
+		params.append(difficulty)
+
+	if not updates:
+		return False
+
+	params.append(f"{card_id}%")
+	query: str = f"UPDATE flashcards SET {', '.join(updates)} WHERE id::text LIKE %s"
+
+	with get_flashcards_connection() as conn:
+		with conn.cursor() as cur:
+			cur.execute(query, params)
+			count: int = cur.rowcount
+		conn.commit()
+
+	return count > 0
+
+
+# ============================================================================
+# AI GENERATION
+# ============================================================================
+
+def generate_flashcards_for_content(content: str, source_name: str, cards_per_note: int = DEFAULT_CARDS_PER_NOTE) -> List[Dict[str, str]]:
+	"""
+	Generate flashcards from content using aipy.
+
+	Returns list of dicts with keys: topic, question, answer
+	"""
+	if not content or not content.strip():
+		return []
+
+	# Truncate very long content to avoid token limits
+	max_content_len: int = 12000
+	if len(content) > max_content_len:
+		content = content[:max_content_len] + "\n\n[Content truncated...]"
+
+	prompt: str = f"""Generate exactly {cards_per_note} flashcards from this note content.
+Each flashcard should test a single, specific concept from the content.
+
+IMPORTANT: Output ONLY valid JSON, no markdown code fences, no explanation.
+
+Required JSON format:
+{{"flashcards": [{{"topic": "section or heading name", "question": "clear question", "answer": "concise answer"}}]}}
+
+Rules:
+- Questions should be clear and unambiguous
+- Answers should be concise but complete
+- Topic should match section headings when applicable
+- Focus on the most important concepts
+- For technical content, include practical usage
+- For code, ask about what commands/functions do
+
+Note content from "{source_name}":
+
+{content}"""
+
+	try:
+		result = subprocess.run(
+			["aipy", "--no-preserve", "--no-streaming", prompt],
+			capture_output=True,
+			text=True,
+			timeout=120,
+		)
+
+		if result.returncode != 0:
+			print(f"Warning: aipy failed for {source_name}: {result.stderr}", file=sys.stderr)
+			return []
+
+		output: str = result.stdout.strip()
+
+		# Try to extract JSON from the output
+		# Sometimes AI wraps in markdown code fences
+		if "```json" in output:
+			output = output.split("```json")[1].split("```")[0]
+		elif "```" in output:
+			output = output.split("```")[1].split("```")[0]
+
+		data: Dict[str, Any] = json.loads(output)
+		cards: List[Dict[str, Any]] = data.get("flashcards", [])
+
+		# Validate cards have required fields
+		valid_cards: List[Dict[str, str]] = []
+		for card in cards:
+			if "question" in card and "answer" in card:
+				valid_cards.append({
+					"topic": card.get("topic", ""),
+					"question": card["question"],
+					"answer": card["answer"],
+				})
+
+		return valid_cards
+
+	except subprocess.TimeoutExpired:
+		print(f"Warning: aipy timed out for {source_name}", file=sys.stderr)
+		return []
+	except json.JSONDecodeError as e:
+		print(f"Warning: Failed to parse AI response for {source_name}: {e}", file=sys.stderr)
+		return []
+	except Exception as e:
+		print(f"Warning: Error generating cards for {source_name}: {e}", file=sys.stderr)
+		return []
+
+
+# ============================================================================
+# SPACED REPETITION
+# ============================================================================
+
+def calculate_next_review(difficulty: int, times_correct: int) -> datetime:
+	"""
+	Calculate next review date based on difficulty and success rate.
+
+	Uses simplified SM-2 inspired intervals.
+	difficulty: 1=easy, 2=medium, 3=hard
+	times_correct: number of successful reviews
+	"""
+	base_intervals: Dict[int, List[int]] = {
+		1: [1, 3, 7, 14, 30, 60, 120],   # Easy: faster progression
+		2: [1, 2, 4, 8, 16, 32, 64],     # Medium: moderate progression
+		3: [1, 1, 2, 4, 8, 16, 32],      # Hard: slower progression
+	}
+
+	intervals: List[int] = base_intervals.get(difficulty, base_intervals[2])
+	idx: int = min(times_correct, len(intervals) - 1)
+	days: int = intervals[idx]
+
+	return datetime.now() + timedelta(days=days)
+
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+
+def cmd_generate(args: argparse.Namespace) -> int:
+	"""Generate flashcards from recent notes."""
+
+	# Handle stdin mode
+	if args.stdin:
+		content: str = sys.stdin.read()
+		if not content.strip():
+			print("Error: No content provided on stdin", file=sys.stderr)
+			return 1
+
+		if args.dry_run:
+			print(f"Would generate {args.cards_per_note} cards from stdin content ({len(content)} chars)")
+			return 0
+
+		cards: List[Dict[str, str]] = generate_flashcards_for_content(content, "stdin", args.cards_per_note)
+		if cards:
+			# For stdin, just output the cards as JSON
+			print(json.dumps({"flashcards": cards}, indent=2))
+		return 0
+
+	# Get recent notes
+	if not args.quiet:
+		print(f"Finding notes modified in last {args.days} days...", file=sys.stderr)
+
+	notes: List[Note] = get_recent_notes(args.days, args.para)
+
+	if not notes:
+		print("No notes found matching criteria", file=sys.stderr)
+		return 0
+
+	if not args.quiet:
+		print(f"Found {len(notes)} notes to process", file=sys.stderr)
+
+	# Filter to notes that need regeneration
+	notes_to_process: List[Note] = []
+	for note in notes:
+		if args.force:
+			notes_to_process.append(note)
+			continue
+
+		latest_card_mtime: Optional[datetime] = get_latest_flashcard_mtime(note.path)
+		if latest_card_mtime is None:
+			# No cards exist yet
+			notes_to_process.append(note)
+		elif note.updated_at > latest_card_mtime:
+			# Note is newer than cards
+			notes_to_process.append(note)
+
+	if not notes_to_process:
+		if not args.quiet:
+			print("All flashcards are up to date", file=sys.stderr)
+		return 0
+
+	if args.dry_run:
+		print(f"Would generate flashcards for {len(notes_to_process)} notes:")
+		for note in notes_to_process:
+			print(f"  - {note.path}")
+		return 0
+
+	if not args.quiet:
+		print(f"Generating flashcards for {len(notes_to_process)} notes...", file=sys.stderr)
+
+	# Process notes (with optional parallelism)
+	total_cards: int = 0
+
+	def process_note(note: Note) -> tuple:
+		cards = generate_flashcards_for_content(note.content, note.path, args.cards_per_note)
+		return note, cards
+
+	if args.parallel > 1:
+		with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+			futures = {executor.submit(process_note, note): note for note in notes_to_process}
+			for future in as_completed(futures):
+				note, cards = future.result()
+				if cards:
+					# Delete old cards and insert new ones
+					delete_flashcards_for_note(note.path)
+					count: int = insert_flashcards(note.path, note.id, note.updated_at, cards)
+					total_cards += count
+					if args.verbose:
+						print(f"  Generated {count} cards for {note.path}", file=sys.stderr)
+	else:
+		for i, note in enumerate(notes_to_process, 1):
+			if not args.quiet:
+				print(f"  [{i}/{len(notes_to_process)}] {note.path}...", file=sys.stderr)
+
+			note, cards = process_note(note)
+			if cards:
+				delete_flashcards_for_note(note.path)
+				count = insert_flashcards(note.path, note.id, note.updated_at, cards)
+				total_cards += count
+				if args.verbose:
+					print(f"    Generated {count} cards", file=sys.stderr)
+
+	if not args.quiet:
+		print(f"Generated {total_cards} flashcards from {len(notes_to_process)} notes", file=sys.stderr)
+
+	return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+	"""Interactive flashcard review session."""
+	# Map difficulty string to int
+	difficulty_map: Dict[str, Optional[int]] = {"easy": 1, "medium": 2, "hard": 3, "all": None}
+	difficulty: Optional[int] = difficulty_map.get(args.difficulty)
+
+	# Get para from args (may be None)
+	para: Optional[str] = getattr(args, "para", None)
+
+	cards: List[Flashcard] = get_review_cards(
+		max_cards=args.max,
+		difficulty=difficulty,
+		topic=args.topic,
+		due_only=args.due_only,
+		note_path=args.note,
+		para=para,
+	)
+
+	if not cards:
+		print("No flashcards found matching criteria")
+		return 0
+
+	print(f"\n{'='*60}")
+	print(f"  FLASHCARD REVIEW SESSION")
+	print(f"  {len(cards)} cards to review")
+	print(f"{'='*60}\n")
+
+	reviewed: int = 0
+	correct: int = 0
+	skipped: int = 0
+
+	for i, card in enumerate(cards, 1):
+		print(f"\n{'-'*60}")
+		print(f"  Card {i}/{len(cards)}", end="")
+		if card.topic:
+			print(f"  |  Topic: {card.topic}", end="")
+		diff_names: Dict[int, str] = {1: "Easy", 2: "Medium", 3: "Hard"}
+		print(f"  |  Difficulty: {diff_names.get(card.difficulty, 'Unknown')}")
+		print(f"{'-'*60}")
+
+		print(f"\n  Q: {card.question}\n")
+
+		try:
+			input("  [Press Enter to reveal answer...]")
+		except (KeyboardInterrupt, EOFError):
+			print("\n\nSession ended early.")
+			break
+
+		print(f"\n  A: {card.answer}\n")
+		print(f"{'-'*60}")
+		print("  Rate your recall:")
+		print("    [1] Easy - Knew it instantly")
+		print("    [2] Medium - Had to think")
+		print("    [3] Hard - Struggled or wrong")
+		print("    [s] Skip - Don't count this card")
+		print("    [q] Quit - End session")
+
+		while True:
+			try:
+				response: str = input("\n  Your rating: ").strip().lower()
+			except (KeyboardInterrupt, EOFError):
+				response = "q"
+
+			if response == "q":
+				print("\nEnding session...")
+				break
+			elif response == "s":
+				skipped += 1
+				break
+			elif response in ["1", "2", "3"]:
+				rating: int = int(response)
+				update_card_after_review(card.id, rating)
+				reviewed += 1
+				if rating == 1:
+					correct += 1
+				break
+			else:
+				print("  Invalid input. Enter 1, 2, 3, s, or q")
+
+		if response == "q":
+			break
+
+	# Session summary
+	print(f"\n{'='*60}")
+	print(f"  SESSION COMPLETE")
+	print(f"{'='*60}")
+	print(f"  Cards reviewed: {reviewed}")
+	print(f"  Easy (correct): {correct}")
+	print(f"  Skipped: {skipped}")
+	if reviewed > 0:
+		print(f"  Success rate: {correct/reviewed*100:.1f}%")
+	print(f"{'='*60}\n")
+
+	return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+	"""List flashcards with optional filters."""
+	conditions: List[str] = []
+	params: List[Any] = []
+
+	if args.note:
+		conditions.append("note_path ILIKE %s")
+		params.append(f"%{args.note}%")
+
+	if args.topic:
+		conditions.append("topic ILIKE %s")
+		params.append(f"%{args.topic}%")
+
+	where_clause: str = ""
+	if conditions:
+		where_clause = "WHERE " + " AND ".join(conditions)
+
+	query: str = f"""
+		SELECT id::text, note_path, question, answer, topic, difficulty,
+		       times_reviewed, times_correct, last_reviewed, next_review
+		FROM flashcards
+		{where_clause}
+		ORDER BY updated_at DESC
+		LIMIT %s
+	"""
+	params.append(args.limit)
+
+	cards: List[Dict[str, Any]] = []
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(query, params)
+			cards = cur.fetchall()
+
+	if not cards:
+		print("No flashcards found")
+		return 0
+
+	if args.format == "json":
+		# Convert datetime objects to strings
+		for card in cards:
+			for key in ["last_reviewed", "next_review"]:
+				if card[key]:
+					card[key] = card[key].isoformat()
+		print(json.dumps(cards, indent=2))
+
+	elif args.format == "yaml":
+		try:
+			import yaml
+			for card in cards:
+				for key in ["last_reviewed", "next_review"]:
+					if card[key]:
+						card[key] = card[key].isoformat()
+			print(yaml.dump(cards, default_flow_style=False))
+		except ImportError:
+			print("Error: PyYAML required for YAML output", file=sys.stderr)
+			return 1
+
+	elif args.format == "csv":
+		import csv
+		writer = csv.DictWriter(sys.stdout, fieldnames=cards[0].keys())
+		writer.writeheader()
+		for card in cards:
+			for key in ["last_reviewed", "next_review"]:
+				if card[key]:
+					card[key] = card[key].isoformat()
+			writer.writerow(card)
+
+	else:  # table format
+		print(f"{'ID':<10} {'Topic':<20} {'Question':<40} {'Diff':>4} {'Rev':>4}")
+		print("-" * 82)
+		for card in cards:
+			card_id: str = card["id"][:8]
+			topic: str = (card["topic"] or "")[:18]
+			question: str = card["question"][:38]
+			diff: int = card["difficulty"]
+			rev: int = card["times_reviewed"]
+			print(f"{card_id:<10} {topic:<20} {question:<40} {diff:>4} {rev:>4}")
+
+	return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+	"""Show flashcard statistics."""
+	stats: Dict[str, Any] = {}
+
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			# Total cards
+			cur.execute("SELECT COUNT(*) as total FROM flashcards")
+			stats["total_cards"] = cur.fetchone()["total"]
+
+			# Cards by difficulty
+			cur.execute("""
+				SELECT difficulty, COUNT(*) as count
+				FROM flashcards
+				GROUP BY difficulty
+				ORDER BY difficulty
+			""")
+			stats["by_difficulty"] = {
+				row["difficulty"]: row["count"] for row in cur.fetchall()
+			}
+
+			# Cards due for review
+			cur.execute("""
+				SELECT COUNT(*) as due
+				FROM flashcards
+				WHERE next_review IS NULL OR next_review <= NOW()
+			""")
+			stats["due_for_review"] = cur.fetchone()["due"]
+
+			# Total reviews
+			cur.execute("SELECT SUM(times_reviewed) as total FROM flashcards")
+			result = cur.fetchone()["total"]
+			stats["total_reviews"] = result or 0
+
+			# Notes with cards
+			cur.execute("SELECT COUNT(DISTINCT note_path) as notes FROM flashcards")
+			stats["notes_with_cards"] = cur.fetchone()["notes"]
+
+			# Average cards per note
+			if stats["notes_with_cards"] > 0:
+				stats["avg_cards_per_note"] = round(stats["total_cards"] / stats["notes_with_cards"], 1)
+			else:
+				stats["avg_cards_per_note"] = 0
+
+	if args.format == "json":
+		print(json.dumps(stats, indent=2))
+
+	elif args.format == "yaml":
+		try:
+			import yaml
+			print(yaml.dump(stats, default_flow_style=False))
+		except ImportError:
+			print("Error: PyYAML required", file=sys.stderr)
+			return 1
+
+	else:  # table
+		print(f"\n{'='*40}")
+		print("  FLASHCARD STATISTICS")
+		print(f"{'='*40}")
+		print(f"  Total cards:        {stats['total_cards']}")
+		print(f"  Notes with cards:   {stats['notes_with_cards']}")
+		print(f"  Avg cards/note:     {stats['avg_cards_per_note']}")
+		print(f"  Due for review:     {stats['due_for_review']}")
+		print(f"  Total reviews:      {stats['total_reviews']}")
+		print(f"\n  By Difficulty:")
+		diff_names: Dict[int, str] = {1: "Easy", 2: "Medium", 3: "Hard"}
+		for diff, count in sorted(stats["by_difficulty"].items()):
+			print(f"    {diff_names.get(diff, 'Unknown')}: {count}")
+		print(f"{'='*40}\n")
+
+	return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+	"""Export flashcards to stdout."""
+	query: str = """
+		SELECT id::text, note_path, note_uuid::text, question, answer, topic,
+		       difficulty, times_reviewed, times_correct, last_reviewed,
+		       next_review, note_mtime, created_at, updated_at
+		FROM flashcards
+		ORDER BY note_path, created_at
+	"""
+
+	cards: List[Dict[str, Any]] = []
+	with get_flashcards_connection() as conn:
+		with conn.cursor(cursor_factory=RealDictCursor) as cur:
+			cur.execute(query)
+			cards = cur.fetchall()
+
+	if not cards:
+		print("[]" if args.format == "json" else "")
+		return 0
+
+	# Convert datetime objects
+	for card in cards:
+		for key in ["last_reviewed", "next_review", "note_mtime", "created_at", "updated_at"]:
+			if card[key]:
+				card[key] = card[key].isoformat()
+
+	if args.format == "json":
+		print(json.dumps(cards, indent=2))
+
+	elif args.format == "yaml":
+		try:
+			import yaml
+			print(yaml.dump(cards, default_flow_style=False))
+		except ImportError:
+			print("Error: PyYAML required", file=sys.stderr)
+			return 1
+
+	elif args.format == "csv":
+		import csv
+		if cards:
+			writer = csv.DictWriter(sys.stdout, fieldnames=cards[0].keys())
+			writer.writeheader()
+			writer.writerows(cards)
+
+	return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+	"""Import flashcards from stdin."""
+	content: str = sys.stdin.read()
+
+	if not content.strip():
+		print("Error: No content on stdin", file=sys.stderr)
+		return 1
+
+	try:
+		if args.format == "yaml":
+			import yaml
+			cards = yaml.safe_load(content)
+		else:  # json
+			cards = json.loads(content)
+	except Exception as e:
+		print(f"Error parsing input: {e}", file=sys.stderr)
+		return 1
+
+	if not isinstance(cards, list):
+		print("Error: Expected a list of flashcards", file=sys.stderr)
+		return 1
+
+	imported: int = 0
+	with get_flashcards_connection() as conn:
+		with conn.cursor() as cur:
+			for card in cards:
+				# Skip if required fields missing
+				if not all(k in card for k in ["note_path", "question", "answer"]):
+					continue
+
+				cur.execute("""
+					INSERT INTO flashcards (
+						note_path, question, answer, topic, difficulty,
+						times_reviewed, times_correct, note_mtime
+					) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+				""", (
+					card["note_path"],
+					card["question"],
+					card["answer"],
+					card.get("topic"),
+					card.get("difficulty", 2),
+					card.get("times_reviewed", 0),
+					card.get("times_correct", 0),
+					card.get("note_mtime", datetime.now()),
+				))
+				imported += 1
+
+		conn.commit()
+
+	print(f"Imported {imported} flashcards", file=sys.stderr)
+	return 0
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+	"""Delete flashcards."""
+	if args.all:
+		if not args.yes:
+			confirm: str = input("Delete ALL flashcards? This cannot be undone. [y/N]: ")
+			if confirm.lower() != "y":
+				print("Aborted")
+				return 0
+
+		with get_flashcards_connection() as conn:
+			with conn.cursor() as cur:
+				cur.execute("DELETE FROM flashcards")
+				count: int = cur.rowcount
+			conn.commit()
+
+		print(f"Deleted {count} flashcards")
+		return 0
+
+	target: Optional[str] = args.target or args.note
+	if not target:
+		print("Error: Specify a note path or card UUID to delete", file=sys.stderr)
+		return 1
+
+	# Check if it looks like a UUID
+	is_uuid: bool = len(target) >= 8 and all(c in "0123456789abcdef-" for c in target.lower())
+
+	with get_flashcards_connection() as conn:
+		with conn.cursor() as cur:
+			if is_uuid:
+				# Delete by UUID (supports partial)
+				cur.execute("DELETE FROM flashcards WHERE id::text LIKE %s", (f"{target}%",))
+			else:
+				# Delete by note path
+				cur.execute("DELETE FROM flashcards WHERE note_path = %s", (target,))
+
+			count = cur.rowcount
+		conn.commit()
+
+	print(f"Deleted {count} flashcards")
+	return 0
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+	"""Regenerate outdated flashcards."""
+	# This is similar to generate but specifically for refresh
+	args.quiet = False
+	args.verbose = True
+	args.stdin = False
+	args.dry_run = getattr(args, "dry_run", False)
+	args.cards_per_note = DEFAULT_CARDS_PER_NOTE
+
+	return cmd_generate(args)
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+	"""Edit a flashcard's fields."""
+	card: Optional[Flashcard] = get_card_by_id(args.card_id)
+	if not card:
+		print(f"Error: Card not found: {args.card_id}", file=sys.stderr)
+		return 1
+
+	if args.interactive:
+		# Open in $EDITOR as YAML
+		try:
+			import yaml
+		except ImportError:
+			print("Error: PyYAML required for interactive edit", file=sys.stderr)
+			return 1
+
+		card_data: Dict[str, Any] = {
+			"question": card.question,
+			"answer": card.answer,
+			"topic": card.topic or "",
+			"difficulty": card.difficulty,
+		}
+
+		with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+			f.write("# Edit flashcard - save and close to apply changes\n")
+			f.write("# Delete all content to cancel\n\n")
+			yaml.dump(card_data, f, default_flow_style=False)
+			temp_path: str = f.name
+
+		editor: str = os.environ.get("EDITOR", "vim")
+		subprocess.run([editor, temp_path])
+
+		with open(temp_path, 'r') as f:
+			content: str = f.read()
+
+		os.unlink(temp_path)
+
+		if not content.strip() or content.startswith("#"):
+			print("Edit cancelled")
+			return 0
+
+		try:
+			new_data: Dict[str, Any] = yaml.safe_load(content)
+		except yaml.YAMLError as e:
+			print(f"Error parsing YAML: {e}", file=sys.stderr)
+			return 1
+
+		success: bool = update_card(
+			card.id,
+			question=new_data.get("question"),
+			answer=new_data.get("answer"),
+			topic=new_data.get("topic"),
+			difficulty=new_data.get("difficulty"),
+		)
+	else:
+		# Use command line arguments
+		difficulty: Optional[int] = None
+		if args.difficulty:
+			diff_map: Dict[str, int] = {"easy": 1, "medium": 2, "hard": 3}
+			difficulty = diff_map.get(args.difficulty)
+
+		success = update_card(
+			card.id,
+			question=args.question,
+			answer=args.answer,
+			topic=args.topic,
+			difficulty=difficulty,
+		)
+
+	if success:
+		print(f"Updated card {card.id[:8]}")
+	else:
+		print("No changes made")
+
+	return 0
+
+
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+	"""Build the argument parser."""
+	parser = argparse.ArgumentParser(
+		prog="flashcards",
+		description="Generate and review flashcards from your notes",
+		formatter_class=argparse.RawDescriptionHelpFormatter,
+		epilog="""
+EXAMPLES:
+    # Generate flashcards from notes modified in last 7 days
+    flashcards --generate
+
+    # Generate with 4 parallel workers for speed
+    flashcards --generate --parallel 4
+
+    # Interactive review session (max 20 cards, shuffled)
+    flashcards --review
+
+    # Review only hard cards
+    flashcards --review --difficulty hard --max 10
+
+    # Review cards from the "areas" PARA category only
+    flashcards --review --para areas
+
+    # Review cards from repos/dotfiles path segment
+    flashcards --review --topic repos/dotfiles
+
+    # Combine filters: areas + repos/dotfiles
+    flashcards --review --para areas --topic repos/dotfiles
+
+    # Export all cards as JSON
+    flashcards --export --format json > flashcards_backup.json
+
+    # Pipe note content directly
+    cat mynote.md | flashcards --generate --stdin
+
+    # Edit a card interactively
+    flashcards --edit abc123 --interactive
+
+    # Show statistics
+    flashcards --stats
+
+    # Launch web UI
+    flashcards --serve
+""",
+	)
+
+	# Commands (mutually exclusive actions)
+	commands = parser.add_argument_group("commands")
+	commands.add_argument(
+		"--generate",
+		action="store_true",
+		help="Generate flashcards from recent notes",
+	)
+	commands.add_argument(
+		"--review",
+		action="store_true",
+		help="Interactive flashcard review",
+	)
+	commands.add_argument(
+		"--list",
+		action="store_true",
+		help="List flashcards",
+	)
+	commands.add_argument(
+		"--stats",
+		action="store_true",
+		help="Show statistics",
+	)
+	commands.add_argument(
+		"--export",
+		action="store_true",
+		help="Export flashcards",
+	)
+	commands.add_argument(
+		"--import",
+		dest="import_cards",
+		action="store_true",
+		help="Import flashcards from stdin",
+	)
+	commands.add_argument(
+		"--delete",
+		metavar="TARGET",
+		nargs="?",
+		const="",
+		help="Delete flashcards (note path or card UUID)",
+	)
+	commands.add_argument(
+		"--refresh",
+		action="store_true",
+		help="Regenerate outdated flashcards",
+	)
+	commands.add_argument(
+		"--edit",
+		metavar="CARD_ID",
+		help="Edit a flashcard (UUID, supports partial match)",
+	)
+	commands.add_argument(
+		"--serve",
+		action="store_true",
+		help="Launch the web UI (flashcards-serve)",
+	)
+
+	# Global options
+	parser.add_argument(
+		"--license",
+		action="store_true",
+		help="Show license information (AGPLv3)",
+	)
+
+	# Generate options
+	gen_opts = parser.add_argument_group("generate options")
+	gen_opts.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"Notes modified in last N days (default: {DEFAULT_DAYS})")
+	gen_opts.add_argument("--para", choices=["inbox", "projects", "areas", "resources", "archives"], help="Filter by PARA category (works with --generate and --review)")
+	gen_opts.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL, help=f"Parallel AI workers (default: {DEFAULT_PARALLEL})")
+	gen_opts.add_argument("--cards-per-note", type=int, default=DEFAULT_CARDS_PER_NOTE, help=f"Target cards per note (default: {DEFAULT_CARDS_PER_NOTE})")
+	gen_opts.add_argument("--force", action="store_true", help="Regenerate even if up-to-date")
+	gen_opts.add_argument("--dry-run", action="store_true", help="Show what would be generated")
+	gen_opts.add_argument("--stdin", action="store_true", help="Read note content from stdin")
+	gen_opts.add_argument("--quiet", action="store_true", help="Suppress progress output")
+	gen_opts.add_argument("--verbose", action="store_true", help="Show detailed progress")
+
+	# Review options
+	rev_opts = parser.add_argument_group("review options")
+	rev_opts.add_argument("--max", type=int, default=DEFAULT_MAX_CARDS, help=f"Maximum cards to review (default: {DEFAULT_MAX_CARDS})")
+	rev_opts.add_argument("--difficulty", choices=["easy", "medium", "hard", "all"], default="all", help="Filter by difficulty")
+	rev_opts.add_argument("--topic", help="Filter by path segment (e.g., 'repos/dotfiles' matches paths containing it)")
+	rev_opts.add_argument("--due-only", action="store_true", help="Only show cards due for review")
+	rev_opts.add_argument("--note", help="Filter by exact note path")
+
+	# List/export options
+	list_opts = parser.add_argument_group("list/export options")
+	list_opts.add_argument("--format", choices=["table", "json", "yaml", "csv"], default="table", help="Output format")
+	list_opts.add_argument("--limit", type=int, default=50, help="Maximum cards to list")
+
+	# Delete options
+	del_opts = parser.add_argument_group("delete options")
+	del_opts.add_argument("--delete-all", action="store_true", help="Delete ALL flashcards (dangerous)")
+	del_opts.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+
+	# Edit options
+	edit_opts = parser.add_argument_group("edit options")
+	edit_opts.add_argument("--question", help="New question text")
+	edit_opts.add_argument("--answer", help="New answer text")
+	edit_opts.add_argument("--set-topic", dest="set_topic", help="New topic")
+	edit_opts.add_argument("--set-difficulty", dest="set_difficulty", choices=["easy", "medium", "hard"], help="New difficulty")
+	edit_opts.add_argument("--interactive", "-i", action="store_true", help="Open in $EDITOR as YAML")
+
+	# Serve options
+	serve_opts = parser.add_argument_group("serve options")
+	serve_opts.add_argument("--host", default="127.0.0.1", help="Host for web server (default: 127.0.0.1)")
+	serve_opts.add_argument("--port", type=int, default=5001, help="Port for web server (default: 5001)")
+	serve_opts.add_argument("--debug", action="store_true", help="Enable debug mode for web server")
+
+	return parser
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main() -> int:
+	"""Main entry point."""
+	parser = build_parser()
+	args = parser.parse_args()
+
+	if args.license:
+		print(LICENSE_TEXT)
+		return 0
+
+	if args.serve:
+		# Launch flashcards-serve
+		serve_cmd: List[str] = ["flashcards-serve", "--host", args.host, "--port", str(args.port)]
+		if args.debug:
+			serve_cmd.append("--debug")
+		os.execvp("flashcards-serve", serve_cmd)
+
+	if args.generate:
+		return cmd_generate(args)
+
+	if args.review:
+		return cmd_review(args)
+
+	if args.list:
+		return cmd_list(args)
+
+	if args.stats:
+		return cmd_stats(args)
+
+	if args.export:
+		return cmd_export(args)
+
+	if args.import_cards:
+		return cmd_import(args)
+
+	if args.delete is not None:
+		# Map args for delete command
+		args.target = args.delete if args.delete else None
+		args.all = args.delete_all
+		return cmd_delete(args)
+
+	if args.refresh:
+		return cmd_refresh(args)
+
+	if args.edit:
+		# Map args for edit command
+		args.card_id = args.edit
+		args.topic = args.set_topic
+		args.difficulty = args.set_difficulty
+		return cmd_edit(args)
+
+	parser.print_help()
+	return 0
+
+
+if __name__ == "__main__":
+	sys.exit(main())
