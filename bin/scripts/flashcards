@@ -38,9 +38,11 @@ if not no_dbox_check and ctr_id != "dev":
 
 # Now import everything else inside the dev container
 import argparse
+import curses
 import json
 import random
 import tempfile
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -641,6 +643,348 @@ def cmd_generate(args: argparse.Namespace) -> int:
 	return 0
 
 
+# ============================================================================
+# TUI REVIEW
+# ============================================================================
+
+def tui_review(cards: List[Flashcard], rapid_mode: bool = False) -> Dict[str, int]:
+	"""
+	TUI-based flashcard review using curses.
+
+	Vim-style keybindings:
+		Space/Enter - Flip card / Next card (rapid mode)
+		j/n         - Next card
+		k/p         - Previous card
+		1/2/3       - Rate Easy/Medium/Hard (non-rapid mode)
+		e           - Edit card (opens $EDITOR)
+		s           - Skip card
+		q           - Quit
+		?           - Show help
+
+	Returns dict with review statistics.
+	"""
+	result: Dict[str, int] = {"reviewed": 0, "correct": 0, "skipped": 0, "total": len(cards)}
+
+	def run_tui(stdscr) -> None:
+		# Use default colors (transparent background support)
+		curses.use_default_colors()
+		curses.start_color()
+
+		# Define color pairs with -1 for transparent background
+		curses.init_pair(1, curses.COLOR_CYAN, -1)     # Title/headers
+		curses.init_pair(2, curses.COLOR_GREEN, -1)    # Question
+		curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Answer
+		curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # Status/info
+		curses.init_pair(5, curses.COLOR_RED, -1)      # Alerts
+		curses.init_pair(6, curses.COLOR_WHITE, -1)    # Normal text
+
+		# Hide cursor
+		curses.curs_set(0)
+
+		# Enable keypad mode
+		stdscr.keypad(True)
+
+		current_idx: int = 0
+		show_answer: bool = False
+		show_help: bool = False
+
+		def get_wrapped_lines(text: str, width: int) -> List[str]:
+			"""Wrap text to fit within width."""
+			lines: List[str] = []
+			for paragraph in text.split('\n'):
+				if paragraph.strip():
+					wrapped = textwrap.wrap(paragraph, width=width - 4)
+					lines.extend(wrapped)
+				else:
+					lines.append('')
+			return lines
+
+		def draw_help(height: int, width: int) -> None:
+			"""Draw help overlay."""
+			stdscr.clear()
+			help_text: List[str] = [
+				"FLASHCARD REVIEW - KEYBOARD SHORTCUTS",
+				"",
+				"Navigation:",
+				"  Space/Enter  Flip card / Next (rapid mode)",
+				"  j / n        Next card",
+				"  k / p        Previous card",
+				"",
+				"Actions:",
+				"  e            Edit current card",
+				"  s            Skip card",
+				"  q            Quit review",
+				"  ?            Toggle this help",
+				"",
+			]
+			if not rapid_mode:
+				help_text.extend([
+					"Rating (after flip):",
+					"  1            Easy - Knew it instantly",
+					"  2            Medium - Had to think",
+					"  3            Hard - Struggled or wrong",
+					"",
+				])
+			help_text.append("Press any key to close help...")
+
+			start_y: int = max(0, (height - len(help_text)) // 2)
+			for i, line in enumerate(help_text):
+				y: int = start_y + i
+				if y < height - 1:
+					x: int = max(0, (width - len(line)) // 2)
+					try:
+						if i == 0:
+							stdscr.addstr(y, x, line, curses.color_pair(1) | curses.A_BOLD)
+						else:
+							stdscr.addstr(y, x, line, curses.color_pair(6))
+					except curses.error:
+						pass
+			stdscr.refresh()
+
+		def draw_card() -> None:
+			"""Draw the current flashcard."""
+			stdscr.clear()
+			height, width = stdscr.getmaxyx()
+
+			if current_idx >= len(cards):
+				# Session complete
+				summary: List[str] = [
+					"SESSION COMPLETE",
+					"",
+					f"Cards reviewed: {result['reviewed']}",
+					f"Easy (correct): {result['correct']}",
+					f"Skipped: {result['skipped']}",
+				]
+				if result['reviewed'] > 0:
+					rate: float = result['correct'] / result['reviewed'] * 100
+					summary.append(f"Success rate: {rate:.1f}%")
+				summary.extend(["", "Press q to exit"])
+
+				start_y = max(0, (height - len(summary)) // 2)
+				for i, line in enumerate(summary):
+					y = start_y + i
+					if y < height - 1:
+						x = max(0, (width - len(line)) // 2)
+						try:
+							if i == 0:
+								stdscr.addstr(y, x, line, curses.color_pair(1) | curses.A_BOLD)
+							else:
+								stdscr.addstr(y, x, line, curses.color_pair(6))
+						except curses.error:
+							pass
+				stdscr.refresh()
+				return
+
+			card: Flashcard = cards[current_idx]
+			diff_names: Dict[int, str] = {1: "Easy", 2: "Medium", 3: "Hard"}
+
+			# Header line
+			header: str = f"Card {current_idx + 1}/{len(cards)}"
+			if card.topic:
+				header += f"  │  {card.topic}"
+			header += f"  │  {diff_names.get(card.difficulty, '?')}"
+			mode_str: str = " [RAPID]" if rapid_mode else ""
+			header += mode_str
+
+			try:
+				stdscr.addstr(0, 0, "─" * (width - 1), curses.color_pair(4))
+				stdscr.addstr(1, 2, header, curses.color_pair(1) | curses.A_BOLD)
+				stdscr.addstr(2, 0, "─" * (width - 1), curses.color_pair(4))
+			except curses.error:
+				pass
+
+			# Question section
+			q_start: int = 4
+			try:
+				stdscr.addstr(q_start, 2, "QUESTION:", curses.color_pair(2) | curses.A_BOLD)
+			except curses.error:
+				pass
+
+			q_lines: List[str] = get_wrapped_lines(card.question, width - 6)
+			for i, line in enumerate(q_lines):
+				y: int = q_start + 1 + i
+				if y < height - 10:
+					try:
+						stdscr.addstr(y, 4, line, curses.color_pair(6))
+					except curses.error:
+						pass
+
+			# Answer section (if revealed)
+			a_start: int = q_start + len(q_lines) + 3
+			if show_answer:
+				try:
+					stdscr.addstr(a_start, 2, "ANSWER:", curses.color_pair(3) | curses.A_BOLD)
+				except curses.error:
+					pass
+
+				a_lines: List[str] = get_wrapped_lines(card.answer, width - 6)
+				for i, line in enumerate(a_lines):
+					y = a_start + 1 + i
+					if y < height - 4:
+						try:
+							stdscr.addstr(y, 4, line, curses.color_pair(6))
+						except curses.error:
+							pass
+
+			# Footer with controls
+			footer_y: int = height - 2
+			try:
+				stdscr.addstr(footer_y - 1, 0, "─" * (width - 1), curses.color_pair(4))
+			except curses.error:
+				pass
+
+			if not show_answer:
+				hint: str = "Space: flip  │  j/k: nav  │  s: skip  │  q: quit  │  ?: help"
+			elif rapid_mode:
+				hint = "Space/j: next  │  k: prev  │  e: edit  │  s: skip  │  q: quit"
+			else:
+				hint = "1/2/3: rate  │  j: next  │  k: prev  │  e: edit  │  s: skip  │  q: quit"
+
+			try:
+				stdscr.addstr(footer_y, 2, hint, curses.color_pair(4))
+			except curses.error:
+				pass
+
+			stdscr.refresh()
+
+		# Main loop
+		while True:
+			if show_help:
+				height, width = stdscr.getmaxyx()
+				draw_help(height, width)
+				stdscr.getch()
+				show_help = False
+				continue
+
+			draw_card()
+
+			if current_idx >= len(cards):
+				# Wait for quit on completion screen
+				key = stdscr.getch()
+				if key in (ord('q'), ord('Q')):
+					break
+				continue
+
+			key = stdscr.getch()
+
+			# Help toggle
+			if key == ord('?'):
+				show_help = True
+				continue
+
+			# Quit
+			if key in (ord('q'), ord('Q')):
+				break
+
+			# Navigation
+			if key in (ord('k'), ord('p'), curses.KEY_UP):
+				# Previous card
+				if current_idx > 0:
+					current_idx -= 1
+					show_answer = False
+				continue
+
+			# Skip
+			if key in (ord('s'), ord('S')):
+				result['skipped'] += 1
+				current_idx += 1
+				show_answer = False
+				continue
+
+			# Edit
+			if key in (ord('e'), ord('E')):
+				# Exit curses temporarily to edit
+				curses.endwin()
+				card = cards[current_idx]
+				try:
+					import yaml
+					card_data = {
+						"question": card.question,
+						"answer": card.answer,
+						"topic": card.topic or "",
+						"difficulty": card.difficulty,
+					}
+					with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+						f.write("# Edit flashcard - save and close to apply\n\n")
+						yaml.dump(card_data, f, default_flow_style=False)
+						temp_path = f.name
+
+					editor = os.environ.get("EDITOR", "vim")
+					subprocess.run([editor, temp_path])
+
+					with open(temp_path, 'r') as f:
+						content = f.read()
+					os.unlink(temp_path)
+
+					if content.strip() and not content.strip().startswith('#'):
+						new_data = yaml.safe_load(content)
+						update_card(
+							card.id,
+							question=new_data.get("question"),
+							answer=new_data.get("answer"),
+							topic=new_data.get("topic"),
+							difficulty=new_data.get("difficulty"),
+						)
+						# Refresh the card data
+						updated = get_card_by_id(card.id)
+						if updated:
+							cards[current_idx] = updated
+				except Exception as e:
+					print(f"Edit error: {e}", file=sys.stderr)
+
+				# Re-initialize curses
+				stdscr = curses.initscr()
+				curses.noecho()
+				curses.cbreak()
+				stdscr.keypad(True)
+				curses.use_default_colors()
+				curses.start_color()
+				curses.init_pair(1, curses.COLOR_CYAN, -1)
+				curses.init_pair(2, curses.COLOR_GREEN, -1)
+				curses.init_pair(3, curses.COLOR_YELLOW, -1)
+				curses.init_pair(4, curses.COLOR_MAGENTA, -1)
+				curses.init_pair(5, curses.COLOR_RED, -1)
+				curses.init_pair(6, curses.COLOR_WHITE, -1)
+				curses.curs_set(0)
+				continue
+
+			# Flip / Next
+			if key in (ord(' '), ord('\n'), curses.KEY_ENTER, 10, 13):
+				if not show_answer:
+					show_answer = True
+				elif rapid_mode:
+					# In rapid mode, space advances without rating
+					current_idx += 1
+					show_answer = False
+				continue
+
+			if key in (ord('j'), ord('n'), curses.KEY_DOWN):
+				if show_answer:
+					if rapid_mode:
+						current_idx += 1
+						show_answer = False
+					# In non-rapid mode, must rate first
+				elif not show_answer:
+					show_answer = True
+				continue
+
+			# Rating (only in non-rapid mode, after answer shown)
+			if not rapid_mode and show_answer:
+				if key in (ord('1'), ord('2'), ord('3')):
+					rating = key - ord('0')
+					update_card_after_review(cards[current_idx].id, rating)
+					result['reviewed'] += 1
+					if rating == 1:
+						result['correct'] += 1
+					current_idx += 1
+					show_answer = False
+					continue
+
+	# Run the curses application
+	curses.wrapper(run_tui)
+	return result
+
+
 def cmd_review(args: argparse.Namespace) -> int:
 	"""Interactive flashcard review session."""
 	# Map difficulty string to int
@@ -649,6 +993,12 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 	# Get para from args (may be None)
 	para: Optional[str] = getattr(args, "para", None)
+
+	# Check for rapid/no-rate mode
+	rapid_mode: bool = getattr(args, "rapid", False) or getattr(args, "no_rate", False)
+
+	# Check for TUI mode
+	use_tui: bool = getattr(args, "tui", False)
 
 	cards: List[Flashcard] = get_review_cards(
 		max_cards=args.max,
@@ -663,9 +1013,20 @@ def cmd_review(args: argparse.Namespace) -> int:
 		print("No flashcards found matching criteria")
 		return 0
 
+	# Use TUI if requested
+	if use_tui:
+		result: Dict[str, int] = tui_review(cards, rapid_mode=rapid_mode)
+		# Print summary after TUI exits (for logging/scripting)
+		if not rapid_mode:
+			print(f"Reviewed: {result['reviewed']}, Correct: {result['correct']}, Skipped: {result['skipped']}")
+		return 0
+
+	# Standard terminal review
 	print(f"\n{'='*60}")
 	print(f"  FLASHCARD REVIEW SESSION")
 	print(f"  {len(cards)} cards to review")
+	if rapid_mode:
+		print(f"  Mode: RAPID (no rating)")
 	print(f"{'='*60}\n")
 
 	reviewed: int = 0
@@ -690,6 +1051,25 @@ def cmd_review(args: argparse.Namespace) -> int:
 			break
 
 		print(f"\n  A: {card.answer}\n")
+
+		if rapid_mode:
+			# In rapid mode, just continue to next card
+			print(f"{'-'*60}")
+			print("  [n] Next  |  [s] Skip  |  [q] Quit")
+			try:
+				response: str = input("\n  > ").strip().lower()
+			except (KeyboardInterrupt, EOFError):
+				response = "q"
+
+			if response == "q":
+				print("\nEnding session...")
+				break
+			elif response == "s":
+				skipped += 1
+			# Any other input (including empty/n) continues
+			continue
+
+		# Standard rating mode
 		print(f"{'-'*60}")
 		print("  Rate your recall:")
 		print("    [1] Easy - Knew it instantly")
@@ -700,7 +1080,7 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 		while True:
 			try:
-				response: str = input("\n  Your rating: ").strip().lower()
+				response = input("\n  Your rating: ").strip().lower()
 			except (KeyboardInterrupt, EOFError):
 				response = "q"
 
@@ -727,10 +1107,11 @@ def cmd_review(args: argparse.Namespace) -> int:
 	print(f"\n{'='*60}")
 	print(f"  SESSION COMPLETE")
 	print(f"{'='*60}")
-	print(f"  Cards reviewed: {reviewed}")
-	print(f"  Easy (correct): {correct}")
+	if not rapid_mode:
+		print(f"  Cards reviewed: {reviewed}")
+		print(f"  Easy (correct): {correct}")
 	print(f"  Skipped: {skipped}")
-	if reviewed > 0:
+	if reviewed > 0 and not rapid_mode:
 		print(f"  Success rate: {correct/reviewed*100:.1f}%")
 	print(f"{'='*60}\n")
 
@@ -1154,6 +1535,13 @@ EXAMPLES:
     # Combine filters: areas + repos/dotfiles
     flashcards --review --para areas --topic repos/dotfiles
 
+    # TUI mode with vim-style navigation (j/k, space, 1/2/3)
+    flashcards --review --tui
+
+    # Rapid review (no rating, just flip through cards)
+    flashcards --review --rapid
+    flashcards --review --tui --rapid
+
     # Export all cards as JSON
     flashcards --export --format json > flashcards_backup.json
 
@@ -1253,6 +1641,9 @@ EXAMPLES:
 	rev_opts.add_argument("--topic", help="Filter by path segment (e.g., 'repos/dotfiles' matches paths containing it)")
 	rev_opts.add_argument("--due-only", action="store_true", help="Only show cards due for review")
 	rev_opts.add_argument("--note", help="Filter by exact note path")
+	rev_opts.add_argument("--tui", action="store_true", help="Use TUI interface with vim-style navigation")
+	rev_opts.add_argument("--rapid", action="store_true", help="Rapid review mode (no rating, just flip through)")
+	rev_opts.add_argument("--no-rate", dest="no_rate", action="store_true", help="Same as --rapid (no rating)")
 
 	# List/export options
 	list_opts = parser.add_argument_group("list/export options")
