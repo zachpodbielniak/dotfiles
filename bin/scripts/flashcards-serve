@@ -514,6 +514,554 @@ async def run_flashcards_command(args: List[str], timeout: int = 120) -> Dict[st
 
 
 # ============================================================================
+# MCP SERVER
+# ============================================================================
+
+def create_mcp_server(host: str = "127.0.0.1", port: int = 5003):
+	"""
+	Create and configure the MCP server for flashcards.
+
+	Args:
+		host: Host to bind to (for HTTP transport)
+		port: Port to bind to (for HTTP transport)
+
+	Provides tools for:
+	- Listing and searching flashcards
+	- Getting flashcard details
+	- Creating flashcards (manual and AI-generated)
+	- Updating flashcards
+	- Deleting flashcards
+	- Getting statistics
+	- Recording review ratings
+	"""
+	try:
+		from mcp.server.fastmcp import FastMCP
+	except ImportError:
+		print("Error: mcp package required for MCP server.", file=sys.stderr)
+		print("Install with: pip install 'mcp[cli]'", file=sys.stderr)
+		sys.exit(1)
+
+	mcp = FastMCP("flashcards", json_response=True, host=host, port=port)
+
+	@mcp.tool()
+	def list_flashcards(
+		limit: int = 50,
+		offset: int = 0,
+		topic: str = "",
+		difficulty: str = "",
+		note_path: str = "",
+		due_only: bool = False,
+	) -> dict:
+		"""
+		List flashcards with optional filters.
+
+		Args:
+			limit: Maximum number of cards to return (default: 50, max: 500)
+			offset: Number of cards to skip for pagination (default: 0)
+			topic: Filter by topic (partial match)
+			difficulty: Filter by difficulty: 'easy', 'medium', 'hard', or '' for all
+			note_path: Filter by note path (partial match)
+			due_only: Only return cards due for review
+
+		Returns:
+			Dictionary with 'cards' list and 'total' count
+		"""
+		limit = min(limit, 500)
+		diff_map = {"easy": 1, "medium": 2, "hard": 3, "": None}
+		diff_int = diff_map.get(difficulty.lower(), None)
+
+		cards = db_get_cards(
+			limit=limit,
+			offset=offset,
+			topic=topic if topic else None,
+			difficulty=diff_int,
+			note_path=note_path if note_path else None,
+			due_only=due_only,
+		)
+
+		# Convert datetime objects to ISO strings
+		for card in cards:
+			for key in ["last_reviewed", "next_review", "note_mtime", "created_at", "updated_at"]:
+				if card.get(key):
+					card[key] = card[key].isoformat()
+
+		return {"cards": cards, "count": len(cards)}
+
+	@mcp.tool()
+	def get_flashcard(card_id: str) -> dict:
+		"""
+		Get a single flashcard by ID.
+
+		Args:
+			card_id: UUID of the flashcard (supports partial match, minimum 8 characters)
+
+		Returns:
+			Flashcard details or error message
+		"""
+		if len(card_id) < 8:
+			return {"error": "card_id must be at least 8 characters"}
+
+		card = db_get_card(card_id)
+		if not card:
+			return {"error": f"Flashcard not found: {card_id}"}
+
+		# Convert datetime objects
+		for key in ["last_reviewed", "next_review", "note_mtime", "created_at", "updated_at"]:
+			if card.get(key):
+				card[key] = card[key].isoformat()
+
+		return card
+
+	@mcp.tool()
+	def create_flashcard(
+		question: str,
+		answer: str,
+		note_path: str = "manual",
+		topic: str = "",
+		difficulty: int = 2,
+	) -> dict:
+		"""
+		Create a single flashcard manually.
+
+		Args:
+			question: The question text
+			answer: The answer text
+			note_path: Source note path (default: 'manual' for manually created)
+			topic: Optional topic/category
+			difficulty: Initial difficulty 1=easy, 2=medium, 3=hard (default: 2)
+
+		Returns:
+			Created flashcard details with ID
+		"""
+		if not question.strip():
+			return {"error": "Question cannot be empty"}
+		if not answer.strip():
+			return {"error": "Answer cannot be empty"}
+		if difficulty not in [1, 2, 3]:
+			return {"error": "Difficulty must be 1, 2, or 3"}
+
+		cards = [{
+			"question": question.strip(),
+			"answer": answer.strip(),
+			"topic": topic.strip() if topic else None,
+		}]
+
+		count = db_insert_cards(
+			cards=cards,
+			note_path=note_path,
+			note_uuid=None,
+			note_mtime=datetime.now(),
+		)
+
+		if count > 0:
+			# Fetch the created card to return it
+			result = db_get_cards(limit=1, note_path=note_path)
+			if result:
+				card = result[0]
+				for key in ["last_reviewed", "next_review", "note_mtime", "created_at", "updated_at"]:
+					if card.get(key):
+						card[key] = card[key].isoformat()
+				return {"created": True, "card": card}
+
+		return {"error": "Failed to create flashcard"}
+
+	@mcp.tool()
+	def generate_flashcards_from_content(
+		content: str,
+		source_name: str = "mcp-input",
+		cards_per_note: int = 5,
+	) -> dict:
+		"""
+		Generate flashcards from text content using AI.
+
+		Args:
+			content: The text content to generate flashcards from
+			source_name: Name to identify the source (default: 'mcp-input')
+			cards_per_note: Target number of cards to generate (default: 5)
+
+		Returns:
+			Dictionary with generated cards or error
+		"""
+		if not content.strip():
+			return {"error": "Content cannot be empty"}
+
+		if len(content) < 50:
+			return {"error": "Content too short (minimum 50 characters)"}
+
+		import subprocess as sp
+
+		# Call flashcards CLI to generate from stdin
+		try:
+			result = sp.run(
+				["flashcards", "--generate", "--stdin", "--cards-per-note", str(cards_per_note)],
+				input=content,
+				capture_output=True,
+				text=True,
+				timeout=120,
+				env={**os.environ, "NO_DBOX_CHECK": "1"},
+			)
+
+			if result.returncode != 0:
+				return {"error": f"Generation failed: {result.stderr}"}
+
+			# Parse the JSON output
+			try:
+				data = json.loads(result.stdout)
+				cards = data.get("flashcards", [])
+
+				# Insert the cards
+				if cards:
+					count = db_insert_cards(
+						cards=cards,
+						note_path=source_name,
+						note_uuid=None,
+						note_mtime=datetime.now(),
+					)
+					return {"generated": count, "cards": cards}
+				else:
+					return {"error": "No cards generated from content"}
+
+			except json.JSONDecodeError:
+				return {"error": "Failed to parse generated cards"}
+
+		except sp.TimeoutExpired:
+			return {"error": "Generation timed out"}
+		except Exception as e:
+			return {"error": f"Generation error: {str(e)}"}
+
+	@mcp.tool()
+	def update_flashcard(
+		card_id: str,
+		question: str = "",
+		answer: str = "",
+		topic: str = "",
+		difficulty: int = 0,
+	) -> dict:
+		"""
+		Update an existing flashcard.
+
+		Args:
+			card_id: UUID of the flashcard to update (minimum 8 characters)
+			question: New question text (empty string = no change)
+			answer: New answer text (empty string = no change)
+			topic: New topic (empty string = no change)
+			difficulty: New difficulty 1-3 (0 = no change)
+
+		Returns:
+			Updated flashcard or error
+		"""
+		if len(card_id) < 8:
+			return {"error": "card_id must be at least 8 characters"}
+
+		# Check card exists
+		existing = db_get_card(card_id)
+		if not existing:
+			return {"error": f"Flashcard not found: {card_id}"}
+
+		updates = {}
+		if question.strip():
+			updates["question"] = question.strip()
+		if answer.strip():
+			updates["answer"] = answer.strip()
+		if topic.strip():
+			updates["topic"] = topic.strip()
+		if difficulty in [1, 2, 3]:
+			updates["difficulty"] = difficulty
+
+		if not updates:
+			return {"error": "No valid updates provided"}
+
+		success = db_update_card(card_id, updates)
+		if success:
+			updated = db_get_card(card_id)
+			for key in ["last_reviewed", "next_review", "note_mtime", "created_at", "updated_at"]:
+				if updated.get(key):
+					updated[key] = updated[key].isoformat()
+			return {"updated": True, "card": updated}
+
+		return {"error": "Failed to update flashcard"}
+
+	@mcp.tool()
+	def delete_flashcard(card_id: str, confirm: bool = False) -> dict:
+		"""
+		Delete a flashcard.
+
+		Args:
+			card_id: UUID of the flashcard to delete (minimum 8 characters)
+			confirm: Must be True to actually delete (safety check)
+
+		Returns:
+			Deletion result
+		"""
+		if not confirm:
+			return {"error": "Set confirm=True to delete the flashcard"}
+
+		if len(card_id) < 8:
+			return {"error": "card_id must be at least 8 characters"}
+
+		# Check card exists
+		existing = db_get_card(card_id)
+		if not existing:
+			return {"error": f"Flashcard not found: {card_id}"}
+
+		success = db_delete_card(card_id)
+		if success:
+			return {"deleted": True, "card_id": existing["id"]}
+
+		return {"error": "Failed to delete flashcard"}
+
+	@mcp.tool()
+	def delete_flashcards_by_note(note_path: str, confirm: bool = False) -> dict:
+		"""
+		Delete all flashcards for a specific note.
+
+		Args:
+			note_path: The note path to delete cards for
+			confirm: Must be True to actually delete (safety check)
+
+		Returns:
+			Deletion result with count
+		"""
+		if not confirm:
+			return {"error": "Set confirm=True to delete flashcards"}
+
+		if not note_path.strip():
+			return {"error": "note_path cannot be empty"}
+
+		# Get cards to delete
+		cards = db_get_cards(limit=1000, note_path=note_path)
+		if not cards:
+			return {"error": f"No flashcards found for note: {note_path}"}
+
+		card_ids = [c["id"] for c in cards]
+		count = db_delete_cards_bulk(card_ids)
+
+		return {"deleted": count, "note_path": note_path}
+
+	@mcp.tool()
+	def get_flashcard_stats() -> dict:
+		"""
+		Get flashcard statistics.
+
+		Returns:
+			Dictionary with total cards, difficulty breakdown, due counts, etc.
+		"""
+		stats = db_get_stats()
+
+		# Map difficulty numbers to names
+		diff_names = {1: "easy", 2: "medium", 3: "hard"}
+		by_difficulty = {}
+		for diff, count in stats.get("by_difficulty", {}).items():
+			name = diff_names.get(diff, f"unknown_{diff}")
+			by_difficulty[name] = count
+
+		return {
+			"total_cards": stats.get("total_cards", 0),
+			"notes_with_cards": stats.get("notes_with_cards", 0),
+			"avg_cards_per_note": stats.get("avg_cards_per_note", 0),
+			"due_for_review": stats.get("due_for_review", 0),
+			"total_reviews": stats.get("total_reviews", 0),
+			"by_difficulty": by_difficulty,
+		}
+
+	@mcp.tool()
+	def review_flashcard(card_id: str, rating: int) -> dict:
+		"""
+		Record a review rating for a flashcard.
+
+		This updates the card's review statistics and calculates the next review date
+		based on spaced repetition algorithms.
+
+		Args:
+			card_id: UUID of the flashcard (minimum 8 characters)
+			rating: Review rating: 1=easy (knew instantly), 2=medium (had to think), 3=hard (struggled)
+
+		Returns:
+			Updated card with new next_review date
+		"""
+		if len(card_id) < 8:
+			return {"error": "card_id must be at least 8 characters"}
+
+		if rating not in [1, 2, 3]:
+			return {"error": "Rating must be 1 (easy), 2 (medium), or 3 (hard)"}
+
+		# Check card exists
+		existing = db_get_card(card_id)
+		if not existing:
+			return {"error": f"Flashcard not found: {card_id}"}
+
+		db_update_after_review(card_id, rating)
+
+		# Return updated card
+		updated = db_get_card(card_id)
+		for key in ["last_reviewed", "next_review", "note_mtime", "created_at", "updated_at"]:
+			if updated.get(key):
+				updated[key] = updated[key].isoformat()
+
+		rating_names = {1: "easy", 2: "medium", 3: "hard"}
+		return {
+			"reviewed": True,
+			"rating": rating_names[rating],
+			"card": updated,
+		}
+
+	@mcp.tool()
+	def get_review_session(
+		max_cards: int = 20,
+		difficulty: str = "",
+		topic: str = "",
+		para: str = "",
+		due_only: bool = False,
+	) -> dict:
+		"""
+		Get a set of flashcards for a review session.
+
+		Args:
+			max_cards: Maximum cards to include (default: 20)
+			difficulty: Filter by difficulty: 'easy', 'medium', 'hard', or '' for all
+			topic: Filter by path segment (e.g., 'repos/dotfiles')
+			para: Filter by PARA category: 'inbox', 'projects', 'areas', 'resources', 'archives'
+			due_only: Only include cards due for review
+
+		Returns:
+			Dictionary with shuffled cards for review
+		"""
+		max_cards = min(max_cards, 100)
+		diff_map = {"easy": 1, "medium": 2, "hard": 3, "": None}
+		diff_int = diff_map.get(difficulty.lower(), None)
+
+		para_map = {
+			"inbox": "00_inbox",
+			"projects": "01_projects",
+			"areas": "02_areas",
+			"resources": "03_resources",
+			"archives": "04_archives",
+		}
+		para_prefix = para_map.get(para.lower(), "") if para else ""
+
+		cards = db_get_review_cards(
+			max_cards=max_cards * 2,  # Get extra for filtering
+			difficulty=diff_int,
+			topic=topic if topic else None,
+			due_only=due_only,
+		)
+
+		# Apply para filter
+		if para_prefix:
+			cards = [c for c in cards if c.get("note_path", "").startswith(para_prefix + "/")]
+
+		# Apply topic path filter
+		if topic:
+			cards = [c for c in cards if f"/{topic}/" in c.get("note_path", "")]
+
+		# Shuffle and limit
+		random.shuffle(cards)
+		cards = cards[:max_cards]
+
+		# Convert datetime objects
+		for card in cards:
+			for key in ["last_reviewed", "next_review", "note_mtime", "created_at", "updated_at"]:
+				if card.get(key):
+					card[key] = card[key].isoformat()
+
+		return {
+			"session_cards": cards,
+			"count": len(cards),
+			"filters": {
+				"difficulty": difficulty or "all",
+				"topic": topic or "all",
+				"para": para or "all",
+				"due_only": due_only,
+			}
+		}
+
+	@mcp.tool()
+	def search_flashcards(query: str, limit: int = 20) -> dict:
+		"""
+		Search flashcards by question or answer text.
+
+		Args:
+			query: Search query (searches in question and answer fields)
+			limit: Maximum results (default: 20, max: 100)
+
+		Returns:
+			Matching flashcards
+		"""
+		if not query.strip():
+			return {"error": "Search query cannot be empty"}
+
+		limit = min(limit, 100)
+
+		# Search in database
+		conditions = []
+		params = []
+
+		conditions.append("(question ILIKE %s OR answer ILIKE %s)")
+		params.extend([f"%{query}%", f"%{query}%"])
+
+		where_clause = "WHERE " + " AND ".join(conditions)
+
+		query_sql = f"""
+			SELECT id::text, note_path, question, answer, topic, difficulty,
+				   times_reviewed, last_reviewed, next_review
+			FROM flashcards
+			{where_clause}
+			ORDER BY updated_at DESC
+			LIMIT %s
+		"""
+		params.append(limit)
+
+		cards = []
+		with get_flashcards_connection() as conn:
+			with conn.cursor(cursor_factory=RealDictCursor) as cur:
+				cur.execute(query_sql, params)
+				cards = [dict(row) for row in cur.fetchall()]
+
+		# Convert datetime objects
+		for card in cards:
+			for key in ["last_reviewed", "next_review"]:
+				if card.get(key):
+					card[key] = card[key].isoformat()
+
+		return {"results": cards, "count": len(cards), "query": query}
+
+	return mcp
+
+
+def run_mcp_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 5003) -> int:
+	"""
+	Run the MCP server.
+
+	Args:
+		transport: Transport type - 'stdio' or 'streamable-http'
+		host: Host to bind to (for HTTP transport)
+		port: Port to bind to (for HTTP transport)
+	"""
+	# Check database first
+	try:
+		conn = get_flashcards_connection()
+		conn.close()
+	except Exception as e:
+		print(f"Error: Could not connect to flashcards database: {e}", file=sys.stderr)
+		print("Make sure to run: local_postgres init-flashcards", file=sys.stderr)
+		return 1
+
+	# Create MCP server with host/port configured (used by HTTP transport)
+	mcp = create_mcp_server(host=host, port=port)
+
+	if transport == "stdio":
+		mcp.run(transport="stdio")
+	elif transport in ("http", "streamable-http"):
+		print(f"Starting MCP server (HTTP) on http://{host}:{port}", file=sys.stderr)
+		mcp.run(transport="streamable-http")
+	else:
+		print(f"Error: Unknown transport: {transport}", file=sys.stderr)
+		return 1
+
+	return 0
+
+
+# ============================================================================
 # TEMPLATES: SHARED CSS
 # ============================================================================
 
@@ -2210,11 +2758,13 @@ def parse_arguments() -> argparse.Namespace:
 	"""Parse command line arguments."""
 	parser = argparse.ArgumentParser(
 		prog="flashcards-serve",
-		description="Web UI for flashcard review and administration",
+		description="Web UI and MCP server for flashcard review and administration",
 	)
 	parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
 	parser.add_argument("--port", type=int, default=5003, help="Port to bind to (default: 5003)")
 	parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+	parser.add_argument("--mcp", action="store_true", help="Run as MCP server (stdio transport)")
+	parser.add_argument("--mcp-http", action="store_true", help="Run as MCP server (HTTP transport, uses --host/--port)")
 	return parser.parse_args()
 
 
@@ -2230,7 +2780,7 @@ async def check_db_available() -> bool:
 
 
 async def main() -> int:
-	"""Main entry point."""
+	"""Main entry point for web UI server."""
 	args = parse_arguments()
 
 	if not await check_db_available():
@@ -2247,4 +2797,13 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-	sys.exit(asyncio.run(main()))
+	args = parse_arguments()
+
+	# MCP server mode - runs its own event loop, so handle before asyncio.run()
+	if args.mcp:
+		sys.exit(run_mcp_server(transport="stdio"))
+	elif args.mcp_http:
+		sys.exit(run_mcp_server(transport="http", host=args.host, port=args.port))
+	else:
+		# Web UI server
+		sys.exit(asyncio.run(main()))
