@@ -1,0 +1,266 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Default values
+CLOUDFLARE_CREDENTIALS="${CLOUDFLARE_CREDENTIALS:-${HOME}/.config/cloudflare/credentials.ini}"
+CERTBOT_IMAGE="docker.io/certbot/dns-cloudflare:latest"
+CERTBOT_DATA_DIR="${HOME}/.local/share/certbot"
+OUTPUT_DIR=""
+DOMAINS=()
+DRY_RUN=false
+RENEW=false
+EMAIL="${CERTBOT_EMAIL:-}"
+
+usage () {
+    cat <<EOF
+certbot_helper - Generate Let's Encrypt certificates using Cloudflare DNS
+
+USAGE:
+    certbot_helper [OPTIONS] -d <domain> [-d <domain>...]
+
+OPTIONS:
+    -d, --domain <domain>       Domain to include in certificate (can be repeated)
+                                Use '*.domain.com' for wildcard certs
+    -e, --email <email>         Email for Let's Encrypt notifications
+                                (or set CERTBOT_EMAIL env var)
+    -c, --credentials <file>    Cloudflare credentials file
+                                (default: ~/.config/cloudflare/credentials.ini)
+    -o, --output <dir>          Output directory for certificates
+    --nginx-private             Output to nginx-private ssl directory
+                                (~/.config/nginx-private/ssl/)
+    --renew                     Renew existing certificates
+    --dry-run                   Test without actually obtaining certificates
+    -h, --help                  Show this help message
+
+CLOUDFLARE CREDENTIALS FILE FORMAT:
+    dns_cloudflare_api_token = <your-api-token>
+
+EXAMPLES:
+    # Generate wildcard cert for podbielniak.com
+    certbot_helper -d podbielniak.com -d '*.podbielniak.com' -e you@example.com
+
+    # Generate cert and output to nginx-private
+    certbot_helper --nginx-private -d localhost.podbielniak.com
+
+    # Renew all certificates
+    certbot_helper --renew
+
+LICENSE:
+    AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
+EOF
+}
+
+parse_args () {
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -d|--domain)
+                if [[ -z "${2:-}" ]]
+                then
+                    echo "Error: --domain requires a value" >&2
+                    exit 1
+                fi
+                DOMAINS+=("${2}")
+                shift 2
+                ;;
+            -e|--email)
+                if [[ -z "${2:-}" ]]
+                then
+                    echo "Error: --email requires a value" >&2
+                    exit 1
+                fi
+                EMAIL="${2}"
+                shift 2
+                ;;
+            -c|--credentials)
+                if [[ -z "${2:-}" ]]
+                then
+                    echo "Error: --credentials requires a value" >&2
+                    exit 1
+                fi
+                CLOUDFLARE_CREDENTIALS="${2}"
+                shift 2
+                ;;
+            -o|--output)
+                if [[ -z "${2:-}" ]]
+                then
+                    echo "Error: --output requires a value" >&2
+                    exit 1
+                fi
+                OUTPUT_DIR="${2}"
+                shift 2
+                ;;
+            --nginx-private)
+                OUTPUT_DIR="${HOME}/.config/nginx-private/ssl"
+                shift
+                ;;
+            --renew)
+                RENEW=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --license)
+                echo "AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html"
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option: ${1}" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+validate_args () {
+    # Check credentials file
+    if [[ ! -f "${CLOUDFLARE_CREDENTIALS}" ]]
+    then
+        echo "Error: Cloudflare credentials file not found: ${CLOUDFLARE_CREDENTIALS}" >&2
+        echo "Create it with:" >&2
+        echo "  mkdir -p ~/.config/cloudflare" >&2
+        echo "  echo 'dns_cloudflare_api_token = <your-token>' > ~/.config/cloudflare/credentials.ini" >&2
+        echo "  chmod 600 ~/.config/cloudflare/credentials.ini" >&2
+        exit 1
+    fi
+
+    # For non-renew operations, require domains and email
+    if [[ "${RENEW}" == "false" ]]
+    then
+        if [[ ${#DOMAINS[@]} -eq 0 ]]
+        then
+            echo "Error: At least one domain is required (-d)" >&2
+            exit 1
+        fi
+
+        if [[ -z "${EMAIL}" ]]
+        then
+            echo "Error: Email is required (-e or CERTBOT_EMAIL env var)" >&2
+            exit 1
+        fi
+    fi
+}
+
+setup_dirs () {
+    mkdir -p "${CERTBOT_DATA_DIR}/etc"
+    mkdir -p "${CERTBOT_DATA_DIR}/var"
+    mkdir -p "${CERTBOT_DATA_DIR}/log"
+
+    if [[ -n "${OUTPUT_DIR}" ]]
+    then
+        mkdir -p "${OUTPUT_DIR}"
+    fi
+}
+
+run_certbot () {
+    local certbot_args=()
+
+    if [[ "${RENEW}" == "true" ]]
+    then
+        certbot_args+=("renew")
+    else
+        certbot_args+=("certonly")
+        certbot_args+=("--dns-cloudflare")
+        certbot_args+=("--dns-cloudflare-credentials" "/etc/cloudflare/credentials.ini")
+        certbot_args+=("--dns-cloudflare-propagation-seconds" "30")
+        certbot_args+=("--email" "${EMAIL}")
+        certbot_args+=("--agree-tos")
+        certbot_args+=("--non-interactive")
+
+        for domain in "${DOMAINS[@]}"
+        do
+            certbot_args+=("-d" "${domain}")
+        done
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        certbot_args+=("--dry-run")
+    fi
+
+    echo "Running certbot with: ${certbot_args[*]}"
+
+    podman run --rm \
+        -v "${CERTBOT_DATA_DIR}/etc:/etc/letsencrypt:z" \
+        -v "${CERTBOT_DATA_DIR}/var:/var/lib/letsencrypt:z" \
+        -v "${CERTBOT_DATA_DIR}/log:/var/log/letsencrypt:z" \
+        -v "$(dirname "${CLOUDFLARE_CREDENTIALS}"):/etc/cloudflare:z,ro" \
+        "${CERTBOT_IMAGE}" \
+        "${certbot_args[@]}"
+}
+
+copy_certs () {
+    if [[ -z "${OUTPUT_DIR}" ]]
+    then
+        echo ""
+        echo "Certificates stored in: ${CERTBOT_DATA_DIR}/etc/live/"
+        return
+    fi
+
+    # Find the cert directory (use first domain as cert name)
+    local cert_name="${DOMAINS[0]}"
+    local cert_dir="${CERTBOT_DATA_DIR}/etc/live/${cert_name}"
+
+    if [[ ! -d "${cert_dir}" ]]
+    then
+        echo "Error: Certificate directory not found: ${cert_dir}" >&2
+        echo "Available certificates:" >&2
+        ls -la "${CERTBOT_DATA_DIR}/etc/live/" 2>/dev/null || echo "  (none)" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "Copying certificates to ${OUTPUT_DIR}..."
+
+    # Copy and rename to match nginx-private expected names
+    cp -L "${cert_dir}/fullchain.pem" "${OUTPUT_DIR}/private.crt"
+    cp -L "${cert_dir}/privkey.pem" "${OUTPUT_DIR}/private.key"
+
+    # Set permissions
+    chmod 600 "${OUTPUT_DIR}/private.key"
+    chmod 644 "${OUTPUT_DIR}/private.crt"
+
+    echo "Certificates copied:"
+    echo "  ${OUTPUT_DIR}/private.crt (fullchain)"
+    echo "  ${OUTPUT_DIR}/private.key (private key)"
+}
+
+main () {
+    parse_args "$@"
+    validate_args
+    setup_dirs
+    run_certbot
+
+    if [[ "${RENEW}" == "false" ]] && [[ "${DRY_RUN}" == "false" ]] && [[ -n "${OUTPUT_DIR}" ]]
+    then
+        copy_certs
+    fi
+
+    echo ""
+    echo "Done!"
+}
+
+main "$@"

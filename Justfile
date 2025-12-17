@@ -105,11 +105,69 @@ tree branch="" parent="master":
 
 # remove git-worktree and optionally delete branch with it
 rm_tree branch="" rm_branch="false":
-    #!/usr/bin/env bash 
-    set -euo pipefail 
-    
+    #!/usr/bin/env bash
+    set -euo pipefail
+
     git worktree remove "./trees/{{branch}}"
     if [[ "true" == "{{rm_branch}}" ]]
-    then 
+    then
         git branch -D "{{branch}}"
     fi
+
+
+# generate self-signed SSL certificate for nginx-private (for testing)
+# for production, use: certbot_helper --nginx-private -d localhost.podbielniak.com
+generate-nginx-private-ssl-selfsigned:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    ssl_dir="${HOME}/.config/nginx-private/ssl"
+    mkdir -p "${ssl_dir}"
+
+    # Get tailscale IP if available
+    tailscale_ip=""
+    if command -v tailscale &>/dev/null
+    then
+        tailscale_ip=$(tailscale ip -4 2>/dev/null || true)
+    fi
+
+    # Build SAN extension
+    san="DNS:localhost,DNS:localhost.podbielniak.com,IP:127.0.0.1"
+    if [[ -n "${tailscale_ip}" ]]
+    then
+        san="${san},IP:${tailscale_ip}"
+        echo "Including tailscale IP: ${tailscale_ip}"
+    fi
+
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "${ssl_dir}/private.key" \
+        -out "${ssl_dir}/private.crt" \
+        -subj "/CN=localhost.podbielniak.com" \
+        -addext "subjectAltName=${san}"
+
+    chmod 600 "${ssl_dir}/private.key"
+    chmod 644 "${ssl_dir}/private.crt"
+
+    echo "Self-signed SSL certificate generated at ${ssl_dir}"
+    echo "Valid for 10 years"
+
+
+# generate Let's Encrypt SSL certificate for nginx-private via certbot
+generate-nginx-private-ssl email="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    email_arg=""
+    if [[ -n "{{email}}" ]]
+    then
+        email_arg="-e {{email}}"
+    elif [[ -n "${CERTBOT_EMAIL:-}" ]]
+    then
+        email_arg="-e ${CERTBOT_EMAIL}"
+    else
+        echo "Error: Email required. Use 'just generate-nginx-private-ssl email@example.com'"
+        echo "       or set CERTBOT_EMAIL environment variable"
+        exit 1
+    fi
+
+    certbot_helper --nginx-private -d localhost.podbielniak.com ${email_arg}
