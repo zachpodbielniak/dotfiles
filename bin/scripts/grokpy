@@ -29,8 +29,12 @@ import base64
 import mimetypes
 import time
 import select
+import asyncio
 from datetime import datetime
 from pathlib import Path
+
+# Voice API support - import websockets only when needed (inside voice functions)
+# to avoid dependency issues when running outside the dev container
 
 
 ctr_id: str|None = ""
@@ -103,6 +107,29 @@ parser.add_argument("--enhance-emojis", action="store_true",
                     help="Post-process the response to add appropriate emojis using a secondary AI call.")
 parser.add_argument("--show-limits", action="store_true",
                     help="Display token limits for all available models and exit")
+
+# Voice options group
+voice_group = parser.add_argument_group("Voice Options (Grok Voice Agent API)")
+voice_group.add_argument("--voice-in", nargs="?", const="-", metavar="FILE",
+    help="Enable voice input. No argument = record from microphone, FILE = read from audio file")
+voice_group.add_argument("--voice-out", nargs="?", const="-", metavar="FILE",
+    help="Enable voice output. No argument = play through speakers, FILE = save to audio file")
+voice_group.add_argument("--voice-format", choices=["pcm", "pcmu", "pcma"], default="pcm",
+    help="Audio format: pcm (default, configurable rate), pcmu (8kHz only), pcma (8kHz only)")
+voice_group.add_argument("--voice-sample-rate", type=int, default=24000,
+    choices=[8000, 16000, 21050, 24000, 32000, 44100, 48000],
+    help="Sample rate in Hz for PCM format (default: 24000)")
+voice_group.add_argument("--voice-name", choices=["ara", "rex", "sal", "eve", "leo"], default="rex",
+    help="Voice persona: ara (warm), rex (confident, default), sal (balanced), eve (energetic), leo (authoritative)")
+voice_group.add_argument("--voice-name-list", action="store_true",
+    help="List available voice personas with descriptions and exit")
+voice_group.add_argument("--voice-record-duration", type=int, default=30, metavar="SECONDS",
+    help="Maximum recording duration for microphone input (default: 30)")
+voice_group.add_argument("--voice-tools", action="store_true",
+    help="Enable built-in tools for voice session (web_search, x_search)")
+voice_group.add_argument("--voice-system-prompt", metavar="TEXT",
+    help="System prompt/instructions for voice session")
+
 args = parser.parse_args()
 
 # Personality definitions
@@ -150,6 +177,23 @@ PERSONALITIES = {
     "investor": "You are an experienced investment professional with deep knowledge of financial markets, portfolio management, risk assessment, and investment strategies. Provide insights on stocks, bonds, real estate, alternative investments, and market analysis while emphasizing the importance of diversification and risk management.",
     
     "cybersecurity": "You are a cybersecurity expert with extensive knowledge of information security, threat analysis, network security, and digital privacy. Help users understand security best practices, identify vulnerabilities, and implement protective measures while staying current with emerging threats and security technologies."
+}
+
+# Voice API constants
+VOICES = {
+    'ara': {'type': 'Female', 'tone': 'Warm, friendly', 'desc': 'Default voice, balanced and conversational'},
+    'rex': {'type': 'Male', 'tone': 'Confident, clear', 'desc': 'Professional and articulate, ideal for business'},
+    'sal': {'type': 'Neutral', 'tone': 'Smooth, balanced', 'desc': 'Versatile voice suitable for various contexts'},
+    'eve': {'type': 'Female', 'tone': 'Energetic, upbeat', 'desc': 'Engaging and enthusiastic, great for interactive'},
+    'leo': {'type': 'Male', 'tone': 'Authoritative, strong', 'desc': 'Decisive and commanding, for instructional content'}
+}
+
+VOICE_SAMPLE_RATES = [8000, 16000, 21050, 24000, 32000, 44100, 48000]
+
+VOICE_FORMATS = {
+    'pcm': {'type': 'audio/pcm', 'desc': 'Linear16 PCM, Little-endian'},
+    'pcmu': {'type': 'audio/pcmu', 'desc': 'G.711 μ-law (8000 Hz only)'},
+    'pcma': {'type': 'audio/pcma', 'desc': 'G.711 A-law (8000 Hz only)'}
 }
 
 def get_personality_prompt(personality_key):
@@ -577,6 +621,517 @@ def save_chat_transaction(provider, model, prompt, response, metadata=None):
     except Exception as e:
         print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
 
+
+# ============================================================================
+# Voice API Functions
+# ============================================================================
+
+def print_voices():
+    """Print available voice personas with descriptions."""
+    use_colors = not args.no_color and environ.get("NO_COLOR", "").lower() not in ("1", "true")
+
+    if use_colors:
+        BOLD = '\033[1m'
+        CYAN = '\033[96m'
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        END = '\033[0m'
+    else:
+        BOLD = CYAN = GREEN = YELLOW = END = ''
+
+    print(f"\n{BOLD}{CYAN}Available Voice Personas:{END}")
+    print(f"{BOLD}{'─' * 75}{END}")
+    print(f"{BOLD}{'Name':<8} {'Type':<10} {'Tone':<20} {'Description':<35}{END}")
+    print(f"{'─' * 8} {'─' * 10} {'─' * 20} {'─' * 35}")
+
+    for name, info in VOICES.items():
+        color = GREEN if name == 'rex' else YELLOW  # Highlight default
+        default_marker = " (default)" if name == 'rex' else ""
+        print(f"{color}{name:<8}{END} {info['type']:<10} {info['tone']:<20} {info['desc'][:35]}{default_marker}")
+
+    print(f"{BOLD}{'─' * 75}{END}\n")
+
+
+def record_audio_from_mic(duration: int, sample_rate: int = 24000) -> bytes:
+    """Record audio from default microphone using ffmpeg."""
+    import subprocess
+
+    print(f"Recording from microphone (max {duration}s, press Ctrl+C to stop early)...", file=sys.stderr)
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'pulse',
+        '-i', 'default',
+        '-t', str(duration),
+        '-ar', str(sample_rate),
+        '-ac', '1',  # Mono
+        '-f', 's16le',  # PCM16 little-endian raw
+        '-loglevel', 'error',
+        '-'
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=duration + 5)
+        if result.returncode != 0 and result.stderr:
+            print(f"Warning: ffmpeg stderr: {result.stderr.decode()}", file=sys.stderr)
+        print(f"Recording complete ({len(result.stdout)} bytes)", file=sys.stderr)
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        print("Recording timed out", file=sys.stderr)
+        return b''
+    except FileNotFoundError:
+        print("Error: ffmpeg not found. Please install ffmpeg.", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_audio_from_file(filepath: str, sample_rate: int = 24000) -> bytes:
+    """Load and convert audio file to PCM16 format using ffmpeg."""
+    import subprocess
+
+    if not os.path.exists(filepath):
+        print(f"Error: Audio file not found: {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading audio from: {filepath}", file=sys.stderr)
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', filepath,
+        '-ar', str(sample_rate),
+        '-ac', '1',  # Mono
+        '-f', 's16le',  # PCM16 little-endian raw
+        '-loglevel', 'error',
+        '-'
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            print(f"Error converting audio: {result.stderr.decode()}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loaded audio ({len(result.stdout)} bytes)", file=sys.stderr)
+        return result.stdout
+    except FileNotFoundError:
+        print("Error: ffmpeg not found. Please install ffmpeg.", file=sys.stderr)
+        sys.exit(1)
+
+
+def play_audio(audio_data: bytes, sample_rate: int = 24000) -> None:
+    """Play PCM16 audio through speakers using ffmpeg."""
+    import subprocess
+
+    if not audio_data:
+        print("Warning: No audio data to play", file=sys.stderr)
+        return
+
+    print(f"Playing audio ({len(audio_data)} bytes)...", file=sys.stderr)
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 's16le',
+        '-ar', str(sample_rate),
+        '-ac', '1',
+        '-i', '-',
+        '-f', 'pulse',
+        '-loglevel', 'error',
+        'default'
+    ]
+
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, stderr = proc.communicate(input=audio_data)
+        if proc.returncode != 0 and stderr:
+            print(f"Warning: ffmpeg stderr: {stderr.decode()}", file=sys.stderr)
+        print("Playback complete", file=sys.stderr)
+    except FileNotFoundError:
+        print("Error: ffmpeg not found. Please install ffmpeg.", file=sys.stderr)
+
+
+def save_audio_to_file(audio_data: bytes, filepath: str, sample_rate: int = 24000) -> None:
+    """Save PCM16 audio data to a file using ffmpeg."""
+    import subprocess
+
+    if not audio_data:
+        print("Warning: No audio data to save", file=sys.stderr)
+        return
+
+    print(f"Saving audio to: {filepath}", file=sys.stderr)
+
+    # Determine output format from extension
+    ext = os.path.splitext(filepath)[1].lower()
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 's16le',
+        '-ar', str(sample_rate),
+        '-ac', '1',
+        '-i', '-',
+        '-loglevel', 'error',
+        filepath
+    ]
+
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, stderr = proc.communicate(input=audio_data)
+        if proc.returncode != 0:
+            print(f"Error saving audio: {stderr.decode()}", file=sys.stderr)
+        else:
+            print(f"Audio saved to: {filepath}", file=sys.stderr)
+    except FileNotFoundError:
+        print("Error: ffmpeg not found. Please install ffmpeg.", file=sys.stderr)
+
+
+class GrokVoiceClient:
+    """WebSocket client for Grok Voice Agent API."""
+
+    def __init__(self, api_key: str, voice: str = 'Rex', sample_rate: int = 24000,
+                 audio_format: str = 'pcm', instructions: str = '', tools: list = None):
+        self.api_key = api_key
+        self.base_url = "wss://api.x.ai/v1/realtime"
+        self.voice = voice
+        self.sample_rate = sample_rate
+        self.audio_format = audio_format
+        self.instructions = instructions
+        self.tools = tools or []
+        self.ws = None
+
+        # Response accumulators
+        self.transcript_buffer = ""
+        self.audio_buffer = bytearray()
+        self.input_transcription = ""
+
+    async def connect(self):
+        """Establish WebSocket connection with authentication."""
+        import websockets
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        self.ws = await websockets.connect(
+            self.base_url,
+            ssl=True,
+            additional_headers=headers
+        )
+
+        # Wait for conversation.created
+        msg = await self.ws.recv()
+        event = json.loads(msg)
+        if event.get("type") == "conversation.created":
+            if args.debug:
+                print(f"Debug: Voice session created: {event.get('conversation', {}).get('id')}", file=sys.stderr)
+
+        # Configure session
+        await self._configure_session()
+
+    async def _configure_session(self):
+        """Send session configuration."""
+        format_type = VOICE_FORMATS.get(self.audio_format, VOICE_FORMATS['pcm'])['type']
+
+        config = {
+            "type": "session.update",
+            "session": {
+                "voice": self.voice,
+                "instructions": self.instructions,
+                "turn_detection": {"type": "server_vad"},
+                "audio": {
+                    "input": {"format": {"type": format_type, "rate": self.sample_rate}},
+                    "output": {"format": {"type": format_type, "rate": self.sample_rate}}
+                }
+            }
+        }
+
+        # Add tools if specified
+        if self.tools:
+            config["session"]["tools"] = self.tools
+
+        await self.ws.send(json.dumps(config))
+
+        # Wait for session.updated acknowledgment
+        msg = await self.ws.recv()
+        event = json.loads(msg)
+        if event.get("type") == "session.updated":
+            if args.debug:
+                print(f"Debug: Voice session configured with voice={self.voice}", file=sys.stderr)
+        elif event.get("type") == "error":
+            raise Exception(f"Session configuration error: {event}")
+
+    async def send_audio(self, audio_data: bytes, want_audio: bool = True):
+        """Send audio data in chunks."""
+        # Chunk audio into manageable sizes (4KB chunks)
+        chunk_size = 4096
+        total_chunks = (len(audio_data) + chunk_size - 1) // chunk_size
+
+        if args.debug:
+            print(f"Debug: Sending {len(audio_data)} bytes in {total_chunks} chunks", file=sys.stderr)
+
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i:i+chunk_size]
+            encoded = base64.b64encode(chunk).decode('utf-8')
+            await self.ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": encoded
+            }))
+
+        # Commit the audio buffer
+        await self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+        # Request response with specified modalities
+        modalities = ["text"]
+        if want_audio:
+            modalities.append("audio")
+
+        await self.ws.send(json.dumps({
+            "type": "response.create",
+            "response": {"modalities": modalities}
+        }))
+
+    async def send_text(self, text: str, want_audio: bool = True):
+        """Send text message and request response."""
+        await self.ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            }
+        }))
+
+        # Request response with specified modalities
+        modalities = ["text"]
+        if want_audio:
+            modalities.append("audio")
+
+        await self.ws.send(json.dumps({
+            "type": "response.create",
+            "response": {"modalities": modalities}
+        }))
+
+    async def receive_response(self):
+        """Process incoming messages until response.done."""
+        # Reset buffers
+        self.transcript_buffer = ""
+        self.audio_buffer = bytearray()
+        self.input_transcription = ""
+
+        async for message in self.ws:
+            event = json.loads(message)
+            event_type = event.get("type", "")
+
+            if args.debug and event_type not in ["response.output_audio.delta"]:
+                print(f"Debug: Received event: {event_type}", file=sys.stderr)
+
+            if event_type == "response.output_audio_transcript.delta":
+                delta = event.get("delta", "")
+                self.transcript_buffer += delta
+                # Stream transcript to stdout in real-time
+                print(delta, end="", flush=True)
+
+            elif event_type == "response.output_audio.delta":
+                audio_chunk = base64.b64decode(event.get("delta", ""))
+                self.audio_buffer.extend(audio_chunk)
+
+            elif event_type == "conversation.item.input_audio_transcription.completed":
+                self.input_transcription = event.get("transcript", "")
+                if self.input_transcription:
+                    print(f"\n[Your speech]: {self.input_transcription}", file=sys.stderr)
+
+            elif event_type == "response.function_call_arguments.done":
+                # Handle function call
+                yield ("function_call", event)
+
+            elif event_type == "response.done":
+                # Print newline after transcript
+                if self.transcript_buffer:
+                    print()
+                yield ("done", {
+                    "transcript": self.transcript_buffer,
+                    "audio": bytes(self.audio_buffer),
+                    "input_transcription": self.input_transcription
+                })
+                break
+
+            elif event_type == "error":
+                print(f"\nError: {event}", file=sys.stderr)
+                yield ("error", event)
+                break
+
+    async def handle_function_call(self, call_id: str, output: str):
+        """Send function call result back to agent."""
+        await self.ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output
+            }
+        }))
+        await self.ws.send(json.dumps({"type": "response.create"}))
+
+    async def close(self):
+        """Close WebSocket connection."""
+        if self.ws:
+            await self.ws.close()
+
+
+async def voice_session(api_key: str, voice: str, sample_rate: int, audio_format: str,
+                       instructions: str, tools: list, voice_in_source: str,
+                       voice_out_dest: str, record_duration: int, text_input: str):
+    """Run a voice session with the Grok Voice Agent API."""
+
+    client = GrokVoiceClient(
+        api_key=api_key,
+        voice=voice,
+        sample_rate=sample_rate,
+        audio_format=audio_format,
+        instructions=instructions,
+        tools=tools
+    )
+
+    try:
+        print("Connecting to Grok Voice Agent...", file=sys.stderr)
+        await client.connect()
+        print("Connected!", file=sys.stderr)
+
+        # Determine if we want audio output
+        want_audio = voice_out_dest is not None
+
+        # Determine input mode
+        if voice_in_source is not None:
+            # Voice input mode
+            if voice_in_source == "-":
+                # Record from microphone
+                audio_data = record_audio_from_mic(record_duration, sample_rate)
+            else:
+                # Load from file
+                audio_data = load_audio_from_file(voice_in_source, sample_rate)
+
+            if audio_data:
+                await client.send_audio(audio_data, want_audio=want_audio)
+        else:
+            # Text input mode
+            await client.send_text(text_input, want_audio=want_audio)
+
+        # Process response
+        transcript = ""
+        audio_response = b""
+
+        async for event_type, data in client.receive_response():
+            if event_type == "function_call":
+                # Handle built-in tool calls (web_search, x_search are handled by API)
+                # For custom functions, we'd need to implement handlers here
+                func_name = data.get("name", "")
+                call_id = data.get("call_id", "")
+
+                if args.debug:
+                    print(f"Debug: Function call: {func_name}", file=sys.stderr)
+
+                # Built-in tools (web_search, x_search) are handled automatically by the API
+                # We just need to continue waiting for the response
+
+            elif event_type == "done":
+                transcript = data["transcript"]
+                audio_response = data["audio"]
+
+            elif event_type == "error":
+                return
+
+        # Handle audio output
+        if voice_out_dest is not None and audio_response:
+            if voice_out_dest == "-":
+                # Play through speakers
+                play_audio(audio_response, sample_rate)
+            else:
+                # Save to file
+                save_audio_to_file(audio_response, voice_out_dest, sample_rate)
+
+        # Save to second-brain if not disabled
+        if not args.no_preserve and transcript:
+            input_text = text_input or client.input_transcription or "[audio input]"
+            save_chat_transaction(
+                "Grok-Voice",
+                f"voice-{voice.lower()}",
+                input_text,
+                transcript,
+                metadata={
+                    'voice_mode': True,
+                    'voice': voice,
+                    'sample_rate': sample_rate,
+                    'audio_format': audio_format,
+                    'input_transcription': client.input_transcription
+                }
+            )
+
+    except Exception as e:
+        print(f"Voice session error: {e}", file=sys.stderr)
+        if args.debug:
+            import traceback
+            traceback.print_exc()
+    finally:
+        await client.close()
+
+
+def handle_voice_mode(query: str) -> bool:
+    """Handle voice mode if voice flags are specified. Returns True if voice mode was used."""
+
+    # Check for voice-name-list first
+    if args.voice_name_list:
+        print_voices()
+        return True
+
+    # Check if any voice mode is requested
+    has_voice_in = args.voice_in is not None
+    has_voice_out = args.voice_out is not None
+
+    if not has_voice_in and not has_voice_out:
+        return False  # No voice mode, use normal text API
+
+    # Validate audio format and sample rate
+    if args.voice_format in ['pcmu', 'pcma'] and args.voice_sample_rate != 8000:
+        print(f"Warning: {args.voice_format} format only supports 8000 Hz, overriding sample rate", file=sys.stderr)
+        sample_rate = 8000
+    else:
+        sample_rate = args.voice_sample_rate
+
+    # Build tools list
+    tools = []
+    if args.voice_tools:
+        tools.extend([
+            {"type": "web_search"},
+            {"type": "x_search"}
+        ])
+
+    # Build instructions
+    instructions = ""
+    if args.personality:
+        instructions += get_personality_prompt(args.personality)
+    if args.voice_system_prompt:
+        instructions += args.voice_system_prompt
+
+    # Determine mode description for output
+    if has_voice_in and has_voice_out:
+        mode = "Voice → Voice"
+    elif has_voice_in:
+        mode = "Voice → Text"
+    else:
+        mode = "Text → Voice"
+
+    print(f"Starting voice session ({mode})...", file=sys.stderr)
+
+    # Run the async voice session
+    asyncio.run(voice_session(
+        api_key=api_key,
+        voice=args.voice_name.capitalize(),
+        sample_rate=sample_rate,
+        audio_format=args.voice_format,
+        instructions=instructions,
+        tools=tools,
+        voice_in_source=args.voice_in if has_voice_in else None,
+        voice_out_dest=args.voice_out if has_voice_out else None,
+        record_duration=args.voice_record_duration,
+        text_input=query
+    ))
+
+    return True
+
+
 # Since outside of the distrobox we may not have these modules
 # quietly ignore the fact that they may not exist
 try:
@@ -795,14 +1350,16 @@ try:
                 print(f"Warning: Could not read file {file_path}: {e}", file=stderr)
     
     # Read from standard input only if there's data available
+    # Skip stdin entirely for voice input mode to avoid terminal blocking asyncio
     query = ""
-    # Check if stdin has data (not a terminal and has content)
-    if not stdin.isatty() or stdin in select.select([stdin], [], [], 0)[0]:
-        query = stdin.read()
-    # If no stdin and no prompt/files provided, and not doing image generation, show error
-    elif not args.prompt and not args.files and not args.image_gen and not args.images:
-        print("Error: No input provided. Use --prompt, -f/--file, or pipe input via stdin", file=stderr)
-        exit(1)
+    if args.voice_in is None:
+        # Check if stdin has data (not a terminal and has content)
+        if not stdin.isatty() or stdin in select.select([stdin], [], [], 0)[0]:
+            query = stdin.read()
+        # If no stdin and no prompt/files provided, and not doing image generation or voice input, show error
+        elif not args.prompt and not args.files and not args.image_gen and not args.images:
+            print("Error: No input provided. Use --prompt, -f/--file, --voice-in, or pipe input via stdin", file=stderr)
+            exit(1)
 
     # Combine file contents with query
     combined_parts = []
@@ -877,6 +1434,10 @@ try:
             query = combined_prompt + query
         else:
             query = combined_prompt.rstrip()  # Remove trailing newlines if no other content
+
+    # Check for voice mode - intercept before text API call
+    if handle_voice_mode(query):
+        exit(0)
 
     # Set up API call
     headers = {
