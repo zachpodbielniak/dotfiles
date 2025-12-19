@@ -128,7 +128,7 @@ _vimban_completions () {
     local cur prev words cword
     _init_completion || return
 
-    local commands="init create list show edit move link dashboard search validate report people sync completion"
+    local commands="init create list show edit move link dashboard kanban search validate report people sync completion"
     local types="epic story task sub-task research bug"
     local statuses="backlog ready in_progress blocked review delegated done cancelled"
     local priorities="critical high medium low"
@@ -320,6 +320,26 @@ _vimban_completions () {
                     ;;
             esac
             ;;
+        kanban)
+            case "${prev}" in
+                -s|--status)
+                    COMPREPLY=($(compgen -W "${statuses}" -- "${cur}"))
+                    ;;
+                -a|--assignee)
+                    local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                    if [[ -d "${pdir}" ]]
+                    then
+                        COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                    fi
+                    ;;
+                -f|--format)
+                    COMPREPLY=($(compgen -W "${formats}" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-P --project -a --assignee --mine -s --status --hide-empty --compact -w --width -f --format" -- "${cur}"))
+                    ;;
+            esac
+            ;;
         search)
             case "${prev}" in
                 --context)
@@ -449,14 +469,14 @@ STATUSES: list[str] = [
 ]
 
 VALID_TRANSITIONS: dict[str, list[str]] = {
-    "backlog": ["ready", "cancelled"],
-    "ready": ["in_progress", "backlog", "cancelled"],
-    "in_progress": ["blocked", "review", "delegated", "done", "cancelled"],
-    "blocked": ["in_progress", "cancelled"],
-    "review": ["in_progress", "done", "cancelled"],
-    "delegated": ["in_progress", "done", "cancelled"],
-    "done": ["in_progress"],  # reopen
-    "cancelled": ["backlog"],  # reopen
+    "backlog": ["ready", "in_progress", "blocked", "review", "delegated", "done", "cancelled"],
+    "ready": ["backlog", "in_progress", "blocked", "review", "delegated", "done", "cancelled"],
+    "in_progress": ["backlog", "ready", "blocked", "review", "delegated", "done", "cancelled"],
+    "blocked": ["backlog", "ready", "in_progress", "review", "delegated", "done", "cancelled"],
+    "review": ["backlog", "ready", "in_progress", "blocked", "delegated", "done", "cancelled"],
+    "delegated": ["backlog", "ready", "in_progress", "blocked", "review", "done", "cancelled"],
+    "done": ["backlog", "ready", "in_progress", "blocked", "review", "delegated", "cancelled"],
+    "cancelled": ["backlog", "ready", "in_progress", "blocked", "review", "delegated", "done"],
 }
 
 TICKET_TYPES: list[str] = ["epic", "story", "task", "sub-task", "research", "bug"]
@@ -1258,6 +1278,176 @@ def format_output(
             lines.append('  '.join(row_parts))
 
         return '\n'.join(lines)
+
+
+def format_kanban(
+    tickets: list[Ticket],
+    fmt: str = 'plain',
+    colors: Optional[Colors] = None,
+    hide_empty: bool = False,
+    compact: bool = False,
+    column_width: Optional[int] = None,
+    statuses: Optional[list[str]] = None
+) -> str:
+    """
+    Format tickets as a kanban board grouped by status.
+
+    Args:
+        tickets: List of tickets to display
+        fmt: Output format ('plain', 'md', 'yaml', 'json')
+        colors: Colors instance for plain output
+        hide_empty: Whether to hide empty columns
+        compact: Whether to use compact card display
+        column_width: Column width for plain output (auto if None)
+        statuses: List of statuses to display (default: all active statuses)
+
+    Returns:
+        Formatted kanban board string
+    """
+    if colors is None:
+        colors = Colors(enabled=True)
+
+    # Default to active statuses (exclude done/cancelled unless specified)
+    if statuses is None:
+        statuses = ['backlog', 'ready', 'in_progress', 'blocked', 'review', 'delegated']
+
+    # Group tickets by status
+    board: dict[str, list[Ticket]] = {status: [] for status in statuses}
+    for ticket in tickets:
+        if ticket.status in board:
+            board[ticket.status].append(ticket)
+
+    # Remove empty columns if requested
+    if hide_empty:
+        board = {s: t for s, t in board.items() if t}
+
+    if not board:
+        return "No tickets found"
+
+    # JSON output
+    if fmt == 'json':
+        data = {}
+        for status, status_tickets in board.items():
+            data[status] = [t.to_dict() for t in status_tickets]
+        return json.dumps(data, indent=2, default=str)
+
+    # YAML output
+    if fmt == 'yaml':
+        data = {}
+        for status, status_tickets in board.items():
+            data[status] = [t.to_dict() for t in status_tickets]
+        return yaml.dump(data, default_flow_style=False, allow_unicode=True)
+
+    # Markdown output
+    if fmt == 'md':
+        lines = []
+        lines.append("# Kanban Board\n")
+        for status, status_tickets in board.items():
+            lines.append(f"## {status.upper().replace('_', ' ')} ({len(status_tickets)})\n")
+            if status_tickets:
+                if compact:
+                    for t in status_tickets:
+                        lines.append(f"- **{t.id}**: {t.title}")
+                else:
+                    lines.append("| ID | Title | Priority | Assignee | Due |")
+                    lines.append("|---|---|---|---|---|")
+                    for t in status_tickets:
+                        assignee = Path(t.assignee.path).stem if t.assignee else ''
+                        due = str(t.due_date) if t.due_date else ''
+                        title = t.title[:40] + '...' if len(t.title) > 40 else t.title
+                        lines.append(f"| {t.id} | {title} | {t.priority} | {assignee} | {due} |")
+            else:
+                lines.append("_Empty_")
+            lines.append("")
+        return '\n'.join(lines)
+
+    # Plain text output (terminal kanban board)
+    # Calculate column width
+    if column_width is None:
+        try:
+            import shutil
+            term_width = shutil.get_terminal_size().columns
+        except Exception:
+            term_width = 120
+        num_cols = len(board)
+        column_width = max(18, (term_width - (num_cols - 1) * 2) // num_cols) if num_cols > 0 else 20
+
+    # Find max tickets in any column
+    max_tickets = max(len(t) for t in board.values()) if board else 0
+
+    lines = []
+
+    # Header row
+    header_parts = []
+    for status in board.keys():
+        count = len(board[status])
+        label = f"{status.upper().replace('_', ' ')} ({count})"
+        color = colors.status_color(status)
+        header_parts.append(f"{color}{colors.BOLD}{label:<{column_width}}{colors.END}")
+    lines.append("  ".join(header_parts))
+
+    # Separator
+    sep_parts = ["\u2500" * column_width for _ in board]
+    lines.append("  ".join(sep_parts))
+
+    # Ticket rows
+    for row_idx in range(max_tickets):
+        # Each ticket takes 3 lines in normal mode, 1 in compact
+        if compact:
+            row_parts = []
+            for status in board.keys():
+                status_tickets = board[status]
+                if row_idx < len(status_tickets):
+                    t = status_tickets[row_idx]
+                    card = f"{t.id}"[:column_width]
+                    row_parts.append(f"{card:<{column_width}}")
+                else:
+                    row_parts.append(" " * column_width)
+            lines.append("  ".join(row_parts))
+        else:
+            # Line 1: ID
+            row_parts = []
+            for status in board.keys():
+                status_tickets = board[status]
+                if row_idx < len(status_tickets):
+                    t = status_tickets[row_idx]
+                    row_parts.append(f"{colors.BOLD}{t.id:<{column_width}}{colors.END}")
+                else:
+                    row_parts.append(" " * column_width)
+            lines.append("  ".join(row_parts))
+
+            # Line 2: Title (truncated)
+            row_parts = []
+            for status in board.keys():
+                status_tickets = board[status]
+                if row_idx < len(status_tickets):
+                    t = status_tickets[row_idx]
+                    title = t.title[:column_width - 1] if len(t.title) >= column_width else t.title
+                    row_parts.append(f"{title:<{column_width}}")
+                else:
+                    row_parts.append(" " * column_width)
+            lines.append("  ".join(row_parts))
+
+            # Line 3: Priority and assignee
+            row_parts = []
+            for status in board.keys():
+                status_tickets = board[status]
+                if row_idx < len(status_tickets):
+                    t = status_tickets[row_idx]
+                    pri_color = colors.priority_color(t.priority)
+                    assignee = '@' + Path(t.assignee.path).stem[:8] if t.assignee else ''
+                    meta = f"[{t.priority[:4]}] {assignee}"[:column_width]
+                    row_parts.append(f"{pri_color}{meta:<{column_width}}{colors.END}")
+                else:
+                    row_parts.append(" " * column_width)
+            lines.append("  ".join(row_parts))
+
+            # Separator between cards
+            if row_idx < max_tickets - 1:
+                sep_parts = ["\u2500" * column_width for _ in board]
+                lines.append("  ".join(sep_parts))
+
+    return '\n'.join(lines)
 
 
 # ============================================================================
@@ -3169,6 +3359,63 @@ def cmd_dashboard(args: argparse.Namespace, config: Config) -> int:
     return EXIT_SUCCESS
 
 
+def cmd_kanban(args: argparse.Namespace, config: Config) -> int:
+    """
+    Display kanban board view of tickets.
+
+    Shows tickets organized by status columns in a kanban-style layout.
+    Supports multiple output formats: plain (terminal), markdown, yaml, json.
+    """
+    # Build filters
+    filters: dict[str, Any] = {}
+    if getattr(args, 'project', None):
+        filters['project'] = args.project
+    if getattr(args, 'assignee', None):
+        filters['assignee'] = args.assignee
+
+    # Get search paths (work, personal, or both)
+    search_paths = get_search_paths(args, config)
+
+    # Collect tickets from all search paths
+    tickets: list[Ticket] = []
+    for search_path in search_paths:
+        if search_path.exists():
+            path_tickets = fallback_list_tickets(search_path, filters)
+            tickets.extend(path_tickets)
+
+    # Filter by --mine
+    if getattr(args, 'mine', False):
+        user = os.environ.get('USER', '')
+        tickets = [t for t in tickets if t.assignee and user.lower() in str(t.assignee).lower()]
+
+    # Parse statuses to display
+    statuses: Optional[list[str]] = None
+    status_arg = getattr(args, 'status', None)
+    if status_arg:
+        statuses = [s.strip() for s in status_arg.split(',')]
+
+    # Get output options
+    fmt = getattr(args, 'format', 'plain')
+    hide_empty = getattr(args, 'hide_empty', False)
+    compact = getattr(args, 'compact', False)
+    column_width = getattr(args, 'width', None)
+    no_color = getattr(args, 'no_color', False)
+
+    # Format and output
+    output = format_kanban(
+        tickets,
+        fmt=fmt,
+        colors=Colors(enabled=not no_color),
+        hide_empty=hide_empty,
+        compact=compact,
+        column_width=column_width,
+        statuses=statuses
+    )
+
+    print(output)
+    return EXIT_SUCCESS
+
+
 def cmd_search(args: argparse.Namespace, config: Config) -> int:
     """
     Search tickets by content.
@@ -3776,6 +4023,16 @@ Environment Variables:
     dashboard_parser.add_argument('--section', help='Output section only (for vim !!)')
     dashboard_parser.add_argument('--markers', action='store_true', help='Include section markers')
 
+    # kanban
+    kanban_parser = subparsers.add_parser('kanban', help='Display kanban board view')
+    kanban_parser.add_argument('-P', '--project', help='Filter by project')
+    kanban_parser.add_argument('-a', '--assignee', help='Filter by assignee')
+    kanban_parser.add_argument('--mine', action='store_true', help='Show only my tickets')
+    kanban_parser.add_argument('-s', '--status', help='Comma-separated statuses to display')
+    kanban_parser.add_argument('--hide-empty', action='store_true', help='Hide empty columns')
+    kanban_parser.add_argument('--compact', action='store_true', help='Compact card display')
+    kanban_parser.add_argument('-w', '--width', type=int, help='Column width (default: auto)')
+
     # search
     search_parser = subparsers.add_parser('search', help='Search tickets')
     search_parser.add_argument('query', help='Search query')
@@ -3904,6 +4161,7 @@ def main() -> int:
         'move': cmd_move,
         'link': cmd_link,
         'dashboard': cmd_dashboard,
+        'kanban': cmd_kanban,
         'search': cmd_search,
         'validate': cmd_validate,
         'report': cmd_report,
