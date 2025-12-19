@@ -11,6 +11,8 @@ stow: dep_dirs
         --ignore=Containerfile \
         --ignore=requirements.txt \
         --ignore=trees \
+        --ignore=share \
+        --ignore=.gitconfig \
         .
 
 
@@ -27,6 +29,7 @@ stow_alt: dep_dirs
         --ignore=Containerfile \
         --ignore=requirements.txt \
         --ignore=trees \
+        --ignore=share \
         --ignore=.gitconfig \
         .
 

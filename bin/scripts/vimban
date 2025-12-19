@@ -1,0 +1,3934 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+vimban - Markdown-native ticket/kanban management system (:wqira)
+
+A CLI-first ticket management tool operating on markdown files with
+YAML frontmatter. Designed for Neovim integration via vim-filter.
+
+Usage:
+    vimban [global-options] <command> [command-options]
+
+Examples:
+    vimban init
+    vimban create task "Fix authentication bug"
+    vimban list --status in_progress --mine
+    vimban move VB-42 done --resolve
+    vimban dashboard daily
+"""
+
+# ============================================================================
+# DISTROBOX CHECK (Before any other imports)
+# ============================================================================
+from os import environ
+from subprocess import run
+from sys import argv, exit
+
+
+ctr_id: str | None = ""
+
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+
+    run(cmd)
+    exit(0)
+
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from typing import Optional, Any
+
+import yaml
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+VERSION: str = "0.1.0"
+DEFAULT_DIR: Path = Path.home() / "Documents" / "notes"
+DEFAULT_PEOPLE_DIR: str = "02_areas/work/people"
+DEFAULT_PREFIX: str = "VB"
+CONFIG_DIR_NAME: str = ".vimban"
+SEQUENCE_FILE: str = ".sequence"
+CONFIG_FILE: str = "config.yaml"
+TEMPLATE_DIR: Path = Path.home() / ".dotfiles" / "share" / "vimban" / "templates"
+
+# Exit codes
+EXIT_SUCCESS: int = 0
+EXIT_GENERAL_ERROR: int = 1
+EXIT_INVALID_ARGS: int = 2
+EXIT_FILE_NOT_FOUND: int = 3
+EXIT_VALIDATION_ERROR: int = 4
+EXIT_KRAFNA_ERROR: int = 5
+
+# License text for --license flag
+LICENSE_TEXT: str = """vimban - Markdown-native ticket/kanban management system
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>."""
+
+# Bash completion script (embedded for `vimban completion bash`)
+BASH_COMPLETION_SCRIPT: str = r'''# vimban bash completion
+# Usage: eval "$(vimban completion bash)"
+
+_vimban_completions () {
+    local cur prev words cword
+    _init_completion || return
+
+    local commands="init create list show edit move link dashboard search validate report people sync completion"
+    local types="epic story task sub-task research bug"
+    local statuses="backlog ready in_progress blocked review delegated done cancelled"
+    local priorities="critical high medium low"
+    local formats="plain md yaml json"
+    local people_cmds="list show edit dashboard create search"
+    local sections="assigned reported watching blocked overdue due_soon full"
+    local relations="member_of relates_to blocked_by blocks"
+    local report_types="burndown velocity workload aging blockers"
+    local dashboard_types="daily weekly sprint project team person"
+
+    # Find command
+    local cmd=""
+    for ((i=1; i < cword; i++)); do
+        [[ "${words[i]}" != -* ]] && { cmd="${words[i]}"; break; }
+    done
+
+    case "${cmd}" in
+        "")
+            COMPREPLY=($(compgen -W "${commands}" -- "${cur}"))
+            ;;
+        create)
+            case "${prev}" in
+                create)
+                    COMPREPLY=($(compgen -W "${types}" -- "${cur}"))
+                    ;;
+                -a|--assignee|-r|--reporter|-w|--watcher)
+                    local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                    if [[ -d "${pdir}" ]]
+                    then
+                        COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                    fi
+                    ;;
+                -p|--priority)
+                    COMPREPLY=($(compgen -W "${priorities}" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-a --assignee -r --reporter -w --watcher -p --priority -t --tags -P --project -m --member-of --due -e --effort -o --output --id --prefix --no-edit --dry-run" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        list)
+            case "${prev}" in
+                -s|--status)
+                    COMPREPLY=($(compgen -W "${statuses}" -- "${cur}"))
+                    ;;
+                -t|--type)
+                    COMPREPLY=($(compgen -W "${types}" -- "${cur}"))
+                    ;;
+                --priority)
+                    COMPREPLY=($(compgen -W "${priorities}" -- "${cur}"))
+                    ;;
+                -f|--format)
+                    COMPREPLY=($(compgen -W "${formats}" -- "${cur}"))
+                    ;;
+                -a|--assignee)
+                    local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                    if [[ -d "${pdir}" ]]
+                    then
+                        COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                    fi
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-s --status -t --type -a --assignee -P --project --tag --priority --overdue --due-soon --blocked --unassigned --mine --sort --reverse --limit --columns --no-header -f --format" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        show)
+            case "${prev}" in
+                show)
+                    # Complete with ticket IDs
+                    local ids
+                    ids=$(NO_DBOX_CHECK=1 vimban list -f plain --no-header 2>/dev/null | awk '{print $1}')
+                    COMPREPLY=($(compgen -W "${ids}" -- "${cur}"))
+                    ;;
+                -f|--format)
+                    COMPREPLY=($(compgen -W "${formats}" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "--links --tree --history --raw -f --format" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        edit)
+            case "${prev}" in
+                edit)
+                    local ids
+                    ids=$(NO_DBOX_CHECK=1 vimban list -f plain --no-header 2>/dev/null | awk '{print $1}')
+                    COMPREPLY=($(compgen -W "${ids}" -- "${cur}"))
+                    ;;
+                -s|--status)
+                    COMPREPLY=($(compgen -W "${statuses}" -- "${cur}"))
+                    ;;
+                -p|--priority)
+                    COMPREPLY=($(compgen -W "${priorities}" -- "${cur}"))
+                    ;;
+                -a|--assignee)
+                    local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                    if [[ -d "${pdir}" ]]
+                    then
+                        COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                    fi
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-i --interactive -a --assignee -s --status -p --priority --add-tag --remove-tag --progress --due --clear --dry-run" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        move)
+            case "${prev}" in
+                move)
+                    local ids
+                    ids=$(NO_DBOX_CHECK=1 vimban list -f plain --no-header 2>/dev/null | awk '{print $1}')
+                    COMPREPLY=($(compgen -W "${ids}" -- "${cur}"))
+                    ;;
+                *)
+                    # Check if we already have ticket ID
+                    local has_ticket=false
+                    for ((i=2; i < cword; i++)); do
+                        if [[ "${words[i]}" =~ ^[A-Z]+-[0-9]+$ ]] || [[ "${words[i]}" =~ ^[0-9]+$ ]]
+                        then
+                            has_ticket=true
+                            break
+                        fi
+                    done
+
+                    if [[ "${has_ticket}" == "true" ]] && [[ "${prev}" != "--"* ]]
+                    then
+                        COMPREPLY=($(compgen -W "${statuses}" -- "${cur}"))
+                    else
+                        COMPREPLY=($(compgen -W "--force --comment --resolve --reopen" -- "${cur}"))
+                    fi
+                    ;;
+            esac
+            ;;
+        link)
+            case "${prev}" in
+                link)
+                    local ids
+                    ids=$(NO_DBOX_CHECK=1 vimban list -f plain --no-header 2>/dev/null | awk '{print $1}')
+                    COMPREPLY=($(compgen -W "${ids}" -- "${cur}"))
+                    ;;
+                member_of|relates_to|blocked_by|blocks)
+                    # Target ticket
+                    local ids
+                    ids=$(NO_DBOX_CHECK=1 vimban list -f plain --no-header 2>/dev/null | awk '{print $1}')
+                    COMPREPLY=($(compgen -W "${ids}" -- "${cur}"))
+                    ;;
+                *)
+                    # Check if we need relation type
+                    local has_relation=false
+                    for rel in ${relations}
+                    do
+                        if [[ " ${words[*]} " =~ " ${rel} " ]]
+                        then
+                            has_relation=true
+                            break
+                        fi
+                    done
+
+                    if [[ "${has_relation}" == "false" ]]
+                    then
+                        COMPREPLY=($(compgen -W "${relations}" -- "${cur}"))
+                    else
+                        COMPREPLY=($(compgen -W "--remove --bidirectional --dry-run" -- "${cur}"))
+                    fi
+                    ;;
+            esac
+            ;;
+        dashboard)
+            case "${prev}" in
+                dashboard)
+                    COMPREPLY=($(compgen -W "${dashboard_types}" -- "${cur}"))
+                    ;;
+                --section)
+                    COMPREPLY=($(compgen -W "${sections}" -- "${cur}"))
+                    ;;
+                --person)
+                    local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                    if [[ -d "${pdir}" ]]
+                    then
+                        COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                    fi
+                    ;;
+                -f|--format)
+                    COMPREPLY=($(compgen -W "${formats}" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-o --output -P --project --person --sprint --section --markers -f --format" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        search)
+            case "${prev}" in
+                --context)
+                    COMPREPLY=($(compgen -W "1 2 3 5 10" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-E --regex -i --ignore-case -I --case-sensitive --body-only --frontmatter-only --context -l --files-only" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        validate)
+            case "${prev}" in
+                *)
+                    COMPREPLY=($(compgen -W "--fix --strict --schema" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        report)
+            case "${prev}" in
+                report)
+                    COMPREPLY=($(compgen -W "${report_types}" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-P --project --sprint --from --to -o --output" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        sync)
+            case "${prev}" in
+                --provider)
+                    COMPREPLY=($(compgen -W "jira monday" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "--provider --dry-run --push --pull" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        people)
+            local pcmd=""
+            for ((i=2; i < cword; i++)); do
+                [[ "${words[i]}" != -* ]] && { pcmd="${words[i]}"; break; }
+            done
+            case "${pcmd}" in
+                "")
+                    COMPREPLY=($(compgen -W "${people_cmds}" -- "${cur}"))
+                    ;;
+                show|edit|dashboard)
+                    case "${prev}" in
+                        show|edit|dashboard)
+                            local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                            if [[ -d "${pdir}" ]]
+                            then
+                                COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                            fi
+                            ;;
+                        --section)
+                            COMPREPLY=($(compgen -W "${sections}" -- "${cur}"))
+                            ;;
+                        *)
+                            if [[ "${pcmd}" == "show" ]]
+                            then
+                                COMPREPLY=($(compgen -W "--tickets --raw -f --format" -- "${cur}"))
+                            elif [[ "${pcmd}" == "dashboard" ]]
+                            then
+                                COMPREPLY=($(compgen -W "--section --update --all -f --format" -- "${cur}"))
+                            fi
+                            # edit has no additional options
+                            ;;
+                    esac
+                    ;;
+                list)
+                    case "${prev}" in
+                        --team)
+                            # Could populate with known teams
+                            ;;
+                        *)
+                            COMPREPLY=($(compgen -W "--team --has-blocked --has-overdue -f --format" -- "${cur}"))
+                            ;;
+                    esac
+                    ;;
+                create)
+                    case "${prev}" in
+                        --manager)
+                            local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                            if [[ -d "${pdir}" ]]
+                            then
+                                COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                            fi
+                            ;;
+                        *)
+                            COMPREPLY=($(compgen -W "--email --role --team --manager --no-edit" -- "${cur}"))
+                            ;;
+                    esac
+                    ;;
+            esac
+            ;;
+        init)
+            case "${prev}" in
+                *)
+                    COMPREPLY=($(compgen -W "-p --prefix --people-dir --no-git --force" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        completion)
+            case "${prev}" in
+                completion)
+                    COMPREPLY=($(compgen -W "bash" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+    esac
+
+    # Add global options to any command
+    if [[ "${cur}" == -* ]]
+    then
+        COMPREPLY+=($(compgen -W "-d --directory -f --format -q --quiet -v --verbose --no-color --work --personal -h --help --version --license" -- "${cur}"))
+    fi
+}
+
+complete -F _vimban_completions vimban
+'''
+
+# Status workflow
+STATUSES: list[str] = [
+    "backlog", "ready", "in_progress", "blocked",
+    "review", "delegated", "done", "cancelled"
+]
+
+VALID_TRANSITIONS: dict[str, list[str]] = {
+    "backlog": ["ready", "cancelled"],
+    "ready": ["in_progress", "backlog", "cancelled"],
+    "in_progress": ["blocked", "review", "delegated", "done", "cancelled"],
+    "blocked": ["in_progress", "cancelled"],
+    "review": ["in_progress", "done", "cancelled"],
+    "delegated": ["in_progress", "done", "cancelled"],
+    "done": ["in_progress"],  # reopen
+    "cancelled": ["backlog"],  # reopen
+}
+
+TICKET_TYPES: list[str] = ["epic", "story", "task", "sub-task", "research", "bug"]
+PRIORITIES: list[str] = ["critical", "high", "medium", "low"]
+
+# Default columns for list output
+DEFAULT_COLUMNS: list[str] = ["id", "status", "priority", "assignee", "title", "due_date"]
+
+# Transclusion regex pattern
+TRANSCLUSION_PATTERN = re.compile(r'!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
+
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
+@dataclass
+class Config:
+    """
+    Vimban project configuration.
+
+    Stores configuration for a vimban-enabled directory including
+    ID prefix, people directory location, and default values.
+    """
+    directory: Path
+    prefix: str = DEFAULT_PREFIX
+    people_dir: str = DEFAULT_PEOPLE_DIR
+    default_status: str = "backlog"
+    default_priority: str = "medium"
+
+    @classmethod
+    def load(cls, directory: Path) -> "Config":
+        """
+        Load config from .vimban/config.yaml or use defaults.
+
+        Args:
+            directory: The directory to load config from
+
+        Returns:
+            Config object with loaded or default values
+        """
+        config_file = directory / CONFIG_DIR_NAME / CONFIG_FILE
+        if config_file.exists():
+            with open(config_file, 'r') as f:
+                data = yaml.safe_load(f) or {}
+            return cls(
+                directory=directory,
+                prefix=data.get('prefix', DEFAULT_PREFIX),
+                people_dir=data.get('people_dir', DEFAULT_PEOPLE_DIR),
+                default_status=data.get('default_status', 'backlog'),
+                default_priority=data.get('default_priority', 'medium'),
+            )
+        return cls(directory=directory)
+
+    def save(self) -> None:
+        """Save config to .vimban/config.yaml."""
+        config_dir = self.directory / CONFIG_DIR_NAME
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_file = config_dir / CONFIG_FILE
+
+        data = {
+            'prefix': self.prefix,
+            'people_dir': self.people_dir,
+            'default_status': self.default_status,
+            'default_priority': self.default_priority,
+        }
+
+        with open(config_file, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False)
+
+
+@dataclass
+class TransclusionLink:
+    """
+    Represents a ![[path]] or ![[path|alias]] transclusion.
+
+    Transclusion links are used to reference other files in the
+    knowledge base, particularly for people references and ticket
+    relationships.
+    """
+    path: str
+    alias: Optional[str] = None
+
+    def __str__(self) -> str:
+        if self.alias:
+            return f"![[{self.path}|{self.alias}]]"
+        return f"![[{self.path}]]"
+
+    @classmethod
+    def parse(cls, text: str) -> Optional["TransclusionLink"]:
+        """
+        Parse a transclusion string.
+
+        Args:
+            text: String potentially containing a transclusion
+
+        Returns:
+            TransclusionLink if valid, None otherwise
+        """
+        if not text:
+            return None
+
+        match = TRANSCLUSION_PATTERN.match(text.strip())
+        if match:
+            return cls(path=match.group(1), alias=match.group(2))
+
+        return None
+
+
+@dataclass
+class Ticket:
+    """
+    Represents a ticket from markdown frontmatter.
+
+    Contains all fields defined in the vimban ticket schema including
+    required fields (id, title, type, status, created, filepath) and
+    optional fields for dates, people, classification, relationships,
+    and progress tracking.
+    """
+    # Required fields
+    id: str
+    title: str
+    type: str
+    status: str
+    created: datetime
+    filepath: Path
+
+    # Dates
+    start_date: Optional[date] = None
+    due_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+    # People (transclusion format)
+    assignee: Optional[TransclusionLink] = None
+    reporter: Optional[TransclusionLink] = None
+    watchers: list[TransclusionLink] = field(default_factory=list)
+
+    # Classification
+    priority: str = "medium"
+    effort: Optional[int] = None
+    tags: list[str] = field(default_factory=list)
+    project: Optional[str] = None
+    sprint: Optional[str] = None
+
+    # Relationships (transclusion format)
+    member_of: list[TransclusionLink] = field(default_factory=list)
+    relates_to: list[TransclusionLink] = field(default_factory=list)
+    blocked_by: list[TransclusionLink] = field(default_factory=list)
+    blocks: list[TransclusionLink] = field(default_factory=list)
+
+    # Progress
+    progress: int = 0
+    checklist_total: int = 0
+    checklist_done: int = 0
+
+    # Metadata
+    updated: Optional[datetime] = None
+    version: int = 1
+
+    # External system integration
+    issue_link: Optional[str] = None
+
+    @classmethod
+    def from_file(cls, filepath: Path) -> "Ticket":
+        """
+        Load ticket from markdown file.
+
+        Args:
+            filepath: Path to the markdown file
+
+        Returns:
+            Ticket object populated from frontmatter
+
+        Raises:
+            ValueError: If required fields are missing
+        """
+        content = filepath.read_text()
+        metadata, _ = parse_frontmatter(content)
+
+        if not metadata:
+            raise ValueError(f"No frontmatter found in {filepath}")
+
+        # Parse required fields
+        ticket_id = metadata.get('id', '').strip('"')
+        title = metadata.get('title', '')
+        ticket_type = metadata.get('type', '')
+        status = metadata.get('status', '')
+        created_str = metadata.get('created', '')
+
+        if not all([ticket_id, title, ticket_type, status, created_str]):
+            raise ValueError(f"Missing required fields in {filepath}")
+
+        # Parse created datetime
+        if isinstance(created_str, datetime):
+            created = created_str
+        else:
+            created = datetime.fromisoformat(str(created_str))
+
+        # Parse optional date fields
+        start_date = parse_date_field(metadata.get('start_date'))
+        due_date = parse_date_field(metadata.get('due_date'))
+        end_date = parse_date_field(metadata.get('end_date'))
+
+        # Parse people fields
+        assignee = TransclusionLink.parse(metadata.get('assignee', ''))
+        reporter = TransclusionLink.parse(metadata.get('reporter', ''))
+        watchers = [TransclusionLink.parse(w) for w in metadata.get('watchers', [])]
+        watchers = [w for w in watchers if w]
+
+        # Parse relationship fields
+        member_of = [TransclusionLink.parse(m) for m in metadata.get('member_of', [])]
+        member_of = [m for m in member_of if m]
+        relates_to = [TransclusionLink.parse(r) for r in metadata.get('relates_to', [])]
+        relates_to = [r for r in relates_to if r]
+        blocked_by = [TransclusionLink.parse(b) for b in metadata.get('blocked_by', [])]
+        blocked_by = [b for b in blocked_by if b]
+        blocks = [TransclusionLink.parse(b) for b in metadata.get('blocks', [])]
+        blocks = [b for b in blocks if b]
+
+        # Parse updated datetime
+        updated_str = metadata.get('updated')
+        updated = None
+        if updated_str:
+            if isinstance(updated_str, datetime):
+                updated = updated_str
+            else:
+                updated = datetime.fromisoformat(str(updated_str))
+
+        return cls(
+            id=ticket_id,
+            title=title,
+            type=ticket_type,
+            status=status,
+            created=created,
+            filepath=filepath,
+            start_date=start_date,
+            due_date=due_date,
+            end_date=end_date,
+            assignee=assignee,
+            reporter=reporter,
+            watchers=watchers,
+            priority=metadata.get('priority', 'medium'),
+            effort=metadata.get('effort'),
+            tags=metadata.get('tags', []),
+            project=metadata.get('project'),
+            sprint=metadata.get('sprint'),
+            member_of=member_of,
+            relates_to=relates_to,
+            blocked_by=blocked_by,
+            blocks=blocks,
+            progress=metadata.get('progress', 0),
+            checklist_total=metadata.get('checklist_total', 0),
+            checklist_done=metadata.get('checklist_done', 0),
+            updated=updated,
+            version=metadata.get('version', 1),
+            issue_link=metadata.get('issue_link'),
+        )
+
+    def to_frontmatter(self) -> dict:
+        """
+        Convert to frontmatter dict.
+
+        Returns:
+            Dictionary suitable for YAML frontmatter
+        """
+        data: dict[str, Any] = {
+            'id': f'"{self.id}"',
+            'title': self.title,
+            'type': self.type,
+            'status': self.status,
+            'created': self.created.isoformat(),
+        }
+
+        # Dates
+        if self.start_date:
+            data['start_date'] = self.start_date.isoformat()
+        if self.due_date:
+            data['due_date'] = self.due_date.isoformat()
+        if self.end_date:
+            data['end_date'] = self.end_date.isoformat()
+
+        # People
+        if self.assignee:
+            data['assignee'] = str(self.assignee)
+        if self.reporter:
+            data['reporter'] = str(self.reporter)
+        if self.watchers:
+            data['watchers'] = [str(w) for w in self.watchers]
+
+        # Classification
+        data['priority'] = self.priority
+        if self.effort is not None:
+            data['effort'] = self.effort
+        if self.tags:
+            data['tags'] = self.tags
+        if self.project:
+            data['project'] = self.project
+        if self.sprint:
+            data['sprint'] = self.sprint
+
+        # Relationships
+        if self.member_of:
+            data['member_of'] = [str(m) for m in self.member_of]
+        if self.relates_to:
+            data['relates_to'] = [str(r) for r in self.relates_to]
+        if self.blocked_by:
+            data['blocked_by'] = [str(b) for b in self.blocked_by]
+        if self.blocks:
+            data['blocks'] = [str(b) for b in self.blocks]
+
+        # Progress
+        data['progress'] = self.progress
+        if self.checklist_total:
+            data['checklist_total'] = self.checklist_total
+            data['checklist_done'] = self.checklist_done
+
+        # Metadata
+        data['updated'] = datetime.now().isoformat()
+        data['version'] = self.version
+
+        # External link
+        if self.issue_link:
+            data['issue_link'] = self.issue_link
+
+        return data
+
+    def to_dict(self) -> dict:
+        """
+        Convert to plain dictionary for output formatting.
+
+        Returns:
+            Dictionary with string values suitable for display
+        """
+        assignee_str = ""
+        if self.assignee:
+            # Extract just the filename without extension
+            assignee_str = Path(self.assignee.path).stem
+
+        return {
+            'id': self.id,
+            'title': self.title,
+            'type': self.type,
+            'status': self.status,
+            'priority': self.priority,
+            'assignee': assignee_str,
+            'due_date': str(self.due_date) if self.due_date else '',
+            'project': self.project or '',
+            'tags': ','.join(self.tags) if self.tags else '',
+            'progress': self.progress,
+            'filepath': str(self.filepath),
+            'issue_link': self.issue_link or '',
+        }
+
+
+@dataclass
+class Person:
+    """
+    Represents a person from their markdown file.
+
+    Used for tracking team members and their relationships,
+    including manager/direct-report hierarchy.
+    """
+    name: str
+    filepath: Path
+    email: Optional[str] = None
+    slack: Optional[str] = None
+    role: Optional[str] = None
+    team: Optional[str] = None
+    manager: Optional[TransclusionLink] = None
+    direct_reports: list[TransclusionLink] = field(default_factory=list)
+    created: Optional[datetime] = None
+    updated: Optional[datetime] = None
+
+    @classmethod
+    def from_file(cls, filepath: Path) -> "Person":
+        """
+        Load person from markdown file.
+
+        Args:
+            filepath: Path to the person's markdown file
+
+        Returns:
+            Person object populated from frontmatter
+        """
+        content = filepath.read_text()
+        metadata, _ = parse_frontmatter(content)
+
+        if not metadata:
+            raise ValueError(f"No frontmatter found in {filepath}")
+
+        name = metadata.get('name', filepath.stem.replace('_', ' ').title())
+
+        manager = TransclusionLink.parse(metadata.get('manager', ''))
+        direct_reports = [
+            TransclusionLink.parse(d) for d in metadata.get('direct_reports', [])
+        ]
+        direct_reports = [d for d in direct_reports if d]
+
+        created_str = metadata.get('created')
+        created = None
+        if created_str:
+            if isinstance(created_str, datetime):
+                created = created_str
+            else:
+                created = datetime.fromisoformat(str(created_str))
+
+        updated_str = metadata.get('updated')
+        updated = None
+        if updated_str:
+            if isinstance(updated_str, datetime):
+                updated = updated_str
+            else:
+                updated = datetime.fromisoformat(str(updated_str))
+
+        return cls(
+            name=name,
+            filepath=filepath,
+            email=metadata.get('email'),
+            slack=metadata.get('slack'),
+            role=metadata.get('role'),
+            team=metadata.get('team'),
+            manager=manager,
+            direct_reports=direct_reports,
+            created=created,
+            updated=updated,
+        )
+
+    def to_dict(self) -> dict:
+        """
+        Convert to plain dictionary for output formatting.
+
+        Returns:
+            Dictionary with string values suitable for display
+        """
+        return {
+            'name': self.name,
+            'email': self.email or '',
+            'role': self.role or '',
+            'team': self.team or '',
+            'filepath': str(self.filepath),
+        }
+
+
+# ============================================================================
+# SYNC PROVIDER ABSTRACT CLASS (Extensibility)
+# ============================================================================
+class SyncProvider(ABC):
+    """
+    Abstract base class for external system integration.
+
+    Implement this class to add sync capability with external
+    ticket management systems like Jira, Monday.com, Linear, etc.
+
+    The provider is responsible for:
+    1. Authentication with the external system
+    2. Mapping between vimban tickets and external tickets
+    3. Bidirectional sync of ticket data
+    4. Handling conflicts and merge strategies
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Provider name (e.g., 'jira', 'monday')."""
+        ...
+
+    @property
+    @abstractmethod
+    def requires_auth(self) -> bool:
+        """Whether this provider requires authentication."""
+        ...
+
+    @abstractmethod
+    def authenticate(self, **kwargs) -> bool:
+        """
+        Authenticate with the external system.
+
+        Returns True if authentication successful.
+        Credentials should be sourced from environment variables or config.
+        """
+        ...
+
+    @abstractmethod
+    def fetch_tickets(
+        self,
+        project: Optional[str] = None,
+        since: Optional[datetime] = None
+    ) -> list[dict]:
+        """
+        Fetch tickets from external system.
+
+        Returns list of ticket data dicts that can be converted to Ticket objects.
+        """
+        ...
+
+    @abstractmethod
+    def push_ticket(self, ticket: Ticket) -> Optional[str]:
+        """
+        Push a ticket to the external system.
+
+        Returns the external system's ID for the ticket (to store in issue_link).
+        Returns None if push failed.
+        """
+        ...
+
+    @abstractmethod
+    def update_ticket(self, ticket: Ticket) -> bool:
+        """
+        Update an existing ticket in the external system.
+
+        Uses ticket.issue_link to identify the external ticket.
+        Returns True if update successful.
+        """
+        ...
+
+    @abstractmethod
+    def map_status(self, vimban_status: str) -> str:
+        """Map vimban status to external system status."""
+        ...
+
+    @abstractmethod
+    def reverse_map_status(self, external_status: str) -> str:
+        """Map external system status to vimban status."""
+        ...
+
+    def sync(
+        self,
+        directory: Path,
+        project: Optional[str] = None,
+        dry_run: bool = False
+    ) -> dict:
+        """
+        Perform bidirectional sync.
+
+        Default implementation:
+        1. Fetch external tickets
+        2. Compare with local tickets (using issue_link)
+        3. Update local tickets with external changes
+        4. Push local changes to external system
+
+        Returns dict with sync statistics.
+        """
+        stats = {
+            'fetched': 0,
+            'created': 0,
+            'updated': 0,
+            'errors': 0,
+        }
+        # Subclasses should implement actual sync logic
+        return stats
+
+
+class JiraSyncProvider(SyncProvider):
+    """Jira integration - not yet implemented."""
+
+    @property
+    def name(self) -> str:
+        return "jira"
+
+    @property
+    def requires_auth(self) -> bool:
+        return True
+
+    def authenticate(self, **kwargs) -> bool:
+        raise NotImplementedError("Jira sync not yet implemented")
+
+    def fetch_tickets(
+        self,
+        project: Optional[str] = None,
+        since: Optional[datetime] = None
+    ) -> list[dict]:
+        raise NotImplementedError("Jira sync not yet implemented")
+
+    def push_ticket(self, ticket: Ticket) -> Optional[str]:
+        raise NotImplementedError("Jira sync not yet implemented")
+
+    def update_ticket(self, ticket: Ticket) -> bool:
+        raise NotImplementedError("Jira sync not yet implemented")
+
+    def map_status(self, vimban_status: str) -> str:
+        raise NotImplementedError("Jira sync not yet implemented")
+
+    def reverse_map_status(self, external_status: str) -> str:
+        raise NotImplementedError("Jira sync not yet implemented")
+
+
+class MondaySyncProvider(SyncProvider):
+    """Monday.com integration - not yet implemented."""
+
+    @property
+    def name(self) -> str:
+        return "monday"
+
+    @property
+    def requires_auth(self) -> bool:
+        return True
+
+    def authenticate(self, **kwargs) -> bool:
+        raise NotImplementedError("Monday.com sync not yet implemented")
+
+    def fetch_tickets(
+        self,
+        project: Optional[str] = None,
+        since: Optional[datetime] = None
+    ) -> list[dict]:
+        raise NotImplementedError("Monday.com sync not yet implemented")
+
+    def push_ticket(self, ticket: Ticket) -> Optional[str]:
+        raise NotImplementedError("Monday.com sync not yet implemented")
+
+    def update_ticket(self, ticket: Ticket) -> bool:
+        raise NotImplementedError("Monday.com sync not yet implemented")
+
+    def map_status(self, vimban_status: str) -> str:
+        raise NotImplementedError("Monday.com sync not yet implemented")
+
+    def reverse_map_status(self, external_status: str) -> str:
+        raise NotImplementedError("Monday.com sync not yet implemented")
+
+
+# Provider registry
+SYNC_PROVIDERS: dict[str, type[SyncProvider]] = {
+    "jira": JiraSyncProvider,
+    "monday": MondaySyncProvider,
+}
+
+
+# ============================================================================
+# OUTPUT FORMATTING & COLORS
+# ============================================================================
+class Colors:
+    """ANSI color codes with --no-color support."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+
+    @property
+    def HEADER(self) -> str:
+        return '\033[95m' if self.enabled else ''
+
+    @property
+    def BLUE(self) -> str:
+        return '\033[94m' if self.enabled else ''
+
+    @property
+    def CYAN(self) -> str:
+        return '\033[96m' if self.enabled else ''
+
+    @property
+    def GREEN(self) -> str:
+        return '\033[92m' if self.enabled else ''
+
+    @property
+    def YELLOW(self) -> str:
+        return '\033[93m' if self.enabled else ''
+
+    @property
+    def RED(self) -> str:
+        return '\033[91m' if self.enabled else ''
+
+    @property
+    def BOLD(self) -> str:
+        return '\033[1m' if self.enabled else ''
+
+    @property
+    def DIM(self) -> str:
+        return '\033[2m' if self.enabled else ''
+
+    @property
+    def END(self) -> str:
+        return '\033[0m' if self.enabled else ''
+
+    def status_color(self, status: str) -> str:
+        """Get color for a status."""
+        status_colors = {
+            'backlog': self.DIM,
+            'ready': self.BLUE,
+            'in_progress': self.CYAN,
+            'blocked': self.RED,
+            'review': self.YELLOW,
+            'delegated': self.HEADER,
+            'done': self.GREEN,
+            'cancelled': self.DIM,
+        }
+        return status_colors.get(status, '')
+
+    def priority_color(self, priority: str) -> str:
+        """Get color for a priority."""
+        priority_colors = {
+            'critical': self.RED,
+            'high': self.YELLOW,
+            'medium': '',
+            'low': self.DIM,
+        }
+        return priority_colors.get(priority, '')
+
+
+def format_output(
+    data: Any,
+    fmt: str,
+    columns: Optional[list[str]] = None,
+    colors: Optional[Colors] = None,
+    no_header: bool = False
+) -> str:
+    """
+    Format data for output.
+
+    Args:
+        data: Data to format (list of dicts, single dict, or Ticket/Person objects)
+        fmt: Output format ('plain', 'md', 'yaml', 'json')
+        columns: Columns to include (for plain/md table formats)
+        colors: Colors instance for plain output
+        no_header: Whether to omit header row
+
+    Returns:
+        Formatted string
+    """
+    if colors is None:
+        colors = Colors(enabled=True)
+
+    # Convert objects to dicts
+    if isinstance(data, (Ticket, Person)):
+        data = [data.to_dict()]
+    elif isinstance(data, list) and len(data) > 0:
+        if isinstance(data[0], Ticket):
+            data = [t.to_dict() for t in data]
+        elif isinstance(data[0], Person):
+            data = [p.to_dict() for p in data]
+
+    # Ensure we have a list
+    if isinstance(data, dict):
+        data = [data]
+
+    if not data:
+        return ""
+
+    # Use default columns if not specified
+    if columns is None:
+        columns = DEFAULT_COLUMNS
+
+    if fmt == 'json':
+        return json.dumps(data, indent=2, default=str)
+
+    elif fmt == 'yaml':
+        return yaml.dump(data, default_flow_style=False, allow_unicode=True)
+
+    elif fmt == 'md':
+        # Markdown table format
+        lines = []
+        if not no_header:
+            lines.append('| ' + ' | '.join(columns) + ' |')
+            lines.append('|' + '|'.join(['---'] * len(columns)) + '|')
+
+        for item in data:
+            row = []
+            for col in columns:
+                val = str(item.get(col, ''))
+                # Escape pipe characters in markdown
+                val = val.replace('|', '\\|')
+                row.append(val)
+            lines.append('| ' + ' | '.join(row) + ' |')
+
+        return '\n'.join(lines)
+
+    else:  # plain format
+        lines = []
+
+        # Calculate column widths
+        widths = {col: len(col) for col in columns}
+        for item in data:
+            for col in columns:
+                val = str(item.get(col, ''))
+                widths[col] = max(widths[col], len(val))
+
+        # Header
+        if not no_header:
+            header_parts = []
+            for col in columns:
+                header_parts.append(f"{colors.BOLD}{col.upper():<{widths[col]}}{colors.END}")
+            lines.append('  '.join(header_parts))
+
+        # Data rows
+        for item in data:
+            row_parts = []
+            for col in columns:
+                val = str(item.get(col, ''))
+
+                # Apply color based on column
+                color = ''
+                if col == 'status':
+                    color = colors.status_color(val)
+                elif col == 'priority':
+                    color = colors.priority_color(val)
+
+                if color:
+                    row_parts.append(f"{color}{val:<{widths[col]}}{colors.END}")
+                else:
+                    row_parts.append(f"{val:<{widths[col]}}")
+
+            lines.append('  '.join(row_parts))
+
+        return '\n'.join(lines)
+
+
+# ============================================================================
+# ERROR HANDLING
+# ============================================================================
+def error(msg: str, code: int = EXIT_GENERAL_ERROR) -> None:
+    """Print error message and exit."""
+    print(f"vimban: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg: str) -> None:
+    """Print warning message to stderr."""
+    print(f"vimban: warning: {msg}", file=sys.stderr)
+
+
+def info(msg: str, verbose: bool = False) -> None:
+    """Print info message (only if verbose)."""
+    if verbose:
+        print(f"vimban: {msg}", file=sys.stderr)
+
+
+# ============================================================================
+# FRONTMATTER HANDLING
+# ============================================================================
+def parse_frontmatter(content: str) -> tuple[dict, str]:
+    """
+    Parse YAML frontmatter from markdown content.
+
+    Args:
+        content: Full file content
+
+    Returns:
+        Tuple of (metadata dict, body content)
+    """
+    if not content.startswith('---'):
+        return {}, content
+
+    try:
+        # Find the closing ---
+        end_idx = content.index('---', 3)
+        yaml_content = content[3:end_idx].strip()
+        body = content[end_idx + 3:].strip()
+
+        metadata = yaml.safe_load(yaml_content) or {}
+        return metadata, body
+    except (ValueError, yaml.YAMLError):
+        return {}, content
+
+
+def dump_frontmatter(metadata: dict, body: str) -> str:
+    """
+    Create markdown content with YAML frontmatter.
+
+    Args:
+        metadata: Frontmatter dict
+        body: Body content
+
+    Returns:
+        Full markdown content
+    """
+    yaml_str = yaml.dump(
+        metadata,
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False
+    )
+    return f"---\n{yaml_str}---\n\n{body}"
+
+
+def update_frontmatter_field(
+    filepath: Path,
+    field: str,
+    value: Any,
+    increment_version: bool = True
+) -> None:
+    """
+    Update a single field in a file's frontmatter.
+
+    Also updates the 'updated' timestamp and optionally increments version.
+
+    Args:
+        filepath: Path to the markdown file
+        field: Field name to update
+        value: New value for the field
+        increment_version: Whether to increment the version number
+    """
+    content = filepath.read_text()
+    metadata, body = parse_frontmatter(content)
+
+    metadata[field] = value
+    metadata['updated'] = datetime.now().isoformat()
+
+    if increment_version:
+        metadata['version'] = metadata.get('version', 0) + 1
+
+    filepath.write_text(dump_frontmatter(metadata, body))
+
+
+def parse_date_field(value: Any) -> Optional[date]:
+    """
+    Parse a date field from frontmatter.
+
+    Args:
+        value: Date value (string, date, datetime, or None)
+
+    Returns:
+        date object or None
+    """
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str) and value:
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+# ============================================================================
+# DATE PARSING
+# ============================================================================
+def parse_date(date_str: str) -> Optional[date]:
+    """
+    Parse a date string supporting absolute and relative formats.
+
+    Supports:
+    - ISO format: 2025-12-25
+    - Relative: +7d, +2w
+    - Named days: today, tomorrow, monday, tuesday, etc.
+
+    Args:
+        date_str: Date string to parse
+
+    Returns:
+        date object or None if invalid
+    """
+    if not date_str:
+        return None
+
+    date_str = date_str.lower().strip()
+    today = date.today()
+
+    # Handle special names
+    if date_str == 'today':
+        return today
+    elif date_str == 'tomorrow':
+        return today + timedelta(days=1)
+
+    # Handle relative dates (+7d, +2w)
+    relative_match = re.match(r'\+(\d+)([dwm])', date_str)
+    if relative_match:
+        num = int(relative_match.group(1))
+        unit = relative_match.group(2)
+        if unit == 'd':
+            return today + timedelta(days=num)
+        elif unit == 'w':
+            return today + timedelta(weeks=num)
+        elif unit == 'm':
+            return today + timedelta(days=num * 30)  # Approximate
+
+    # Handle day names (monday, tuesday, etc.)
+    day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+    if date_str in day_names:
+        target_day = day_names.index(date_str)
+        current_day = today.weekday()
+        days_ahead = target_day - current_day
+        if days_ahead <= 0:
+            days_ahead += 7
+        return today + timedelta(days=days_ahead)
+
+    # Try ISO format
+    try:
+        return date.fromisoformat(date_str)
+    except ValueError:
+        return None
+
+
+# ============================================================================
+# ID GENERATION
+# ============================================================================
+def next_id(
+    config_dir: Path,
+    custom_id: Optional[str] = None,
+    prefix: Optional[str] = None
+) -> str:
+    """
+    Generate next ticket ID with file-based locking.
+
+    Args:
+        config_dir: Path to .vimban directory
+        custom_id: Custom ID to use (bypasses sequence)
+        prefix: Custom prefix (default: from config)
+
+    Returns:
+        New ticket ID (e.g., "VB-00042")
+    """
+    if custom_id:
+        return custom_id
+
+    sequence_file = config_dir / SEQUENCE_FILE
+    prefix = prefix or DEFAULT_PREFIX
+
+    # Ensure sequence file exists
+    if not sequence_file.exists():
+        sequence_file.write_text('0')
+
+    # Use file locking for concurrent access safety
+    with open(sequence_file, 'r+') as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            current = int(f.read().strip() or '0')
+            next_num = current + 1
+            f.seek(0)
+            f.truncate()
+            f.write(str(next_num))
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    return f"{prefix}-{next_num:05d}"
+
+
+# ============================================================================
+# KRAFNA INTEGRATION
+# ============================================================================
+def krafna_query(query: str, directory: Path) -> list[dict]:
+    """
+    Execute a Krafna query.
+
+    Args:
+        query: Krafna query string
+        directory: Directory to search in
+
+    Returns:
+        List of result dicts
+    """
+    try:
+        result = subprocess.run(
+            ["krafna", "--json", "--from", str(directory), query],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return json.loads(result.stdout) if result.stdout else []
+    except subprocess.CalledProcessError as e:
+        error(f"Krafna query failed: {e.stderr}", EXIT_KRAFNA_ERROR)
+    except json.JSONDecodeError as e:
+        error(f"Failed to parse Krafna output: {e}", EXIT_KRAFNA_ERROR)
+    except FileNotFoundError:
+        # Krafna not installed, fall back to manual scan
+        warn("krafna not found, using fallback search")
+        return []
+    return []
+
+
+def fallback_list_tickets(directory: Path, filters: dict) -> list[Ticket]:
+    """
+    List tickets without Krafna (fallback method).
+
+    Scans markdown files and filters based on frontmatter.
+
+    Args:
+        directory: Directory to search
+        filters: Dictionary of filter criteria
+
+    Returns:
+        List of matching Ticket objects
+    """
+    tickets = []
+
+    # Find all markdown files
+    for md_file in directory.rglob('*.md'):
+        try:
+            content = md_file.read_text()
+            metadata, _ = parse_frontmatter(content)
+
+            # Skip files without vimban frontmatter
+            if not metadata.get('id') or not metadata.get('type'):
+                continue
+
+            # Skip if type is 'person'
+            if metadata.get('type') == 'person':
+                continue
+
+            ticket = Ticket.from_file(md_file)
+
+            # Apply filters
+            if filters.get('status'):
+                statuses = filters['status'].split(',')
+                if ticket.status not in statuses:
+                    continue
+
+            if filters.get('type'):
+                types = filters['type'].split(',')
+                if ticket.type not in types:
+                    continue
+
+            if filters.get('priority'):
+                if ticket.priority != filters['priority']:
+                    continue
+
+            if filters.get('project'):
+                if ticket.project != filters['project']:
+                    continue
+
+            if filters.get('assignee'):
+                if not ticket.assignee:
+                    continue
+                if filters['assignee'].lower() not in str(ticket.assignee).lower():
+                    continue
+
+            tickets.append(ticket)
+
+        except (ValueError, yaml.YAMLError):
+            # Skip files that can't be parsed
+            continue
+
+    return tickets
+
+
+# ============================================================================
+# SECTION MARKERS (for vim !! integration)
+# ============================================================================
+SECTION_PATTERN = re.compile(
+    r'(<!-- VIMBAN:(\w+):START -->)(.*?)(<!-- VIMBAN:\2:END -->)',
+    re.DOTALL
+)
+
+
+def extract_section(content: str, section: str) -> Optional[str]:
+    """
+    Extract content between VIMBAN section markers.
+
+    Args:
+        content: Full file content
+        section: Section name (e.g., 'DASHBOARD', '1ON1')
+
+    Returns:
+        Content between markers or None if not found
+    """
+    pattern = re.compile(
+        rf'<!-- VIMBAN:{section}:START -->(.*?)<!-- VIMBAN:{section}:END -->',
+        re.DOTALL
+    )
+    match = pattern.search(content)
+    return match.group(1).strip() if match else None
+
+
+def replace_section(content: str, section: str, new_content: str) -> str:
+    """
+    Replace content between VIMBAN section markers.
+
+    Preserves the markers themselves.
+
+    Args:
+        content: Full file content
+        section: Section name
+        new_content: New content to insert
+
+    Returns:
+        Updated content
+    """
+    pattern = re.compile(
+        rf'(<!-- VIMBAN:{section}:START -->)(.*?)(<!-- VIMBAN:{section}:END -->)',
+        re.DOTALL
+    )
+
+    replacement = f'\\1\n\n{new_content}\n\n\\3'
+    return pattern.sub(replacement, content)
+
+
+# ============================================================================
+# TRANSCLUSION HANDLING
+# ============================================================================
+def create_transclusion(
+    path: str,
+    alias: Optional[str] = None
+) -> str:
+    """
+    Create a transclusion string.
+
+    Args:
+        path: Path to the file
+        alias: Optional display alias
+
+    Returns:
+        Transclusion string like ![[path]] or ![[path|alias]]
+    """
+    if alias:
+        return f"![[{path}|{alias}]]"
+    return f"![[{path}]]"
+
+
+def resolve_person_reference(
+    ref: str,
+    people_dir: Path,
+    fuzzy: bool = True
+) -> Optional[TransclusionLink]:
+    """
+    Resolve a person reference to a transclusion link.
+
+    Accepts:
+    - Full transclusion: ![[02_areas/work/people/john.md]]
+    - Filename: john_smith
+    - Name: "John Smith"
+    - Fuzzy: john (if unique match)
+
+    Args:
+        ref: Reference string
+        people_dir: Path to people directory
+        fuzzy: Whether to allow fuzzy matching
+
+    Returns:
+        TransclusionLink or None if not found
+    """
+    if not ref:
+        return None
+
+    # Already a transclusion
+    if ref.startswith('![['):
+        return TransclusionLink.parse(ref)
+
+    # Ensure people_dir exists
+    if not people_dir.exists():
+        return None
+
+    # Try exact filename match
+    for person_file in people_dir.glob('*.md'):
+        if person_file.stem == ref:
+            rel_path = str(person_file.relative_to(people_dir.parent.parent.parent))
+            return TransclusionLink(path=rel_path)
+
+    # Try name match in frontmatter
+    for person_file in people_dir.glob('*.md'):
+        try:
+            content = person_file.read_text()
+            metadata, _ = parse_frontmatter(content)
+            if metadata.get('name', '').lower() == ref.lower():
+                rel_path = str(person_file.relative_to(people_dir.parent.parent.parent))
+                return TransclusionLink(path=rel_path)
+        except (ValueError, yaml.YAMLError):
+            continue
+
+    # Fuzzy match if enabled
+    if fuzzy:
+        matches = []
+        ref_lower = ref.lower()
+        for person_file in people_dir.glob('*.md'):
+            if ref_lower in person_file.stem.lower():
+                matches.append(person_file)
+            else:
+                try:
+                    content = person_file.read_text()
+                    metadata, _ = parse_frontmatter(content)
+                    name = metadata.get('name', '').lower()
+                    if ref_lower in name:
+                        matches.append(person_file)
+                except (ValueError, yaml.YAMLError):
+                    continue
+
+        if len(matches) == 1:
+            rel_path = str(matches[0].relative_to(people_dir.parent.parent.parent))
+            return TransclusionLink(path=rel_path)
+
+    return None
+
+
+# ============================================================================
+# TEMPLATE HANDLING
+# ============================================================================
+DEFAULT_TEMPLATES: dict[str, str] = {
+    'task': '''---
+id: {{ID}}
+title: "{{TITLE}}"
+type: task
+status: backlog
+created: {{CREATED}}
+updated: {{CREATED}}
+version: 1
+
+assignee: {{ASSIGNEE}}
+reporter: {{REPORTER}}
+watchers: []
+priority: {{PRIORITY}}
+effort:
+tags: {{TAGS}}
+project: {{PROJECT}}
+
+due_date: {{DUE_DATE}}
+start_date:
+end_date:
+
+member_of: {{MEMBER_OF}}
+relates_to: []
+blocked_by: []
+blocks: []
+
+progress: 0
+issue_link:
+---
+
+# {{TITLE}}
+
+## Description
+
+
+
+## Acceptance Criteria
+
+- [ ]
+
+## Notes
+
+''',
+    'epic': '''---
+id: {{ID}}
+title: "{{TITLE}}"
+type: epic
+status: backlog
+created: {{CREATED}}
+updated: {{CREATED}}
+version: 1
+
+assignee: {{ASSIGNEE}}
+reporter: {{REPORTER}}
+watchers: []
+priority: {{PRIORITY}}
+effort:
+tags: {{TAGS}}
+project: {{PROJECT}}
+
+due_date: {{DUE_DATE}}
+start_date:
+end_date:
+
+relates_to: []
+
+progress: 0
+issue_link:
+---
+
+# {{TITLE}}
+
+## Overview
+
+
+
+## Goals
+
+- [ ]
+
+## Stories
+
+<!-- VIMBAN:STORIES:START -->
+
+<!-- VIMBAN:STORIES:END -->
+
+## Notes
+
+''',
+    'story': '''---
+id: {{ID}}
+title: "{{TITLE}}"
+type: story
+status: backlog
+created: {{CREATED}}
+updated: {{CREATED}}
+version: 1
+
+assignee: {{ASSIGNEE}}
+reporter: {{REPORTER}}
+watchers: []
+priority: {{PRIORITY}}
+effort:
+tags: {{TAGS}}
+project: {{PROJECT}}
+
+due_date: {{DUE_DATE}}
+start_date:
+end_date:
+
+member_of: {{MEMBER_OF}}
+relates_to: []
+blocked_by: []
+blocks: []
+
+progress: 0
+issue_link:
+---
+
+# {{TITLE}}
+
+## User Story
+
+As a [user type], I want to [action] so that [benefit].
+
+## Acceptance Criteria
+
+- [ ]
+
+## Tasks
+
+<!-- VIMBAN:TASKS:START -->
+
+<!-- VIMBAN:TASKS:END -->
+
+## Notes
+
+''',
+    'sub-task': '''---
+id: {{ID}}
+title: "{{TITLE}}"
+type: sub-task
+status: backlog
+created: {{CREATED}}
+updated: {{CREATED}}
+version: 1
+
+assignee: {{ASSIGNEE}}
+reporter: {{REPORTER}}
+priority: {{PRIORITY}}
+tags: {{TAGS}}
+
+due_date: {{DUE_DATE}}
+start_date:
+end_date:
+
+member_of: {{MEMBER_OF}}
+blocked_by: []
+blocks: []
+
+progress: 0
+issue_link:
+---
+
+# {{TITLE}}
+
+## Description
+
+
+
+## Notes
+
+''',
+    'research': '''---
+id: {{ID}}
+title: "{{TITLE}}"
+type: research
+status: backlog
+created: {{CREATED}}
+updated: {{CREATED}}
+version: 1
+
+assignee: {{ASSIGNEE}}
+reporter: {{REPORTER}}
+priority: {{PRIORITY}}
+tags: {{TAGS}}
+project: {{PROJECT}}
+
+due_date: {{DUE_DATE}}
+
+relates_to: []
+
+progress: 0
+issue_link:
+---
+
+# {{TITLE}}
+
+## Research Question
+
+
+
+## Findings
+
+
+
+## Recommendations
+
+
+
+## Resources
+
+- [ ]
+
+## Notes
+
+''',
+    'bug': '''---
+id: {{ID}}
+title: "{{TITLE}}"
+type: bug
+status: backlog
+created: {{CREATED}}
+updated: {{CREATED}}
+version: 1
+
+assignee: {{ASSIGNEE}}
+reporter: {{REPORTER}}
+watchers: []
+priority: {{PRIORITY}}
+tags: {{TAGS}}
+project: {{PROJECT}}
+
+due_date: {{DUE_DATE}}
+start_date:
+end_date:
+
+relates_to: []
+blocked_by: []
+blocks: []
+
+progress: 0
+issue_link:
+---
+
+# {{TITLE}}
+
+## Description
+
+
+
+## Steps to Reproduce
+
+1.
+
+## Expected Behavior
+
+
+
+## Actual Behavior
+
+
+
+## Environment
+
+- OS:
+- Version:
+
+## Notes
+
+''',
+    'person': '''---
+name: "{{NAME}}"
+email: "{{EMAIL}}"
+role: "{{ROLE}}"
+team: "{{TEAM}}"
+type: person
+created: {{CREATED}}
+updated: {{CREATED}}
+
+manager: {{MANAGER}}
+direct_reports: []
+---
+
+# {{NAME}}
+
+## About
+
+
+
+## 1:1 Notes
+
+<!-- VIMBAN:1ON1:START -->
+
+<!-- VIMBAN:1ON1:END -->
+
+## Current Focus
+
+<!-- VIMBAN:DASHBOARD:START -->
+
+<!-- VIMBAN:DASHBOARD:END -->
+
+## Notes
+
+''',
+}
+
+
+def load_template(ticket_type: str) -> str:
+    """
+    Load template for a ticket type.
+
+    First checks the user's template directory, then falls back to defaults.
+
+    Args:
+        ticket_type: Type of ticket (task, epic, story, etc.)
+
+    Returns:
+        Template string
+    """
+    # Check user template directory
+    user_template = TEMPLATE_DIR / f"{ticket_type}.md"
+    if user_template.exists():
+        return user_template.read_text()
+
+    # Fall back to default
+    return DEFAULT_TEMPLATES.get(ticket_type, DEFAULT_TEMPLATES['task'])
+
+
+def fill_template(
+    template: str,
+    ticket_id: str,
+    title: str,
+    assignee: Optional[TransclusionLink] = None,
+    reporter: Optional[TransclusionLink] = None,
+    priority: str = "medium",
+    due_date: Optional[date] = None,
+    tags: Optional[list[str]] = None,
+    project: Optional[str] = None,
+    member_of: Optional[list[str]] = None,
+    **kwargs
+) -> str:
+    """
+    Fill template placeholders with values.
+
+    Args:
+        template: Template string with {{PLACEHOLDER}} markers
+        ticket_id: Ticket ID
+        title: Ticket title
+        assignee: Assignee transclusion link
+        reporter: Reporter transclusion link
+        priority: Priority level
+        due_date: Due date
+        tags: List of tags
+        project: Project identifier
+        member_of: Parent ticket paths
+        **kwargs: Additional template variables
+
+    Returns:
+        Filled template string
+    """
+    now = datetime.now().isoformat()
+
+    replacements = {
+        '{{ID}}': f'"{ticket_id}"',
+        '{{TITLE}}': title,
+        '{{CREATED}}': now,
+        '{{ASSIGNEE}}': f'"{assignee}"' if assignee else '',
+        '{{REPORTER}}': f'"{reporter}"' if reporter else '',
+        '{{PRIORITY}}': priority,
+        '{{DUE_DATE}}': str(due_date) if due_date else '',
+        '{{TAGS}}': json.dumps(tags) if tags else '[]',
+        '{{PROJECT}}': project or '',
+        '{{MEMBER_OF}}': json.dumps(member_of) if member_of else '[]',
+        '{{NAME}}': kwargs.get('name', ''),
+        '{{EMAIL}}': kwargs.get('email', ''),
+        '{{ROLE}}': kwargs.get('role', ''),
+        '{{TEAM}}': kwargs.get('team', ''),
+        '{{MANAGER}}': kwargs.get('manager', ''),
+    }
+
+    result = template
+    for placeholder, value in replacements.items():
+        result = result.replace(placeholder, str(value))
+
+    return result
+
+
+# ============================================================================
+# TICKET RESOLUTION
+# ============================================================================
+def find_ticket(
+    ticket_ref: str,
+    config: Config,
+    args: argparse.Namespace
+) -> Optional[Path]:
+    """
+    Find a ticket file by ID or path.
+
+    Searches work and personal directories based on --work/--personal flags.
+    If no flag specified, searches both directories.
+
+    Accepts:
+    - Full ID: VB-00042
+    - Partial ID: 42
+    - File path: ./tasks/my_task.md
+
+    Args:
+        ticket_ref: Ticket reference (ID or path)
+        config: Vimban configuration
+        args: Parsed command line arguments (for scope flags)
+
+    Returns:
+        Path to ticket file or None
+    """
+    # Check if it's a path
+    if '/' in ticket_ref or ticket_ref.endswith('.md'):
+        path = Path(ticket_ref)
+        if not path.is_absolute():
+            path = config.directory / path
+        if path.exists():
+            return path
+        return None
+
+    # Handle partial ID (just number)
+    if ticket_ref.isdigit():
+        ticket_ref = f"{config.prefix}-{int(ticket_ref):05d}"
+
+    # Get search paths (work, personal, or both)
+    search_paths = get_search_paths(args, config)
+
+    # Search for matching ID in frontmatter
+    for search_path in search_paths:
+        if not search_path.exists():
+            continue
+        for md_file in search_path.rglob('*.md'):
+            try:
+                content = md_file.read_text()
+                metadata, _ = parse_frontmatter(content)
+                file_id = metadata.get('id', '').strip('"')
+                if file_id == ticket_ref:
+                    return md_file
+            except (ValueError, yaml.YAMLError):
+                continue
+
+    return None
+
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+def cmd_init(args: argparse.Namespace, config: Config) -> int:
+    """
+    Initialize vimban in a directory.
+
+    Creates:
+    - .vimban/config.yaml
+    - .vimban/.sequence
+    - Optionally updates .gitignore
+    """
+    target_dir = Path(args.directory) if args.directory else config.directory
+    vimban_dir = target_dir / CONFIG_DIR_NAME
+
+    if vimban_dir.exists():
+        if not getattr(args, 'force', False):
+            error(f"vimban already initialized in {target_dir}", EXIT_GENERAL_ERROR)
+        warn(f"Reinitializing vimban in {target_dir}")
+
+    vimban_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create config
+    new_config = Config(
+        directory=target_dir,
+        prefix=getattr(args, 'prefix', None) or DEFAULT_PREFIX,
+        people_dir=getattr(args, 'people_dir', None) or DEFAULT_PEOPLE_DIR,
+    )
+    new_config.save()
+
+    # Create sequence file
+    sequence_file = vimban_dir / SEQUENCE_FILE
+    if not sequence_file.exists():
+        sequence_file.write_text('0')
+
+    # Update .gitignore
+    if not getattr(args, 'no_git', False):
+        gitignore = target_dir / '.gitignore'
+        ignore_entry = '.vimban/.sequence'
+        if gitignore.exists():
+            content = gitignore.read_text()
+            if ignore_entry not in content:
+                with open(gitignore, 'a') as f:
+                    f.write(f'\n{ignore_entry}\n')
+        else:
+            gitignore.write_text(f'{ignore_entry}\n')
+
+    print(f"Initialized vimban in {target_dir}")
+    print(f"  Prefix: {new_config.prefix}")
+    print(f"  People dir: {new_config.people_dir}")
+
+    return EXIT_SUCCESS
+
+
+def get_projects_base(
+    args: argparse.Namespace,
+    config: Config,
+    interactive: bool = False
+) -> Path:
+    """
+    Get the base projects path based on --work or --personal flags.
+
+    If interactive=True and neither flag set, prompt user to choose.
+    Returns path to 01_projects/work/, 01_projects/personal/, or 01_projects/.
+
+    Args:
+        args: Parsed command line arguments
+        config: Config instance with directory info
+        interactive: If True, prompt user when no scope specified
+
+    Returns:
+        Path to the projects base directory
+    """
+    base = config.directory / "01_projects"
+
+    if getattr(args, 'work', False):
+        return base / "work"
+    elif getattr(args, 'personal', False):
+        return base / "personal"
+    elif interactive:
+        # Prompt user to choose
+        print("Select scope:")
+        print("  1) work")
+        print("  2) personal")
+        try:
+            choice = input("Choice [1/2]: ").strip()
+        except EOFError:
+            error("No scope specified and stdin not available", EXIT_INVALID_ARGS)
+        if choice == '1' or choice.lower() == 'work' or choice.lower() == 'w':
+            return base / "work"
+        elif choice == '2' or choice.lower() == 'personal' or choice.lower() == 'p':
+            return base / "personal"
+        else:
+            error(f"Invalid choice: {choice}. Use 1/work or 2/personal", EXIT_INVALID_ARGS)
+    else:
+        return base  # Return base for searching both
+
+
+def get_search_paths(args: argparse.Namespace, config: Config) -> list[Path]:
+    """
+    Get list of paths to search for tickets.
+
+    If --work or --personal specified, returns only that path.
+    Otherwise returns both work and personal paths.
+
+    Args:
+        args: Parsed command line arguments
+        config: Config instance with directory info
+
+    Returns:
+        List of paths to search
+    """
+    base = config.directory / "01_projects"
+
+    if getattr(args, 'work', False):
+        return [base / "work"]
+    elif getattr(args, 'personal', False):
+        return [base / "personal"]
+    else:
+        return [base / "work", base / "personal"]
+
+
+def get_people_dirs(args: argparse.Namespace, config: Config) -> list[Path]:
+    """
+    Get list of people directories to search based on --work/--personal flags.
+
+    If --work specified, returns only work people directory.
+    If --personal specified, returns only personal people directory.
+    Otherwise returns both.
+
+    Args:
+        args: Parsed command line arguments
+        config: Config instance with directory info
+
+    Returns:
+        List of people directory paths to search
+    """
+    base = config.directory / "02_areas"
+
+    if getattr(args, 'work', False):
+        return [base / "work" / "people"]
+    elif getattr(args, 'personal', False):
+        return [base / "personal" / "people"]
+    else:
+        return [base / "work" / "people", base / "personal" / "people"]
+
+
+def get_people_base(
+    args: argparse.Namespace,
+    config: Config,
+    interactive: bool = False
+) -> Path:
+    """
+    Get single people directory for creation.
+
+    If interactive=True and no scope specified, prompt user.
+
+    Args:
+        args: Parsed command line arguments
+        config: Config instance with directory info
+        interactive: If True, prompt user when no scope specified
+
+    Returns:
+        Path to the people directory
+    """
+    base = config.directory / "02_areas"
+
+    if getattr(args, 'work', False):
+        return base / "work" / "people"
+    elif getattr(args, 'personal', False):
+        return base / "personal" / "people"
+    elif interactive:
+        print("Select scope:")
+        print("  1) work")
+        print("  2) personal")
+        try:
+            choice = input("Choice [1/2]: ").strip()
+        except EOFError:
+            error("No scope specified and stdin not available", EXIT_INVALID_ARGS)
+        if choice == '1' or choice.lower() in ('work', 'w'):
+            return base / "work" / "people"
+        elif choice == '2' or choice.lower() in ('personal', 'p'):
+            return base / "personal" / "people"
+        else:
+            error(f"Invalid choice: {choice}", EXIT_INVALID_ARGS)
+    else:
+        # Default to work for backwards compatibility
+        return base / "work" / "people"
+
+
+def find_person_in_scopes(
+    person_ref: str,
+    args: argparse.Namespace,
+    config: Config
+) -> Optional[TransclusionLink]:
+    """
+    Find a person by reference, searching work and personal if not specified.
+
+    Args:
+        person_ref: Person reference (name, filename, or transclusion)
+        args: Parsed command line arguments (for scope flags)
+        config: Config instance with directory info
+
+    Returns:
+        TransclusionLink if found, None otherwise
+    """
+    people_dirs = get_people_dirs(args, config)
+
+    for people_dir in people_dirs:
+        if not people_dir.exists():
+            continue
+        result = resolve_person_reference(person_ref, people_dir)
+        if result:
+            return result
+
+    return None
+
+
+def find_ticket_path(
+    ticket_id: str,
+    config: Config,
+    args: argparse.Namespace
+) -> Optional[Path]:
+    """
+    Find a ticket file by ID, searching work and personal if not specified.
+
+    Handles both full IDs (VB-00042) and short form (42).
+
+    Args:
+        ticket_id: Ticket ID to find (full or short form)
+        config: Config instance with directory info
+        args: Parsed command line arguments (for scope flags)
+
+    Returns:
+        Path to the ticket file if found, None otherwise
+    """
+    # Normalize ID (handle short form like "42" -> "VB-00042")
+    if ticket_id.isdigit():
+        ticket_id = f"{config.prefix}-{int(ticket_id):05d}"
+
+    # Get search paths
+    search_paths = get_search_paths(args, config)
+
+    # Search for ticket
+    for search_path in search_paths:
+        if not search_path.exists():
+            continue
+        for md_file in search_path.rglob("*.md"):
+            # Quick check: ID in filename
+            if ticket_id.lower() in md_file.name.lower():
+                return md_file
+            # Check frontmatter for ID
+            try:
+                content = md_file.read_text()
+                # Check first 500 chars for efficiency (frontmatter is at top)
+                header = content[:500]
+                if f'id: "{ticket_id}"' in header or f"id: '{ticket_id}'" in header:
+                    return md_file
+                if f"id: {ticket_id}" in header:
+                    return md_file
+            except Exception:
+                continue
+
+    return None
+
+
+def resolve_parent_path(member_of_ref: str, config: Config) -> Optional[Path]:
+    """
+    Resolve a member_of reference to a file path.
+
+    Accepts transclusion format (![[path/to/file.md]]) or relative path.
+
+    Args:
+        member_of_ref: A transclusion link or relative path
+        config: Config instance with directory info
+
+    Returns:
+        Path to the parent file if found, None otherwise
+    """
+    if not member_of_ref:
+        return None
+
+    # Handle transclusion format: ![[path/to/file.md]]
+    if member_of_ref.startswith('![['):
+        match = TRANSCLUSION_PATTERN.match(member_of_ref.strip())
+        if match:
+            return config.directory / match.group(1)
+
+    # Handle direct path
+    path = Path(member_of_ref)
+    if not path.is_absolute():
+        path = config.directory / member_of_ref
+
+    if path.exists():
+        return path
+
+    return None
+
+
+def determine_output_path(
+    ticket_type: str,
+    safe_title: str,
+    member_of: Optional[list[str]],
+    config: Config,
+    projects_base: Path
+) -> Path:
+    """
+    Determine output path based on ticket type and parent relationship.
+
+    Directory structure rules:
+    - epic: creates directory, file inside (base/epic_{title}/epic_{title}.md)
+    - story with epic parent: directory under epic (epic_dir/story_{title}/story_{title}.md)
+    - story without parent: directory in base (base/story_{title}/story_{title}.md)
+    - task/sub-task with parent: flat file in parent's directory
+    - task/sub-task without parent: flat file in base
+    - bug/research: flat files in base
+
+    Args:
+        ticket_type: Type of ticket (epic, story, task, etc.)
+        safe_title: Sanitized title for filename
+        member_of: List of parent references (transclusion links or paths)
+        config: Config instance with directory info
+        projects_base: Base path for projects (e.g., 01_projects/work/)
+
+    Returns:
+        Path where the ticket file should be created
+    """
+    base = projects_base
+
+    if ticket_type == 'epic':
+        # Epic always creates a directory
+        dir_name = f"epic_{safe_title}"
+        return base / dir_name / f"epic_{safe_title}.md"
+
+    elif ticket_type == 'story':
+        # Story creates a directory
+        dir_name = f"story_{safe_title}"
+
+        if member_of:
+            # Find parent epic directory
+            parent_path = resolve_parent_path(member_of[0], config)
+            if parent_path and parent_path.parent.name.startswith('epic_'):
+                return parent_path.parent / dir_name / f"story_{safe_title}.md"
+
+        # No epic parent - create directory in 01_projects
+        return base / dir_name / f"story_{safe_title}.md"
+
+    else:
+        # task, sub-task, bug, research - flat files
+        filename = f"{ticket_type}_{safe_title}.md"
+
+        if member_of and ticket_type in ('task', 'sub-task'):
+            parent_path = resolve_parent_path(member_of[0], config)
+            if parent_path:
+                # Place in parent's directory
+                return parent_path.parent / filename
+
+        return base / filename
+
+
+def cmd_create(args: argparse.Namespace, config: Config) -> int:
+    """
+    Create a new ticket.
+
+    Supports:
+    - Template-based creation
+    - People reference resolution
+    - Date parsing (absolute and relative)
+    - stdin for title
+    - --dry-run preview
+    """
+    # Get title from args or stdin
+    title = getattr(args, 'title', None)
+    if not title and not sys.stdin.isatty():
+        title = sys.stdin.read().strip()
+
+    if not title:
+        error("Title is required", EXIT_INVALID_ARGS)
+
+    # Check if initialized
+    config_dir = config.directory / CONFIG_DIR_NAME
+    if not config_dir.exists():
+        error(f"vimban not initialized in {config.directory}. Run 'vimban init' first.", EXIT_GENERAL_ERROR)
+
+    # Generate ID
+    ticket_id = next_id(
+        config_dir,
+        custom_id=getattr(args, 'id', None),
+        prefix=getattr(args, 'prefix', None) or config.prefix
+    )
+
+    # Resolve people references (search both work/personal scopes)
+    assignee = find_person_in_scopes(
+        getattr(args, 'assignee', None) or '',
+        args, config
+    )
+    reporter = find_person_in_scopes(
+        getattr(args, 'reporter', None) or '',
+        args, config
+    )
+
+    # Parse due date
+    due_date = parse_date(getattr(args, 'due', None) or '')
+
+    # Parse tags
+    tags_str = getattr(args, 'tags', None) or ''
+    tags = [t.strip() for t in tags_str.split(',')] if tags_str else []
+
+    # Load and fill template
+    template = load_template(args.type)
+    content = fill_template(
+        template,
+        ticket_id=ticket_id,
+        title=title,
+        assignee=assignee,
+        reporter=reporter,
+        priority=getattr(args, 'priority', None) or config.default_priority,
+        due_date=due_date,
+        tags=tags,
+        project=getattr(args, 'project', None),
+        member_of=getattr(args, 'member_of', None),
+    )
+
+    # Determine output path
+    # Sanitize title for filename
+    safe_title = re.sub(r'[^\w\s-]', '', title).strip().lower()
+    safe_title = re.sub(r'[-\s]+', '_', safe_title)[:50]
+
+    output_path: Path
+    if getattr(args, 'output', None):
+        output_path = Path(args.output)
+        if not output_path.is_absolute():
+            output_path = config.directory / output_path
+    else:
+        # Get projects base (interactive prompt if no --work/--personal)
+        projects_base = get_projects_base(args, config, interactive=True)
+
+        # Use hierarchical directory structure based on ticket type
+        output_path = determine_output_path(
+            args.type,
+            safe_title,
+            getattr(args, 'member_of', None),
+            config,
+            projects_base
+        )
+
+    if getattr(args, 'dry_run', False):
+        print("=== DRY RUN ===")
+        print(f"Would create: {output_path}")
+        print(f"ID: {ticket_id}")
+        print(f"Content:\n{content}")
+        return EXIT_SUCCESS
+
+    # Write file
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content)
+
+    # Open in editor unless --no-edit
+    if not getattr(args, 'no_edit', False):
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, str(output_path)])
+
+    # Output based on format
+    fmt = getattr(args, 'format', 'plain')
+    if fmt == 'json':
+        print(json.dumps({'id': ticket_id, 'path': str(output_path)}))
+    elif fmt == 'yaml':
+        print(yaml.dump({'id': ticket_id, 'path': str(output_path)}))
+    else:
+        print(f"Created {ticket_id}: {output_path}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_list(args: argparse.Namespace, config: Config) -> int:
+    """
+    List tickets with filters.
+
+    Uses Krafna for querying when available,
+    falls back to filesystem scan otherwise.
+    Searches both work and personal directories if no scope specified.
+    """
+    # Build filters dict
+    filters = {
+        'status': getattr(args, 'status', None),
+        'type': getattr(args, 'type', None),
+        'priority': getattr(args, 'priority', None),
+        'project': getattr(args, 'project', None),
+        'assignee': getattr(args, 'assignee', None),
+    }
+
+    # Get search paths (work, personal, or both)
+    search_paths = get_search_paths(args, config)
+
+    # Collect tickets from all search paths
+    tickets: list[Ticket] = []
+    for search_path in search_paths:
+        if search_path.exists():
+            path_tickets = fallback_list_tickets(search_path, filters)
+            tickets.extend(path_tickets)
+
+    # Apply additional filters
+    today = date.today()
+
+    if getattr(args, 'overdue', False):
+        tickets = [t for t in tickets if t.due_date and t.due_date < today]
+
+    due_soon = getattr(args, 'due_soon', None)
+    if due_soon:
+        days = int(due_soon) if due_soon != True else 7
+        cutoff = today + timedelta(days=days)
+        tickets = [t for t in tickets if t.due_date and t.due_date <= cutoff]
+
+    if getattr(args, 'blocked', False):
+        tickets = [t for t in tickets if t.status == 'blocked']
+
+    if getattr(args, 'unassigned', False):
+        tickets = [t for t in tickets if not t.assignee]
+
+    if getattr(args, 'mine', False):
+        user = os.environ.get('USER', '')
+        tickets = [t for t in tickets if t.assignee and user.lower() in str(t.assignee).lower()]
+
+    # Sort
+    sort_field = getattr(args, 'sort', None) or 'due_date'
+    reverse = getattr(args, 'reverse', False)
+
+    def sort_key(t: Ticket) -> Any:
+        val = getattr(t, sort_field, None)
+        if val is None:
+            # Return max date for None so tickets without dates sort last
+            if sort_field in ('due_date', 'start_date', 'end_date', 'created', 'updated'):
+                return date.max
+            return ''
+        return val
+
+    tickets.sort(key=sort_key, reverse=reverse)
+
+    # Limit
+    limit = getattr(args, 'limit', None)
+    if limit:
+        tickets = tickets[:limit]
+
+    # Format output
+    columns_str = getattr(args, 'columns', None)
+    columns = columns_str.split(',') if columns_str else None
+    no_header = getattr(args, 'no_header', False)
+    no_color = getattr(args, 'no_color', False)
+    fmt = getattr(args, 'format', 'plain')
+
+    output = format_output(
+        tickets,
+        fmt,
+        columns=columns,
+        colors=Colors(enabled=not no_color),
+        no_header=no_header
+    )
+
+    if output:
+        print(output)
+
+    return EXIT_SUCCESS
+
+
+def cmd_show(args: argparse.Namespace, config: Config) -> int:
+    """
+    Show ticket details.
+
+    Displays full ticket information including linked tickets
+    if --links is specified.
+    """
+    ticket_ref = args.ticket
+    ticket_path = find_ticket(ticket_ref, config, args)
+
+    if not ticket_path:
+        error(f"Ticket not found: {ticket_ref}", EXIT_FILE_NOT_FOUND)
+
+    # Show raw content if requested
+    if getattr(args, 'raw', False):
+        print(ticket_path.read_text())
+        return EXIT_SUCCESS
+
+    try:
+        ticket = Ticket.from_file(ticket_path)
+    except ValueError as e:
+        error(str(e), EXIT_VALIDATION_ERROR)
+
+    fmt = getattr(args, 'format', 'plain')
+
+    if fmt == 'json':
+        print(json.dumps(ticket.to_dict(), indent=2))
+    elif fmt == 'yaml':
+        print(yaml.dump(ticket.to_dict(), default_flow_style=False))
+    elif fmt == 'md':
+        # Show full markdown content
+        print(ticket_path.read_text())
+    else:
+        # Plain format - detailed view
+        colors = Colors(enabled=not getattr(args, 'no_color', False))
+
+        print(f"{colors.BOLD}{ticket.id}{colors.END}: {ticket.title}")
+        print(f"  Type: {ticket.type}")
+        print(f"  Status: {colors.status_color(ticket.status)}{ticket.status}{colors.END}")
+        print(f"  Priority: {colors.priority_color(ticket.priority)}{ticket.priority}{colors.END}")
+
+        if ticket.assignee:
+            print(f"  Assignee: {Path(ticket.assignee.path).stem}")
+        if ticket.reporter:
+            print(f"  Reporter: {Path(ticket.reporter.path).stem}")
+        if ticket.due_date:
+            overdue = ticket.due_date < date.today()
+            color = colors.RED if overdue else ''
+            print(f"  Due: {color}{ticket.due_date}{colors.END}")
+        if ticket.project:
+            print(f"  Project: {ticket.project}")
+        if ticket.tags:
+            print(f"  Tags: {', '.join(ticket.tags)}")
+        if ticket.issue_link:
+            print(f"  External: {ticket.issue_link}")
+        print(f"  Progress: {ticket.progress}%")
+        print(f"  File: {ticket_path}")
+
+        # Show linked tickets if requested
+        if getattr(args, 'links', False):
+            print()
+            if ticket.member_of:
+                print("  Member of:")
+                for link in ticket.member_of:
+                    print(f"    - {link.path}")
+            if ticket.blocked_by:
+                print("  Blocked by:")
+                for link in ticket.blocked_by:
+                    print(f"    - {link.path}")
+            if ticket.blocks:
+                print("  Blocks:")
+                for link in ticket.blocks:
+                    print(f"    - {link.path}")
+            if ticket.relates_to:
+                print("  Related to:")
+                for link in ticket.relates_to:
+                    print(f"    - {link.path}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_edit(args: argparse.Namespace, config: Config) -> int:
+    """
+    Edit ticket fields.
+
+    Updates frontmatter fields directly or opens in $EDITOR.
+    """
+    ticket_ref = args.ticket
+    ticket_path = find_ticket(ticket_ref, config, args)
+
+    if not ticket_path:
+        error(f"Ticket not found: {ticket_ref}", EXIT_FILE_NOT_FOUND)
+
+    # Interactive edit
+    if getattr(args, 'interactive', False):
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, str(ticket_path)])
+        return EXIT_SUCCESS
+
+    # Collect updates
+    updates: dict[str, Any] = {}
+
+    if getattr(args, 'status', None):
+        updates['status'] = args.status
+    if getattr(args, 'priority', None):
+        updates['priority'] = args.priority
+    if getattr(args, 'progress', None) is not None:
+        updates['progress'] = args.progress
+    if getattr(args, 'due', None):
+        due = parse_date(args.due)
+        if due:
+            updates['due_date'] = due.isoformat()
+
+    # Handle assignee (search both work/personal scopes)
+    if getattr(args, 'assignee', None):
+        assignee = find_person_in_scopes(args.assignee, args, config)
+        if assignee:
+            updates['assignee'] = str(assignee)
+
+    # Handle tags
+    if getattr(args, 'add_tag', None):
+        content = ticket_path.read_text()
+        metadata, body = parse_frontmatter(content)
+        tags = metadata.get('tags', [])
+        if args.add_tag not in tags:
+            tags.append(args.add_tag)
+        updates['tags'] = tags
+
+    if getattr(args, 'remove_tag', None):
+        content = ticket_path.read_text()
+        metadata, body = parse_frontmatter(content)
+        tags = metadata.get('tags', [])
+        if args.remove_tag in tags:
+            tags.remove(args.remove_tag)
+        updates['tags'] = tags
+
+    # Handle clear
+    if getattr(args, 'clear', None):
+        updates[args.clear] = None
+
+    # Handle positional field=value arguments
+    for filter_arg in getattr(args, 'fields', []) or []:
+        if '=' in filter_arg:
+            field, value = filter_arg.split('=', 1)
+            updates[field] = value
+
+    if not updates:
+        error("No updates specified", EXIT_INVALID_ARGS)
+
+    # Preview changes
+    if getattr(args, 'dry_run', False):
+        print("=== DRY RUN ===")
+        print(f"Would update {ticket_path}:")
+        for field, value in updates.items():
+            print(f"  {field}: {value}")
+        return EXIT_SUCCESS
+
+    # Apply updates
+    content = ticket_path.read_text()
+    metadata, body = parse_frontmatter(content)
+
+    for field, value in updates.items():
+        metadata[field] = value
+
+    metadata['updated'] = datetime.now().isoformat()
+    metadata['version'] = metadata.get('version', 0) + 1
+
+    ticket_path.write_text(dump_frontmatter(metadata, body))
+
+    fmt = getattr(args, 'format', 'plain')
+    if fmt == 'json':
+        print(json.dumps({'updated': ticket_ref, 'fields': list(updates.keys())}))
+    else:
+        print(f"Updated {ticket_ref}: {', '.join(updates.keys())}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_move(args: argparse.Namespace, config: Config) -> int:
+    """
+    Move ticket to new status.
+
+    Validates workflow transitions unless --force is specified.
+    Sets end_date when moving to done.
+    """
+    ticket_ref = args.ticket
+    new_status = args.status
+    ticket_path = find_ticket(ticket_ref, config, args)
+
+    if not ticket_path:
+        error(f"Ticket not found: {ticket_ref}", EXIT_FILE_NOT_FOUND)
+
+    content = ticket_path.read_text()
+    metadata, body = parse_frontmatter(content)
+    current_status = metadata.get('status', 'backlog')
+
+    # Validate transition
+    if not getattr(args, 'force', False):
+        valid_next = VALID_TRANSITIONS.get(current_status, [])
+        if new_status not in valid_next:
+            error(
+                f"Invalid transition: {current_status} -> {new_status}. "
+                f"Valid transitions: {', '.join(valid_next)}",
+                EXIT_VALIDATION_ERROR
+            )
+
+    # Update status
+    metadata['status'] = new_status
+    metadata['updated'] = datetime.now().isoformat()
+    metadata['version'] = metadata.get('version', 0) + 1
+
+    # Set end_date if completing
+    if new_status == 'done' and getattr(args, 'resolve', False):
+        metadata['end_date'] = date.today().isoformat()
+
+    # Set start_date if starting
+    if new_status == 'in_progress' and not metadata.get('start_date'):
+        metadata['start_date'] = date.today().isoformat()
+
+    # Clear end_date if reopening
+    if getattr(args, 'reopen', False) and current_status in ('done', 'cancelled'):
+        metadata['end_date'] = None
+
+    ticket_path.write_text(dump_frontmatter(metadata, body))
+
+    fmt = getattr(args, 'format', 'plain')
+    if fmt == 'json':
+        print(json.dumps({'ticket': ticket_ref, 'from': current_status, 'to': new_status}))
+    else:
+        print(f"Moved {ticket_ref}: {current_status} -> {new_status}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_link(args: argparse.Namespace, config: Config) -> int:
+    """
+    Link tickets together.
+
+    Supports bidirectional linking when --bidirectional is specified.
+    """
+    ticket_ref = args.ticket
+    relation = args.relation
+    target_ref = args.target
+    ticket_path = find_ticket(ticket_ref, config, args)
+
+    if not ticket_path:
+        error(f"Ticket not found: {ticket_ref}", EXIT_FILE_NOT_FOUND)
+
+    target_path = find_ticket(target_ref, config, args)
+    if not target_path:
+        error(f"Target ticket not found: {target_ref}", EXIT_FILE_NOT_FOUND)
+
+    # Create transclusion link
+    rel_target = str(target_path.relative_to(config.directory))
+    target_link = create_transclusion(rel_target)
+
+    # Load ticket
+    content = ticket_path.read_text()
+    metadata, body = parse_frontmatter(content)
+
+    # Get or create the relationship list
+    relations = metadata.get(relation, [])
+    if not isinstance(relations, list):
+        relations = [relations] if relations else []
+
+    if getattr(args, 'remove', False):
+        # Remove the link
+        relations = [r for r in relations if target_link not in r]
+    else:
+        # Add the link if not already present
+        if target_link not in relations:
+            relations.append(target_link)
+
+    metadata[relation] = relations
+    metadata['updated'] = datetime.now().isoformat()
+    metadata['version'] = metadata.get('version', 0) + 1
+
+    if getattr(args, 'dry_run', False):
+        print("=== DRY RUN ===")
+        print(f"Would update {ticket_path}:")
+        print(f"  {relation}: {relations}")
+        return EXIT_SUCCESS
+
+    ticket_path.write_text(dump_frontmatter(metadata, body))
+
+    # Handle bidirectional
+    if getattr(args, 'bidirectional', False) and not getattr(args, 'remove', False):
+        reverse_relations = {
+            'blocked_by': 'blocks',
+            'blocks': 'blocked_by',
+            'member_of': 'relates_to',  # Parent doesn't track children by default
+            'relates_to': 'relates_to',
+        }
+        reverse = reverse_relations.get(relation)
+        if reverse:
+            rel_source = str(ticket_path.relative_to(config.directory))
+            source_link = create_transclusion(rel_source)
+
+            target_content = target_path.read_text()
+            target_metadata, target_body = parse_frontmatter(target_content)
+
+            target_relations = target_metadata.get(reverse, [])
+            if not isinstance(target_relations, list):
+                target_relations = [target_relations] if target_relations else []
+
+            if source_link not in target_relations:
+                target_relations.append(source_link)
+
+            target_metadata[reverse] = target_relations
+            target_metadata['updated'] = datetime.now().isoformat()
+            target_metadata['version'] = target_metadata.get('version', 0) + 1
+
+            target_path.write_text(dump_frontmatter(target_metadata, target_body))
+
+    action = "Unlinked" if getattr(args, 'remove', False) else "Linked"
+    print(f"{action} {ticket_ref} {relation} {target_ref}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_dashboard(args: argparse.Namespace, config: Config) -> int:
+    """
+    Generate dashboard views.
+
+    Supports daily, weekly, sprint, project, team, and person dashboards.
+    """
+    dashboard_type = getattr(args, 'type', 'daily') or 'daily'
+    fmt = getattr(args, 'format', 'md')
+    section = getattr(args, 'section', None)
+    person_ref = getattr(args, 'person', None)
+
+    # Get all tickets
+    tickets = fallback_list_tickets(config.directory, {})
+    today = date.today()
+
+    # Filter based on dashboard type
+    if dashboard_type == 'daily':
+        # My tasks: in_progress, blocked, due today/overdue
+        user = os.environ.get('USER', '')
+        my_tickets = [t for t in tickets if t.assignee and user.lower() in str(t.assignee).lower()]
+        active = [t for t in my_tickets if t.status in ('in_progress', 'blocked', 'review')]
+        due_today = [t for t in my_tickets if t.due_date == today]
+        overdue = [t for t in my_tickets if t.due_date and t.due_date < today and t.status != 'done']
+
+        if section == 'assigned':
+            tickets = active
+        elif section == 'overdue':
+            tickets = overdue
+        elif section == 'due_soon':
+            cutoff = today + timedelta(days=7)
+            tickets = [t for t in my_tickets if t.due_date and t.due_date <= cutoff]
+        else:
+            # Full daily view
+            output_lines = []
+            output_lines.append("# Daily Dashboard")
+            output_lines.append(f"\n**Date:** {today}")
+            output_lines.append(f"\n## Active ({len(active)})")
+            if active:
+                output_lines.append(format_output(active, 'md', ['id', 'status', 'priority', 'title', 'due_date']))
+            else:
+                output_lines.append("_No active tickets_")
+
+            output_lines.append(f"\n## Overdue ({len(overdue)})")
+            if overdue:
+                output_lines.append(format_output(overdue, 'md', ['id', 'status', 'priority', 'title', 'due_date']))
+            else:
+                output_lines.append("_No overdue tickets_")
+
+            output_lines.append(f"\n## Due Today ({len(due_today)})")
+            if due_today:
+                output_lines.append(format_output(due_today, 'md', ['id', 'status', 'priority', 'title']))
+            else:
+                output_lines.append("_Nothing due today_")
+
+            print('\n'.join(output_lines))
+            return EXIT_SUCCESS
+
+    elif dashboard_type == 'person' and person_ref:
+        # Person-specific dashboard (search both work/personal scopes)
+        person_link = find_person_in_scopes(person_ref, args, config)
+
+        if not person_link:
+            error(f"Person not found: {person_ref}", EXIT_FILE_NOT_FOUND)
+
+        person_tickets = [
+            t for t in tickets
+            if t.assignee and person_link.path in str(t.assignee)
+        ]
+
+        if section:
+            section = section.upper()
+            if section == 'ASSIGNED':
+                active = [t for t in person_tickets if t.status not in ('done', 'cancelled')]
+                tickets = active
+            elif section == 'BLOCKED':
+                tickets = [t for t in person_tickets if t.status == 'blocked']
+            elif section == 'OVERDUE':
+                tickets = [t for t in person_tickets if t.due_date and t.due_date < today and t.status != 'done']
+            elif section == 'DASHBOARD':
+                active = [t for t in person_tickets if t.status not in ('done', 'cancelled')]
+                tickets = active
+        else:
+            tickets = person_tickets
+
+    # Output the results
+    if not tickets:
+        if fmt == 'md':
+            print("_No tickets found_")
+        else:
+            print("No tickets found")
+        return EXIT_SUCCESS
+
+    output = format_output(
+        tickets,
+        fmt,
+        columns=['id', 'status', 'priority', 'title', 'due_date'],
+        colors=Colors(enabled=not getattr(args, 'no_color', False))
+    )
+    print(output)
+
+    return EXIT_SUCCESS
+
+
+def cmd_search(args: argparse.Namespace, config: Config) -> int:
+    """
+    Search tickets by content.
+
+    Uses ripgrep for full-text search with optional regex support.
+    """
+    query = args.query
+    regex_mode = getattr(args, 'regex', False)
+    case_sensitive = getattr(args, 'case_sensitive', False)
+    files_only = getattr(args, 'files_only', False)
+    context_lines = getattr(args, 'context', 0)
+
+    # Build ripgrep command
+    rg_cmd = ['rg']
+
+    if not case_sensitive:
+        rg_cmd.append('-i')
+
+    if files_only:
+        rg_cmd.append('-l')
+    elif context_lines:
+        rg_cmd.extend(['-C', str(context_lines)])
+
+    if regex_mode:
+        rg_cmd.append('-e')
+    else:
+        rg_cmd.append('-F')  # Fixed string
+
+    rg_cmd.extend([query, str(config.directory)])
+    rg_cmd.extend(['--glob', '*.md'])
+
+    try:
+        result = subprocess.run(rg_cmd, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout)
+        return EXIT_SUCCESS if result.returncode == 0 else EXIT_GENERAL_ERROR
+    except FileNotFoundError:
+        error("ripgrep (rg) not found", EXIT_GENERAL_ERROR)
+
+    return EXIT_GENERAL_ERROR
+
+
+def cmd_validate(args: argparse.Namespace, config: Config) -> int:
+    """
+    Validate ticket frontmatter.
+
+    Checks for required fields and valid values.
+    Optionally fixes issues with --fix.
+    """
+    files = getattr(args, 'files', None) or []
+    fix_mode = getattr(args, 'fix', False)
+    strict = getattr(args, 'strict', False)
+
+    # Get files to validate
+    if files:
+        paths = [Path(f) for f in files]
+    else:
+        paths = list(config.directory.rglob('*.md'))
+
+    errors = []
+    warnings = []
+    fixed = []
+
+    for path in paths:
+        try:
+            content = path.read_text()
+            metadata, body = parse_frontmatter(content)
+
+            # Skip non-vimban files
+            if not metadata.get('id') and not metadata.get('type'):
+                continue
+
+            # Check required fields
+            if metadata.get('type') != 'person':
+                required = ['id', 'title', 'type', 'status', 'created']
+                for field in required:
+                    if not metadata.get(field):
+                        errors.append(f"{path}: Missing required field '{field}'")
+
+            # Check valid status
+            status = metadata.get('status', '')
+            if status and status not in STATUSES:
+                errors.append(f"{path}: Invalid status '{status}'")
+
+            # Check valid type
+            ticket_type = metadata.get('type', '')
+            if ticket_type and ticket_type not in TICKET_TYPES + ['person']:
+                errors.append(f"{path}: Invalid type '{ticket_type}'")
+
+            # Check valid priority
+            priority = metadata.get('priority', '')
+            if priority and priority not in PRIORITIES:
+                warnings.append(f"{path}: Invalid priority '{priority}'")
+
+            # Check dates
+            due_date = metadata.get('due_date')
+            if due_date and not parse_date_field(due_date):
+                warnings.append(f"{path}: Invalid due_date format")
+
+        except (ValueError, yaml.YAMLError) as e:
+            errors.append(f"{path}: Parse error: {e}")
+
+    # Output results
+    if errors:
+        print("Errors:")
+        for err in errors:
+            print(f"  {err}")
+
+    if warnings:
+        print("\nWarnings:")
+        for warn_msg in warnings:
+            print(f"  {warn_msg}")
+
+    if not errors and not warnings:
+        print("All files valid")
+
+    if strict and (errors or warnings):
+        return EXIT_VALIDATION_ERROR
+
+    return EXIT_SUCCESS if not errors else EXIT_VALIDATION_ERROR
+
+
+def cmd_report(args: argparse.Namespace, config: Config) -> int:
+    """
+    Generate reports and analytics.
+
+    Supports burndown, velocity, workload, aging, and blocker reports.
+    """
+    report_type = args.type
+    project = getattr(args, 'project', None)
+
+    # Get tickets
+    filters = {'project': project} if project else {}
+    tickets = fallback_list_tickets(config.directory, filters)
+
+    if report_type == 'workload':
+        # Count tickets by assignee
+        workload: dict[str, dict[str, int]] = {}
+        for t in tickets:
+            if t.status in ('done', 'cancelled'):
+                continue
+            assignee = Path(t.assignee.path).stem if t.assignee else 'Unassigned'
+            if assignee not in workload:
+                workload[assignee] = {'total': 0, 'in_progress': 0, 'blocked': 0}
+            workload[assignee]['total'] += 1
+            if t.status == 'in_progress':
+                workload[assignee]['in_progress'] += 1
+            elif t.status == 'blocked':
+                workload[assignee]['blocked'] += 1
+
+        print("# Workload Report\n")
+        print("| Assignee | Total | In Progress | Blocked |")
+        print("|----------|-------|-------------|---------|")
+        for assignee, counts in sorted(workload.items()):
+            print(f"| {assignee} | {counts['total']} | {counts['in_progress']} | {counts['blocked']} |")
+
+    elif report_type == 'blockers':
+        # List blocked tickets
+        blocked = [t for t in tickets if t.status == 'blocked']
+        print(f"# Blockers Report ({len(blocked)} blocked)\n")
+        if blocked:
+            output = format_output(
+                blocked, 'md',
+                columns=['id', 'priority', 'assignee', 'title', 'due_date']
+            )
+            print(output)
+        else:
+            print("_No blocked tickets_")
+
+    elif report_type == 'aging':
+        # Tickets by age
+        today = date.today()
+        aging: dict[str, list[Ticket]] = {
+            '< 1 week': [],
+            '1-2 weeks': [],
+            '2-4 weeks': [],
+            '> 4 weeks': [],
+        }
+
+        for t in tickets:
+            if t.status in ('done', 'cancelled'):
+                continue
+            age = (today - t.created.date()).days
+            if age < 7:
+                aging['< 1 week'].append(t)
+            elif age < 14:
+                aging['1-2 weeks'].append(t)
+            elif age < 28:
+                aging['2-4 weeks'].append(t)
+            else:
+                aging['> 4 weeks'].append(t)
+
+        print("# Aging Report\n")
+        for period, period_tickets in aging.items():
+            print(f"## {period} ({len(period_tickets)})")
+            if period_tickets:
+                output = format_output(period_tickets, 'md', columns=['id', 'status', 'title'])
+                print(output)
+            print()
+
+    else:
+        warn(f"Report type '{report_type}' not fully implemented")
+        print(f"Total tickets: {len(tickets)}")
+        print(f"Active: {len([t for t in tickets if t.status not in ('done', 'cancelled')])}")
+        print(f"Done: {len([t for t in tickets if t.status == 'done'])}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_sync(args: argparse.Namespace, config: Config) -> int:
+    """
+    Sync with external systems.
+
+    Stub implementation - providers not yet implemented.
+    """
+    provider_name = getattr(args, 'provider', None) or 'jira'
+    dry_run = getattr(args, 'dry_run', False)
+
+    if provider_name not in SYNC_PROVIDERS:
+        error(f"Unknown sync provider: {provider_name}. Available: {', '.join(SYNC_PROVIDERS.keys())}")
+
+    provider_class = SYNC_PROVIDERS[provider_name]
+    provider = provider_class()
+
+    try:
+        if dry_run:
+            print(f"=== DRY RUN: {provider.name} sync ===")
+            print("Would authenticate and sync tickets")
+            return EXIT_SUCCESS
+
+        provider.authenticate()
+    except NotImplementedError as e:
+        error(str(e), EXIT_GENERAL_ERROR)
+
+    return EXIT_SUCCESS
+
+
+def cmd_people_list(args: argparse.Namespace, config: Config) -> int:
+    """List all people from work and/or personal directories."""
+    people_dirs = get_people_dirs(args, config)
+
+    people = []
+    found_any = False
+    for people_dir in people_dirs:
+        if not people_dir.exists():
+            continue
+        found_any = True
+        for person_file in people_dir.glob('*.md'):
+            try:
+                person = Person.from_file(person_file)
+                people.append(person)
+            except (ValueError, yaml.YAMLError):
+                continue
+
+    if not found_any:
+        print("No people directory found")
+        return EXIT_SUCCESS
+
+    # Apply filters
+    team = getattr(args, 'team', None)
+    if team:
+        people = [p for p in people if p.team and team.lower() in p.team.lower()]
+
+    fmt = getattr(args, 'format', 'plain')
+    output = format_output(
+        people, fmt,
+        columns=['name', 'role', 'team', 'email'],
+        colors=Colors(enabled=not getattr(args, 'no_color', False))
+    )
+
+    if output:
+        print(output)
+
+    return EXIT_SUCCESS
+
+
+def cmd_people_show(args: argparse.Namespace, config: Config) -> int:
+    """Show person details, searching work and personal if not specified."""
+    person_ref = args.person
+    person_link = find_person_in_scopes(person_ref, args, config)
+
+    if not person_link:
+        error(f"Person not found: {person_ref}", EXIT_FILE_NOT_FOUND)
+
+    person_path = config.directory / person_link.path
+
+    if getattr(args, 'raw', False):
+        print(person_path.read_text())
+        return EXIT_SUCCESS
+
+    try:
+        person = Person.from_file(person_path)
+    except ValueError as e:
+        error(str(e), EXIT_VALIDATION_ERROR)
+
+    fmt = getattr(args, 'format', 'plain')
+
+    if fmt == 'json':
+        print(json.dumps(person.to_dict(), indent=2))
+    elif fmt == 'yaml':
+        print(yaml.dump(person.to_dict(), default_flow_style=False))
+    else:
+        colors = Colors(enabled=not getattr(args, 'no_color', False))
+        print(f"{colors.BOLD}{person.name}{colors.END}")
+        if person.role:
+            print(f"  Role: {person.role}")
+        if person.team:
+            print(f"  Team: {person.team}")
+        if person.email:
+            print(f"  Email: {person.email}")
+        if person.slack:
+            print(f"  Slack: {person.slack}")
+        print(f"  File: {person_path}")
+
+        # Show tickets if requested
+        if getattr(args, 'tickets', False):
+            tickets = fallback_list_tickets(config.directory, {})
+            person_tickets = [
+                t for t in tickets
+                if t.assignee and person_link.path in str(t.assignee)
+                and t.status not in ('done', 'cancelled')
+            ]
+            if person_tickets:
+                print(f"\n  Active Tickets ({len(person_tickets)}):")
+                for t in person_tickets[:10]:  # Limit to 10
+                    print(f"    {t.id}: {t.title[:40]}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_people_edit(args: argparse.Namespace, config: Config) -> int:
+    """Open person file in $EDITOR."""
+    person_ref = args.person
+    person_link = find_person_in_scopes(person_ref, args, config)
+
+    if not person_link:
+        error(f"Person not found: {person_ref}", EXIT_FILE_NOT_FOUND)
+
+    person_path = config.directory / person_link.path
+
+    editor = os.environ.get('EDITOR', 'vim')
+    subprocess.run([editor, str(person_path)])
+    return EXIT_SUCCESS
+
+
+def cmd_people_create(args: argparse.Namespace, config: Config) -> int:
+    """Create a new person file, prompting for scope if not specified."""
+    name = args.name
+
+    # Get people directory (interactive prompt if no scope)
+    people_dir = get_people_base(args, config, interactive=True)
+    people_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate filename from name
+    filename = name.lower().replace(' ', '_') + '.md'
+    filepath = people_dir / filename
+
+    if filepath.exists():
+        error(f"Person file already exists: {filepath}", EXIT_GENERAL_ERROR)
+
+    # Load and fill template
+    template = load_template('person')
+
+    # Resolve manager if specified (search both scopes)
+    manager = ''
+    if getattr(args, 'manager', None):
+        manager_link = find_person_in_scopes(args.manager, args, config)
+        if manager_link:
+            manager = str(manager_link)
+
+    content = fill_template(
+        template,
+        ticket_id='',
+        title='',
+        name=name,
+        email=getattr(args, 'email', '') or '',
+        role=getattr(args, 'role', '') or '',
+        team=getattr(args, 'team', '') or '',
+        manager=manager,
+    )
+
+    filepath.write_text(content)
+
+    # Open in editor
+    if not getattr(args, 'no_edit', False):
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, str(filepath)])
+
+    print(f"Created person: {filepath}")
+    return EXIT_SUCCESS
+
+
+def cmd_people(args: argparse.Namespace, config: Config) -> int:
+    """People management dispatcher."""
+    people_cmd = getattr(args, 'people_command', None)
+
+    if people_cmd == 'list':
+        return cmd_people_list(args, config)
+    elif people_cmd == 'show':
+        return cmd_people_show(args, config)
+    elif people_cmd == 'edit':
+        return cmd_people_edit(args, config)
+    elif people_cmd == 'create':
+        return cmd_people_create(args, config)
+    elif people_cmd == 'dashboard':
+        # Delegate to dashboard command with person context
+        args.type = 'person'
+        return cmd_dashboard(args, config)
+    elif people_cmd == 'search':
+        # Simple search through people files (both scopes if not specified)
+        query = getattr(args, 'query', '')
+        people_dirs = get_people_dirs(args, config)
+
+        for people_dir in people_dirs:
+            if not people_dir.exists():
+                continue
+            for person_file in people_dir.glob('*.md'):
+                content = person_file.read_text()
+                if query.lower() in content.lower():
+                    metadata, _ = parse_frontmatter(content)
+                    name = metadata.get('name', person_file.stem)
+                    print(f"{name}: {person_file}")
+
+        return EXIT_SUCCESS
+    else:
+        error("No people subcommand specified. Use: list, show, create, dashboard, search")
+
+    return EXIT_GENERAL_ERROR
+
+
+def cmd_completion(args: argparse.Namespace, config: Config) -> int:
+    """Output shell completion script."""
+    shell = getattr(args, 'shell', 'bash')
+    if shell == 'bash':
+        print(BASH_COMPLETION_SCRIPT)
+    else:
+        error(f"Unsupported shell: {shell}", EXIT_INVALID_ARGS)
+    return EXIT_SUCCESS
+
+
+# ============================================================================
+# CLI PARSER
+# ============================================================================
+def create_parser() -> argparse.ArgumentParser:
+    """Create the argument parser with all subcommands."""
+
+    epilog = """
+Examples:
+    vimban init
+    vimban create task "Fix authentication bug" -a john -p high
+    vimban list --status in_progress,review --mine
+    vimban show VB-42 --links
+    vimban move VB-42 done --resolve
+    vimban edit VB-42 status=review -a jane
+    vimban link VB-42 blocked_by VB-41
+    vimban dashboard daily -f md
+    vimban search "authentication"
+    vimban people list --has-overdue
+    vimban report workload
+
+Environment Variables:
+    VIMBAN_DIR             Default directory (default: ~/Documents/notes)
+    VIMBAN_FORMAT          Default output format
+    VIMBAN_ID_PREFIX       ID prefix (default: VB)
+    VIMBAN_PEOPLE_DIR      People subdir (default: 02_areas/work/people)
+"""
+
+    parser = argparse.ArgumentParser(
+        prog='vimban',
+        description='Markdown-native ticket/kanban management system (:wqira)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=epilog
+    )
+
+    # Global options
+    parser.add_argument('-d', '--directory',
+                        help=f'Working directory (default: {DEFAULT_DIR})')
+    parser.add_argument('-f', '--format',
+                        choices=['plain', 'md', 'yaml', 'json'],
+                        default='plain',
+                        help='Output format (default: plain)')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='Suppress non-essential output')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose output')
+    parser.add_argument('--no-color', action='store_true',
+                        help='Disable colors')
+    parser.add_argument('--version', action='version',
+                        version=f'%(prog)s {VERSION}')
+    parser.add_argument('--license', action='store_true',
+                        help='Show license (AGPLv3)')
+
+    # Work/Personal scope (mutually exclusive)
+    scope_group = parser.add_mutually_exclusive_group()
+    scope_group.add_argument('--work', action='store_true',
+                             help='Operate on work tickets (01_projects/work/)')
+    scope_group.add_argument('--personal', action='store_true',
+                             help='Operate on personal tickets (01_projects/personal/)')
+
+    # Subparsers
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # init
+    init_parser = subparsers.add_parser('init', help='Initialize vimban')
+    init_parser.add_argument('directory', nargs='?', help='Directory to initialize')
+    init_parser.add_argument('-p', '--prefix', help=f'ID prefix (default: {DEFAULT_PREFIX})')
+    init_parser.add_argument('--people-dir', help=f'People subdir (default: {DEFAULT_PEOPLE_DIR})')
+    init_parser.add_argument('--no-git', action='store_true', help='Skip .gitignore')
+    init_parser.add_argument('--force', action='store_true', help='Reinitialize if exists')
+
+    # create
+    create_parser = subparsers.add_parser('create', help='Create a ticket')
+    create_parser.add_argument('type', choices=TICKET_TYPES, help='Ticket type')
+    create_parser.add_argument('title', nargs='?', help='Ticket title')
+    create_parser.add_argument('--id', help='Custom full ID')
+    create_parser.add_argument('--prefix', help='Custom prefix (auto sequence)')
+    create_parser.add_argument('-a', '--assignee', help='Assignee reference')
+    create_parser.add_argument('-r', '--reporter', help='Reporter reference')
+    create_parser.add_argument('-w', '--watcher', action='append', help='Add watcher')
+    create_parser.add_argument('-p', '--priority', choices=PRIORITIES, help='Priority')
+    create_parser.add_argument('-t', '--tags', help='Comma-separated tags')
+    create_parser.add_argument('-P', '--project', help='Project identifier')
+    create_parser.add_argument('-m', '--member-of', action='append', help='Parent ticket')
+    create_parser.add_argument('--due', help='Due date (YYYY-MM-DD or +7d)')
+    create_parser.add_argument('-e', '--effort', type=int, help='Story points')
+    create_parser.add_argument('-o', '--output', help='Output file path')
+    create_parser.add_argument('--no-edit', action='store_true', help="Don't open editor")
+    create_parser.add_argument('--dry-run', action='store_true', help='Preview creation')
+
+    # list
+    list_parser = subparsers.add_parser('list', help='List tickets')
+    list_parser.add_argument('-s', '--status', help='Filter status (comma-sep)')
+    list_parser.add_argument('-t', '--type', help='Filter type (comma-sep)')
+    list_parser.add_argument('-a', '--assignee', help='Filter assignee')
+    list_parser.add_argument('-P', '--project', help='Filter project')
+    list_parser.add_argument('--tag', action='append', help='Filter tag')
+    list_parser.add_argument('--priority', help='Filter priority')
+    list_parser.add_argument('--due-before', help='Due before date')
+    list_parser.add_argument('--due-after', help='Due after date')
+    list_parser.add_argument('--overdue', action='store_true', help='Only overdue')
+    list_parser.add_argument('--due-soon', nargs='?', const='7', help='Due within N days')
+    list_parser.add_argument('--stale', nargs='?', const='14', help='Not updated in N days')
+    list_parser.add_argument('--blocked', action='store_true', help='Only blocked')
+    list_parser.add_argument('--unassigned', action='store_true', help='Only unassigned')
+    list_parser.add_argument('--mine', action='store_true', help='Assigned to $USER')
+    list_parser.add_argument('--sort', help='Sort field (default: due_date)')
+    list_parser.add_argument('--reverse', action='store_true', help='Reverse sort')
+    list_parser.add_argument('--limit', type=int, help='Limit results')
+    list_parser.add_argument('--columns', help='Columns (comma-sep)')
+    list_parser.add_argument('--no-header', action='store_true', help='Omit header')
+    list_parser.add_argument('--krafna', help='Raw Krafna query')
+    list_parser.add_argument('filters', nargs='*', help='field=value filters')
+
+    # show
+    show_parser = subparsers.add_parser('show', help='Show ticket details')
+    show_parser.add_argument('ticket', help='Ticket ID or path')
+    show_parser.add_argument('--links', action='store_true', help='Show linked tickets')
+    show_parser.add_argument('--tree', action='store_true', help='Show hierarchy')
+    show_parser.add_argument('--history', action='store_true', help='Git history')
+    show_parser.add_argument('--raw', action='store_true', help='Raw file content')
+
+    # edit
+    edit_parser = subparsers.add_parser('edit', help='Edit ticket')
+    edit_parser.add_argument('ticket', help='Ticket ID or path')
+    edit_parser.add_argument('fields', nargs='*', help='field=value updates')
+    edit_parser.add_argument('-i', '--interactive', action='store_true', help='Open in $EDITOR')
+    edit_parser.add_argument('-a', '--assignee', help='Set assignee')
+    edit_parser.add_argument('-s', '--status', help='Set status')
+    edit_parser.add_argument('-p', '--priority', choices=PRIORITIES, help='Set priority')
+    edit_parser.add_argument('--add-tag', help='Add tag')
+    edit_parser.add_argument('--remove-tag', help='Remove tag')
+    edit_parser.add_argument('--progress', type=int, help='Set progress (0-100)')
+    edit_parser.add_argument('--due', help='Set due date')
+    edit_parser.add_argument('--clear', help='Clear field')
+    edit_parser.add_argument('--dry-run', action='store_true', help='Preview changes')
+
+    # move
+    move_parser = subparsers.add_parser('move', help='Move ticket status')
+    move_parser.add_argument('ticket', help='Ticket ID or path')
+    move_parser.add_argument('status', choices=STATUSES, help='New status')
+    move_parser.add_argument('--force', action='store_true', help='Skip validation')
+    move_parser.add_argument('--comment', help='Transition comment')
+    move_parser.add_argument('--resolve', action='store_true', help='Set end_date (for done)')
+    move_parser.add_argument('--reopen', action='store_true', help='Reopen from done/cancelled')
+
+    # link
+    link_parser = subparsers.add_parser('link', help='Link tickets')
+    link_parser.add_argument('ticket', help='Ticket ID or path')
+    link_parser.add_argument('relation', choices=['member_of', 'relates_to', 'blocked_by', 'blocks'],
+                             help='Relation type')
+    link_parser.add_argument('target', help='Target ticket')
+    link_parser.add_argument('--remove', action='store_true', help='Remove instead of add')
+    link_parser.add_argument('--bidirectional', action='store_true', help='Create reverse link')
+    link_parser.add_argument('--dry-run', action='store_true', help='Preview changes')
+
+    # dashboard
+    dashboard_parser = subparsers.add_parser('dashboard', help='Generate dashboard')
+    dashboard_parser.add_argument('type', nargs='?', default='daily',
+                                  choices=['daily', 'weekly', 'sprint', 'project', 'team', 'person'],
+                                  help='Dashboard type')
+    dashboard_parser.add_argument('-o', '--output', help='Output file')
+    dashboard_parser.add_argument('-P', '--project', help='Filter project')
+    dashboard_parser.add_argument('--person', help='Person reference')
+    dashboard_parser.add_argument('--sprint', help='Filter sprint')
+    dashboard_parser.add_argument('--section', help='Output section only (for vim !!)')
+    dashboard_parser.add_argument('--markers', action='store_true', help='Include section markers')
+
+    # search
+    search_parser = subparsers.add_parser('search', help='Search tickets')
+    search_parser.add_argument('query', help='Search query')
+    search_parser.add_argument('-E', '--regex', action='store_true', help='Regex mode')
+    search_parser.add_argument('-i', '--ignore-case', action='store_true', default=True,
+                               help='Case insensitive (default)')
+    search_parser.add_argument('-I', '--case-sensitive', action='store_true', help='Case sensitive')
+    search_parser.add_argument('--body-only', action='store_true', help='Body only')
+    search_parser.add_argument('--frontmatter-only', action='store_true', help='Frontmatter only')
+    search_parser.add_argument('--context', type=int, default=0, help='Context lines')
+    search_parser.add_argument('-l', '--files-only', action='store_true', help='List files only')
+
+    # validate
+    validate_parser = subparsers.add_parser('validate', help='Validate tickets')
+    validate_parser.add_argument('files', nargs='*', help='Files to validate')
+    validate_parser.add_argument('--fix', action='store_true', help='Auto-fix issues')
+    validate_parser.add_argument('--strict', action='store_true', help='Fail on warnings')
+    validate_parser.add_argument('--schema', help='Custom schema file')
+
+    # report
+    report_parser = subparsers.add_parser('report', help='Generate reports')
+    report_parser.add_argument('type', choices=['burndown', 'velocity', 'workload', 'aging', 'blockers'],
+                               help='Report type')
+    report_parser.add_argument('-P', '--project', help='Filter project')
+    report_parser.add_argument('--sprint', help='Filter sprint')
+    report_parser.add_argument('--from', dest='from_date', help='Start date')
+    report_parser.add_argument('--to', dest='to_date', help='End date')
+    report_parser.add_argument('-o', '--output', help='Output file')
+
+    # sync
+    sync_parser = subparsers.add_parser('sync', help='Sync with external systems')
+    sync_parser.add_argument('--provider', choices=['jira', 'monday'], default='jira',
+                             help='Sync provider')
+    sync_parser.add_argument('--dry-run', action='store_true', help='Preview sync')
+    sync_parser.add_argument('--push', action='store_true', help='Push local changes')
+    sync_parser.add_argument('--pull', action='store_true', help='Pull external changes')
+
+    # people
+    people_parser = subparsers.add_parser('people', help='People management')
+    people_subparsers = people_parser.add_subparsers(dest='people_command')
+
+    # people list
+    people_list = people_subparsers.add_parser('list', help='List all people')
+    people_list.add_argument('--team', help='Filter by team')
+    people_list.add_argument('--has-blocked', action='store_true', help='Has blocked tickets')
+    people_list.add_argument('--has-overdue', action='store_true', help='Has overdue tickets')
+
+    # people show
+    people_show = people_subparsers.add_parser('show', help='Show person details')
+    people_show.add_argument('person', help='Person reference')
+    people_show.add_argument('--tickets', action='store_true', help='Include ticket details')
+    people_show.add_argument('--raw', action='store_true', help='Raw file content')
+
+    # people edit
+    people_edit = people_subparsers.add_parser('edit', help='Edit person file')
+    people_edit.add_argument('person', help='Person reference')
+
+    # people dashboard
+    people_dash = people_subparsers.add_parser('dashboard', help='Generate person dashboard')
+    people_dash.add_argument('person', help='Person reference')
+    people_dash.add_argument('--section', help='Section only (for vim !!)')
+    people_dash.add_argument('--update', action='store_true', help='Update file in-place')
+    people_dash.add_argument('--all', action='store_true', help='All people')
+
+    # people create
+    people_create = people_subparsers.add_parser('create', help='Create person file')
+    people_create.add_argument('name', help='Person name')
+    people_create.add_argument('--email', help='Email address')
+    people_create.add_argument('--role', help='Role/title')
+    people_create.add_argument('--team', help='Team name')
+    people_create.add_argument('--manager', help='Manager reference')
+    people_create.add_argument('--no-edit', action='store_true', help="Don't open editor")
+
+    # people search
+    people_search = people_subparsers.add_parser('search', help='Search people')
+    people_search.add_argument('query', help='Search query')
+
+    # completion
+    completion_parser = subparsers.add_parser('completion', help='Generate shell completion')
+    completion_parser.add_argument('shell', nargs='?', default='bash', choices=['bash'],
+                                   help='Shell type (default: bash)')
+
+    return parser
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main() -> int:
+    """Main entry point."""
+    parser = create_parser()
+    args = parser.parse_args()
+
+    # Handle --license
+    if getattr(args, 'license', False):
+        print(LICENSE_TEXT)
+        return EXIT_SUCCESS
+
+    # Get directory from args, env, or default
+    directory = Path(
+        getattr(args, 'directory', None) or
+        environ.get('VIMBAN_DIR', '') or
+        str(DEFAULT_DIR)
+    ).expanduser()
+
+    # Load config
+    config = Config.load(directory)
+
+    # Override format from env if not specified
+    if not getattr(args, 'format', None):
+        args.format = environ.get('VIMBAN_FORMAT', 'plain')
+
+    # Dispatch command
+    command = getattr(args, 'command', None)
+
+    if not command:
+        parser.print_help()
+        return EXIT_SUCCESS
+
+    commands = {
+        'init': cmd_init,
+        'create': cmd_create,
+        'list': cmd_list,
+        'show': cmd_show,
+        'edit': cmd_edit,
+        'move': cmd_move,
+        'link': cmd_link,
+        'dashboard': cmd_dashboard,
+        'search': cmd_search,
+        'validate': cmd_validate,
+        'report': cmd_report,
+        'sync': cmd_sync,
+        'people': cmd_people,
+        'completion': cmd_completion,
+    }
+
+    cmd_func = commands.get(command)
+    if cmd_func:
+        try:
+            return cmd_func(args, config)
+        except KeyboardInterrupt:
+            print("\nInterrupted", file=sys.stderr)
+            return EXIT_GENERAL_ERROR
+        except Exception as e:
+            if getattr(args, 'verbose', False):
+                import traceback
+                traceback.print_exc()
+            error(str(e), EXIT_GENERAL_ERROR)
+    else:
+        error(f"Unknown command: {command}", EXIT_INVALID_ARGS)
+
+    return EXIT_SUCCESS
+
+
+if __name__ == "__main__":
+    sys.exit(main())

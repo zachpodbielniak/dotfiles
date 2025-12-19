@@ -217,6 +217,7 @@ _have kubectl && source <(kubectl completion bash)
 _have fzf && eval "$(fzf --bash)"
 _have himalaya && eval "$(himalaya completion bash)"
 _have glab && eval "$(glab completion -s bash)"
+_have "${HOME}/.dotfiles/share/vimban/completion.bash" && source "${HOME}/.dotfiles/share/vimban/completion.bash"
 
 
 # Keybinds
