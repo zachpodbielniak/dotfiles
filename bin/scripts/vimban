@@ -128,7 +128,7 @@ _vimban_completions () {
     local cur prev words cword
     _init_completion || return
 
-    local commands="init create list show edit move link dashboard kanban search validate report people sync completion"
+    local commands="init create list show edit move link comment dashboard kanban search validate report people sync completion"
     local types="epic story task sub-task research bug"
     local statuses="backlog ready in_progress blocked review delegated done cancelled"
     local priorities="critical high medium low"
@@ -294,6 +294,29 @@ _vimban_completions () {
                     else
                         COMPREPLY=($(compgen -W "--remove --bidirectional --dry-run" -- "${cur}"))
                     fi
+                    ;;
+            esac
+            ;;
+        comment)
+            case "${prev}" in
+                comment)
+                    # Complete with ticket IDs
+                    local ids
+                    ids=$(NO_DBOX_CHECK=1 vimban list -f plain --no-header 2>/dev/null | awk '{print $1}')
+                    COMPREPLY=($(compgen -W "${ids}" -- "${cur}"))
+                    ;;
+                --reply-to)
+                    # Complete with comment numbers (would need file context)
+                    COMPREPLY=($(compgen -W "1 2 3 4 5" -- "${cur}"))
+                    ;;
+                --print|--print-full)
+                    COMPREPLY=($(compgen -W "all 1 2 3" -- "${cur}"))
+                    ;;
+                -f|--format)
+                    COMPREPLY=($(compgen -W "${formats}" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "--reply-to --print --print-full --new-id-output -e --edit --dry-run -f --format" -- "${cur}"))
                     ;;
             esac
             ;;
@@ -487,6 +510,14 @@ DEFAULT_COLUMNS: list[str] = ["id", "status", "priority", "assignee", "title", "
 
 # Transclusion regex pattern
 TRANSCLUSION_PATTERN = re.compile(r'!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
+
+# Comment patterns
+COMMENT_HEADER_PATTERN = re.compile(
+    r'^### Comment #(\d+) \(([^)]+)\)\s*$'
+)
+REPLY_HEADER_PATTERN = re.compile(
+    r'^#### Reply \(([^)]+)\)\s*$'
+)
 
 
 # ============================================================================
@@ -916,6 +947,38 @@ class Person:
             'role': self.role or '',
             'team': self.team or '',
             'filepath': str(self.filepath),
+        }
+
+
+@dataclass
+class Comment:
+    """
+    Represents a comment on a ticket or person file.
+
+    Comments support single-level threading where the parent comment
+    can have multiple replies. Each comment has an auto-incremented ID
+    and timestamp.
+    """
+    id: int
+    timestamp: datetime
+    content: str
+    replies: list[tuple[datetime, str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """
+        Convert to plain dictionary for output formatting.
+
+        Returns:
+            Dictionary with string values suitable for display
+        """
+        return {
+            'id': self.id,
+            'timestamp': self.timestamp.isoformat(),
+            'content': self.content,
+            'replies': [
+                {'timestamp': ts.isoformat(), 'content': c}
+                for ts, c in self.replies
+            ],
         }
 
 
@@ -1825,6 +1888,357 @@ def replace_section(content: str, section: str, new_content: str) -> str:
 
 
 # ============================================================================
+# COMMENT HANDLING
+# ============================================================================
+def parse_comments(content: str) -> list[Comment]:
+    """
+    Extract comments from markdown content.
+
+    Parses the Comments section between VIMBAN:COMMENTS markers and
+    extracts all comments with their replies.
+
+    Args:
+        content: Full file content
+
+    Returns:
+        List of Comment objects
+    """
+    comments: list[Comment] = []
+    section = extract_comment_section(content)
+
+    if not section:
+        return comments
+
+    lines = section.split('\n')
+    current_comment: Optional[Comment] = None
+    current_content: list[str] = []
+    in_reply: bool = False
+    reply_timestamp: Optional[datetime] = None
+    reply_content: list[str] = []
+
+    for line in lines:
+        # Check for new comment header
+        comment_match = COMMENT_HEADER_PATTERN.match(line)
+        if comment_match:
+            # Save previous comment if exists
+            if current_comment is not None:
+                if in_reply and reply_timestamp:
+                    current_comment.replies.append(
+                        (reply_timestamp, '\n'.join(reply_content).strip())
+                    )
+                current_comment.content = '\n'.join(current_content).strip()
+                comments.append(current_comment)
+
+            # Start new comment
+            comment_id = int(comment_match.group(1))
+            timestamp_str = comment_match.group(2)
+            try:
+                timestamp = datetime.fromisoformat(timestamp_str)
+            except ValueError:
+                timestamp = datetime.now()
+
+            current_comment = Comment(
+                id=comment_id,
+                timestamp=timestamp,
+                content='',
+                replies=[]
+            )
+            current_content = []
+            in_reply = False
+            reply_content = []
+            continue
+
+        # Check for reply header
+        reply_match = REPLY_HEADER_PATTERN.match(line)
+        if reply_match and current_comment is not None:
+            # Save previous reply if exists
+            if in_reply and reply_timestamp:
+                current_comment.replies.append(
+                    (reply_timestamp, '\n'.join(reply_content).strip())
+                )
+
+            timestamp_str = reply_match.group(1)
+            try:
+                reply_timestamp = datetime.fromisoformat(timestamp_str)
+            except ValueError:
+                reply_timestamp = datetime.now()
+
+            in_reply = True
+            reply_content = []
+            continue
+
+        # Accumulate content
+        if current_comment is not None:
+            if in_reply:
+                reply_content.append(line)
+            else:
+                current_content.append(line)
+
+    # Save last comment
+    if current_comment is not None:
+        if in_reply and reply_timestamp:
+            current_comment.replies.append(
+                (reply_timestamp, '\n'.join(reply_content).strip())
+            )
+        current_comment.content = '\n'.join(current_content).strip()
+        comments.append(current_comment)
+
+    return comments
+
+
+def extract_comment_section(content: str) -> Optional[str]:
+    """
+    Get raw comment section between VIMBAN:COMMENTS markers.
+
+    Args:
+        content: Full file content
+
+    Returns:
+        Content between markers or None if not found
+    """
+    return extract_section(content, 'COMMENTS')
+
+
+def parse_comment_range(range_str: str, max_id: int) -> list[int]:
+    """
+    Parse a comment range string into list of IDs.
+
+    Supports:
+    - 'all' for all comments
+    - Single IDs: '1,3,5'
+    - Ranges: '2-5'
+    - Combined: '1,2-5,9'
+
+    Args:
+        range_str: Range specification string
+        max_id: Maximum comment ID in file
+
+    Returns:
+        List of comment IDs to display
+    """
+    if range_str.lower() == 'all':
+        return list(range(1, max_id + 1))
+
+    ids: set[int] = set()
+    parts = range_str.split(',')
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if '-' in part:
+            try:
+                start, end = part.split('-', 1)
+                start_id = int(start.strip())
+                end_id = int(end.strip())
+                for i in range(start_id, end_id + 1):
+                    if 1 <= i <= max_id:
+                        ids.add(i)
+            except ValueError:
+                continue
+        else:
+            try:
+                comment_id = int(part)
+                if 1 <= comment_id <= max_id:
+                    ids.add(comment_id)
+            except ValueError:
+                continue
+
+    return sorted(ids)
+
+
+def format_comment_output(
+    comments: list[Comment],
+    ids: list[int],
+    include_threads: bool = False,
+    fmt: str = 'plain',
+    colors: Optional[Colors] = None
+) -> str:
+    """
+    Format comments for terminal output.
+
+    Args:
+        comments: List of all comments
+        ids: List of comment IDs to display
+        include_threads: Whether to include thread replies
+        fmt: Output format ('plain', 'md', 'yaml', 'json')
+        colors: Colors instance for plain output
+
+    Returns:
+        Formatted string for display
+    """
+    if colors is None:
+        colors = Colors(enabled=True)
+
+    # Filter to requested IDs
+    filtered = [c for c in comments if c.id in ids]
+
+    if not filtered:
+        return "No comments found"
+
+    if fmt == 'json':
+        data = [c.to_dict() for c in filtered]
+        if not include_threads:
+            for item in data:
+                item.pop('replies', None)
+        return json.dumps(data, indent=2, default=str)
+
+    if fmt == 'yaml':
+        data = [c.to_dict() for c in filtered]
+        if not include_threads:
+            for item in data:
+                item.pop('replies', None)
+        return yaml.dump(data, default_flow_style=False, allow_unicode=True)
+
+    if fmt == 'md':
+        lines = []
+        for c in filtered:
+            lines.append(f"### Comment #{c.id} ({c.timestamp.isoformat()})")
+            lines.append("")
+            lines.append(c.content)
+            lines.append("")
+            if include_threads and c.replies:
+                for ts, reply in c.replies:
+                    lines.append(f"#### Reply ({ts.isoformat()})")
+                    lines.append("")
+                    lines.append(reply)
+                    lines.append("")
+        return '\n'.join(lines)
+
+    # Plain format
+    lines = []
+    for c in filtered:
+        lines.append(
+            f"{colors.BOLD}#{c.id}{colors.END} "
+            f"{colors.DIM}({c.timestamp.strftime('%Y-%m-%d %H:%M')}){colors.END}"
+        )
+        lines.append(c.content)
+        if include_threads and c.replies:
+            for ts, reply in c.replies:
+                lines.append(
+                    f"  {colors.CYAN}↳ Reply{colors.END} "
+                    f"{colors.DIM}({ts.strftime('%Y-%m-%d %H:%M')}){colors.END}"
+                )
+                # Indent reply content
+                for reply_line in reply.split('\n'):
+                    lines.append(f"    {reply_line}")
+        lines.append("")
+
+    return '\n'.join(lines)
+
+
+def get_next_comment_id(content: str) -> int:
+    """
+    Get next available comment ID by parsing existing comments.
+
+    Args:
+        content: Full file content
+
+    Returns:
+        Next available comment ID (1 if no comments exist)
+    """
+    comments = parse_comments(content)
+    if not comments:
+        return 1
+    return max(c.id for c in comments) + 1
+
+
+def ensure_comment_section(content: str) -> str:
+    """
+    Add comment section markers if missing.
+
+    Adds the Comments section at the end of the file if it doesn't exist.
+
+    Args:
+        content: Full file content
+
+    Returns:
+        Content with comment section markers
+    """
+    if '<!-- VIMBAN:COMMENTS:START -->' in content:
+        return content
+
+    # Add comment section at end
+    if not content.endswith('\n'):
+        content += '\n'
+
+    content += '\n## Comments\n\n'
+    content += '<!-- VIMBAN:COMMENTS:START -->\n\n'
+    content += '<!-- VIMBAN:COMMENTS:END -->\n'
+
+    return content
+
+
+def insert_comment(
+    filepath: Path,
+    text: str,
+    reply_to: Optional[int] = None
+) -> int:
+    """
+    Insert a comment into a file.
+
+    If reply_to is specified, adds a thread reply to that comment.
+    Otherwise, creates a new top-level comment.
+
+    Args:
+        filepath: Path to the markdown file
+        text: Comment text
+        reply_to: Comment ID to reply to (None for new comment)
+
+    Returns:
+        Comment ID (new ID for top-level, parent ID for reply)
+
+    Raises:
+        ValueError: If reply_to comment doesn't exist
+    """
+    content = filepath.read_text()
+
+    # Ensure comment section exists
+    content = ensure_comment_section(content)
+
+    timestamp = datetime.now().isoformat()
+
+    if reply_to is not None:
+        # Adding a reply to existing comment
+        comments = parse_comments(content)
+        parent = next((c for c in comments if c.id == reply_to), None)
+        if not parent:
+            raise ValueError(f"Comment #{reply_to} not found")
+
+        # Find the end of the parent comment or its last reply
+        # and insert the reply there
+        reply_markdown = f"\n#### Reply ({timestamp})\n\n{text}\n"
+
+        # Find the comment header and insert before the next comment or end marker
+        pattern = re.compile(
+            rf'(### Comment #{reply_to} \([^)]+\).*?)'
+            rf'(?=### Comment #|<!-- VIMBAN:COMMENTS:END -->)',
+            re.DOTALL
+        )
+        match = pattern.search(content)
+        if match:
+            insert_pos = match.end()
+            content = content[:insert_pos] + reply_markdown + content[insert_pos:]
+
+        filepath.write_text(content)
+        return reply_to
+    else:
+        # Adding a new top-level comment
+        new_id = get_next_comment_id(content)
+        comment_markdown = f"### Comment #{new_id} ({timestamp})\n\n{text}\n\n"
+
+        # Insert before the end marker
+        content = content.replace(
+            '<!-- VIMBAN:COMMENTS:END -->',
+            comment_markdown + '<!-- VIMBAN:COMMENTS:END -->'
+        )
+
+        filepath.write_text(content)
+        return new_id
+
+
+# ============================================================================
 # TRANSCLUSION HANDLING
 # ============================================================================
 def create_transclusion(
@@ -1966,6 +2380,13 @@ issue_link:
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
 ''',
     'epic': '''---
 id: {{ID}}
@@ -2012,6 +2433,13 @@ issue_link:
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
 ''',
     'story': '''---
 id: {{ID}}
@@ -2061,6 +2489,13 @@ As a [user type], I want to [action] so that [benefit].
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
 ''',
     'sub-task': '''---
 id: {{ID}}
@@ -2096,6 +2531,13 @@ issue_link:
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
 ''',
     'research': '''---
 id: {{ID}}
@@ -2140,6 +2582,13 @@ issue_link:
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
 ''',
     'bug': '''---
 id: {{ID}}
@@ -2194,6 +2643,13 @@ issue_link:
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
 ''',
     'person': '''---
 name: "{{NAME}}"
@@ -2228,6 +2684,13 @@ direct_reports: []
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
 ''',
 }
 
@@ -3856,6 +4319,125 @@ def cmd_completion(args: argparse.Namespace, config: Config) -> int:
     return EXIT_SUCCESS
 
 
+def cmd_comment(args: argparse.Namespace, config: Config) -> int:
+    """
+    Add or view comments on tickets and people.
+
+    Supports:
+    - Adding new comments (from args or stdin)
+    - Threading with --reply-to
+    - Viewing with --print and --print-full
+    - Script-friendly --new-id-output
+    """
+    target_ref = args.target
+    no_color = getattr(args, 'no_color', False)
+    colors = Colors(enabled=not no_color)
+    fmt = getattr(args, 'format', 'plain')
+
+    # Resolve target (try ticket first, then person)
+    target_path = find_ticket(target_ref, config, args)
+
+    if not target_path:
+        # Try as person
+        people_dirs = get_people_dirs(args, config)
+        for pdir in people_dirs:
+            if pdir.exists():
+                person_link = resolve_person_reference(target_ref, pdir)
+                if person_link:
+                    target_path = config.directory / person_link.path
+                    break
+
+    if not target_path or not target_path.exists():
+        error(f"Target not found: {target_ref}", EXIT_FILE_NOT_FOUND)
+
+    content = target_path.read_text()
+
+    # Handle --print or --print-full (view mode)
+    print_range = getattr(args, 'print', None)
+    print_full_range = getattr(args, 'print_full', None)
+
+    if print_range is not None or print_full_range is not None:
+        comments = parse_comments(content)
+        if not comments:
+            print("No comments found")
+            return EXIT_SUCCESS
+
+        max_id = max(c.id for c in comments)
+        range_str = print_full_range if print_full_range is not None else print_range
+        include_threads = print_full_range is not None
+
+        ids = parse_comment_range(range_str, max_id)
+        output = format_comment_output(
+            comments, ids, include_threads=include_threads, fmt=fmt, colors=colors
+        )
+        print(output)
+        return EXIT_SUCCESS
+
+    # Adding a comment - get text from args or stdin
+    text = getattr(args, 'text', None)
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+
+    if not text:
+        error("Comment text is required (provide as argument or via stdin)", EXIT_INVALID_ARGS)
+
+    # Handle --edit if specified
+    if getattr(args, 'edit', False):
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            suffix='.md',
+            delete=False
+        ) as f:
+            f.write(text)
+            temp_file = f.name
+
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, temp_file])
+
+        with open(temp_file, 'r') as f:
+            text = f.read().strip()
+        os.unlink(temp_file)
+
+        if not text:
+            print("Comment cancelled (empty text)")
+            return EXIT_SUCCESS
+
+    reply_to = getattr(args, 'reply_to', None)
+
+    # Handle --dry-run
+    if getattr(args, 'dry_run', False):
+        print("=== DRY RUN ===")
+        print(f"Target: {target_path}")
+        if reply_to:
+            print(f"Reply to: #{reply_to}")
+        else:
+            next_id = get_next_comment_id(content)
+            print(f"New comment ID: #{next_id}")
+        print(f"Text:\n{text}")
+        return EXIT_SUCCESS
+
+    # Insert comment
+    try:
+        comment_id = insert_comment(target_path, text, reply_to=reply_to)
+    except ValueError as e:
+        error(str(e), EXIT_VALIDATION_ERROR)
+
+    # Handle output
+    new_id_output = getattr(args, 'new_id_output', False)
+
+    if new_id_output:
+        # Script-friendly: just output the ID
+        print(comment_id)
+    else:
+        if reply_to:
+            print(f"Reply added to comment #{reply_to}")
+        else:
+            print(f"Comment #{comment_id} added to {target_path.name}")
+
+    return EXIT_SUCCESS
+
+
 # ============================================================================
 # CLI PARSER
 # ============================================================================
@@ -4010,6 +4592,23 @@ Environment Variables:
     link_parser.add_argument('--remove', action='store_true', help='Remove instead of add')
     link_parser.add_argument('--bidirectional', action='store_true', help='Create reverse link')
     link_parser.add_argument('--dry-run', action='store_true', help='Preview changes')
+
+    # comment
+    comment_parser = subparsers.add_parser('comment', help='Add/view comments')
+    comment_parser.add_argument('target', help='Ticket ID, path, or person')
+    comment_parser.add_argument('text', nargs='?', help='Comment text (reads stdin if absent)')
+    comment_parser.add_argument('--reply-to', type=int, metavar='N',
+                                help='Reply to comment #N')
+    comment_parser.add_argument('--print', nargs='?', const='all', metavar='RANGE',
+                                help='Print parent comments (e.g., 1,2-5,9 or all)')
+    comment_parser.add_argument('--print-full', nargs='?', const='all', metavar='RANGE',
+                                help='Print comments with threads')
+    comment_parser.add_argument('--new-id-output', action='store_true',
+                                help='Output only new comment ID (for scripting)')
+    comment_parser.add_argument('-e', '--edit', action='store_true',
+                                help='Edit comment in $EDITOR before saving')
+    comment_parser.add_argument('--dry-run', action='store_true',
+                                help='Preview without writing')
 
     # dashboard
     dashboard_parser = subparsers.add_parser('dashboard', help='Generate dashboard')
@@ -4168,6 +4767,7 @@ def main() -> int:
         'sync': cmd_sync,
         'people': cmd_people,
         'completion': cmd_completion,
+        'comment': cmd_comment,
     }
 
     cmd_func = commands.get(command)
