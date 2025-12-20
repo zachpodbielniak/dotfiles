@@ -770,8 +770,11 @@ def is_specialized_type(type_name: str) -> bool:
 # Default columns for list output
 DEFAULT_COLUMNS: list[str] = ["id", "status", "priority", "assignee", "title", "due_date"]
 
-# Transclusion regex pattern
+# Transclusion regex pattern: ![[path]] or ![[path|alias]]
 TRANSCLUSION_PATTERN = re.compile(r'!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
+
+# Markdown link pattern: [text](path)
+MARKDOWN_LINK_PATTERN = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 
 # Comment patterns
 COMMENT_HEADER_PATTERN = re.compile(
@@ -860,10 +863,14 @@ class TransclusionLink:
     @classmethod
     def parse(cls, text: str) -> Optional["TransclusionLink"]:
         """
-        Parse a transclusion string.
+        Parse a transclusion or markdown link string.
+
+        Supports both formats:
+        - Transclusion: ![[path]] or ![[path|alias]]
+        - Markdown: [text](path)
 
         Args:
-            text: String potentially containing a transclusion
+            text: String potentially containing a link
 
         Returns:
             TransclusionLink if valid, None otherwise
@@ -871,9 +878,18 @@ class TransclusionLink:
         if not text:
             return None
 
-        match = TRANSCLUSION_PATTERN.match(text.strip())
+        text = text.strip()
+
+        # Try transclusion format first: ![[path]] or ![[path|alias]]
+        match = TRANSCLUSION_PATTERN.match(text)
         if match:
             return cls(path=match.group(1), alias=match.group(2))
+
+        # Try markdown link format: [text](path)
+        match = MARKDOWN_LINK_PATTERN.match(text)
+        if match:
+            # For markdown links, text becomes alias, path is the URL/path
+            return cls(path=match.group(2), alias=match.group(1))
 
         return None
 
@@ -3158,6 +3174,73 @@ def find_ticket(
     return None
 
 
+def find_person(
+    person_ref: str,
+    config: Config,
+    args: argparse.Namespace
+) -> Optional[Path]:
+    """
+    Find a person file by name, filename, or path.
+
+    Searches people directories (work and personal) based on --work/--personal flags.
+    If no flag specified, searches both directories.
+
+    Accepts:
+    - Full path: ./people/john_smith.md
+    - Filename: john_smith
+    - Name: "John Smith"
+
+    Args:
+        person_ref: Person reference (name, filename, or path)
+        config: Vimban configuration
+        args: Parsed command line arguments (for scope flags)
+
+    Returns:
+        Path to person file or None
+    """
+    # Check if it's a path
+    if '/' in person_ref or person_ref.endswith('.md'):
+        path = Path(person_ref)
+        if not path.is_absolute():
+            path = config.directory / path
+        if path.exists():
+            return path
+        return None
+
+    # Get people directories
+    people_dirs = get_people_dirs(args, config)
+
+    for people_dir in people_dirs:
+        if not people_dir.exists():
+            continue
+
+        # Try exact filename match
+        exact_path = people_dir / f"{person_ref}.md"
+        if exact_path.exists():
+            return exact_path
+
+        # Try sanitized filename
+        sanitized = sanitize_filename(person_ref)
+        sanitized_path = people_dir / f"{sanitized}.md"
+        if sanitized_path.exists():
+            return sanitized_path
+
+        # Search by name in frontmatter
+        for md_file in people_dir.glob('*.md'):
+            try:
+                content = md_file.read_text()
+                metadata, _ = parse_frontmatter(content)
+                if metadata.get('type') != 'person':
+                    continue
+                name = metadata.get('name', '')
+                if name.lower() == person_ref.lower():
+                    return md_file
+            except (ValueError, yaml.YAMLError):
+                continue
+
+    return None
+
+
 # ============================================================================
 # COMMANDS
 # ============================================================================
@@ -4088,43 +4171,74 @@ def cmd_show(args: argparse.Namespace, config: Config) -> int:
 
 def cmd_generate_link(args: argparse.Namespace, config: Config) -> int:
     """
-    Generate transclusion link for a ticket.
+    Generate markdown or transclusion link for a ticket or person.
 
-    Outputs a transclusion link (![[path]]) to stdout.
-    By default uses path relative to notes directory.
+    Outputs a link to stdout:
+    - Default: markdown format [text](path)
+    - With --transclusion: transclusion format ![[path]]
+
+    For tickets, markdown text is the ticket ID.
+    For people, markdown text is the person's name.
     """
-    ticket_ref = args.ticket
-    ticket_path = find_ticket(ticket_ref, config, args)
-
-    if not ticket_path:
-        error(f"Ticket not found: {ticket_ref}", EXIT_FILE_NOT_FOUND)
-
+    ref = args.ticket  # Can be ticket ID or person reference
     use_absolute = getattr(args, 'absolute', False)
-    use_markdown = getattr(args, 'markdown', False)
+    use_transclusion = getattr(args, 'transclusion', False)
 
-    if use_absolute:
-        link_path = str(ticket_path)
-    else:
-        # Make path relative to notes directory
-        try:
-            link_path = str(ticket_path.relative_to(config.directory))
-        except ValueError:
-            # Path is not under config.directory, use absolute
+    # Try to find as ticket first
+    ticket_path = find_ticket(ref, config, args)
+
+    if ticket_path:
+        # It's a ticket
+        if use_absolute:
             link_path = str(ticket_path)
+        else:
+            try:
+                link_path = str(ticket_path.relative_to(config.directory))
+            except ValueError:
+                link_path = str(ticket_path)
 
-    if use_markdown:
-        # Get title for markdown link
-        try:
-            ticket = Ticket.from_file(ticket_path)
-            title = ticket.title
-        except ValueError:
-            title = ticket_path.stem.replace('_', ' ').title()
-        print(f"[{title}]({link_path})")
-    else:
-        # Transclusion format
-        print(f"![[{link_path}]]")
+        if use_transclusion:
+            print(f"![[{link_path}]]")
+        else:
+            # Markdown format (default) - use ticket ID for link text
+            try:
+                ticket = Ticket.from_file(ticket_path)
+                link_text = ticket.id
+            except ValueError:
+                link_text = ticket_path.stem
+            print(f"[{link_text}]({link_path})")
+        return EXIT_SUCCESS
 
-    return EXIT_SUCCESS
+    # Try to find as person
+    person_path = find_person(ref, config, args)
+
+    if person_path:
+        if use_absolute:
+            link_path = str(person_path)
+        else:
+            try:
+                link_path = str(person_path.relative_to(config.directory))
+            except ValueError:
+                link_path = str(person_path)
+
+        if use_transclusion:
+            print(f"![[{link_path}]]")
+        else:
+            # Markdown format (default) - use person's display name for link text
+            try:
+                person = Person.from_file(person_path)
+                name = person.name
+                # If name looks like a filename (has underscores, no spaces), format it
+                if '_' in name and ' ' not in name:
+                    link_text = name.replace('_', ' ').title()
+                else:
+                    link_text = name
+            except ValueError:
+                link_text = person_path.stem.replace('_', ' ').title()
+            print(f"[{link_text}]({link_path})")
+        return EXIT_SUCCESS
+
+    error(f"Not found: {ref}", EXIT_FILE_NOT_FOUND)
 
 
 def cmd_edit(args: argparse.Namespace, config: Config) -> int:
@@ -5630,10 +5744,11 @@ Environment Variables:
     show_parser.add_argument('--content', action='store_true', help='Show content only (no frontmatter)')
 
     # generate-link
-    genlink_parser = subparsers.add_parser('generate-link', help='Generate transclusion link for ticket')
-    genlink_parser.add_argument('ticket', help='Ticket ID or path')
+    genlink_parser = subparsers.add_parser('generate-link', help='Generate link for ticket or person')
+    genlink_parser.add_argument('ticket', help='Ticket ID or person reference')
     genlink_parser.add_argument('--absolute', action='store_true', help='Use absolute path instead of relative')
-    genlink_parser.add_argument('--markdown', action='store_true', help='Output markdown link instead of transclusion')
+    genlink_parser.add_argument('--markdown', action='store_true', help='Output markdown link (default)')
+    genlink_parser.add_argument('--transclusion', action='store_true', help='Output transclusion link ![[path]]')
 
     # edit
     edit_parser = subparsers.add_parser('edit', help='Edit ticket')
