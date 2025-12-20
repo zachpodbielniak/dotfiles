@@ -72,6 +72,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from abc import ABC, abstractmethod
@@ -129,7 +130,7 @@ _vimban_completions () {
     _init_completion || return
 
     local commands="init create list show edit move link comment dashboard kanban search validate report people sync completion"
-    local types="epic story task sub-task research bug"
+    local types="epic story task sub-task research bug area resource"
     local statuses="backlog ready in_progress blocked review delegated done cancelled"
     local priorities="critical high medium low"
     local formats="plain md yaml json"
@@ -165,7 +166,7 @@ _vimban_completions () {
                     COMPREPLY=($(compgen -W "${priorities}" -- "${cur}"))
                     ;;
                 *)
-                    COMPREPLY=($(compgen -W "-a --assignee -r --reporter -w --watcher -p --priority -t --tags -P --project -m --member-of --due -e --effort -o --output --id --prefix --no-edit --dry-run" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "-a --assignee -r --reporter -w --watcher -p --priority -t --tags -P --project -m --member-of --due -e --effort -o --output --id --prefix --topic --no-edit --dry-run" -- "${cur}"))
                     ;;
             esac
             ;;
@@ -191,7 +192,7 @@ _vimban_completions () {
                     fi
                     ;;
                 *)
-                    COMPREPLY=($(compgen -W "-s --status -t --type -a --assignee -P --project --tag --priority --overdue --due-soon --blocked --unassigned --mine --sort --reverse --limit --columns --no-header -f --format" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "-s --status -t --type -a --assignee -P --project --tag --priority --overdue --due-soon --blocked --unassigned --mine --areas --resources --sort --reverse --limit --columns --no-header -f --format" -- "${cur}"))
                     ;;
             esac
             ;;
@@ -504,6 +505,20 @@ VALID_TRANSITIONS: dict[str, list[str]] = {
 
 TICKET_TYPES: list[str] = ["epic", "story", "task", "sub-task", "research", "bug"]
 PRIORITIES: list[str] = ["critical", "high", "medium", "low"]
+
+# PARA types (non-project types for areas and resources)
+PARA_TYPES: list[str] = ["area", "resource"]
+ALL_TYPES: list[str] = TICKET_TYPES + PARA_TYPES
+
+# Separate ID prefixes for PARA types
+PARA_PREFIXES: dict[str, str] = {
+    "area": "AR",
+    "resource": "RS"
+}
+
+# Sequence files for each type category
+SEQUENCE_FILE_AREA: str = ".sequence_area"
+SEQUENCE_FILE_RESOURCE: str = ".sequence_resource"
 
 # Default columns for list output
 DEFAULT_COLUMNS: list[str] = ["id", "status", "priority", "assignee", "title", "due_date"]
@@ -1699,7 +1714,8 @@ def parse_date(date_str: str) -> Optional[date]:
 def next_id(
     config_dir: Path,
     custom_id: Optional[str] = None,
-    prefix: Optional[str] = None
+    prefix: Optional[str] = None,
+    ticket_type: Optional[str] = None
 ) -> str:
     """
     Generate next ticket ID with file-based locking.
@@ -1708,15 +1724,24 @@ def next_id(
         config_dir: Path to .vimban directory
         custom_id: Custom ID to use (bypasses sequence)
         prefix: Custom prefix (default: from config)
+        ticket_type: Type of ticket (area/resource use separate sequences)
 
     Returns:
-        New ticket ID (e.g., "VB-00042")
+        New ticket ID (e.g., "VB-00042", "AR-00001", "RS-00001")
     """
     if custom_id:
         return custom_id
 
-    sequence_file = config_dir / SEQUENCE_FILE
-    prefix = prefix or DEFAULT_PREFIX
+    # Determine sequence file and prefix based on type
+    if ticket_type == "area":
+        sequence_file = config_dir / SEQUENCE_FILE_AREA
+        prefix = prefix or PARA_PREFIXES["area"]
+    elif ticket_type == "resource":
+        sequence_file = config_dir / SEQUENCE_FILE_RESOURCE
+        prefix = prefix or PARA_PREFIXES["resource"]
+    else:
+        sequence_file = config_dir / SEQUENCE_FILE
+        prefix = prefix or DEFAULT_PREFIX
 
     # Ensure sequence file exists
     if not sequence_file.exists():
@@ -1771,7 +1796,11 @@ def krafna_query(query: str, directory: Path) -> list[dict]:
     return []
 
 
-def fallback_list_tickets(directory: Path, filters: dict) -> list[Ticket]:
+def fallback_list_tickets(
+    directory: Path,
+    filters: dict,
+    exclude_types: Optional[list[str]] = None
+) -> list[Ticket]:
     """
     List tickets without Krafna (fallback method).
 
@@ -1780,10 +1809,14 @@ def fallback_list_tickets(directory: Path, filters: dict) -> list[Ticket]:
     Args:
         directory: Directory to search
         filters: Dictionary of filter criteria
+        exclude_types: List of types to exclude (default: ['person'])
 
     Returns:
         List of matching Ticket objects
     """
+    if exclude_types is None:
+        exclude_types = ['person']
+
     tickets = []
 
     # Find all markdown files
@@ -1796,8 +1829,8 @@ def fallback_list_tickets(directory: Path, filters: dict) -> list[Ticket]:
             if not metadata.get('id') or not metadata.get('type'):
                 continue
 
-            # Skip if type is 'person'
-            if metadata.get('type') == 'person':
+            # Skip excluded types
+            if metadata.get('type') in exclude_types:
                 continue
 
             ticket = Ticket.from_file(md_file)
@@ -2757,6 +2790,7 @@ def fill_template(
         '{{ASSIGNEE}}': f'"{assignee}"' if assignee else '',
         '{{REPORTER}}': f'"{reporter}"' if reporter else '',
         '{{PRIORITY}}': priority,
+        '{{STATUS}}': kwargs.get('status', 'backlog'),
         '{{DUE_DATE}}': str(due_date) if due_date else '',
         '{{TAGS}}': json.dumps(tags) if tags else '[]',
         '{{PROJECT}}': project or '',
@@ -2982,6 +3016,63 @@ def get_people_dirs(args: argparse.Namespace, config: Config) -> list[Path]:
         return [base / "work" / "people", base / "personal" / "people"]
 
 
+def get_para_base(
+    args: argparse.Namespace,
+    config: Config,
+    para_type: str
+) -> Path:
+    """
+    Get base directory for PARA types (area/resource) using --topic.
+
+    Args:
+        args: Parsed command line arguments (expects --topic)
+        config: Config instance with directory info
+        para_type: Either "area" or "resource"
+
+    Returns:
+        Path to the PARA type base directory with topic subdirectory
+    """
+    if para_type == "area":
+        base = config.directory / "02_areas"
+    elif para_type == "resource":
+        base = config.directory / "03_resources"
+    else:
+        error(f"Invalid PARA type: {para_type}", EXIT_INVALID_ARGS)
+
+    # Add topic subdirectory if specified
+    topic = getattr(args, 'topic', None)
+    if topic:
+        return base / topic
+    else:
+        return base
+
+
+def get_para_search_paths(
+    args: argparse.Namespace,
+    config: Config
+) -> list[Path]:
+    """
+    Get list of paths to search for PARA types (areas/resources).
+
+    Based on --areas and --resources flags.
+
+    Args:
+        args: Parsed command line arguments
+        config: Config instance with directory info
+
+    Returns:
+        List of paths to search for areas/resources
+    """
+    paths: list[Path] = []
+
+    if getattr(args, 'areas', False):
+        paths.append(config.directory / "02_areas")
+    if getattr(args, 'resources', False):
+        paths.append(config.directory / "03_resources")
+
+    return paths
+
+
 def get_people_base(
     args: argparse.Namespace,
     config: Config,
@@ -3195,6 +3286,110 @@ def determine_output_path(
         return base / filename
 
 
+def cmd_create_para(
+    args: argparse.Namespace,
+    config: Config,
+    title: str
+) -> int:
+    """
+    Create a new PARA type (area or resource).
+
+    PARA types have different handling:
+    - Use --topic instead of --work/--personal for path
+    - Use separate ID sequences (AR-XXX, RS-XXX)
+    - No type prefix in filename
+    - Areas have status, resources don't
+
+    Args:
+        args: Parsed command line arguments
+        config: Config instance with directory info
+        title: Title for the new item
+
+    Returns:
+        Exit code
+    """
+    config_dir = config.directory / CONFIG_DIR_NAME
+
+    # Generate ID with type-specific prefix and sequence
+    ticket_id = next_id(
+        config_dir,
+        custom_id=getattr(args, 'id', None),
+        prefix=getattr(args, 'prefix', None),
+        ticket_type=args.type
+    )
+
+    # Parse tags
+    tags_str = getattr(args, 'tags', None) or ''
+    tags = [t.strip() for t in tags_str.split(',')] if tags_str else []
+
+    # Load template
+    template = load_template(args.type)
+
+    # Fill template - areas have status, resources don't
+    if args.type == "area":
+        # Areas use status
+        status = getattr(args, 'status', None) or config.default_status
+        content = fill_template(
+            template,
+            ticket_id=ticket_id,
+            title=title,
+            status=status,
+            tags=tags,
+        )
+    else:
+        # Resources don't have status
+        content = fill_template(
+            template,
+            ticket_id=ticket_id,
+            title=title,
+            tags=tags,
+        )
+
+    # Sanitize title for filename (NO type prefix for PARA types)
+    safe_title = re.sub(r'[^\w\s-]', '', title).strip().lower()
+    safe_title = re.sub(r'[-\s]+', '_', safe_title)[:50]
+
+    # Determine output path
+    output_path: Path
+    if getattr(args, 'output', None):
+        output_path = Path(args.output)
+        if not output_path.is_absolute():
+            output_path = config.directory / output_path
+    else:
+        # Get PARA base with topic
+        para_base = get_para_base(args, config, args.type)
+
+        # Simple flat file - no type prefix
+        output_path = para_base / f"{safe_title}.md"
+
+    if getattr(args, 'dry_run', False):
+        print("=== DRY RUN ===")
+        print(f"Would create: {output_path}")
+        print(f"ID: {ticket_id}")
+        print(f"Content:\n{content}")
+        return EXIT_SUCCESS
+
+    # Write file
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content)
+
+    # Open in editor unless --no-edit
+    if not getattr(args, 'no_edit', False):
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, str(output_path)])
+
+    # Output based on format
+    fmt = getattr(args, 'format', 'plain')
+    if fmt == 'json':
+        print(json.dumps({'id': ticket_id, 'path': str(output_path)}))
+    elif fmt == 'yaml':
+        print(yaml.dump({'id': ticket_id, 'path': str(output_path)}))
+    else:
+        print(f"Created {ticket_id}: {output_path}")
+
+    return EXIT_SUCCESS
+
+
 def cmd_create(args: argparse.Namespace, config: Config) -> int:
     """
     Create a new ticket.
@@ -3205,6 +3400,7 @@ def cmd_create(args: argparse.Namespace, config: Config) -> int:
     - Date parsing (absolute and relative)
     - stdin for title
     - --dry-run preview
+    - PARA types (area/resource) with --topic
     """
     # Get title from args or stdin
     title = getattr(args, 'title', None)
@@ -3219,7 +3415,11 @@ def cmd_create(args: argparse.Namespace, config: Config) -> int:
     if not config_dir.exists():
         error(f"vimban not initialized in {config.directory}. Run 'vimban init' first.", EXIT_GENERAL_ERROR)
 
-    # Generate ID
+    # Handle PARA types (area/resource) differently
+    if args.type in PARA_TYPES:
+        return cmd_create_para(args, config, title)
+
+    # Generate ID for regular ticket types
     ticket_id = next_id(
         config_dir,
         custom_id=getattr(args, 'id', None),
@@ -3316,6 +3516,7 @@ def cmd_list(args: argparse.Namespace, config: Config) -> int:
     Uses Krafna for querying when available,
     falls back to filesystem scan otherwise.
     Searches both work and personal directories if no scope specified.
+    Excludes areas/resources by default unless --areas or --resources flags used.
     """
     # Build filters dict
     filters = {
@@ -3326,14 +3527,29 @@ def cmd_list(args: argparse.Namespace, config: Config) -> int:
         'assignee': getattr(args, 'assignee', None),
     }
 
+    # Determine which types to exclude
+    # Always exclude 'person', exclude PARA types unless explicitly requested
+    exclude_types = ['person']
+    include_areas = getattr(args, 'areas', False)
+    include_resources = getattr(args, 'resources', False)
+
+    if not include_areas:
+        exclude_types.append('area')
+    if not include_resources:
+        exclude_types.append('resource')
+
     # Get search paths (work, personal, or both)
     search_paths = get_search_paths(args, config)
+
+    # Add PARA search paths if requested
+    para_paths = get_para_search_paths(args, config)
+    search_paths.extend(para_paths)
 
     # Collect tickets from all search paths
     tickets: list[Ticket] = []
     for search_path in search_paths:
         if search_path.exists():
-            path_tickets = fallback_list_tickets(search_path, filters)
+            path_tickets = fallback_list_tickets(search_path, filters, exclude_types)
             tickets.extend(path_tickets)
 
     # Apply additional filters
@@ -3417,6 +3633,13 @@ def cmd_show(args: argparse.Namespace, config: Config) -> int:
         print(ticket_path.read_text())
         return EXIT_SUCCESS
 
+    # Show content only (no frontmatter) if requested
+    if getattr(args, 'content', False):
+        content = ticket_path.read_text()
+        _, body = parse_frontmatter(content)
+        print(body.strip())
+        return EXIT_SUCCESS
+
     try:
         ticket = Ticket.from_file(ticket_path)
     except ValueError as e:
@@ -3484,15 +3707,84 @@ def cmd_edit(args: argparse.Namespace, config: Config) -> int:
     """
     Edit ticket fields.
 
-    Updates frontmatter fields directly or opens in $EDITOR.
+    If no ticket specified, opens fzf picker.
+    If ticket specified but no updates, opens in $EDITOR.
+    Otherwise updates frontmatter fields directly.
     """
-    ticket_ref = args.ticket
+    ticket_ref = getattr(args, 'ticket', None)
+
+    # No ticket specified → fzf picker
+    if not ticket_ref:
+        # Check if fzf is available
+        if not shutil.which('fzf'):
+            error("fzf is required for interactive ticket selection", EXIT_INVALID_ARGS)
+
+        # Get search paths and collect tickets
+        search_paths = get_search_paths(args, config)
+        tickets: list[Ticket] = []
+        for search_path in search_paths:
+            if search_path.exists():
+                path_tickets = fallback_list_tickets(search_path, {})
+                tickets.extend(path_tickets)
+
+        if not tickets:
+            error("No tickets found", EXIT_FILE_NOT_FOUND)
+
+        # Format for fzf: ID | status | priority | assignee | title
+        lines: list[str] = []
+        for t in tickets:
+            assignee = Path(t.assignee.path).stem if t.assignee else '-'
+            line = f"{t.id}\t{t.status}\t{t.priority}\t{assignee}\t{t.title}"
+            lines.append(line)
+
+        # Run fzf with preview
+        fzf_cmd = [
+            'fzf',
+            '--header', 'ID\tStatus\tPriority\tAssignee\tTitle',
+            '--preview', 'vimban show {1} --content',
+            '--preview-window', 'right:60%:wrap',
+            '--delimiter', '\t',
+        ]
+
+        result = subprocess.run(
+            fzf_cmd,
+            input='\n'.join(lines),
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            # User cancelled
+            return EXIT_SUCCESS
+
+        ticket_ref = result.stdout.strip().split('\t')[0]
+
     ticket_path = find_ticket(ticket_ref, config, args)
 
     if not ticket_path:
         error(f"Ticket not found: {ticket_ref}", EXIT_FILE_NOT_FOUND)
 
-    # Interactive edit
+    # Check if any updates are specified
+    has_updates = (
+        getattr(args, 'interactive', False) or
+        getattr(args, 'status', None) or
+        getattr(args, 'priority', None) or
+        getattr(args, 'progress', None) is not None or
+        getattr(args, 'due', None) or
+        getattr(args, 'assignee', None) or
+        getattr(args, 'add_tag', None) or
+        getattr(args, 'remove_tag', None) or
+        getattr(args, 'clear', None) or
+        (getattr(args, 'fields', None) and len(args.fields) > 0)
+    )
+
+    # No updates specified → open in editor (implicit -i)
+    if not has_updates:
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, str(ticket_path)])
+        return EXIT_SUCCESS
+
+    # Interactive edit flag
     if getattr(args, 'interactive', False):
         editor = os.environ.get('EDITOR', 'vim')
         subprocess.run([editor, str(ticket_path)])
@@ -3546,7 +3838,10 @@ def cmd_edit(args: argparse.Namespace, config: Config) -> int:
             updates[field] = value
 
     if not updates:
-        error("No updates specified", EXIT_INVALID_ARGS)
+        # This shouldn't happen due to has_updates check, but safety fallback
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, str(ticket_path)])
+        return EXIT_SUCCESS
 
     # Preview changes
     if getattr(args, 'dry_run', False):
@@ -4510,7 +4805,7 @@ Environment Variables:
 
     # create
     create_parser = subparsers.add_parser('create', help='Create a ticket')
-    create_parser.add_argument('type', choices=TICKET_TYPES, help='Ticket type')
+    create_parser.add_argument('type', choices=ALL_TYPES, help='Ticket type')
     create_parser.add_argument('title', nargs='?', help='Ticket title')
     create_parser.add_argument('--id', help='Custom full ID')
     create_parser.add_argument('--prefix', help='Custom prefix (auto sequence)')
@@ -4524,6 +4819,7 @@ Environment Variables:
     create_parser.add_argument('--due', help='Due date (YYYY-MM-DD or +7d)')
     create_parser.add_argument('-e', '--effort', type=int, help='Story points')
     create_parser.add_argument('-o', '--output', help='Output file path')
+    create_parser.add_argument('--topic', help='Topic path for area/resource (e.g., technical/linux)')
     create_parser.add_argument('--no-edit', action='store_true', help="Don't open editor")
     create_parser.add_argument('--dry-run', action='store_true', help='Preview creation')
 
@@ -4543,6 +4839,8 @@ Environment Variables:
     list_parser.add_argument('--blocked', action='store_true', help='Only blocked')
     list_parser.add_argument('--unassigned', action='store_true', help='Only unassigned')
     list_parser.add_argument('--mine', action='store_true', help='Assigned to $USER')
+    list_parser.add_argument('--areas', action='store_true', help='Include areas')
+    list_parser.add_argument('--resources', action='store_true', help='Include resources')
     list_parser.add_argument('--sort', help='Sort field (default: due_date)')
     list_parser.add_argument('--reverse', action='store_true', help='Reverse sort')
     list_parser.add_argument('--limit', type=int, help='Limit results')
@@ -4558,10 +4856,11 @@ Environment Variables:
     show_parser.add_argument('--tree', action='store_true', help='Show hierarchy')
     show_parser.add_argument('--history', action='store_true', help='Git history')
     show_parser.add_argument('--raw', action='store_true', help='Raw file content')
+    show_parser.add_argument('--content', action='store_true', help='Show content only (no frontmatter)')
 
     # edit
     edit_parser = subparsers.add_parser('edit', help='Edit ticket')
-    edit_parser.add_argument('ticket', help='Ticket ID or path')
+    edit_parser.add_argument('ticket', nargs='?', help='Ticket ID or path (fzf picker if omitted)')
     edit_parser.add_argument('fields', nargs='*', help='field=value updates')
     edit_parser.add_argument('-i', '--interactive', action='store_true', help='Open in $EDITOR')
     edit_parser.add_argument('-a', '--assignee', help='Set assignee')

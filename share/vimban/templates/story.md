@@ -46,3 +46,10 @@ As a [user type], I want to [action] so that [benefit].
 
 ## Notes
 
+
+
+## Comments
+
+<!-- VIMBAN:COMMENTS:START -->
+
+<!-- VIMBAN:COMMENTS:END -->
