@@ -141,6 +141,7 @@ alias y="yazi"
 alias sv="source venv/bin/activate"
 alias c2b="clip2brain"
 alias c2ba="clip2brain --audio"
+alias vb="vimban"
 
 alias cdd="cd ${HOME}/.dotfiles"
 alias cdp="cd ${HOME}/Source/Projects"
