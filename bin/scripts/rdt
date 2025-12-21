@@ -1,0 +1,1131 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Now import everything else inside the dev container
+import argparse
+import hashlib
+import json
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+# Optional YAML support
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+
+# =============================================================================
+# GLOBAL CONFIGURATION
+# =============================================================================
+
+# Cache directory - easily changeable
+CACHE_DIR: str = "/tmp/rdt_cache/"
+
+# User agent to avoid Reddit blocking (must look like a browser)
+USER_AGENT: str = "Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"
+
+# Reddit base URL
+REDDIT_BASE_URL: str = "https://www.reddit.com"
+
+# Exit codes
+EXIT_SUCCESS: int = 0
+EXIT_GENERAL_ERROR: int = 1
+EXIT_USAGE_ERROR: int = 2
+EXIT_NETWORK_ERROR: int = 5
+
+# Request timeout
+REQUEST_TIMEOUT: int = 30
+
+# Cache max age in hours
+CACHE_MAX_AGE_HOURS: int = 24
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class RedditComment:
+    """Represents a Reddit comment with nested replies."""
+    id: str
+    author: str
+    body: str
+    score: int
+    depth: int
+    created_utc: float
+    replies: list["RedditComment"] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for YAML/JSON output."""
+        return {
+            "id": self.id,
+            "author": self.author,
+            "body": self.body,
+            "score": self.score,
+            "depth": self.depth,
+            "created_utc": self.created_utc,
+            "created": datetime.fromtimestamp(self.created_utc).isoformat(),
+            "replies": [r.to_dict() for r in self.replies]
+        }
+
+
+@dataclass
+class RedditPost:
+    """Represents a Reddit post."""
+    id: str
+    title: str
+    author: str
+    selftext: str
+    score: int
+    num_comments: int
+    permalink: str
+    subreddit: str
+    created_utc: float
+    url: str
+    is_self: bool
+    upvote_ratio: float = 0.0
+    link_flair_text: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for YAML/JSON output."""
+        return {
+            "id": self.id,
+            "title": self.title,
+            "author": self.author,
+            "selftext": self.selftext,
+            "score": self.score,
+            "num_comments": self.num_comments,
+            "permalink": self.permalink,
+            "subreddit": self.subreddit,
+            "created_utc": self.created_utc,
+            "created": datetime.fromtimestamp(self.created_utc).isoformat(),
+            "url": self.url,
+            "is_self": self.is_self,
+            "upvote_ratio": self.upvote_ratio,
+            "link_flair_text": self.link_flair_text
+        }
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def error(message: str, exit_code: int = EXIT_GENERAL_ERROR) -> None:
+    """Print error message to stderr and exit."""
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(exit_code)
+
+
+def warn(message: str) -> None:
+    """Print warning message to stderr."""
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+def debug(message: str, enabled: bool = False) -> None:
+    """Print debug message if debug mode enabled."""
+    if enabled:
+        print(f"[DEBUG] {message}", file=sys.stderr)
+
+
+# =============================================================================
+# CACHE FUNCTIONS
+# =============================================================================
+
+def get_cache_path(url: str) -> Path:
+    """Generate cache file path from URL hash."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:16]
+    return Path(CACHE_DIR) / f"{url_hash}.json"
+
+
+def save_to_cache(url: str, data: dict, debug_mode: bool = False) -> Path:
+    """Save JSON response to cache, return path."""
+    Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+    cache_path = get_cache_path(url)
+
+    # Store metadata with the data
+    cache_data = {
+        "url": url,
+        "cached_at": time.time(),
+        "data": data
+    }
+
+    with open(cache_path, 'w') as f:
+        json.dump(cache_data, f)
+
+    debug(f"Saved to cache: {cache_path}", debug_mode)
+    return cache_path
+
+
+def load_from_cache(path: Path, debug_mode: bool = False) -> dict:
+    """Load JSON from cache file."""
+    debug(f"Loading from cache: {path}", debug_mode)
+    with open(path, 'r') as f:
+        cache_data = json.load(f)
+
+    # Handle both raw Reddit JSON and our cached format
+    if "data" in cache_data and "cached_at" in cache_data:
+        return cache_data["data"]
+    return cache_data
+
+
+def clean_old_cache(max_age_hours: int = CACHE_MAX_AGE_HOURS) -> int:
+    """Remove cache files older than max_age_hours. Return count removed."""
+    cache_dir = Path(CACHE_DIR)
+    if not cache_dir.exists():
+        return 0
+
+    removed = 0
+    cutoff = time.time() - (max_age_hours * 3600)
+
+    for cache_file in cache_dir.glob("*.json"):
+        if cache_file.stat().st_mtime < cutoff:
+            cache_file.unlink()
+            removed += 1
+
+    return removed
+
+
+# =============================================================================
+# API FUNCTIONS
+# =============================================================================
+
+def fetch_json(url: str, timeout: int = REQUEST_TIMEOUT, debug_mode: bool = False) -> dict:
+    """
+    Fetch JSON from Reddit API.
+
+    Args:
+        url: Full Reddit URL (will append .json if needed)
+        timeout: Request timeout in seconds
+        debug_mode: Enable debug output
+
+    Returns:
+        Parsed JSON response
+
+    Raises:
+        SystemExit on network errors (exit code 5)
+    """
+    # Normalize URL - insert .json before query params if present
+    url = url.rstrip('/')
+
+    if '.json' not in url:
+        if '?' in url:
+            # Insert .json before query string
+            base, query = url.split('?', 1)
+            url = f"{base}.json?{query}"
+        else:
+            url = url + '.json'
+
+    debug(f"Fetching: {url}", debug_mode)
+
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+
+    try:
+        response = urllib.request.urlopen(req, timeout=timeout)
+        data = json.loads(response.read().decode('utf-8'))
+        return data
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            error("Rate limited by Reddit. Try again later.", EXIT_NETWORK_ERROR)
+        elif e.code == 403:
+            error("Access forbidden. Reddit may be blocking requests.", EXIT_NETWORK_ERROR)
+        elif e.code == 404:
+            error(f"Not found: {url}", EXIT_NETWORK_ERROR)
+        else:
+            error(f"HTTP error {e.code}: {e.reason}", EXIT_NETWORK_ERROR)
+    except urllib.error.URLError as e:
+        error(f"Network error: {e.reason}", EXIT_NETWORK_ERROR)
+    except json.JSONDecodeError as e:
+        error(f"Failed to parse JSON response: {e}", EXIT_GENERAL_ERROR)
+
+    return {}  # Never reached, but satisfies type checker
+
+
+def fetch_subreddit(
+    subreddit: str,
+    sort: str = "hot",
+    limit: int = 25,
+    after: Optional[str] = None,
+    time_filter: Optional[str] = None,
+    use_cache: bool = True,
+    debug_mode: bool = False
+) -> tuple[list[RedditPost], Optional[str]]:
+    """
+    Fetch posts from a subreddit.
+
+    Args:
+        subreddit: Subreddit name (without r/)
+        sort: hot, new, top, rising
+        limit: Number of posts (max 100)
+        after: Pagination cursor
+        time_filter: Time filter for top (hour, day, week, month, year, all)
+        use_cache: Whether to use caching
+        debug_mode: Enable debug output
+
+    Returns:
+        Tuple of (list of posts, next page cursor)
+    """
+    # Build URL
+    url = f"{REDDIT_BASE_URL}/r/{subreddit}/{sort}"
+    params = [f"limit={min(limit, 100)}"]
+
+    if after:
+        params.append(f"after={after}")
+    if time_filter and sort == "top":
+        params.append(f"t={time_filter}")
+
+    if params:
+        url = url + "?" + "&".join(params)
+
+    # Try cache first
+    cache_path = get_cache_path(url)
+    if use_cache and cache_path.exists():
+        cache_age = time.time() - cache_path.stat().st_mtime
+        if cache_age < (CACHE_MAX_AGE_HOURS * 3600):
+            debug(f"Using cached data (age: {cache_age/3600:.1f}h)", debug_mode)
+            data = load_from_cache(cache_path, debug_mode)
+            return parse_subreddit_listing(data, debug_mode)
+
+    # Fetch fresh data
+    data = fetch_json(url, debug_mode=debug_mode)
+
+    # Cache the response
+    if use_cache:
+        save_to_cache(url, data, debug_mode)
+
+    return parse_subreddit_listing(data, debug_mode)
+
+
+def parse_subreddit_listing(data: dict, debug_mode: bool = False) -> tuple[list[RedditPost], Optional[str]]:
+    """Parse subreddit listing response into RedditPost objects."""
+    posts: list[RedditPost] = []
+    next_cursor: Optional[str] = None
+
+    # Handle single listing or array format
+    if isinstance(data, list):
+        listing = data[0] if data else {}
+    else:
+        listing = data
+
+    if listing.get("kind") != "Listing":
+        debug(f"Unexpected response kind: {listing.get('kind')}", debug_mode)
+        return posts, next_cursor
+
+    listing_data = listing.get("data", {})
+    next_cursor = listing_data.get("after")
+
+    for child in listing_data.get("children", []):
+        if child.get("kind") != "t3":  # t3 = post
+            continue
+
+        post_data = child.get("data", {})
+
+        # Handle crossposts - get selftext from original if this is a crosspost
+        selftext = post_data.get("selftext", "")
+        if not selftext and "crosspost_parent_list" in post_data:
+            crosspost_list = post_data.get("crosspost_parent_list", [])
+            if crosspost_list:
+                selftext = crosspost_list[0].get("selftext", "")
+
+        post = RedditPost(
+            id=post_data.get("id", ""),
+            title=post_data.get("title", ""),
+            author=post_data.get("author", "[deleted]"),
+            selftext=selftext,
+            score=post_data.get("score", 0),
+            num_comments=post_data.get("num_comments", 0),
+            permalink=post_data.get("permalink", ""),
+            subreddit=post_data.get("subreddit", ""),
+            created_utc=post_data.get("created_utc", 0),
+            url=post_data.get("url", ""),
+            is_self=post_data.get("is_self", False),
+            upvote_ratio=post_data.get("upvote_ratio", 0.0),
+            link_flair_text=post_data.get("link_flair_text")
+        )
+        posts.append(post)
+
+    debug(f"Parsed {len(posts)} posts", debug_mode)
+    return posts, next_cursor
+
+
+def parse_comments(children: list, depth: int = 0, debug_mode: bool = False) -> list[RedditComment]:
+    """Recursively parse comment tree from Reddit API response."""
+    comments: list[RedditComment] = []
+
+    for child in children:
+        if child.get("kind") != "t1":  # t1 = comment
+            continue
+
+        comment_data = child.get("data", {})
+
+        # Parse nested replies
+        replies_data = comment_data.get("replies", "")
+        nested_replies: list[RedditComment] = []
+
+        if isinstance(replies_data, dict):
+            replies_children = replies_data.get("data", {}).get("children", [])
+            nested_replies = parse_comments(replies_children, depth + 1, debug_mode)
+
+        comment = RedditComment(
+            id=comment_data.get("id", ""),
+            author=comment_data.get("author", "[deleted]"),
+            body=comment_data.get("body", ""),
+            score=comment_data.get("score", 0),
+            depth=depth,
+            created_utc=comment_data.get("created_utc", 0),
+            replies=nested_replies
+        )
+        comments.append(comment)
+
+    return comments
+
+
+def fetch_post_with_comments(
+    permalink: str,
+    use_cache: bool = True,
+    debug_mode: bool = False
+) -> tuple[Optional[RedditPost], list[RedditComment]]:
+    """
+    Fetch a post and its comments.
+
+    Args:
+        permalink: Reddit permalink (e.g., /r/python/comments/abc123/title/)
+        use_cache: Whether to use caching
+        debug_mode: Enable debug output
+
+    Returns:
+        Tuple of (post, list of top-level comments with nested replies)
+    """
+    # Build full URL
+    if permalink.startswith('/'):
+        url = f"{REDDIT_BASE_URL}{permalink}"
+    elif not permalink.startswith('http'):
+        url = f"{REDDIT_BASE_URL}/{permalink}"
+    else:
+        url = permalink
+
+    # Try cache first
+    cache_path = get_cache_path(url)
+    if use_cache and cache_path.exists():
+        cache_age = time.time() - cache_path.stat().st_mtime
+        if cache_age < (CACHE_MAX_AGE_HOURS * 3600):
+            debug(f"Using cached data (age: {cache_age/3600:.1f}h)", debug_mode)
+            data = load_from_cache(cache_path, debug_mode)
+            return parse_post_with_comments(data, debug_mode)
+
+    # Fetch fresh data
+    data = fetch_json(url, debug_mode=debug_mode)
+
+    # Cache the response
+    if use_cache:
+        save_to_cache(url, data, debug_mode)
+
+    return parse_post_with_comments(data, debug_mode)
+
+
+def parse_post_with_comments(data: list, debug_mode: bool = False) -> tuple[Optional[RedditPost], list[RedditComment]]:
+    """Parse post with comments response."""
+    if not isinstance(data, list) or len(data) < 2:
+        debug("Unexpected response format for post+comments", debug_mode)
+        return None, []
+
+    # First element is the post listing
+    posts, _ = parse_subreddit_listing(data[0], debug_mode)
+    post = posts[0] if posts else None
+
+    # Second element is the comments listing
+    comments_listing = data[1]
+    if comments_listing.get("kind") != "Listing":
+        return post, []
+
+    comments_children = comments_listing.get("data", {}).get("children", [])
+    comments = parse_comments(comments_children, depth=0, debug_mode=debug_mode)
+
+    debug(f"Parsed {len(comments)} top-level comments", debug_mode)
+    return post, comments
+
+
+# =============================================================================
+# FORMAT FUNCTIONS
+# =============================================================================
+
+def format_stdout(posts: list[RedditPost], show_index: bool = True) -> str:
+    """
+    Format posts for plain stdout output.
+
+    Example output:
+    [1] Title of the post (123 pts, 45 comments)
+        by u/username in r/subreddit
+        https://reddit.com/r/...
+    """
+    lines: list[str] = []
+
+    for i, post in enumerate(posts, 1):
+        flair = f" [{post.link_flair_text}]" if post.link_flair_text else ""
+
+        if show_index:
+            lines.append(f"[{i}] {post.title}{flair} ({post.score} pts, {post.num_comments} comments)")
+        else:
+            lines.append(f"{post.title}{flair} ({post.score} pts, {post.num_comments} comments)")
+
+        lines.append(f"    by u/{post.author} in r/{post.subreddit}")
+        lines.append(f"    {REDDIT_BASE_URL}{post.permalink}")
+        lines.append("")
+
+    return '\n'.join(lines)
+
+
+def format_stdout_post(post: RedditPost, comments: list[RedditComment]) -> str:
+    """Format a single post with comments for stdout."""
+    lines: list[str] = []
+
+    # Post header
+    lines.append(f"# {post.title}")
+    lines.append(f"by u/{post.author} in r/{post.subreddit} | {post.score} pts | {post.num_comments} comments")
+    lines.append("")
+
+    # Post content
+    if post.selftext:
+        lines.append(post.selftext)
+        lines.append("")
+    elif not post.is_self:
+        lines.append(f"Link: {post.url}")
+        lines.append("")
+
+    # Comments
+    if comments:
+        lines.append("-" * 60)
+        lines.append(f"Comments ({post.num_comments}):")
+        lines.append("")
+        lines.extend(format_comment_tree_stdout(comments))
+
+    return '\n'.join(lines)
+
+
+def format_comment_tree_stdout(comments: list[RedditComment], depth: int = 0, max_depth: int = 5) -> list[str]:
+    """Format comment tree for stdout with indentation."""
+    lines: list[str] = []
+    indent = "  " * depth
+
+    for comment in comments:
+        lines.append(f"{indent}u/{comment.author} ({comment.score} pts):")
+
+        # Indent body lines
+        for line in comment.body.split('\n'):
+            lines.append(f"{indent}  {line}")
+        lines.append("")
+
+        # Recurse into replies
+        if comment.replies and depth < max_depth:
+            lines.extend(format_comment_tree_stdout(comment.replies, depth + 1, max_depth))
+
+    return lines
+
+
+def format_markdown_list(posts: list[RedditPost], subreddit: str = "", sort: str = "hot") -> str:
+    """
+    Format posts as markdown with transclusion links for neovim integration.
+    """
+    lines: list[str] = []
+
+    # Header
+    if subreddit:
+        lines.append(f"## r/{subreddit} - {sort.capitalize()} Posts")
+    else:
+        lines.append("## Reddit Posts")
+    lines.append("")
+
+    for i, post in enumerate(posts, 1):
+        flair = f" `{post.link_flair_text}`" if post.link_flair_text else ""
+
+        lines.append(f"### {i}. {post.title}{flair}")
+        lines.append("")
+        lines.append(f"- **Score**: {post.score} | **Comments**: {post.num_comments} | **Ratio**: {post.upvote_ratio:.0%}")
+        lines.append(f"- **Author**: u/{post.author}")
+        lines.append(f"- **Posted**: {datetime.fromtimestamp(post.created_utc).strftime('%Y-%m-%d %H:%M')}")
+
+        # Link to reddit
+        lines.append(f"- **Reddit**: [{post.permalink}]({REDDIT_BASE_URL}{post.permalink})")
+
+        # Transclusion for opening full post in neovim
+        full_url = f"{REDDIT_BASE_URL}{post.permalink}"
+        lines.append(f"- **Open**: `![[!rdt --url {full_url} --format markdown]]`")
+
+        # Preview of selftext if available
+        if post.selftext:
+            preview = post.selftext[:200].replace('\n', ' ')
+            if len(post.selftext) > 200:
+                preview += "..."
+            lines.append(f"- **Preview**: {preview}")
+        elif not post.is_self:
+            lines.append(f"- **Link**: {post.url}")
+
+        lines.append("")
+
+    return '\n'.join(lines)
+
+
+def format_markdown_post(post: RedditPost, comments: list[RedditComment]) -> str:
+    """
+    Format a single post with comments as markdown.
+
+    Uses blockquotes for comment threading.
+    """
+    lines: list[str] = []
+
+    # Post title
+    lines.append(f"# {post.title}")
+    lines.append("")
+
+    # Post metadata
+    flair = f" | `{post.link_flair_text}`" if post.link_flair_text else ""
+    lines.append(f"**u/{post.author}** | {post.score} points | r/{post.subreddit}{flair}")
+    lines.append(f"*Posted: {datetime.fromtimestamp(post.created_utc).strftime('%Y-%m-%d %H:%M UTC')}*")
+    lines.append("")
+
+    # Post content
+    if post.selftext:
+        lines.append(post.selftext)
+        lines.append("")
+    elif not post.is_self:
+        lines.append(f"**Link**: [{post.url}]({post.url})")
+        lines.append("")
+
+    # Separator and comments
+    lines.append("---")
+    lines.append("")
+    lines.append(f"## Comments ({post.num_comments})")
+    lines.append("")
+
+    if comments:
+        lines.append(format_comment_tree_markdown(comments))
+    else:
+        lines.append("*No comments yet*")
+
+    return '\n'.join(lines)
+
+
+def format_comment_tree_markdown(comments: list[RedditComment], depth: int = 0, max_depth: int = 8) -> str:
+    """
+    Recursively format comment tree with proper indentation.
+
+    Uses '> ' markdown blockquotes for threading.
+    Each depth level adds another '> ' prefix.
+    """
+    lines: list[str] = []
+    prefix = "> " * depth
+
+    for comment in comments:
+        # Header with author and score
+        lines.append(f"{prefix}**u/{comment.author}** ({comment.score} pts)")
+        lines.append(f"{prefix}")
+
+        # Body - preserve line breaks, handle empty lines in blockquotes
+        for line in comment.body.split('\n'):
+            if line.strip():
+                lines.append(f"{prefix}{line}")
+            else:
+                lines.append(f"{prefix}")
+
+        lines.append(f"{prefix}")
+
+        # Recurse into replies
+        if comment.replies and depth < max_depth:
+            lines.append(format_comment_tree_markdown(comment.replies, depth + 1, max_depth))
+
+        # Add spacing between top-level comments
+        if depth == 0:
+            lines.append("")
+
+    return '\n'.join(lines)
+
+
+def format_yaml(data: dict) -> str:
+    """Format as YAML using PyYAML."""
+    if not YAML_AVAILABLE:
+        error("YAML output requires PyYAML. Install with: pip install pyyaml", EXIT_USAGE_ERROR)
+
+    return yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
+def format_json_output(data: dict) -> str:
+    """Format as pretty-printed JSON."""
+    return json.dumps(data, indent=2, default=str, ensure_ascii=False)
+
+
+# =============================================================================
+# FZF INTEGRATION
+# =============================================================================
+
+def fzf_select_post(posts: list[RedditPost], debug_mode: bool = False) -> Optional[RedditPost]:
+    """
+    Interactive post selection with fzf.
+
+    Shows title, score, comment count.
+    Preview shows post content and top comments.
+    """
+    if not posts:
+        return None
+
+    # Create preview script
+    script_path = os.path.abspath(sys.argv[0])
+    preview_script = f'''#!/bin/bash
+permalink="$1"
+NO_DBOX_CHECK=1 "{script_path}" --url "https://reddit.com$permalink" --format markdown 2>/dev/null | head -100
+'''
+
+    # Write preview script to temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+        f.write(preview_script)
+        preview_file = f.name
+    os.chmod(preview_file, 0o755)
+
+    try:
+        # Prepare fzf input: index\ttitle (truncated)\tscore\tcomments\tpermalink
+        lines: list[str] = []
+        for i, post in enumerate(posts):
+            # Truncate title for display
+            title = post.title[:60]
+            if len(post.title) > 60:
+                title += "..."
+
+            flair = f" [{post.link_flair_text}]" if post.link_flair_text else ""
+            line = f"{i}\t{title}{flair}\t{post.score}\t{post.num_comments}\t{post.permalink}"
+            lines.append(line)
+
+        fzf_input = '\n'.join(lines)
+
+        fzf_cmd = [
+            'fzf',
+            '--header', 'Title                                                         Score  Comments',
+            '--preview', f'{preview_file} {{5}}',
+            '--preview-window', 'right:60%:wrap',
+            '--delimiter', '\t',
+            '--with-nth', '2,3,4',
+            '--tabstop', '4',
+        ]
+
+        debug(f"Running fzf: {' '.join(fzf_cmd)}", debug_mode)
+
+        result = subprocess.run(
+            fzf_cmd,
+            input=fzf_input,
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0 and result.stdout.strip():
+            selected = result.stdout.strip()
+            index = int(selected.split('\t')[0])
+            return posts[index]
+
+        return None
+
+    finally:
+        # Clean up preview script
+        if os.path.exists(preview_file):
+            os.unlink(preview_file)
+
+
+# =============================================================================
+# CLI ARGUMENT PARSING
+# =============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser with organized groups."""
+    parser = argparse.ArgumentParser(
+        prog="rdt",
+        description="Reddit terminal browser with caching and neovim integration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  rdt python                           List hot posts from r/python
+  rdt linux --sort top --time week     Top posts this week from r/linux
+  rdt zfs --editor                     Browse r/zfs in $EDITOR with transclusion links
+  rdt --url https://reddit.com/r/...   Fetch specific post with comments
+  rdt programming --fzf                Interactive fzf selection, output to stdout
+  rdt vim --fzf --editor               FZF selection, then open post in $EDITOR
+
+Output Formats:
+  stdout     Plain text summary (default)
+  markdown   Full markdown with comment threading
+  yaml       Structured YAML output (requires PyYAML)
+  json       Pretty-printed JSON
+
+Neovim Integration:
+  Use --editor to browse subreddits in neovim with transclusion links.
+  Press <leader>tf on a link to preview posts in a floating window.
+  Command transclusions: ![[!rdt ...]] or [title](!rdt ...)
+
+Environment Variables:
+  NO_DBOX_CHECK=1    Skip distrobox container check
+  EDITOR             Editor for --editor mode (default: nvim)
+"""
+    )
+
+    # Positional argument
+    parser.add_argument(
+        "subreddit",
+        nargs="?",
+        help="Subreddit name (without r/)"
+    )
+
+    # Input source group
+    input_group = parser.add_argument_group("Input Sources")
+    input_group.add_argument(
+        "--url", "-u",
+        metavar="URL",
+        help="Fetch specific Reddit URL (post or subreddit)"
+    )
+    input_group.add_argument(
+        "--article", "-a",
+        metavar="PATH",
+        help="Read from local JSON cache file"
+    )
+
+    # Listing options
+    list_group = parser.add_argument_group("Listing Options")
+    list_group.add_argument(
+        "--limit", "-l",
+        type=int,
+        default=25,
+        help="Number of posts to fetch (default: 25, max: 100)"
+    )
+    list_group.add_argument(
+        "--sort", "-s",
+        choices=["hot", "new", "top", "rising"],
+        default="hot",
+        help="Sort order (default: hot)"
+    )
+    list_group.add_argument(
+        "--time", "-t",
+        choices=["hour", "day", "week", "month", "year", "all"],
+        help="Time filter for top posts"
+    )
+    list_group.add_argument(
+        "--after",
+        metavar="CURSOR",
+        help="Pagination cursor for next page"
+    )
+
+    # Output format
+    output_group = parser.add_argument_group("Output Format")
+    output_group.add_argument(
+        "--format", "-f",
+        choices=["stdout", "markdown", "yaml", "json"],
+        default="stdout",
+        help="Output format (default: stdout)"
+    )
+
+    # Interactive mode
+    interactive_group = parser.add_argument_group("Interactive Mode")
+    interactive_group.add_argument(
+        "--fzf",
+        action="store_true",
+        help="Interactive fzf selection with preview"
+    )
+    interactive_group.add_argument(
+        "--editor", "-e",
+        action="store_true",
+        help="Open in $EDITOR (listing with transclusion links, or post if --fzf)"
+    )
+
+    # Cache options
+    cache_group = parser.add_argument_group("Cache Options")
+    cache_group.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass cache, always fetch fresh"
+    )
+    cache_group.add_argument(
+        "--cache-dir",
+        default=CACHE_DIR,
+        metavar="DIR",
+        help=f"Cache directory (default: {CACHE_DIR})"
+    )
+    cache_group.add_argument(
+        "--clean-cache",
+        action="store_true",
+        help="Remove old cache files and exit"
+    )
+
+    # Standard options
+    parser.add_argument(
+        "--debug", "-d",
+        action="store_true",
+        help="Enable debug output"
+    )
+    parser.add_argument(
+        "--license",
+        action="store_true",
+        help="Show license information (AGPLv3)"
+    )
+
+    return parser
+
+
+def print_license() -> None:
+    """Print license information."""
+    print("""rdt - Reddit Terminal Browser
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.""")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main() -> int:
+    """Main entry point."""
+    global CACHE_DIR
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Handle special flags
+    if args.license:
+        print_license()
+        return EXIT_SUCCESS
+
+    if args.clean_cache:
+        removed = clean_old_cache()
+        print(f"Removed {removed} old cache files from {CACHE_DIR}")
+        return EXIT_SUCCESS
+
+    # Update global cache dir if specified
+    CACHE_DIR = args.cache_dir
+
+    debug_mode = args.debug
+    use_cache = not args.no_cache
+
+    # Determine input source and fetch data
+    posts: list[RedditPost] = []
+    comments: list[RedditComment] = []
+    subreddit_name = ""
+
+    if args.article:
+        # Load from local JSON file
+        article_path = Path(args.article)
+        if not article_path.exists():
+            error(f"File not found: {args.article}", EXIT_USAGE_ERROR)
+
+        data = load_from_cache(article_path, debug_mode)
+
+        # Detect if this is a post+comments or subreddit listing
+        if isinstance(data, list) and len(data) >= 2:
+            # Post with comments format
+            post, comments = parse_post_with_comments(data, debug_mode)
+            if post:
+                posts = [post]
+                subreddit_name = post.subreddit
+        else:
+            # Subreddit listing format
+            posts, _ = parse_subreddit_listing(data, debug_mode)
+            if posts:
+                subreddit_name = posts[0].subreddit
+
+    elif args.url:
+        # Fetch specific URL
+        url = args.url
+
+        # Detect if this is a post URL (contains /comments/)
+        if '/comments/' in url:
+            post, comments = fetch_post_with_comments(url, use_cache=use_cache, debug_mode=debug_mode)
+            if post:
+                posts = [post]
+                subreddit_name = post.subreddit
+        else:
+            # Treat as subreddit URL
+            posts, _ = fetch_subreddit(
+                args.subreddit or "",
+                sort=args.sort,
+                limit=args.limit,
+                after=args.after,
+                time_filter=args.time,
+                use_cache=use_cache,
+                debug_mode=debug_mode
+            )
+            if posts:
+                subreddit_name = posts[0].subreddit
+
+    elif args.subreddit:
+        # Fetch subreddit
+        subreddit_name = args.subreddit
+        posts, next_cursor = fetch_subreddit(
+            args.subreddit,
+            sort=args.sort,
+            limit=args.limit,
+            after=args.after,
+            time_filter=args.time,
+            use_cache=use_cache,
+            debug_mode=debug_mode
+        )
+
+        if next_cursor:
+            debug(f"Next page cursor: {next_cursor}", debug_mode)
+
+    else:
+        parser.print_help()
+        return EXIT_USAGE_ERROR
+
+    # Editor mode (without fzf): open subreddit listing in $EDITOR
+    if args.editor and not args.fzf:
+        if not posts:
+            error("No posts found", EXIT_GENERAL_ERROR)
+
+        # Format as markdown listing with transclusion links
+        content = format_markdown_list(posts, subreddit_name, args.sort)
+
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            suffix='.md',
+            prefix=f'rdt_{subreddit_name}_',
+            delete=False
+        ) as f:
+            f.write(content)
+            temp_path = f.name
+
+        editor = os.environ.get('EDITOR', 'nvim')
+        subprocess.run([editor, temp_path])
+
+        # Clean up temp file after editor closes
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+        return EXIT_SUCCESS
+
+    # FZF mode: interactive selection
+    if args.fzf:
+        if not posts:
+            error("No posts to select from", EXIT_GENERAL_ERROR)
+
+        selected = fzf_select_post(posts, debug_mode)
+        if not selected:
+            debug("FZF selection cancelled", debug_mode)
+            return EXIT_SUCCESS
+
+        # Fetch full post with comments
+        post, comments = fetch_post_with_comments(
+            selected.permalink,
+            use_cache=use_cache,
+            debug_mode=debug_mode
+        )
+        if post:
+            posts = [post]
+
+        # If --editor, open in editor; otherwise output to stdout
+        if args.editor:
+            content = format_markdown_post(posts[0], comments) if posts else ""
+
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                suffix='.md',
+                prefix='rdt_',
+                delete=False
+            ) as f:
+                f.write(content)
+                temp_path = f.name
+
+            editor = os.environ.get('EDITOR', 'nvim')
+            subprocess.run([editor, temp_path])
+
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+            return EXIT_SUCCESS
+        else:
+            # Output selected post to stdout
+            output = format_markdown_post(posts[0], comments) if posts else ""
+            print(output)
+            return EXIT_SUCCESS
+
+    # Format output
+    if not posts:
+        print("No posts found", file=sys.stderr)
+        return EXIT_SUCCESS
+
+    output = ""
+
+    if args.format == 'markdown':
+        if comments:
+            output = format_markdown_post(posts[0], comments)
+        else:
+            output = format_markdown_list(posts, subreddit_name, args.sort)
+
+    elif args.format == 'yaml':
+        data_dict = {'posts': [p.to_dict() for p in posts]}
+        if comments:
+            data_dict['comments'] = [c.to_dict() for c in comments]
+        output = format_yaml(data_dict)
+
+    elif args.format == 'json':
+        data_dict = {'posts': [p.to_dict() for p in posts]}
+        if comments:
+            data_dict['comments'] = [c.to_dict() for c in comments]
+        output = format_json_output(data_dict)
+
+    else:  # stdout
+        if comments:
+            output = format_stdout_post(posts[0], comments)
+        else:
+            output = format_stdout(posts)
+
+    print(output)
+    return EXIT_SUCCESS
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
+    except BrokenPipeError:
+        # Handle piping to head/less/etc
+        sys.exit(0)
