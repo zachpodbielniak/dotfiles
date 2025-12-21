@@ -85,6 +85,16 @@ import yaml
 
 
 # ============================================================================
+# MCP SERVER SUPPORT (Optional)
+# ============================================================================
+try:
+    from mcp.server.fastmcp import FastMCP
+    MCP_AVAILABLE: bool = True
+except ImportError:
+    MCP_AVAILABLE = False
+
+
+# ============================================================================
 # CONSTANTS
 # ============================================================================
 VERSION: str = "0.1.0"
@@ -5658,6 +5668,1534 @@ def cmd_comment(args: argparse.Namespace, config: Config) -> int:
 
 
 # ============================================================================
+# MCP SERVER
+# ============================================================================
+def ticket_to_mcp_dict(ticket: Ticket) -> dict:
+    """
+    Convert a Ticket object to a JSON-serializable dictionary for MCP.
+
+    Args:
+        ticket: The Ticket object to convert
+
+    Returns:
+        Dictionary with all ticket fields, dates as ISO strings
+    """
+    return {
+        'id': ticket.id,
+        'title': ticket.title,
+        'type': ticket.type,
+        'status': ticket.status,
+        'priority': ticket.priority,
+        'assignee': str(ticket.assignee) if ticket.assignee else None,
+        'reporter': str(ticket.reporter) if ticket.reporter else None,
+        'watchers': [str(w) for w in ticket.watchers],
+        'created': ticket.created.isoformat() if ticket.created else None,
+        'updated': ticket.updated.isoformat() if ticket.updated else None,
+        'start_date': str(ticket.start_date) if ticket.start_date else None,
+        'due_date': str(ticket.due_date) if ticket.due_date else None,
+        'end_date': str(ticket.end_date) if ticket.end_date else None,
+        'effort': ticket.effort,
+        'tags': ticket.tags,
+        'project': ticket.project,
+        'sprint': ticket.sprint,
+        'member_of': [str(m) for m in ticket.member_of],
+        'relates_to': [str(r) for r in ticket.relates_to],
+        'blocked_by': [str(b) for b in ticket.blocked_by],
+        'blocks': [str(b) for b in ticket.blocks],
+        'progress': ticket.progress,
+        'checklist_total': ticket.checklist_total,
+        'checklist_done': ticket.checklist_done,
+        'issue_link': ticket.issue_link,
+        'filepath': str(ticket.filepath),
+    }
+
+
+def person_to_mcp_dict(person: Person) -> dict:
+    """
+    Convert a Person object to a JSON-serializable dictionary for MCP.
+
+    Args:
+        person: The Person object to convert
+
+    Returns:
+        Dictionary with all person fields
+    """
+    return {
+        'name': person.name,
+        'email': person.email,
+        'slack': person.slack,
+        'role': person.role,
+        'team': person.team,
+        'manager': str(person.manager) if person.manager else None,
+        'direct_reports': [str(d) for d in person.direct_reports],
+        'created': person.created.isoformat() if person.created else None,
+        'updated': person.updated.isoformat() if person.updated else None,
+        'filepath': str(person.filepath),
+    }
+
+
+def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
+    """
+    Create and configure the MCP server for vimban.
+
+    Args:
+        host: Host to bind to (for HTTP transport)
+        port: Port to bind to (for HTTP transport)
+
+    Provides tools for:
+    - Creating tickets
+    - Listing and filtering tickets
+    - Getting ticket details
+    - Editing tickets
+    - Moving tickets between statuses
+    - Managing ticket relationships
+    - Comments
+    - Dashboards and kanban views
+    - Search
+    - Reports
+    - People management
+    """
+    if not MCP_AVAILABLE:
+        print("Error: mcp package required for MCP server.", file=sys.stderr)
+        print("Install with: pip install 'mcp[cli]'", file=sys.stderr)
+        sys.exit(1)
+
+    mcp = FastMCP("vimban", json_response=True, host=host, port=port)
+
+    # Load default config
+    directory = Path(environ.get('VIMBAN_DIR', '') or str(DEFAULT_DIR)).expanduser()
+    config = Config.load(directory)
+
+    @mcp.tool()
+    def create_ticket(
+        ticket_type: str,
+        title: str,
+        assignee: str = "",
+        reporter: str = "",
+        priority: str = "",
+        tags: str = "",
+        project: str = "",
+        member_of: str = "",
+        due_date: str = "",
+        effort: int = 0,
+        topic: str = "",
+        ticket_date: str = "",
+        scope: str = "",
+    ) -> dict:
+        """
+        Create a new ticket.
+
+        Args:
+            ticket_type: Type of ticket (epic, story, task, sub-task, research,
+                        bug, area, resource, meeting, journal, recipe)
+            title: The ticket title
+            assignee: Person reference to assign the ticket to
+            reporter: Person reference who reported the ticket
+            priority: Priority level (critical, high, medium, low)
+            tags: Comma-separated list of tags
+            project: Project identifier
+            member_of: Parent ticket ID this belongs to
+            due_date: Due date (YYYY-MM-DD or +7d for relative)
+            effort: Story points / effort estimate
+            topic: Topic path for area/resource types (e.g., 'technical/linux')
+            ticket_date: Date for meeting type (YYYY-MM-DD)
+            scope: Scope filter (work, personal, or empty for default)
+
+        Returns:
+            Dictionary with created ticket details or error
+        """
+        # Build args namespace
+        args = argparse.Namespace(
+            type=ticket_type,
+            title=title,
+            assignee=assignee if assignee else None,
+            reporter=reporter if reporter else None,
+            watcher=None,
+            priority=priority if priority else None,
+            tags=tags if tags else None,
+            project=project if project else None,
+            member_of=[member_of] if member_of else None,
+            due=due_date if due_date else None,
+            effort=effort if effort else None,
+            topic=topic if topic else None,
+            date=ticket_date if ticket_date else None,
+            id=None,
+            prefix=None,
+            output=None,
+            no_edit=True,
+            dry_run=False,
+            work=scope == "work",
+            personal=scope == "personal",
+            format='json',
+            quiet=True,
+            verbose=False,
+        )
+
+        try:
+            # Handle specialized types (meeting, journal, recipe)
+            if is_specialized_type(ticket_type):
+                result = cmd_create_para(args, config)
+                if result == EXIT_SUCCESS:
+                    # Find the created ticket
+                    filters = {'type': ticket_type}
+                    search_paths = get_search_paths(args, config)
+                    para_paths = get_para_search_paths(args, config)
+                    search_paths.extend(para_paths)
+                    for search_path in search_paths:
+                        if search_path.exists():
+                            tickets = fallback_list_tickets(search_path, filters, [])
+                            if tickets:
+                                tickets.sort(key=lambda t: t.created, reverse=True)
+                                return {"success": True, "ticket": ticket_to_mcp_dict(tickets[0])}
+                    return {"success": True, "message": f"Created {ticket_type}"}
+                return {"error": f"Failed to create {ticket_type}"}
+            else:
+                result = cmd_create(args, config)
+                if result == EXIT_SUCCESS:
+                    filters = {'type': ticket_type}
+                    search_paths = get_search_paths(args, config)
+                    for search_path in search_paths:
+                        if search_path.exists():
+                            tickets = fallback_list_tickets(search_path, filters, [])
+                            if tickets:
+                                tickets.sort(key=lambda t: t.created, reverse=True)
+                                return {"success": True, "ticket": ticket_to_mcp_dict(tickets[0])}
+                    return {"success": True, "message": f"Created {ticket_type}"}
+                return {"error": f"Failed to create {ticket_type}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def list_tickets(
+        status: str = "",
+        ticket_type: str = "",
+        assignee: str = "",
+        project: str = "",
+        tags: str = "",
+        priority: str = "",
+        overdue: bool = False,
+        due_soon: int = 0,
+        blocked: bool = False,
+        unassigned: bool = False,
+        mine: bool = False,
+        include_areas: bool = False,
+        include_resources: bool = False,
+        sort: str = "due_date",
+        limit: int = 50,
+        scope: str = "",
+    ) -> dict:
+        """
+        List tickets with optional filters.
+
+        Args:
+            status: Filter by status (comma-separated: backlog,ready,in_progress,
+                   blocked,review,delegated,done,cancelled)
+            ticket_type: Filter by type (comma-separated: epic,story,task,etc.)
+            assignee: Filter by assignee (partial match)
+            project: Filter by project identifier
+            tags: Filter by tags (comma-separated)
+            priority: Filter by priority (critical,high,medium,low)
+            overdue: Only show overdue tickets
+            due_soon: Only show tickets due within N days (0 = disabled)
+            blocked: Only show blocked tickets
+            unassigned: Only show unassigned tickets
+            mine: Only show tickets assigned to $USER
+            include_areas: Include area type items
+            include_resources: Include resource type items
+            sort: Sort field (due_date, priority, created, updated)
+            limit: Maximum number of tickets to return (default: 50)
+            scope: Scope filter (work, personal, or empty for both)
+
+        Returns:
+            Dictionary with 'tickets' list and 'count'
+        """
+        try:
+            # Normalize type names
+            normalized_type = None
+            if ticket_type:
+                normalized_type = ','.join(
+                    normalize_type_name(t.strip()) for t in ticket_type.split(',')
+                )
+
+            filters = {
+                'status': status if status else None,
+                'type': normalized_type,
+                'priority': priority if priority else None,
+                'project': project if project else None,
+                'assignee': assignee if assignee else None,
+            }
+
+            exclude_types = ['person']
+            if not include_areas:
+                exclude_types.append('area')
+            if not include_resources:
+                exclude_types.append('resource')
+
+            # Create args for path resolution
+            args = argparse.Namespace(
+                work=scope == "work",
+                personal=scope == "personal",
+                areas=include_areas,
+                resources=include_resources,
+            )
+
+            search_paths = get_search_paths(args, config)
+            para_paths = get_para_search_paths(args, config)
+            search_paths.extend(para_paths)
+
+            tickets: list[Ticket] = []
+            for search_path in search_paths:
+                if search_path.exists():
+                    path_tickets = fallback_list_tickets(search_path, filters, exclude_types)
+                    tickets.extend(path_tickets)
+
+            # Apply additional filters
+            today = date.today()
+
+            if overdue:
+                tickets = [t for t in tickets if t.due_date and t.due_date < today]
+
+            if due_soon > 0:
+                cutoff = today + timedelta(days=due_soon)
+                tickets = [t for t in tickets if t.due_date and t.due_date <= cutoff]
+
+            if blocked:
+                tickets = [t for t in tickets if t.status == 'blocked']
+
+            if unassigned:
+                tickets = [t for t in tickets if not t.assignee]
+
+            if mine:
+                user = os.environ.get('USER', '')
+                tickets = [t for t in tickets if t.assignee and user.lower() in str(t.assignee).lower()]
+
+            # Sort
+            def sort_key(t: Ticket) -> Any:
+                if sort == 'priority':
+                    priority_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+                    return priority_order.get(t.priority, 2)
+                elif sort == 'created':
+                    return t.created
+                elif sort == 'updated':
+                    return t.updated or t.created
+                else:  # due_date
+                    return t.due_date or date.max
+
+            tickets.sort(key=sort_key)
+            tickets = tickets[:limit]
+
+            return {
+                "tickets": [ticket_to_mcp_dict(t) for t in tickets],
+                "count": len(tickets),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def show_ticket(
+        ticket: str,
+        include_links: bool = False,
+        include_tree: bool = False,
+        raw: bool = False,
+        content_only: bool = False,
+    ) -> dict:
+        """
+        Get details of a specific ticket.
+
+        Args:
+            ticket: Ticket ID or path
+            include_links: Include linked ticket details
+            include_tree: Show hierarchy tree
+            raw: Return raw file content
+            content_only: Return body without frontmatter
+
+        Returns:
+            Ticket details or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+            ticket_path = find_ticket(ticket, config, args)
+
+            if not ticket_path or not ticket_path.exists():
+                return {"error": f"Ticket not found: {ticket}"}
+
+            if raw:
+                content = ticket_path.read_text()
+                return {"content": content, "filepath": str(ticket_path)}
+
+            if content_only:
+                content = ticket_path.read_text()
+                _, body = parse_frontmatter(content)
+                return {"body": body, "filepath": str(ticket_path)}
+
+            ticket_obj = Ticket.from_file(ticket_path)
+            result = ticket_to_mcp_dict(ticket_obj)
+
+            if include_links:
+                links = {
+                    'member_of': [],
+                    'relates_to': [],
+                    'blocked_by': [],
+                    'blocks': [],
+                }
+                for link in ticket_obj.member_of:
+                    link_path = find_ticket(link.path, config, args)
+                    if link_path and link_path.exists():
+                        try:
+                            linked = Ticket.from_file(link_path)
+                            links['member_of'].append(ticket_to_mcp_dict(linked))
+                        except Exception:
+                            pass
+                result['linked_tickets'] = links
+
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def edit_ticket(
+        ticket: str,
+        assignee: str = "",
+        status: str = "",
+        priority: str = "",
+        add_tag: str = "",
+        remove_tag: str = "",
+        progress: int = -1,
+        due_date: str = "",
+        clear_field: str = "",
+    ) -> dict:
+        """
+        Edit a ticket's fields.
+
+        Args:
+            ticket: Ticket ID or path
+            assignee: Set assignee (person reference)
+            status: Set status
+            priority: Set priority (critical, high, medium, low)
+            add_tag: Add a tag
+            remove_tag: Remove a tag
+            progress: Set progress (0-100, -1 = no change)
+            due_date: Set due date (YYYY-MM-DD or +7d)
+            clear_field: Clear a field (e.g., 'assignee', 'due_date')
+
+        Returns:
+            Updated ticket details or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+            ticket_path = find_ticket(ticket, config, args)
+
+            if not ticket_path or not ticket_path.exists():
+                return {"error": f"Ticket not found: {ticket}"}
+
+            content = ticket_path.read_text()
+            metadata, body = parse_frontmatter(content)
+            changes_made = False
+
+            if assignee:
+                people_dirs = get_people_dirs(args, config)
+                for pdir in people_dirs:
+                    if pdir.exists():
+                        person_link = resolve_person_reference(assignee, pdir)
+                        if person_link:
+                            metadata['assignee'] = str(person_link)
+                            changes_made = True
+                            break
+
+            if status:
+                metadata['status'] = status
+                changes_made = True
+
+            if priority:
+                metadata['priority'] = priority
+                changes_made = True
+
+            if add_tag:
+                tags = metadata.get('tags', [])
+                if add_tag not in tags:
+                    tags.append(add_tag)
+                    metadata['tags'] = tags
+                    changes_made = True
+
+            if remove_tag:
+                tags = metadata.get('tags', [])
+                if remove_tag in tags:
+                    tags.remove(remove_tag)
+                    metadata['tags'] = tags
+                    changes_made = True
+
+            if progress >= 0:
+                metadata['progress'] = min(100, max(0, progress))
+                changes_made = True
+
+            if due_date:
+                parsed_date = parse_relative_date(due_date)
+                if parsed_date:
+                    metadata['due_date'] = str(parsed_date)
+                    changes_made = True
+
+            if clear_field:
+                if clear_field in metadata:
+                    del metadata[clear_field]
+                    changes_made = True
+
+            if changes_made:
+                metadata['updated'] = datetime.now().isoformat()
+                new_content = format_frontmatter(metadata) + body
+                ticket_path.write_text(new_content)
+
+            ticket_obj = Ticket.from_file(ticket_path)
+            return {"success": True, "ticket": ticket_to_mcp_dict(ticket_obj)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def move_ticket(
+        ticket: str,
+        status: str,
+        comment: str = "",
+        resolve: bool = False,
+        reopen: bool = False,
+        force: bool = False,
+    ) -> dict:
+        """
+        Change a ticket's status.
+
+        Args:
+            ticket: Ticket ID or path
+            status: New status (backlog, ready, in_progress, blocked,
+                   review, delegated, done, cancelled)
+            comment: Add a transition comment
+            resolve: Set end_date when moving to done
+            reopen: Clear end_date when reopening from done/cancelled
+            force: Skip validation
+
+        Returns:
+            Updated ticket details or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+            ticket_path = find_ticket(ticket, config, args)
+
+            if not ticket_path or not ticket_path.exists():
+                return {"error": f"Ticket not found: {ticket}"}
+
+            content = ticket_path.read_text()
+            metadata, body = parse_frontmatter(content)
+
+            old_status = metadata.get('status', '')
+            metadata['status'] = status
+            metadata['updated'] = datetime.now().isoformat()
+
+            if resolve and status == 'done':
+                metadata['end_date'] = str(date.today())
+
+            if reopen and old_status in ('done', 'cancelled'):
+                if 'end_date' in metadata:
+                    del metadata['end_date']
+
+            if comment:
+                comment_id = get_next_comment_id(content)
+                user = os.environ.get('USER', 'system')
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+                transition_comment = f"**Status changed** from `{old_status}` to `{status}`\n\n{comment}"
+                comment_block = f"\n\n---\n**#{comment_id}** | {user} | {timestamp}\n\n{transition_comment}\n"
+                body = body.rstrip() + comment_block
+
+            new_content = format_frontmatter(metadata) + body
+            ticket_path.write_text(new_content)
+
+            ticket_obj = Ticket.from_file(ticket_path)
+            return {"success": True, "ticket": ticket_to_mcp_dict(ticket_obj)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def link_tickets(
+        ticket: str,
+        relation: str,
+        target: str,
+        remove: bool = False,
+        bidirectional: bool = False,
+    ) -> dict:
+        """
+        Create or remove a relationship between tickets.
+
+        Args:
+            ticket: Source ticket ID or path
+            relation: Relationship type (member_of, relates_to, blocked_by, blocks)
+            target: Target ticket ID or path
+            remove: Remove the link instead of adding
+            bidirectional: Create reverse link on target ticket
+
+        Returns:
+            Success status or error
+        """
+        try:
+            if relation not in ('member_of', 'relates_to', 'blocked_by', 'blocks'):
+                return {"error": f"Invalid relation type: {relation}"}
+
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+
+            source_path = find_ticket(ticket, config, args)
+            target_path = find_ticket(target, config, args)
+
+            if not source_path or not source_path.exists():
+                return {"error": f"Source ticket not found: {ticket}"}
+            if not target_path or not target_path.exists():
+                return {"error": f"Target ticket not found: {target}"}
+
+            # Get target link path relative to notes dir
+            target_rel = target_path.relative_to(config.directory)
+            target_link = f"![[{target_rel}]]"
+
+            content = source_path.read_text()
+            metadata, body = parse_frontmatter(content)
+
+            links = metadata.get(relation, [])
+            if isinstance(links, str):
+                links = [links] if links else []
+
+            if remove:
+                links = [l for l in links if target not in l and str(target_rel) not in l]
+            else:
+                if target_link not in links:
+                    links.append(target_link)
+
+            metadata[relation] = links
+            metadata['updated'] = datetime.now().isoformat()
+
+            new_content = format_frontmatter(metadata) + body
+            source_path.write_text(new_content)
+
+            if bidirectional:
+                reverse_relation = {
+                    'blocked_by': 'blocks',
+                    'blocks': 'blocked_by',
+                    'relates_to': 'relates_to',
+                    'member_of': 'member_of',
+                }.get(relation, relation)
+
+                source_rel = source_path.relative_to(config.directory)
+                source_link = f"![[{source_rel}]]"
+
+                target_content = target_path.read_text()
+                target_metadata, target_body = parse_frontmatter(target_content)
+
+                target_links = target_metadata.get(reverse_relation, [])
+                if isinstance(target_links, str):
+                    target_links = [target_links] if target_links else []
+
+                if remove:
+                    target_links = [l for l in target_links if ticket not in l and str(source_rel) not in l]
+                else:
+                    if source_link not in target_links:
+                        target_links.append(source_link)
+
+                target_metadata[reverse_relation] = target_links
+                target_metadata['updated'] = datetime.now().isoformat()
+
+                target_new = format_frontmatter(target_metadata) + target_body
+                target_path.write_text(target_new)
+
+            return {"success": True, "message": f"Link {'removed' if remove else 'created'}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def add_comment(
+        target: str,
+        text: str,
+        reply_to: int = 0,
+    ) -> dict:
+        """
+        Add a comment to a ticket or person.
+
+        Args:
+            target: Ticket ID or person reference
+            text: Comment text (supports markdown)
+            reply_to: Reply to comment #N (0 = top-level comment)
+
+        Returns:
+            Comment ID or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+            target_path = find_ticket(target, config, args)
+
+            if not target_path:
+                people_dirs = get_people_dirs(args, config)
+                for pdir in people_dirs:
+                    if pdir.exists():
+                        person_link = resolve_person_reference(target, pdir)
+                        if person_link:
+                            target_path = config.directory / person_link.path
+                            break
+
+            if not target_path or not target_path.exists():
+                return {"error": f"Target not found: {target}"}
+
+            reply_arg = reply_to if reply_to > 0 else None
+            comment_id = insert_comment(target_path, text, reply_to=reply_arg)
+
+            return {"success": True, "comment_id": comment_id}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def get_comments(
+        target: str,
+        comment_range: str = "all",
+        include_threads: bool = False,
+    ) -> dict:
+        """
+        Get comments from a ticket or person.
+
+        Args:
+            target: Ticket ID or person reference
+            comment_range: Range to fetch (e.g., 'all', '1,2-5,9')
+            include_threads: Include reply threads
+
+        Returns:
+            List of comments or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+            target_path = find_ticket(target, config, args)
+
+            if not target_path:
+                people_dirs = get_people_dirs(args, config)
+                for pdir in people_dirs:
+                    if pdir.exists():
+                        person_link = resolve_person_reference(target, pdir)
+                        if person_link:
+                            target_path = config.directory / person_link.path
+                            break
+
+            if not target_path or not target_path.exists():
+                return {"error": f"Target not found: {target}"}
+
+            content = target_path.read_text()
+            comments = parse_comments(content)
+
+            if not comments:
+                return {"comments": [], "count": 0}
+
+            max_id = max(c.id for c in comments)
+            ids = parse_comment_range(comment_range, max_id)
+
+            result_comments = []
+            for c in comments:
+                if c.id in ids:
+                    comment_dict = c.to_dict()
+                    if include_threads:
+                        replies = [r.to_dict() for r in comments if r.reply_to == c.id]
+                        comment_dict['replies'] = replies
+                    result_comments.append(comment_dict)
+
+            return {"comments": result_comments, "count": len(result_comments)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def get_dashboard(
+        dashboard_type: str = "daily",
+        project: str = "",
+        person: str = "",
+        sprint: str = "",
+        section: str = "",
+    ) -> dict:
+        """
+        Generate a dashboard view.
+
+        Args:
+            dashboard_type: Type of dashboard (daily, weekly, sprint, project, team, person)
+            project: Filter by project
+            person: Person reference for person dashboard
+            sprint: Filter by sprint
+            section: Return specific section only
+
+        Returns:
+            Dashboard content or error
+        """
+        try:
+            args = argparse.Namespace(
+                dashboard_type=dashboard_type,
+                project=project if project else None,
+                person=person if person else None,
+                sprint=sprint if sprint else None,
+                section=section if section else None,
+                output=None,
+                markers=False,
+                format='md',
+                work=False,
+                personal=False,
+                quiet=True,
+            )
+
+            # Capture stdout
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            try:
+                result = cmd_dashboard(args, config)
+                output = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+
+            if result == EXIT_SUCCESS:
+                return {"dashboard": output, "type": dashboard_type}
+            return {"error": "Failed to generate dashboard"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def get_kanban(
+        project: str = "",
+        assignee: str = "",
+        mine: bool = False,
+        statuses: str = "",
+        hide_empty: bool = False,
+        compact: bool = False,
+    ) -> dict:
+        """
+        Get a kanban board view.
+
+        Args:
+            project: Filter by project
+            assignee: Filter by assignee
+            mine: Show only tickets assigned to $USER
+            statuses: Comma-separated statuses to display
+            hide_empty: Hide empty columns
+            compact: Compact card display
+
+        Returns:
+            Kanban board data or error
+        """
+        try:
+            args = argparse.Namespace(
+                project=project if project else None,
+                assignee=assignee if assignee else None,
+                mine=mine,
+                status=statuses if statuses else None,
+                hide_empty=hide_empty,
+                compact=compact,
+                width=None,
+                format='json',
+                work=False,
+                personal=False,
+                quiet=True,
+            )
+
+            # Get tickets
+            filters = {
+                'project': project if project else None,
+                'assignee': assignee if assignee else None,
+            }
+
+            search_paths = get_search_paths(args, config)
+            tickets: list[Ticket] = []
+            for search_path in search_paths:
+                if search_path.exists():
+                    path_tickets = fallback_list_tickets(search_path, filters, ['person', 'area', 'resource'])
+                    tickets.extend(path_tickets)
+
+            if mine:
+                user = os.environ.get('USER', '')
+                tickets = [t for t in tickets if t.assignee and user.lower() in str(t.assignee).lower()]
+
+            # Group by status
+            columns = {}
+            status_order = ['backlog', 'ready', 'in_progress', 'blocked', 'review', 'delegated', 'done', 'cancelled']
+
+            for status in status_order:
+                status_tickets = [t for t in tickets if t.status == status]
+                if not hide_empty or status_tickets:
+                    columns[status] = [ticket_to_mcp_dict(t) for t in status_tickets]
+
+            return {"columns": columns, "total": len(tickets)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def search_tickets(
+        query: str,
+        regex: bool = False,
+        case_sensitive: bool = False,
+        body_only: bool = False,
+        frontmatter_only: bool = False,
+        context_lines: int = 0,
+        files_only: bool = False,
+    ) -> dict:
+        """
+        Search through tickets.
+
+        Args:
+            query: Search query string
+            regex: Use regex matching
+            case_sensitive: Case sensitive search
+            body_only: Search body only
+            frontmatter_only: Search frontmatter only
+            context_lines: Number of context lines to show
+            files_only: Return file paths only
+
+        Returns:
+            Search results or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+
+            search_paths = get_search_paths(args, config)
+            results = []
+
+            flags = 0 if case_sensitive else re.IGNORECASE
+            pattern = re.compile(query, flags) if regex else None
+
+            for search_path in search_paths:
+                if not search_path.exists():
+                    continue
+
+                for md_file in search_path.rglob('*.md'):
+                    try:
+                        content = md_file.read_text()
+                        metadata, body = parse_frontmatter(content)
+
+                        if not metadata.get('id'):
+                            continue
+
+                        search_text = ""
+                        if body_only:
+                            search_text = body
+                        elif frontmatter_only:
+                            search_text = yaml.dump(metadata)
+                        else:
+                            search_text = content
+
+                        matched = False
+                        if pattern:
+                            matched = bool(pattern.search(search_text))
+                        else:
+                            if case_sensitive:
+                                matched = query in search_text
+                            else:
+                                matched = query.lower() in search_text.lower()
+
+                        if matched:
+                            if files_only:
+                                results.append(str(md_file))
+                            else:
+                                ticket = Ticket.from_file(md_file)
+                                result = ticket_to_mcp_dict(ticket)
+                                if context_lines > 0:
+                                    lines = search_text.split('\n')
+                                    context = []
+                                    for i, line in enumerate(lines):
+                                        line_matches = False
+                                        if pattern:
+                                            line_matches = bool(pattern.search(line))
+                                        else:
+                                            if case_sensitive:
+                                                line_matches = query in line
+                                            else:
+                                                line_matches = query.lower() in line.lower()
+                                        if line_matches:
+                                            start = max(0, i - context_lines)
+                                            end = min(len(lines), i + context_lines + 1)
+                                            context.extend(lines[start:end])
+                                    result['context'] = '\n'.join(context)
+                                results.append(result)
+                    except Exception:
+                        continue
+
+            return {"results": results, "count": len(results)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def validate_tickets(
+        files: str = "",
+        strict: bool = False,
+    ) -> dict:
+        """
+        Validate ticket structure and frontmatter.
+
+        Args:
+            files: Comma-separated file paths (empty = validate all)
+            strict: Fail on warnings
+
+        Returns:
+            Validation results
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+
+            search_paths = get_search_paths(args, config)
+            errors = []
+            warnings = []
+            valid_count = 0
+
+            if files:
+                file_list = [Path(f.strip()) for f in files.split(',')]
+            else:
+                file_list = []
+                for search_path in search_paths:
+                    if search_path.exists():
+                        file_list.extend(search_path.rglob('*.md'))
+
+            for md_file in file_list:
+                try:
+                    content = md_file.read_text()
+                    metadata, _ = parse_frontmatter(content)
+
+                    if not metadata.get('id'):
+                        continue
+
+                    # Check required fields
+                    required = ['id', 'title', 'type', 'created']
+                    for field in required:
+                        if not metadata.get(field):
+                            errors.append(f"{md_file}: Missing required field '{field}'")
+
+                    # Check status for types that need it
+                    ticket_type = metadata.get('type', '')
+                    if ticket_type not in ('resource', 'recipe') and not metadata.get('status'):
+                        errors.append(f"{md_file}: Missing status field")
+
+                    # Warnings
+                    if not metadata.get('assignee'):
+                        warnings.append(f"{md_file}: No assignee")
+
+                    valid_count += 1
+                except Exception as e:
+                    errors.append(f"{md_file}: Parse error - {e}")
+
+            return {
+                "valid_count": valid_count,
+                "errors": errors,
+                "warnings": warnings,
+                "passed": len(errors) == 0 and (not strict or len(warnings) == 0),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def generate_report(
+        report_type: str,
+        project: str = "",
+        sprint: str = "",
+        from_date: str = "",
+        to_date: str = "",
+    ) -> dict:
+        """
+        Generate an analytical report.
+
+        Args:
+            report_type: Report type (burndown, velocity, workload, aging, blockers)
+            project: Filter by project
+            sprint: Filter by sprint
+            from_date: Start date (YYYY-MM-DD)
+            to_date: End date (YYYY-MM-DD)
+
+        Returns:
+            Report data or error
+        """
+        try:
+            args = argparse.Namespace(
+                report_type=report_type,
+                project=project if project else None,
+                sprint=sprint if sprint else None,
+                from_date=from_date if from_date else None,
+                to_date=to_date if to_date else None,
+                output=None,
+                format='json',
+                work=False,
+                personal=False,
+                quiet=True,
+            )
+
+            # Capture stdout
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            try:
+                result = cmd_report(args, config)
+                output = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+
+            if result == EXIT_SUCCESS:
+                try:
+                    return json.loads(output)
+                except json.JSONDecodeError:
+                    return {"report": output, "type": report_type}
+            return {"error": "Failed to generate report"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def list_people(
+        team: str = "",
+        has_blocked: bool = False,
+        has_overdue: bool = False,
+    ) -> dict:
+        """
+        List people in the knowledge base.
+
+        Args:
+            team: Filter by team
+            has_blocked: Only people with blocked tickets
+            has_overdue: Only people with overdue tickets
+
+        Returns:
+            List of people or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+
+            people_dirs = get_people_dirs(args, config)
+            people = []
+
+            for people_dir in people_dirs:
+                if not people_dir.exists():
+                    continue
+
+                for md_file in people_dir.rglob('*.md'):
+                    try:
+                        person = Person.from_file(md_file)
+
+                        if team and person.team != team:
+                            continue
+
+                        person_dict = person_to_mcp_dict(person)
+
+                        if has_blocked or has_overdue:
+                            # Check tickets for this person
+                            person_ref = md_file.stem
+                            filters = {'assignee': person_ref}
+                            search_paths = get_search_paths(args, config)
+
+                            person_tickets = []
+                            for search_path in search_paths:
+                                if search_path.exists():
+                                    tickets = fallback_list_tickets(search_path, filters, ['person'])
+                                    person_tickets.extend(tickets)
+
+                            if has_blocked:
+                                blocked = [t for t in person_tickets if t.status == 'blocked']
+                                if not blocked:
+                                    continue
+                                person_dict['blocked_count'] = len(blocked)
+
+                            if has_overdue:
+                                today = date.today()
+                                overdue = [t for t in person_tickets if t.due_date and t.due_date < today]
+                                if not overdue:
+                                    continue
+                                person_dict['overdue_count'] = len(overdue)
+
+                        people.append(person_dict)
+                    except Exception:
+                        continue
+
+            return {"people": people, "count": len(people)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def show_person(
+        person: str,
+        include_tickets: bool = False,
+        raw: bool = False,
+    ) -> dict:
+        """
+        Get details of a specific person.
+
+        Args:
+            person: Person reference (name or filename)
+            include_tickets: Include assigned ticket details
+            raw: Return raw file content
+
+        Returns:
+            Person details or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+
+            people_dirs = get_people_dirs(args, config)
+            person_path = None
+
+            for pdir in people_dirs:
+                if pdir.exists():
+                    person_link = resolve_person_reference(person, pdir)
+                    if person_link:
+                        person_path = config.directory / person_link.path
+                        break
+
+            if not person_path or not person_path.exists():
+                return {"error": f"Person not found: {person}"}
+
+            if raw:
+                content = person_path.read_text()
+                return {"content": content, "filepath": str(person_path)}
+
+            person_obj = Person.from_file(person_path)
+            result = person_to_mcp_dict(person_obj)
+
+            if include_tickets:
+                person_ref = person_path.stem
+                filters = {'assignee': person_ref}
+                search_paths = get_search_paths(args, config)
+
+                person_tickets = []
+                for search_path in search_paths:
+                    if search_path.exists():
+                        tickets = fallback_list_tickets(search_path, filters, ['person'])
+                        person_tickets.extend(tickets)
+
+                result['tickets'] = [ticket_to_mcp_dict(t) for t in person_tickets]
+
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def create_person(
+        name: str,
+        email: str = "",
+        role: str = "",
+        team: str = "",
+        manager: str = "",
+    ) -> dict:
+        """
+        Create a new person file.
+
+        Args:
+            name: Person's name
+            email: Email address
+            role: Role/title
+            team: Team name
+            manager: Manager reference
+
+        Returns:
+            Created person details or error
+        """
+        try:
+            args = argparse.Namespace(
+                name=name,
+                email=email if email else None,
+                role=role if role else None,
+                team=team if team else None,
+                manager=manager if manager else None,
+                no_edit=True,
+                format='json',
+                work=False,
+                personal=False,
+                quiet=True,
+            )
+
+            result = cmd_people_create(args, config)
+
+            if result == EXIT_SUCCESS:
+                # Find the created person
+                people_dirs = get_people_dirs(args, config)
+                for pdir in people_dirs:
+                    if pdir.exists():
+                        person_link = resolve_person_reference(name, pdir)
+                        if person_link:
+                            person_path = config.directory / person_link.path
+                            if person_path.exists():
+                                person_obj = Person.from_file(person_path)
+                                return {"success": True, "person": person_to_mcp_dict(person_obj)}
+                return {"success": True, "message": f"Created person: {name}"}
+            return {"error": "Failed to create person"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def search_people(
+        query: str,
+    ) -> dict:
+        """
+        Search for people by name, email, role, or team.
+
+        Args:
+            query: Search query
+
+        Returns:
+            Matching people or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+
+            people_dirs = get_people_dirs(args, config)
+            results = []
+            query_lower = query.lower()
+
+            for people_dir in people_dirs:
+                if not people_dir.exists():
+                    continue
+
+                for md_file in people_dir.rglob('*.md'):
+                    try:
+                        person = Person.from_file(md_file)
+
+                        # Search in name, email, role, team
+                        searchable = ' '.join(filter(None, [
+                            person.name,
+                            person.email,
+                            person.role,
+                            person.team,
+                        ])).lower()
+
+                        if query_lower in searchable:
+                            results.append(person_to_mcp_dict(person))
+                    except Exception:
+                        continue
+
+            return {"results": results, "count": len(results)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def get_person_dashboard(
+        person: str,
+        section: str = "",
+    ) -> dict:
+        """
+        Generate a dashboard for a specific person.
+
+        Args:
+            person: Person reference
+            section: Return specific section only
+
+        Returns:
+            Person dashboard or error
+        """
+        try:
+            args = argparse.Namespace(
+                person=person,
+                section=section if section else None,
+                update=False,
+                all=False,
+                format='md',
+                work=False,
+                personal=False,
+                quiet=True,
+            )
+
+            # Capture stdout
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            try:
+                # Use the person dashboard command
+                people_dirs = get_people_dirs(args, config)
+                for pdir in people_dirs:
+                    if pdir.exists():
+                        person_link = resolve_person_reference(person, pdir)
+                        if person_link:
+                            args.person = str(person_link.path)
+                            break
+
+                result = cmd_people(argparse.Namespace(
+                    subcommand='dashboard',
+                    **vars(args)
+                ), config)
+                output = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+
+            if result == EXIT_SUCCESS or output:
+                return {"dashboard": output, "person": person}
+            return {"error": "Failed to generate person dashboard"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def generate_link(
+        target: str,
+        absolute: bool = False,
+        link_format: str = "markdown",
+    ) -> dict:
+        """
+        Generate a transclusion or markdown link.
+
+        Args:
+            target: Ticket ID or person reference
+            absolute: Use absolute path
+            link_format: Link format (markdown or transclusion)
+
+        Returns:
+            Generated link or error
+        """
+        try:
+            args = argparse.Namespace(
+                work=False,
+                personal=False,
+            )
+
+            target_path = find_ticket(target, config, args)
+
+            if not target_path:
+                people_dirs = get_people_dirs(args, config)
+                for pdir in people_dirs:
+                    if pdir.exists():
+                        person_link = resolve_person_reference(target, pdir)
+                        if person_link:
+                            target_path = config.directory / person_link.path
+                            break
+
+            if not target_path or not target_path.exists():
+                return {"error": f"Target not found: {target}"}
+
+            if absolute:
+                path_str = str(target_path)
+            else:
+                path_str = str(target_path.relative_to(config.directory))
+
+            if link_format == "transclusion":
+                link = f"![[{path_str}]]"
+            else:
+                # Get title for markdown link
+                try:
+                    content = target_path.read_text()
+                    metadata, _ = parse_frontmatter(content)
+                    title = metadata.get('title', '') or metadata.get('name', '') or target_path.stem
+                except Exception:
+                    title = target_path.stem
+                link = f"[{title}]({path_str})"
+
+            return {"link": link, "path": path_str, "format": link_format}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def convert_find_missing(
+        areas: bool = False,
+        resources: bool = False,
+        meetings: bool = False,
+        journals: bool = False,
+        recipes: bool = False,
+        dry_run: bool = True,
+    ) -> dict:
+        """
+        Find and convert untracked markdown files to vimban tickets.
+
+        Args:
+            areas: Scan 02_areas/ directory
+            resources: Scan 03_resources/ directory
+            meetings: Scan meetings directory
+            journals: Scan journals directory
+            recipes: Scan recipes directory
+            dry_run: Preview without making changes (default: true for safety)
+
+        Returns:
+            List of files found/converted or error
+        """
+        try:
+            args = argparse.Namespace(
+                areas=areas,
+                resources=resources,
+                meetings=meetings,
+                journals=journals,
+                recipes=recipes,
+                dry_run=dry_run,
+                no_confirm=True,
+                verbose=False,
+                format='json',
+                work=False,
+                personal=False,
+                quiet=True,
+            )
+
+            # Capture stdout
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            try:
+                result = cmd_convert_find_missing(args, config)
+                output = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+
+            if result == EXIT_SUCCESS:
+                try:
+                    return json.loads(output)
+                except json.JSONDecodeError:
+                    lines = output.strip().split('\n')
+                    return {"files": lines, "count": len(lines), "dry_run": dry_run}
+            return {"files": [], "count": 0, "dry_run": dry_run}
+        except Exception as e:
+            return {"error": str(e)}
+
+    return mcp
+
+
+def run_mcp_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 5004) -> int:
+    """
+    Run the MCP server with specified transport.
+
+    Args:
+        transport: Transport type ('stdio' or 'http')
+        host: Host to bind for HTTP transport
+        port: Port to bind for HTTP transport
+
+    Returns:
+        Exit code
+    """
+    if not MCP_AVAILABLE:
+        print("Error: mcp package required for MCP server.", file=sys.stderr)
+        print("Install with: pip install 'mcp[cli]'", file=sys.stderr)
+        return EXIT_GENERAL_ERROR
+
+    mcp = create_mcp_server(host=host, port=port)
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport="streamable-http")
+
+    return EXIT_SUCCESS
+
+
+# ============================================================================
 # CLI PARSER
 # ============================================================================
 def create_parser() -> argparse.ArgumentParser:
@@ -5708,6 +7246,13 @@ Environment Variables:
                         version=f'%(prog)s {VERSION}')
     parser.add_argument('--license', action='store_true',
                         help='Show license (AGPLv3)')
+
+    # MCP server modes (mutually exclusive)
+    mcp_group = parser.add_mutually_exclusive_group()
+    mcp_group.add_argument('--mcp', action='store_true',
+                           help='Run as MCP server (stdio transport)')
+    mcp_group.add_argument('--mcp-http', action='store_true',
+                           help='Run as MCP server (HTTP transport, port 5004)')
 
     # Work/Personal scope (mutually exclusive)
     scope_group = parser.add_mutually_exclusive_group()
@@ -5986,6 +7531,12 @@ def main() -> int:
     if getattr(args, 'license', False):
         print(LICENSE_TEXT)
         return EXIT_SUCCESS
+
+    # Handle MCP server modes
+    if getattr(args, 'mcp', False):
+        return run_mcp_server(transport="stdio")
+    elif getattr(args, 'mcp_http', False):
+        return run_mcp_server(transport="http", host="127.0.0.1", port=5004)
 
     # Get directory from args, env, or default
     directory = Path(
