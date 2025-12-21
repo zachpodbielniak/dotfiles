@@ -1,0 +1,518 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# =============================================================================
+# mcp_helper - Generate MCP server configurations for various clients
+# =============================================================================
+
+VERSION="2.0.0"
+SCRIPT_NAME="$(basename "$0")"
+
+# Temp directory for bundle creation
+TEMP_DIR=""
+
+# Server configuration globals (set by get_server_config)
+SERVER_NAME=""
+SERVER_VERSION=""
+SERVER_DESCRIPTION=""
+SERVER_COMMAND=""
+SERVER_ARGS_STDIO=""
+SERVER_ARGS_HTTP=""
+SERVER_HTTP_PORT=""
+
+# =============================================================================
+# CLEANUP
+# =============================================================================
+
+cleanup () {
+    if [[ -n "${TEMP_DIR}" ]] && [[ -d "${TEMP_DIR}" ]]
+    then
+        rm -rf "${TEMP_DIR}"
+    fi
+}
+
+trap cleanup EXIT
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+usage () {
+    cat <<EOF
+${SCRIPT_NAME} - Generate MCP server configurations for various clients
+
+USAGE:
+    ${SCRIPT_NAME} --<server> --<client> [options]
+    ${SCRIPT_NAME} --list
+    ${SCRIPT_NAME} -h|--help
+
+SERVER OPTIONS:
+    --flashcards        Spaced repetition flashcards with AI generation
+    --vimban            Markdown-native ticket and kanban management
+
+CLIENT OPTIONS:
+    --claude-code       Generate for Claude Code CLI
+    --claude-desktop    Generate for Claude Desktop (.mcpb bundle)
+    --opencode          Generate for OpenCode
+
+TRANSPORT OPTIONS:
+    --http              Use HTTP transport instead of stdio (default: stdio)
+                        Uses the server's HTTP endpoint (e.g., port 5003, 5004)
+
+OUTPUT OPTIONS:
+    --config            Output config JSON snippet instead of add command
+                        (for --claude-code and --opencode)
+    --json              Output JSON config instead of .mcpb bundle
+                        (for --claude-desktop)
+    -o, --output        Write to file instead of stdout/default path
+
+GENERAL OPTIONS:
+    --list              List available server configurations
+    -h, --help          Show this help message
+    --license           Show license information
+    --version           Show version
+
+EXAMPLES:
+    # Claude Code - print add command (stdio, default)
+    ${SCRIPT_NAME} --vimban --claude-code
+    # Output: claude mcp add --transport stdio vimban -- vimban --mcp
+
+    # Claude Code - HTTP transport
+    ${SCRIPT_NAME} --vimban --claude-code --http
+    # Output: claude mcp add --transport http vimban http://127.0.0.1:5004
+
+    # Claude Code - print config snippet
+    ${SCRIPT_NAME} --vimban --claude-code --config
+    # Output: { "vimban": { "type": "stdio", "command": "vimban", "args": ["--mcp"] } }
+
+    # Claude Desktop - generate .mcpb bundle (default)
+    ${SCRIPT_NAME} --vimban --claude-desktop
+    # Creates: ./vimban.mcpb
+
+    # Claude Desktop - output JSON config
+    ${SCRIPT_NAME} --vimban --claude-desktop --json
+    # Output: { "vimban": { "command": "vimban", "args": ["--mcp"] } }
+
+    # OpenCode - print config snippet (stdio)
+    ${SCRIPT_NAME} --vimban --opencode --config
+    # Output: { "vimban": { "type": "local", "command": ["vimban", "--mcp"], "enabled": true } }
+
+    # OpenCode - HTTP config
+    ${SCRIPT_NAME} --vimban --opencode --config --http
+    # Output: { "vimban": { "type": "remote", "url": "http://127.0.0.1:5004", "enabled": true } }
+
+EOF
+}
+
+show_license () {
+    cat <<EOF
+mcp_helper - Generate MCP server configurations for various clients
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+list_servers () {
+    cat <<EOF
+Available MCP server configurations:
+
+  flashcards      Spaced repetition flashcards with AI generation
+                  Command: flashcards-serve --mcp (stdio) / --mcp-http (HTTP port 5003)
+
+  vimban          Markdown-native ticket and kanban management
+                  Command: vimban --mcp (stdio) / --mcp-http (HTTP port 5004)
+
+To add more servers, edit the get_server_config function in this script.
+EOF
+}
+
+# =============================================================================
+# SERVER CONFIGURATIONS
+# =============================================================================
+
+# Sets global variables for server configuration
+get_server_config () {
+    local server="${1}"
+
+    case "${server}" in
+        flashcards)
+            SERVER_NAME="flashcards"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Spaced repetition flashcards with AI generation from notes"
+            SERVER_COMMAND="flashcards-serve"
+            SERVER_ARGS_STDIO="--mcp"
+            SERVER_ARGS_HTTP="--mcp-http"
+            SERVER_HTTP_PORT="5003"
+            ;;
+        vimban)
+            SERVER_NAME="vimban"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Markdown-native ticket and kanban management"
+            SERVER_COMMAND="vimban"
+            SERVER_ARGS_STDIO="--mcp"
+            SERVER_ARGS_HTTP="--mcp-http"
+            SERVER_HTTP_PORT="5004"
+            ;;
+        *)
+            echo "Error: Unknown server '${server}'" >&2
+            echo "Run '${SCRIPT_NAME} --list' to see available servers" >&2
+            return 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# CLAUDE CODE GENERATORS
+# =============================================================================
+
+generate_claude_code_command () {
+    local http_mode="${1}"
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        echo "claude mcp add --transport http ${SERVER_NAME} http://127.0.0.1:${SERVER_HTTP_PORT}"
+    else
+        echo "claude mcp add --transport stdio ${SERVER_NAME} -- ${SERVER_COMMAND} ${SERVER_ARGS_STDIO}"
+    fi
+}
+
+generate_claude_code_config () {
+    local http_mode="${1}"
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "http",
+    "url": "http://127.0.0.1:${SERVER_HTTP_PORT}"
+  }
+}
+EOF
+    else
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "stdio",
+    "command": "${SERVER_COMMAND}",
+    "args": ["${SERVER_ARGS_STDIO}"]
+  }
+}
+EOF
+    fi
+}
+
+# =============================================================================
+# CLAUDE DESKTOP GENERATORS
+# =============================================================================
+
+generate_manifest () {
+    cat <<EOF
+{
+  "manifest_version": "0.1",
+  "name": "${SERVER_NAME}",
+  "version": "${SERVER_VERSION}",
+  "description": "${SERVER_DESCRIPTION}",
+  "author": {
+    "name": "Zach Podbielniak"
+  },
+  "server": {
+    "type": "binary",
+    "entry_point": "run.sh",
+    "mcp_config": {
+      "command": "bash",
+      "args": ["\${__dirname}/run.sh"]
+    }
+  }
+}
+EOF
+}
+
+generate_run_script () {
+    cat <<EOF
+#!/bin/bash
+exec ${SERVER_COMMAND} ${SERVER_ARGS_STDIO}
+EOF
+}
+
+generate_claude_desktop_bundle () {
+    local output="${1}"
+
+    # Create temp directory
+    TEMP_DIR="$(mktemp -d)"
+    local bundle_dir="${TEMP_DIR}/${SERVER_NAME}"
+    mkdir -p "${bundle_dir}"
+
+    # Generate files
+    generate_manifest > "${bundle_dir}/manifest.json"
+    generate_run_script > "${bundle_dir}/run.sh"
+    chmod +x "${bundle_dir}/run.sh"
+
+    # Create ZIP bundle
+    (
+        cd "${bundle_dir}"
+        zip -q -r "${TEMP_DIR}/${SERVER_NAME}.mcpb" manifest.json run.sh
+    )
+
+    # Move to output location
+    mv "${TEMP_DIR}/${SERVER_NAME}.mcpb" "${output}"
+
+    echo "Created: ${output}" >&2
+}
+
+generate_claude_desktop_json () {
+    local http_mode="${1}"
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "command": "${SERVER_COMMAND}",
+    "args": ["${SERVER_ARGS_HTTP}"]
+  }
+}
+EOF
+    else
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "command": "${SERVER_COMMAND}",
+    "args": ["${SERVER_ARGS_STDIO}"]
+  }
+}
+EOF
+    fi
+}
+
+# =============================================================================
+# OPENCODE GENERATORS
+# =============================================================================
+
+generate_opencode_command () {
+    local http_mode="${1}"
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        cat <<EOF
+# Add to ~/.config/opencode/opencode.json under "mcp":
+#   "${SERVER_NAME}": {
+#     "type": "remote",
+#     "url": "http://127.0.0.1:${SERVER_HTTP_PORT}",
+#     "enabled": true
+#   }
+EOF
+    else
+        cat <<EOF
+# Add to ~/.config/opencode/opencode.json under "mcp":
+#   "${SERVER_NAME}": {
+#     "type": "local",
+#     "command": ["${SERVER_COMMAND}", "${SERVER_ARGS_STDIO}"],
+#     "enabled": true
+#   }
+EOF
+    fi
+}
+
+generate_opencode_config () {
+    local http_mode="${1}"
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "remote",
+    "url": "http://127.0.0.1:${SERVER_HTTP_PORT}",
+    "enabled": true
+  }
+}
+EOF
+    else
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "local",
+    "command": ["${SERVER_COMMAND}", "${SERVER_ARGS_STDIO}"],
+    "enabled": true
+  }
+}
+EOF
+    fi
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main () {
+    local server=""
+    local client=""
+    local http_mode="false"
+    local config_mode="false"
+    local json_mode="false"
+    local output_file=""
+    local output=""
+
+    if [[ $# -eq 0 ]]
+    then
+        usage
+        exit 0
+    fi
+
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --license)
+                show_license
+                exit 0
+                ;;
+            --version)
+                echo "${SCRIPT_NAME} ${VERSION}"
+                exit 0
+                ;;
+            --list)
+                list_servers
+                exit 0
+                ;;
+            --claude-code)
+                client="claude-code"
+                shift
+                ;;
+            --claude-desktop)
+                client="claude-desktop"
+                shift
+                ;;
+            --opencode)
+                client="opencode"
+                shift
+                ;;
+            --http)
+                http_mode="true"
+                shift
+                ;;
+            --config)
+                config_mode="true"
+                shift
+                ;;
+            --json)
+                json_mode="true"
+                shift
+                ;;
+            -o|--output)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: -o requires an argument" >&2
+                    exit 1
+                fi
+                output_file="${2}"
+                shift 2
+                ;;
+            --flashcards|--vimban)
+                server="${1#--}"
+                shift
+                ;;
+            --*)
+                echo "Error: Unknown option '${1}'" >&2
+                echo "Run '${SCRIPT_NAME} --list' to see available servers" >&2
+                exit 1
+                ;;
+            *)
+                echo "Error: Unknown argument '${1}'" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Validate required arguments
+    if [[ -z "${server}" ]]
+    then
+        echo "Error: No server specified (--flashcards or --vimban)" >&2
+        exit 1
+    fi
+
+    if [[ -z "${client}" ]]
+    then
+        echo "Error: No client specified (--claude-code, --claude-desktop, or --opencode)" >&2
+        exit 1
+    fi
+
+    # Get server configuration
+    get_server_config "${server}"
+
+    # Generate output based on client
+    case "${client}" in
+        claude-code)
+            if [[ "${config_mode}" == "true" ]]
+            then
+                output="$(generate_claude_code_config "${http_mode}")"
+            else
+                output="$(generate_claude_code_command "${http_mode}")"
+            fi
+            ;;
+        claude-desktop)
+            if [[ "${json_mode}" == "true" ]]
+            then
+                output="$(generate_claude_desktop_json "${http_mode}")"
+            else
+                # .mcpb bundles always use stdio (run local command)
+                local bundle_output="${output_file:-${SERVER_NAME}.mcpb}"
+                generate_claude_desktop_bundle "${bundle_output}"
+                exit 0
+            fi
+            ;;
+        opencode)
+            if [[ "${config_mode}" == "true" ]]
+            then
+                output="$(generate_opencode_config "${http_mode}")"
+            else
+                output="$(generate_opencode_command "${http_mode}")"
+            fi
+            ;;
+    esac
+
+    # Handle output
+    if [[ -n "${output_file}" ]]
+    then
+        echo "${output}" > "${output_file}"
+        echo "Written to: ${output_file}" >&2
+    else
+        echo "${output}"
+    fi
+}
+
+main "$@"
