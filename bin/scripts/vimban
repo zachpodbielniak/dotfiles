@@ -539,6 +539,16 @@ PARA_PREFIXES: dict[str, str] = {
     "resource": "RS"
 }
 
+# Prefixes for ticket types
+TICKET_PREFIXES: dict[str, str] = {
+    "epic": "PROJ",
+    "story": "PROJ",
+    "task": "PROJ",
+    "sub-task": "PROJ",
+    "research": "RESEARCH",
+    "bug": "BUG",
+}
+
 # Sequence files for each type category
 SEQUENCE_FILE_AREA: str = ".sequence_area"
 SEQUENCE_FILE_RESOURCE: str = ".sequence_resource"
@@ -2064,7 +2074,7 @@ def next_id(
         prefix = prefix or PARA_PREFIXES["resource"]
     else:
         sequence_file = config_dir / SEQUENCE_FILE
-        prefix = prefix or DEFAULT_PREFIX
+        prefix = prefix or TICKET_PREFIXES.get(ticket_type, DEFAULT_PREFIX)
 
     # Ensure sequence file exists
     if not sequence_file.exists():
@@ -3638,6 +3648,60 @@ def resolve_parent_path(member_of_ref: str, config: Config) -> Optional[Path]:
     return None
 
 
+def update_parent_children(
+    parent_path: Path,
+    child_path: Path,
+    config: Config
+) -> bool:
+    """
+    Update parent ticket to add child to its 'children' field.
+
+    Creates the 'children' field if it doesn't exist.
+
+    Args:
+        parent_path: Path to the parent ticket file
+        child_path: Path to the newly created child ticket file
+        config: Config instance with directory info
+
+    Returns:
+        True if parent was updated, False otherwise
+    """
+    if not parent_path.exists():
+        return False
+
+    try:
+        # Read parent content
+        parent_content = parent_path.read_text()
+        metadata, body = parse_frontmatter(parent_content)
+
+        # Create transclusion link to child
+        rel_child = str(child_path.relative_to(config.directory))
+        child_link = create_transclusion(rel_child)
+
+        # Get or create children field
+        children = metadata.get('children', [])
+        if not isinstance(children, list):
+            children = [children] if children else []
+
+        # Add child if not already present
+        if child_link not in children:
+            children.append(child_link)
+
+        # Update metadata
+        metadata['children'] = children
+        metadata['updated'] = datetime.now().isoformat()
+        metadata['version'] = metadata.get('version', 0) + 1
+
+        # Write updated parent
+        parent_path.write_text(dump_frontmatter(metadata, body))
+        return True
+
+    except Exception as e:
+        # Don't fail child creation if parent update fails
+        print(f"Warning: Could not update parent {parent_path}: {e}", file=sys.stderr)
+        return False
+
+
 def determine_output_path(
     ticket_type: str,
     safe_title: str,
@@ -3748,6 +3812,24 @@ def cmd_create_para(
         tags_str = getattr(args, 'tags', None) or ''
         tags = [t.strip() for t in tags_str.split(',')] if tags_str else []
 
+        # Resolve people references (search both work/personal scopes)
+        assignee = find_person_in_scopes(
+            getattr(args, 'assignee', None) or '',
+            args, config
+        )
+        reporter = find_person_in_scopes(
+            getattr(args, 'reporter', None) or '',
+            args, config
+        )
+
+        # Parse due date
+        due_date = parse_date(getattr(args, 'due', None) or '')
+
+        # Get member_of, project, priority
+        member_of = getattr(args, 'member_of', None)
+        project = getattr(args, 'project', None)
+        priority = getattr(args, 'priority', None) or config.default_priority
+
         # Load template
         template = load_template(ticket_type)
 
@@ -3758,15 +3840,27 @@ def cmd_create_para(
                 template,
                 ticket_id=ticket_id,
                 title=actual_title,
-                status=status,
+                assignee=assignee,
+                reporter=reporter,
+                priority=priority,
+                due_date=due_date,
                 tags=tags,
+                project=project,
+                member_of=member_of,
+                status=status,
             )
         else:
             content = fill_template(
                 template,
                 ticket_id=ticket_id,
                 title=actual_title,
+                assignee=assignee,
+                reporter=reporter,
+                priority=priority,
+                due_date=due_date,
                 tags=tags,
+                project=project,
+                member_of=member_of,
             )
 
         # Apply type-specific template replacements
@@ -3787,6 +3881,13 @@ def cmd_create_para(
             output_path = Path(args.output)
             if not output_path.is_absolute():
                 output_path = config.directory / output_path
+        elif member_of:
+            # Place in parent's directory if member_of is specified
+            parent_path = resolve_parent_path(member_of[0], config)
+            if parent_path:
+                output_path = parent_path.parent / filename
+            else:
+                output_path = para_base / filename
         else:
             output_path = para_base / filename
 
@@ -3856,6 +3957,13 @@ def cmd_create_para(
     # Write file
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(content)
+
+    # Update parent ticket's children field if member_of was specified
+    if member_of:
+        for parent_ref in member_of:
+            parent_path = resolve_parent_path(parent_ref, config)
+            if parent_path:
+                update_parent_children(parent_path, output_path, config)
 
     # Open in editor unless --no-edit
     if not getattr(args, 'no_edit', False):
@@ -3977,6 +4085,14 @@ def cmd_create(args: argparse.Namespace, config: Config) -> int:
     # Write file
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(content)
+
+    # Update parent ticket's children field if member_of was specified
+    member_of = getattr(args, 'member_of', None)
+    if member_of:
+        for parent_ref in member_of:
+            parent_path = resolve_parent_path(parent_ref, config)
+            if parent_path:
+                update_parent_children(parent_path, output_path, config)
 
     # Open in editor unless --no-edit
     if not getattr(args, 'no_edit', False):
@@ -4572,7 +4688,7 @@ def cmd_link(args: argparse.Namespace, config: Config) -> int:
         reverse_relations = {
             'blocked_by': 'blocks',
             'blocks': 'blocked_by',
-            'member_of': 'relates_to',  # Parent doesn't track children by default
+            'member_of': 'children',  # Parent tracks children in children field
             'relates_to': 'relates_to',
         }
         reverse = reverse_relations.get(relation)
