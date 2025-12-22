@@ -63,6 +63,9 @@ except ImportError:
 # Cache directory - easily changeable
 CACHE_DIR: str = "/tmp/rdt_cache/"
 
+# Config file path
+CONFIG_FILE: str = os.path.expanduser("~/.config/rdt/config.yaml")
+
 # MCP server port (for HTTP transport)
 MCP_HTTP_PORT: int = 5005
 
@@ -149,6 +152,69 @@ class RedditPost:
             "upvote_ratio": self.upvote_ratio,
             "link_flair_text": self.link_flair_text
         }
+
+
+@dataclass
+class Config:
+    """User configuration loaded from config file."""
+    subreddits: list[str] = field(default_factory=list)
+    sort: str = "hot"
+    limit: int = 25
+    time_filter: str = ""
+    format: str = "stdout"
+    editor: bool = False
+    fzf: bool = False
+
+    @classmethod
+    def load(cls, path: str = CONFIG_FILE) -> "Config":
+        """
+        Load configuration from YAML file.
+
+        Args:
+            path: Path to config file
+
+        Returns:
+            Config object with loaded values (or defaults if file doesn't exist)
+        """
+        config = cls()
+        config_path = Path(path)
+
+        if not config_path.exists():
+            return config
+
+        if not YAML_AVAILABLE:
+            warn(f"Config file exists but PyYAML not installed: {path}")
+            return config
+
+        try:
+            with open(config_path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+
+            # Parse subreddits - can be string (CSV) or list
+            subs = data.get("subreddits", [])
+            if isinstance(subs, str):
+                config.subreddits = [s.strip() for s in subs.split(",") if s.strip()]
+            elif isinstance(subs, list):
+                config.subreddits = [str(s).strip() for s in subs if s]
+
+            # Parse other options
+            if "sort" in data:
+                config.sort = str(data["sort"])
+            if "limit" in data:
+                config.limit = int(data["limit"])
+            if "time" in data or "time_filter" in data:
+                config.time_filter = str(data.get("time") or data.get("time_filter", ""))
+            if "format" in data:
+                config.format = str(data["format"])
+            if "editor" in data:
+                config.editor = bool(data["editor"])
+            if "fzf" in data:
+                config.fzf = bool(data["fzf"])
+
+        except Exception as e:
+            warn(f"Failed to load config from {path}: {e}")
+
+        return config
 
 
 # =============================================================================
@@ -392,6 +458,76 @@ def parse_subreddit_listing(data: dict, debug_mode: bool = False) -> tuple[list[
     return posts, next_cursor
 
 
+def fetch_multiple_subreddits(
+    subreddits: list[str],
+    sort: str = "hot",
+    limit: int = 25,
+    time_filter: Optional[str] = None,
+    use_cache: bool = True,
+    debug_mode: bool = False
+) -> list[RedditPost]:
+    """
+    Fetch posts from multiple subreddits and merge/sort them.
+
+    Args:
+        subreddits: List of subreddit names (without r/)
+        sort: hot, new, top, rising
+        limit: Total number of posts to return
+        time_filter: Time filter for top (hour, day, week, month, year, all)
+        use_cache: Whether to use caching
+        debug_mode: Enable debug output
+
+    Returns:
+        List of posts sorted according to sort option, limited to limit count
+    """
+    all_posts: list[RedditPost] = []
+
+    # Fetch enough posts from each subreddit to satisfy the limit after merging
+    # We fetch limit posts from each to ensure we have enough after sorting
+    per_sub_limit = min(limit, 100)  # Reddit max is 100
+
+    for subreddit in subreddits:
+        debug(f"Fetching from r/{subreddit}", debug_mode)
+        try:
+            posts, _ = fetch_subreddit(
+                subreddit,
+                sort=sort,
+                limit=per_sub_limit,
+                time_filter=time_filter,
+                use_cache=use_cache,
+                debug_mode=debug_mode
+            )
+            all_posts.extend(posts)
+        except SystemExit:
+            # fetch_subreddit calls error() which exits - catch and continue
+            warn(f"Failed to fetch r/{subreddit}, skipping")
+            continue
+
+    # Sort combined posts based on sort option
+    if sort == "new":
+        all_posts.sort(key=lambda p: p.created_utc, reverse=True)
+    elif sort == "top":
+        all_posts.sort(key=lambda p: p.score, reverse=True)
+    elif sort == "rising":
+        # Rising is complex (score over time), approximate with score/age ratio
+        now = time.time()
+        all_posts.sort(
+            key=lambda p: p.score / max(now - p.created_utc, 1),
+            reverse=True
+        )
+    else:  # hot (default)
+        # Hot is a complex algorithm, approximate with score * recency factor
+        now = time.time()
+        def hot_score(post: RedditPost) -> float:
+            age_hours = (now - post.created_utc) / 3600
+            # Reddit-like hot ranking: score decays with time
+            return post.score / max(age_hours ** 1.5, 1)
+        all_posts.sort(key=hot_score, reverse=True)
+
+    # Apply limit
+    return all_posts[:limit]
+
+
 def parse_comments(children: list, depth: int = 0, debug_mode: bool = False) -> list[RedditComment]:
     """Recursively parse comment tree from Reddit API response."""
     comments: list[RedditComment] = []
@@ -572,9 +708,18 @@ def format_markdown_list(posts: list[RedditPost], subreddit: str = "", sort: str
     """
     lines: list[str] = []
 
+    # Detect if this is a multi-subreddit listing
+    is_multi = "," in subreddit
+
     # Header
     if subreddit:
-        lines.append(f"## r/{subreddit} - {sort.capitalize()} Posts")
+        if is_multi:
+            # Show list of subreddits
+            subs = [s.strip() for s in subreddit.split(",")]
+            sub_display = ", ".join(f"r/{s}" for s in subs)
+            lines.append(f"## {sub_display} - {sort.capitalize()} Posts (Combined)")
+        else:
+            lines.append(f"## r/{subreddit} - {sort.capitalize()} Posts")
     else:
         lines.append("## Reddit Posts")
     lines.append("")
@@ -584,7 +729,10 @@ def format_markdown_list(posts: list[RedditPost], subreddit: str = "", sort: str
 
         lines.append(f"### {i}. {post.title}{flair}")
         lines.append("")
-        lines.append(f"- **Score**: {post.score} | **Comments**: {post.num_comments} | **Ratio**: {post.upvote_ratio:.0%}")
+
+        # Show subreddit when listing multiple
+        sub_info = f" | **Sub**: r/{post.subreddit}" if is_multi else ""
+        lines.append(f"- **Score**: {post.score} | **Comments**: {post.num_comments} | **Ratio**: {post.upvote_ratio:.0%}{sub_info}")
         lines.append(f"- **Author**: u/{post.author}")
         lines.append(f"- **Posted**: {datetime.fromtimestamp(post.created_utc).strftime('%Y-%m-%d %H:%M')}")
 
@@ -1004,7 +1152,9 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   rdt python                           List hot posts from r/python
   rdt linux --sort top --time week     Top posts this week from r/linux
+  rdt zfs,linux,freebsd --limit 20     Top 20 posts from multiple subreddits (merged & sorted)
   rdt zfs --editor                     Browse r/zfs in $EDITOR with transclusion links
+  rdt                                  Use default subreddits from config file
   rdt --url https://reddit.com/r/...   Fetch specific post with comments
   rdt programming --fzf                Interactive fzf selection, output to stdout
   rdt vim --fzf --editor               FZF selection, then open post in $EDITOR
@@ -1031,6 +1181,9 @@ Neovim Integration:
   Press <leader>tf on a link to preview posts in a floating window.
   Command transclusions: ![[!rdt ...]] or [title](!rdt ...)
 
+Configuration File:
+  ~/.config/rdt/config.yaml            Default settings (subreddits, sort, editor, etc.)
+
 Environment Variables:
   NO_DBOX_CHECK=1    Skip distrobox container check
   EDITOR             Editor for --editor mode (default: nvim)
@@ -1041,7 +1194,7 @@ Environment Variables:
     parser.add_argument(
         "subreddit",
         nargs="?",
-        help="Subreddit name (without r/)"
+        help="Subreddit name(s) - single or comma-separated list (e.g., 'zfs,linux,freebsd')"
     )
 
     # Input source group
@@ -1201,13 +1354,43 @@ def main() -> int:
     # Update global cache dir if specified
     CACHE_DIR = args.cache_dir
 
+    # Load config file
+    config = Config.load()
+
     debug_mode = args.debug
     use_cache = not args.no_cache
+
+    # Apply config defaults for options not specified on command line
+    # argparse uses default values, so we check if user explicitly provided values
+    sort_order = args.sort
+    limit = args.limit
+    time_filter = args.time
+    use_editor = args.editor
+    use_fzf = args.fzf
+    output_format = args.format
+
+    # If no subreddit provided, use config defaults
+    if not args.subreddit and not args.url and not args.article:
+        if config.subreddits:
+            # Use config defaults
+            if sort_order == "hot":  # default value
+                sort_order = config.sort
+            if limit == 25:  # default value
+                limit = config.limit
+            if not time_filter and config.time_filter:
+                time_filter = config.time_filter
+            if output_format == "stdout":  # default value
+                output_format = config.format
+            if not use_editor:
+                use_editor = config.editor
+            if not use_fzf:
+                use_fzf = config.fzf
 
     # Determine input source and fetch data
     posts: list[RedditPost] = []
     comments: list[RedditComment] = []
     subreddit_name = ""
+    subreddit_list: list[str] = []
 
     if args.article:
         # Load from local JSON file
@@ -1244,10 +1427,10 @@ def main() -> int:
             # Treat as subreddit URL
             posts, _ = fetch_subreddit(
                 args.subreddit or "",
-                sort=args.sort,
-                limit=args.limit,
+                sort=sort_order,
+                limit=limit,
                 after=args.after,
-                time_filter=args.time,
+                time_filter=time_filter,
                 use_cache=use_cache,
                 debug_mode=debug_mode
             )
@@ -1255,37 +1438,82 @@ def main() -> int:
                 subreddit_name = posts[0].subreddit
 
     elif args.subreddit:
-        # Fetch subreddit
-        subreddit_name = args.subreddit
-        posts, next_cursor = fetch_subreddit(
-            args.subreddit,
-            sort=args.sort,
-            limit=args.limit,
-            after=args.after,
-            time_filter=args.time,
-            use_cache=use_cache,
-            debug_mode=debug_mode
-        )
+        # Parse CSV subreddits
+        subreddit_list = [s.strip() for s in args.subreddit.split(",") if s.strip()]
 
-        if next_cursor:
-            debug(f"Next page cursor: {next_cursor}", debug_mode)
+        if len(subreddit_list) == 1:
+            # Single subreddit - use original fetch for pagination support
+            subreddit_name = subreddit_list[0]
+            posts, next_cursor = fetch_subreddit(
+                subreddit_name,
+                sort=sort_order,
+                limit=limit,
+                after=args.after,
+                time_filter=time_filter,
+                use_cache=use_cache,
+                debug_mode=debug_mode
+            )
+            if next_cursor:
+                debug(f"Next page cursor: {next_cursor}", debug_mode)
+        else:
+            # Multiple subreddits - fetch and merge
+            subreddit_name = ",".join(subreddit_list)
+            posts = fetch_multiple_subreddits(
+                subreddit_list,
+                sort=sort_order,
+                limit=limit,
+                time_filter=time_filter,
+                use_cache=use_cache,
+                debug_mode=debug_mode
+            )
+
+    elif config.subreddits:
+        # Use subreddits from config file
+        subreddit_list = config.subreddits
+        debug(f"Using subreddits from config: {subreddit_list}", debug_mode)
+
+        if len(subreddit_list) == 1:
+            subreddit_name = subreddit_list[0]
+            posts, next_cursor = fetch_subreddit(
+                subreddit_name,
+                sort=sort_order,
+                limit=limit,
+                after=args.after,
+                time_filter=time_filter,
+                use_cache=use_cache,
+                debug_mode=debug_mode
+            )
+            if next_cursor:
+                debug(f"Next page cursor: {next_cursor}", debug_mode)
+        else:
+            subreddit_name = ",".join(subreddit_list)
+            posts = fetch_multiple_subreddits(
+                subreddit_list,
+                sort=sort_order,
+                limit=limit,
+                time_filter=time_filter,
+                use_cache=use_cache,
+                debug_mode=debug_mode
+            )
 
     else:
         parser.print_help()
         return EXIT_USAGE_ERROR
 
     # Editor mode (without fzf): open subreddit listing in $EDITOR
-    if args.editor and not args.fzf:
+    if use_editor and not use_fzf:
         if not posts:
             error("No posts found", EXIT_GENERAL_ERROR)
 
         # Format as markdown listing with transclusion links
-        content = format_markdown_list(posts, subreddit_name, args.sort)
+        content = format_markdown_list(posts, subreddit_name, sort_order)
 
+        # Use a sanitized prefix for temp file (replace commas with underscores)
+        safe_name = subreddit_name.replace(",", "_")
         with tempfile.NamedTemporaryFile(
             mode='w',
             suffix='.md',
-            prefix=f'rdt_{subreddit_name}_',
+            prefix=f'rdt_{safe_name}_',
             delete=False
         ) as f:
             f.write(content)
@@ -1301,7 +1529,7 @@ def main() -> int:
         return EXIT_SUCCESS
 
     # FZF mode: interactive selection
-    if args.fzf:
+    if use_fzf:
         if not posts:
             error("No posts to select from", EXIT_GENERAL_ERROR)
 
@@ -1320,7 +1548,7 @@ def main() -> int:
             posts = [post]
 
         # If --editor, open in editor; otherwise output to stdout
-        if args.editor:
+        if use_editor:
             content = format_markdown_post(posts[0], comments) if posts else ""
 
             with tempfile.NamedTemporaryFile(
@@ -1352,19 +1580,19 @@ def main() -> int:
 
     output = ""
 
-    if args.format == 'markdown':
+    if output_format == 'markdown':
         if comments:
             output = format_markdown_post(posts[0], comments)
         else:
-            output = format_markdown_list(posts, subreddit_name, args.sort)
+            output = format_markdown_list(posts, subreddit_name, sort_order)
 
-    elif args.format == 'yaml':
+    elif output_format == 'yaml':
         data_dict = {'posts': [p.to_dict() for p in posts]}
         if comments:
             data_dict['comments'] = [c.to_dict() for c in comments]
         output = format_yaml(data_dict)
 
-    elif args.format == 'json':
+    elif output_format == 'json':
         data_dict = {'posts': [p.to_dict() for p in posts]}
         if comments:
             data_dict['comments'] = [c.to_dict() for c in comments]
