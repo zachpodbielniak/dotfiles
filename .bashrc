@@ -243,3 +243,8 @@ elif command -v starship &>/dev/null
 then
     eval "$(starship init bash)"
 fi
+
+if [[ -n "$KITTY_WINDOW_ID" ]]; then
+    export KITTY_WINDOW_ID
+    export KITTY_LISTEN_ON
+fi
