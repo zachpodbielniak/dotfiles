@@ -71,6 +71,7 @@ if not no_dbox_check and ("dev" != ctr_id):
 import argparse
 import curses
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -1061,6 +1062,127 @@ class DialogManager:
             return None
         return self._select_from_list("Remove Tag", tags)
 
+    def select_comment(self, item_ref: str, directory: Path) -> Optional[int]:
+        """
+        Show a comment selection dialog for replying.
+
+        Fetches comments from vimban and displays them for selection.
+
+        Args:
+            item_ref: Ticket ID or person reference
+            directory: Vimban directory path
+
+        Returns:
+            Comment number to reply to, or None if cancelled/no comments.
+        """
+        # Fetch comments using vimban CLI
+        cmd: list[str] = [
+            'vimban', '--no-color', '--directory', str(directory),
+            'comment', item_ref, '--print', 'all'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return None
+
+        # Parse comments from output
+        # Format: "#N (timestamp)" on one line, comment text on next line
+        comments: list[tuple[int, str]] = []
+        lines: list[str] = result.stdout.strip().split('\n')
+        i: int = 0
+        while i < len(lines):
+            line: str = lines[i].strip()
+            # Match lines like "#1 (2025-12-22 13:19)" or just "#1"
+            match = re.match(r'^#(\d+)', line)
+            if match:
+                num: int = int(match.group(1))
+                # Next line is the comment text
+                text: str = ""
+                if i + 1 < len(lines):
+                    text = lines[i + 1].strip()
+                comments.append((num, text))
+                i += 2  # Skip the text line
+            else:
+                i += 1
+
+        if not comments:
+            return None
+
+        # Build display items
+        display_items: list[str] = []
+        for num, text in comments:
+            preview: str = text[:40] + "..." if len(text) > 40 else text
+            display_items.append(f"#{num}: {preview}")
+
+        # Show selection dialog
+        height, width = self.stdscr.getmaxyx()
+
+        dialog_width: int = min(60, width - 4)
+        dialog_height: int = min(len(display_items) + 5, height - 4)
+        start_y: int = (height - dialog_height) // 2
+        start_x: int = (width - dialog_width) // 2
+
+        dialog: Any = curses.newwin(dialog_height, dialog_width, start_y, start_x)
+        selected: int = 0
+        scroll: int = 0
+        visible_items: int = dialog_height - 5
+
+        while True:
+            dialog.clear()
+            dialog.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            dialog.box()
+            dialog.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+
+            # Title
+            dialog.attron(curses.A_BOLD)
+            try:
+                dialog.addstr(1, 2, "Reply to Comment")
+            except curses.error:
+                pass
+            dialog.attroff(curses.A_BOLD)
+
+            # List comments
+            for i, item in enumerate(display_items[scroll:scroll + visible_items]):
+                actual_idx: int = scroll + i
+                row: int = 3 + i
+
+                if actual_idx == selected:
+                    dialog.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                    try:
+                        dialog.addstr(row, 2, f"> {item:<{dialog_width - 6}}"[:dialog_width - 4])
+                    except curses.error:
+                        pass
+                    dialog.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                else:
+                    try:
+                        dialog.addstr(row, 2, f"  {item}"[:dialog_width - 4])
+                    except curses.error:
+                        pass
+
+            # Help text
+            try:
+                dialog.addstr(dialog_height - 2, 2, "j/k:navigate  Enter:select  q:cancel")
+            except curses.error:
+                pass
+
+            dialog.refresh()
+
+            key: int = self.stdscr.getch()
+            if key == ord('q') or key == 27:  # ESC
+                return None
+            elif key == ord('j') or key == curses.KEY_DOWN:
+                if selected < len(display_items) - 1:
+                    selected += 1
+                    if selected >= scroll + visible_items:
+                        scroll += 1
+            elif key == ord('k') or key == curses.KEY_UP:
+                if selected > 0:
+                    selected -= 1
+                    if selected < scroll:
+                        scroll -= 1
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                return comments[selected][0]
+
     def _select_from_list(
         self,
         title: str,
@@ -1715,9 +1837,9 @@ class VimbanTUI:
         """Draw the footer/status bar."""
         # Help hints based on current view
         if self.state.current_view == ViewType.PEOPLE:
-            hints: str = "j/k:navigate  e:edit  n:new  d:delete  t:view  TAB:layout  ?:help"
+            hints: str = "j/k:navigate  e:edit  n:new  d:delete  c/C:comment  t:view  TAB:layout  ?:help"
         else:
-            hints = "j/k:nav  h/l:col  e:edit  E:meta  n:new  d:del  m:move  r:render  t:view  ?:help"
+            hints = "j/k:nav  h/l:col  e:edit  E:meta  n:new  d:del  m:move  c/C:comment  r:render  ?:help"
 
         # Status message overrides hints if present
         if self.state.status_message:
@@ -1772,6 +1894,7 @@ class VimbanTUI:
             "  m         Move ticket to different status",
             "  p         Change ticket priority",
             "  c         Add comment",
+            "  C         Reply to comment (threaded)",
             "  r         Toggle markdown rendering",
             "  R         Refresh data",
             "",
@@ -1918,6 +2041,8 @@ class VimbanTUI:
             self._action_priority()
         elif key == ord('c'):
             self._action_comment()
+        elif key == ord('C'):
+            self._action_comment_reply()
         elif key == ord('r'):
             self.state.render_markdown = not self.state.render_markdown
             status: str = "on" if self.state.render_markdown else "off"
@@ -2130,8 +2255,8 @@ class VimbanTUI:
 
         # Call vimban comment
         cmd: list[str] = [
-            'vimban', 'comment', item_ref, comment_text,
-            '--directory', str(self.vimban_config.directory)
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'comment', item_ref, comment_text
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -2140,6 +2265,46 @@ class VimbanTUI:
         else:
             self.state_manager.set_status(
                 f"Error adding comment",
+                is_error=True
+            )
+
+    def _action_comment_reply(self) -> None:
+        """Add a threaded reply to an existing comment."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        item_ref: str = item.id if hasattr(item, 'id') and item.id else item.name
+
+        # Select which comment to reply to
+        reply_to: Optional[int] = self.dialog_manager.select_comment(
+            item_ref, self.vimban_config.directory
+        )
+        if reply_to is None:
+            self.state_manager.set_status("No comments to reply to", is_error=True)
+            return
+
+        # Get reply text
+        comment_text: Optional[str] = self.dialog_manager.text_input(
+            f"Reply to #{reply_to}:"
+        )
+        if comment_text is None:
+            return
+
+        # Call vimban comment with --reply-to
+        cmd: list[str] = [
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'comment', item_ref, comment_text,
+            '--reply-to', str(reply_to)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.state_manager.set_status(f"Replied to comment #{reply_to}")
+        else:
+            self.state_manager.set_status(
+                f"Error adding reply",
                 is_error=True
             )
 
