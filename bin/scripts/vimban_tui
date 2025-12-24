@@ -80,6 +80,13 @@ from typing import Optional, Any, Callable
 
 import yaml
 
+# Optional markdown rendering support
+try:
+    import mistune
+    HAS_MISTUNE: bool = True
+except ImportError:
+    HAS_MISTUNE: bool = False
+
 # Import from vimban (same directory, loaded as module)
 # Set NO_DBOX_CHECK to prevent vimban from doing its own distrobox re-exec
 # since vimban_tui already handles this above
@@ -220,6 +227,11 @@ class ThemeManager:
     PAIR_PRIORITY_HIGH: int = 21
     PAIR_PRIORITY_MEDIUM: int = 22
     PAIR_PRIORITY_LOW: int = 23
+    # Markdown colors (30-33)
+    PAIR_MD_HEADING: int = 30
+    PAIR_MD_CODE: int = 31
+    PAIR_MD_QUOTE: int = 32
+    PAIR_MD_LINK: int = 33
 
     @classmethod
     def apply_theme(cls) -> None:
@@ -261,6 +273,12 @@ class ThemeManager:
         curses.init_pair(cls.PAIR_PRIORITY_MEDIUM, c["text"], -1)
         curses.init_pair(cls.PAIR_PRIORITY_LOW, c["overlay1"], -1)
 
+        # Markdown colors
+        curses.init_pair(cls.PAIR_MD_HEADING, c["mauve"], -1)
+        curses.init_pair(cls.PAIR_MD_CODE, c["green"], -1)
+        curses.init_pair(cls.PAIR_MD_QUOTE, c["overlay0"], -1)
+        curses.init_pair(cls.PAIR_MD_LINK, c["sapphire"], -1)
+
     @classmethod
     def get_status_pair(cls, status: str) -> int:
         """Get the color pair index for a status."""
@@ -286,6 +304,154 @@ class ThemeManager:
             "low": cls.PAIR_PRIORITY_LOW,
         }
         return priority_pairs.get(priority, cls.PAIR_PRIORITY_MEDIUM)
+
+
+# ============================================================================
+# MARKDOWN RENDERER
+# ============================================================================
+class MarkdownRenderer:
+    """
+    Renders markdown tokens to curses-compatible (text, attr) tuples.
+
+    Uses mistune to parse markdown into AST, then converts each token
+    to styled text segments for curses rendering.
+    """
+
+    def __init__(self):
+        if HAS_MISTUNE:
+            self._parser = mistune.create_markdown(renderer=None)
+        else:
+            self._parser = None
+
+    def render(self, text: str, width: int) -> list[list[tuple[str, int]]]:
+        """
+        Render markdown text to styled lines.
+
+        Args:
+            text: Raw markdown text
+            width: Maximum line width for wrapping
+
+        Returns:
+            List of lines, each line is list of (text, curses_attr) tuples
+        """
+        if not self._parser:
+            return [[(line, 0)] for line in text.split('\n')]
+
+        tokens = self._parser(text)
+        lines: list[list[tuple[str, int]]] = []
+        current_line: list[tuple[str, int]] = []
+
+        for token in tokens:
+            self._render_token(token, lines, current_line, width)
+
+        if current_line:
+            lines.append(current_line)
+
+        return lines
+
+    def _render_token(self, token: dict, lines: list, current_line: list,
+                      width: int) -> None:
+        """Recursively render a token and its children."""
+        token_type: str = token.get('type', '')
+
+        if token_type == 'heading':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            level: int = token.get('attrs', {}).get('level', 1)
+            prefix: str = '#' * level + ' '
+            text: str = self._extract_text(token)
+            attr: int = curses.A_BOLD | curses.color_pair(ThemeManager.PAIR_MD_HEADING)
+            lines.append([(prefix + text, attr)])
+            lines.append([('', 0)])
+
+        elif token_type == 'paragraph':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            self._render_children(token, lines, current_line, width)
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            lines.append([('', 0)])
+
+        elif token_type == 'code_block':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            code: str = token.get('raw', '')
+            attr: int = curses.color_pair(ThemeManager.PAIR_MD_CODE)
+            for code_line in code.rstrip('\n').split('\n'):
+                lines.append([(code_line, attr)])
+            lines.append([('', 0)])
+
+        elif token_type == 'block_quote':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            text: str = self._extract_text(token)
+            attr: int = curses.color_pair(ThemeManager.PAIR_MD_QUOTE)
+            for quote_line in text.split('\n'):
+                lines.append([('> ' + quote_line, attr)])
+            lines.append([('', 0)])
+
+        elif token_type == 'list':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            ordered: bool = token.get('attrs', {}).get('ordered', False)
+            for i, item in enumerate(token.get('children', [])):
+                prefix: str = f"{i+1}. " if ordered else "• "
+                text: str = self._extract_text(item)
+                lines.append([(prefix + text, 0)])
+            lines.append([('', 0)])
+
+        elif token_type == 'strong':
+            text: str = self._extract_text(token)
+            current_line.append((text, curses.A_BOLD))
+
+        elif token_type == 'emphasis':
+            text: str = self._extract_text(token)
+            current_line.append((text, curses.A_DIM))
+
+        elif token_type == 'codespan':
+            text: str = token.get('raw', '')
+            current_line.append((text, curses.color_pair(ThemeManager.PAIR_MD_CODE)))
+
+        elif token_type == 'link':
+            text: str = self._extract_text(token)
+            attr: int = curses.color_pair(ThemeManager.PAIR_MD_LINK) | curses.A_UNDERLINE
+            current_line.append((text, attr))
+
+        elif token_type == 'text':
+            text: str = token.get('raw', '')
+            current_line.append((text, 0))
+
+        elif token_type == 'softbreak':
+            current_line.append((' ', 0))
+
+        elif token_type == 'linebreak':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+
+        else:
+            self._render_children(token, lines, current_line, width)
+
+    def _render_children(self, token: dict, lines: list, current_line: list,
+                         width: int) -> None:
+        """Render all children of a token."""
+        for child in token.get('children', []):
+            self._render_token(child, lines, current_line, width)
+
+    def _extract_text(self, token: dict) -> str:
+        """Extract plain text from a token and its children."""
+        if 'raw' in token:
+            return token['raw']
+        text: str = ''
+        for child in token.get('children', []):
+            text += self._extract_text(child)
+        return text
 
 
 # ============================================================================
@@ -320,6 +486,7 @@ class TUIConfig:
     # Split layout settings
     split_ratio: tuple[int, int] = (40, 60)
     split_show_body: bool = True
+    split_render_markdown: bool = True  # Styled markdown rendering
 
     # Filter defaults
     filter_exclude_done: bool = True
@@ -380,6 +547,7 @@ class TUIConfig:
             list_sort_reverse=data.get('list', {}).get('sort_reverse', False),
             split_ratio=split_ratio,
             split_show_body=data.get('split', {}).get('show_body', True),
+            split_render_markdown=data.get('split', {}).get('render_markdown', True),
             filter_exclude_done=data.get('filters', {}).get('exclude_done', True),
         )
 
@@ -417,6 +585,7 @@ class AppState:
 
     # UI state
     show_help: bool = False
+    render_markdown: bool = True  # Toggle with 'r' key
     status_message: str = ""
     status_is_error: bool = False
 
@@ -441,6 +610,7 @@ class StateManager:
         self.state: AppState = AppState(
             current_view=tui_config.default_view,
             current_layout=tui_config.default_layout,
+            render_markdown=tui_config.split_render_markdown,
         )
         self._load_data()
 
@@ -1152,10 +1322,12 @@ class SplitRenderer:
     Detail pane shows full ticket information including body content.
     """
 
-    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig):
+    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig,
+                 md_renderer: MarkdownRenderer):
         self.stdscr: Any = stdscr
         self.state: AppState = state
         self.config: TUIConfig = config
+        self.md_renderer: MarkdownRenderer = md_renderer
         self.list_renderer: ListRenderer = ListRenderer(stdscr, state, config)
 
     def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
@@ -1195,48 +1367,66 @@ class SplitRenderer:
 
         ticket: Ticket = tickets[self.state.selected_row]
 
-        lines: list[str] = []
+        # Use styled segments: each line is list of (text, attr) tuples
+        lines: list[list[tuple[str, int]]] = []
 
-        # Header
-        lines.append(ticket.id)
-        lines.append(ticket.title)
-        lines.append("-" * (width - 2))
+        # Header with styling
+        heading_attr: int = curses.A_BOLD | curses.color_pair(
+            ThemeManager.PAIR_MD_HEADING
+        )
+        lines.append([(ticket.id, heading_attr)])
+        lines.append([(ticket.title, curses.A_BOLD)])
+        lines.append([("-" * (width - 2), curses.color_pair(ThemeManager.PAIR_BORDER))])
 
-        # Metadata
-        lines.append(f"Status: {ticket.status:<15} Priority: {ticket.priority}")
+        # Metadata (plain text)
+        lines.append([(f"Status: {ticket.status:<15} Priority: {ticket.priority}", 0)])
         if ticket.assignee:
             assignee_name: str = Path(ticket.assignee.path).stem.replace('_', ' ')
-            lines.append(f"Assignee: {assignee_name}")
+            lines.append([(f"Assignee: {assignee_name}", 0)])
         if ticket.due_date:
-            lines.append(f"Due: {ticket.due_date}")
+            lines.append([(f"Due: {ticket.due_date}", 0)])
         if ticket.tags:
-            lines.append(f"Tags: {', '.join(ticket.tags)}")
+            lines.append([(f"Tags: {', '.join(ticket.tags)}", 0)])
 
-        lines.append("-" * (width - 2))
+        lines.append([("-" * (width - 2), curses.color_pair(ThemeManager.PAIR_BORDER))])
 
         # Body content
         if self.config.split_show_body:
             try:
                 content: str = ticket.filepath.read_text()
                 _, body = parse_frontmatter(content)
-                for line in body.split('\n'):
-                    # Word wrap
-                    while len(line) > width - 2:
-                        lines.append(line[:width - 2])
-                        line = line[width - 2:]
-                    lines.append(line)
-            except (OSError, ValueError):
-                lines.append("[Could not read file]")
 
-        # Render lines with scrolling
-        for i, line in enumerate(lines[self.state.detail_scroll:]):
+                # Render with markdown styling if enabled
+                if self.state.render_markdown and HAS_MISTUNE:
+                    styled_lines = self.md_renderer.render(body, width - 2)
+                    lines.extend(styled_lines)
+                else:
+                    # Raw markdown - wrap as single-segment lines
+                    for line in body.split('\n'):
+                        while len(line) > width - 2:
+                            lines.append([(line[:width - 2], 0)])
+                            line = line[width - 2:]
+                        lines.append([(line, 0)])
+            except (OSError, ValueError):
+                lines.append([("[Could not read file]", curses.color_pair(
+                    ThemeManager.PAIR_ERROR
+                ))])
+
+        # Render lines with scrolling and styled segments
+        for i, line_segments in enumerate(lines[self.state.detail_scroll:]):
             if i >= height:
                 break
-            try:
-                self.stdscr.addstr(start_y + i, start_x, line[:width - 1])
-            except curses.error:
-                pass
-
+            x_pos: int = start_x
+            for text, attr in line_segments:
+                # Truncate if exceeds width
+                max_len: int = start_x + width - 1 - x_pos
+                if len(text) > max_len:
+                    text = text[:max_len]
+                try:
+                    self.stdscr.addstr(start_y + i, x_pos, text, attr)
+                    x_pos += len(text)
+                except curses.error:
+                    pass
 
 class PeopleRenderer:
     """Renders the people list view."""
@@ -1330,6 +1520,9 @@ class VimbanTUI:
         self.state_manager: StateManager = StateManager(vimban_config, tui_config)
         self.dialog_manager: DialogManager = DialogManager(stdscr)
 
+        # Initialize markdown renderer
+        self.md_renderer: MarkdownRenderer = MarkdownRenderer()
+
         # Initialize renderers
         self.list_renderer: ListRenderer = ListRenderer(
             stdscr, self.state_manager.state, tui_config
@@ -1338,7 +1531,7 @@ class VimbanTUI:
             stdscr, self.state_manager.state, tui_config
         )
         self.split_renderer: SplitRenderer = SplitRenderer(
-            stdscr, self.state_manager.state, tui_config
+            stdscr, self.state_manager.state, tui_config, self.md_renderer
         )
         self.people_renderer: PeopleRenderer = PeopleRenderer(
             stdscr, self.state_manager.state, tui_config
@@ -1475,7 +1668,7 @@ class VimbanTUI:
         if self.state.current_view == ViewType.PEOPLE:
             hints: str = "j/k:navigate  e:edit  n:new  d:delete  t:view  TAB:layout  ?:help"
         else:
-            hints = "j/k:nav  h/l:col  e:edit  n:new  d:delete  m:move  t:view  TAB:layout  ?:help"
+            hints = "j/k:nav  h/l:col  e:edit  n:new  d:del  m:move  r:render  t:view  TAB:layout  ?:help"
 
         # Status message overrides hints if present
         if self.state.status_message:
@@ -1529,6 +1722,7 @@ class VimbanTUI:
             "  m         Move ticket to different status",
             "  p         Change ticket priority",
             "  c         Add comment",
+            "  r         Toggle markdown rendering",
             "  R         Refresh data",
             "",
             "OTHER",
@@ -1674,6 +1868,10 @@ class VimbanTUI:
             self._action_priority()
         elif key == ord('c'):
             self._action_comment()
+        elif key == ord('r'):
+            self.state.render_markdown = not self.state.render_markdown
+            status: str = "on" if self.state.render_markdown else "off"
+            self.state_manager.set_status(f"Markdown rendering {status}")
 
         return None
 
