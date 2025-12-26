@@ -36,6 +36,7 @@ SERVER_COMMAND=""
 SERVER_ARGS_STDIO=""
 SERVER_ARGS_HTTP=""
 SERVER_HTTP_PORT=""
+SERVER_ENV_VARS=""
 
 # Custom server configuration
 CUSTOM_MODE=""              # "stdio" or "http" when using --custom/--custom-http
@@ -72,6 +73,7 @@ SERVER OPTIONS (known servers):
     --flashcards        Spaced repetition flashcards with AI generation
     --rdt               Reddit terminal browser with MCP tools
     --vimban            Markdown-native ticket and kanban management
+    --blender           Blender 3D modeling with Claude AI integration
 
 CUSTOM SERVER OPTIONS:
     --custom <name>     Custom stdio server (requires --command)
@@ -79,6 +81,8 @@ CUSTOM SERVER OPTIONS:
                         Custom HTTP server (requires --http-endpoint)
     --command <cmd>     Command to execute (required for --custom)
     --args <args>       Space-separated args in quotes; can be repeated
+    --env <KEY=VALUE>   Environment variable (can be repeated)
+                        Example: --env TMPDIR=/tmp/custom
     --http-endpoint <url>
                         HTTP endpoint URL (required for --custom-http)
     --server-version <v>
@@ -163,6 +167,30 @@ CUSTOM SERVER EXAMPLES:
         --server-version "2.0.0" --description "My custom server" --claude-desktop
     # Creates: ./my-server.mcpb
 
+    # Custom server with environment variable
+    ${SCRIPT_NAME} --custom my-server --command my-cmd --args "--mcp" --env TMPDIR=/tmp/my-server --claude-code
+    # Output: claude mcp add --transport stdio -e TMPDIR=/tmp/my-server my-server -- my-cmd --mcp
+
+BLENDER EXAMPLES:
+    # Claude Code - stdio transport (default)
+    ${SCRIPT_NAME} --blender --claude-code
+    # Output: claude mcp add --transport stdio -e TMPDIR=/tmp/blender-mcp blender -- uvx blender-mcp
+
+    # Claude Code - config output
+    ${SCRIPT_NAME} --blender --claude-code --config
+    # Output: {"blender": {"type": "stdio", "command": "uvx", "args": ["blender-mcp"], "env": {"TMPDIR": "/tmp/blender-mcp"}}}
+
+    # Claude Desktop - .mcpb bundle
+    ${SCRIPT_NAME} --blender --claude-desktop
+    # Creates: ./blender.mcpb
+
+    # Claude Desktop - JSON config
+    ${SCRIPT_NAME} --blender --claude-desktop --json
+    # Output: {"blender": {"command": "uvx", "args": ["blender-mcp"], "env": {"TMPDIR": "/tmp/blender-mcp"}}}
+
+    # Note: Requires mcp-blender-container to be running first
+    #       The container creates /tmp/blender-mcp automatically
+
 EOF
 }
 
@@ -198,6 +226,11 @@ Available MCP server configurations:
 
   vimban          Markdown-native ticket and kanban management
                   Command: vimban --mcp (stdio) / --mcp-http (HTTP port 5004)
+
+  blender         Blender 3D modeling with Claude AI integration
+                  Command: uvx blender-mcp (stdio only)
+                  Environment: TMPDIR=/tmp/blender-mcp
+                  Note: Requires mcp-blender-container running
 
 To add more servers, edit the get_server_config function in this script.
 EOF
@@ -238,6 +271,16 @@ get_server_config () {
             SERVER_ARGS_STDIO="--mcp"
             SERVER_ARGS_HTTP="--mcp-http"
             SERVER_HTTP_PORT="5004"
+            ;;
+        blender)
+            SERVER_NAME="blender"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Blender 3D modeling with Claude AI integration via MCP"
+            SERVER_COMMAND="uvx"
+            SERVER_ARGS_STDIO="blender-mcp"
+            SERVER_ARGS_HTTP=""
+            SERVER_HTTP_PORT=""
+            SERVER_ENV_VARS="TMPDIR=/tmp/blender-mcp"
             ;;
         *)
             echo "Error: Unknown server '${server}'" >&2
@@ -324,6 +367,47 @@ format_opencode_command_json () {
     printf ']'
 }
 
+# Format env vars as Claude Code CLI flags: -e KEY1=val1 -e KEY2=val2
+format_env_flags () {
+    [[ -z "${SERVER_ENV_VARS}" ]] && return
+    local result=""
+    local env_pair
+    for env_pair in ${SERVER_ENV_VARS}
+    do
+        result="${result}-e ${env_pair} "
+    done
+    printf '%s' "${result}"
+}
+
+# Format env vars as JSON object: {"KEY1": "val1", "KEY2": "val2"}
+format_env_json () {
+    [[ -z "${SERVER_ENV_VARS}" ]] && return
+
+    local first=true
+    local key val env_pair
+
+    printf '{\n'
+    for env_pair in ${SERVER_ENV_VARS}
+    do
+        IFS='=' read -r key val <<< "${env_pair}"
+        [[ "${first}" == "true" ]] || printf ',\n'
+        printf '      "%s": "%s"' "${key}" "${val}"
+        first=false
+    done
+    printf '\n    }'
+}
+
+# Format env vars as shell exports: export KEY1="val1"; export KEY2="val2";
+format_env_shell () {
+    [[ -z "${SERVER_ENV_VARS}" ]] && return
+    local key val env_pair
+    for env_pair in ${SERVER_ENV_VARS}
+    do
+        IFS='=' read -r key val <<< "${env_pair}"
+        printf 'export %s="%s"\n' "${key}" "${val}"
+    done
+}
+
 # =============================================================================
 # CLAUDE CODE GENERATORS
 # =============================================================================
@@ -332,14 +416,17 @@ generate_claude_code_command () {
     local http_mode="${1}"
     local args_str
     local endpoint
+    local env_flags
 
     if [[ "${http_mode}" == "true" ]]
     then
         endpoint="$(get_http_endpoint)"
-        echo "claude mcp add --transport http ${SERVER_NAME} ${endpoint}"
+        env_flags="$(format_env_flags)"
+        echo "claude mcp add --transport http ${env_flags}${SERVER_NAME} ${endpoint}"
     else
         args_str="$(format_args_shell false)"
-        echo "claude mcp add --transport stdio ${SERVER_NAME} -- ${SERVER_COMMAND} ${args_str}"
+        env_flags="$(format_env_flags)"
+        echo "claude mcp add --transport stdio ${env_flags}${SERVER_NAME} -- ${SERVER_COMMAND} ${args_str}"
     fi
 }
 
@@ -347,11 +434,25 @@ generate_claude_code_config () {
     local http_mode="${1}"
     local args_json
     local endpoint
+    local env_json
 
     if [[ "${http_mode}" == "true" ]]
     then
         endpoint="$(get_http_endpoint)"
-        cat <<EOF
+        env_json="$(format_env_json)"
+        if [[ -n "${env_json}" ]]
+        then
+            cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "http",
+    "url": "${endpoint}",
+    "env": ${env_json}
+  }
+}
+EOF
+        else
+            cat <<EOF
 {
   "${SERVER_NAME}": {
     "type": "http",
@@ -359,9 +460,24 @@ generate_claude_code_config () {
   }
 }
 EOF
+        fi
     else
         args_json="$(format_args_json false)"
-        cat <<EOF
+        env_json="$(format_env_json)"
+        if [[ -n "${env_json}" ]]
+        then
+            cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "stdio",
+    "command": "${SERVER_COMMAND}",
+    "args": ${args_json},
+    "env": ${env_json}
+  }
+}
+EOF
+        else
+            cat <<EOF
 {
   "${SERVER_NAME}": {
     "type": "stdio",
@@ -370,6 +486,7 @@ EOF
   }
 }
 EOF
+        fi
     fi
 }
 
@@ -401,11 +518,24 @@ EOF
 
 generate_run_script () {
     local args_str
+    local env_exports
+
     args_str="$(format_args_shell false)"
-    cat <<EOF
+    env_exports="$(format_env_shell)"
+
+    if [[ -n "${env_exports}" ]]
+    then
+        cat <<EOF
+#!/bin/bash
+${env_exports}
+exec ${SERVER_COMMAND} ${args_str}
+EOF
+    else
+        cat <<EOF
 #!/bin/bash
 exec ${SERVER_COMMAND} ${args_str}
 EOF
+    fi
 }
 
 generate_claude_desktop_bundle () {
@@ -436,9 +566,24 @@ generate_claude_desktop_bundle () {
 generate_claude_desktop_json () {
     local http_mode="${1}"
     local args_json
+    local env_json
 
     args_json="$(format_args_json "${http_mode}")"
-    cat <<EOF
+    env_json="$(format_env_json)"
+
+    if [[ -n "${env_json}" ]]
+    then
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "command": "${SERVER_COMMAND}",
+    "args": ${args_json},
+    "env": ${env_json}
+  }
+}
+EOF
+    else
+        cat <<EOF
 {
   "${SERVER_NAME}": {
     "command": "${SERVER_COMMAND}",
@@ -446,6 +591,7 @@ generate_claude_desktop_json () {
   }
 }
 EOF
+    fi
 }
 
 # =============================================================================
@@ -509,6 +655,14 @@ EOF
   }
 }
 EOF
+    fi
+
+    # Add note about environment variables if they are set
+    if [[ -n "${SERVER_ENV_VARS}" ]]
+    then
+        echo "# Note: OpenCode may not support environment variables in config" >&2
+        echo "# Required environment variables: ${SERVER_ENV_VARS}" >&2
+        echo "# Set them manually if needed" >&2
     fi
 }
 
@@ -583,7 +737,7 @@ main () {
                 output_file="${2}"
                 shift 2
                 ;;
-            --flashcards|--rdt|--vimban)
+            --flashcards|--rdt|--vimban|--blender)
                 server="${1#--}"
                 shift
                 ;;
@@ -626,6 +780,22 @@ main () {
                 local new_args
                 read -ra new_args <<< "${2}"
                 CUSTOM_ARGS+=("${new_args[@]}")
+                shift 2
+                ;;
+            --env)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --env requires KEY=VALUE argument" >&2
+                    exit 1
+                fi
+                # Validate format
+                if [[ ! "${2}" =~ ^[A-Z_][A-Z0-9_]*=.+$ ]]
+                then
+                    echo "Error: --env must be in format KEY=VALUE" >&2
+                    exit 1
+                fi
+                # Append to env vars
+                SERVER_ENV_VARS="${SERVER_ENV_VARS}${SERVER_ENV_VARS:+ }${2}"
                 shift 2
                 ;;
             --http-endpoint)
@@ -704,6 +874,14 @@ main () {
         get_server_config "${server}"
     else
         echo "Error: No server specified (use --custom, --custom-http, or a known server)" >&2
+        exit 1
+    fi
+
+    # Special validation for blender + HTTP mode
+    if [[ "${server}" == "blender" ]] && [[ "${http_mode}" == "true" ]]
+    then
+        echo "Error: Blender MCP server does not support HTTP transport" >&2
+        echo "Remove the --http flag to use stdio transport" >&2
         exit 1
     fi
 
