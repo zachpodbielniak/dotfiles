@@ -24,7 +24,9 @@ import sys
 
 ctr_id = os.environ.get("CONTAINER_ID", "")
 no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
-if not no_dbox_check and ctr_id != "dev":
+# MCP mode should run in host, not distrobox
+mcp_mode = "--mcp" in sys.argv or "--mcp-http" in sys.argv
+if not no_dbox_check and not mcp_mode and ctr_id != "dev":
     cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
     subprocess.run(cmd)
     sys.exit(0)
@@ -60,6 +62,16 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
+
+# Try to import MCP dependencies
+try:
+    from mcp.server.fastmcp import FastMCP
+    MCP_AVAILABLE: bool = True
+except ImportError:
+    MCP_AVAILABLE = False
+
+# MCP server configuration
+MCP_HTTP_PORT: int = 5006
 
 # Default decision model for --pick-best feature
 DEFAULT_DECISION_MODEL = "claude-opus-4-20250514"
@@ -3113,6 +3125,843 @@ def save_multi_model_transaction(models, prompt, responses, metadata=None, tags=
                 if new_id:
                     metadata.setdefault('new_chat_ids', []).append(new_id)
 
+
+# =============================================================================
+# MCP SERVER FUNCTIONS
+# =============================================================================
+
+def create_mcp_server(host: str = "127.0.0.1", port: int = MCP_HTTP_PORT):
+    """
+    Create and configure the MCP server for aipy.
+
+    Exposes AI chat functionality as MCP tools:
+    - Searching and viewing chats
+    - Searching and viewing contexts
+    - Executing AI requests
+    - Managing context metadata
+
+    Args:
+        host: Host to bind for HTTP transport
+        port: Port to bind for HTTP transport
+
+    Returns:
+        FastMCP instance with configured tools
+    """
+    if not MCP_AVAILABLE:
+        print("Error: mcp package required for MCP server.", file=sys.stderr)
+        print("Install with: pip install 'mcp[cli]'", file=sys.stderr)
+        sys.exit(1)
+
+    mcp = FastMCP("aipy", json_response=True, host=host, port=port)
+
+    @mcp.tool()
+    def search_chats(
+        query: str,
+        limit: int = 10,
+        provider_filter: str = "",
+        model_filter: str = "",
+        tags_filter: str = "",
+    ) -> dict:
+        """
+        Search AI chat history using full-text search.
+
+        Args:
+            query: Search query string (use "*" for all recent chats)
+            limit: Maximum number of results (default: 10)
+            provider_filter: Filter by provider name (e.g., "claudpy", "grokpy")
+            model_filter: Filter by model name
+            tags_filter: Comma-separated tags to filter by
+
+        Returns:
+            Dictionary with 'chats' list and 'count'
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+            where_clauses = []
+            params = []
+
+            if query and query != "*":
+                where_clauses.append(
+                    "(to_tsvector('english', a.prompt) @@ plainto_tsquery('english', %s) OR "
+                    "to_tsvector('english', a.response) @@ plainto_tsquery('english', %s))"
+                )
+                params.extend([query, query])
+
+            if provider_filter:
+                where_clauses.append("a.provider = %s")
+                params.append(provider_filter)
+
+            if model_filter:
+                where_clauses.append("a.model = %s")
+                params.append(model_filter)
+
+            if tags_filter:
+                tags_list = [t.strip() for t in tags_filter.split(",")]
+                tag_conditions = []
+                for tag in tags_list:
+                    tag_conditions.append("a.tags @> %s")
+                    params.append([tag])
+                if tag_conditions:
+                    where_clauses.append(f"({' OR '.join(tag_conditions)})")
+
+            where_clause = " AND ".join(where_clauses) if where_clauses else "TRUE"
+
+            if query and query != "*":
+                sql = f"""
+                SELECT
+                    a.id,
+                    LEFT(a.prompt, 200) as prompt_snippet,
+                    LEFT(a.response, 200) as response_snippet,
+                    a.provider,
+                    a.model,
+                    a.request_timestamp,
+                    a.duration_ms,
+                    a.cost_total_usd,
+                    a.tags,
+                    a.context_uuid,
+                    c.name as context_name,
+                    ts_rank(
+                        to_tsvector('english', a.prompt || ' ' || a.response),
+                        plainto_tsquery('english', %s)
+                    ) as rank
+                FROM ai_chats a
+                JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                WHERE {where_clause}
+                ORDER BY rank DESC, a.request_timestamp DESC
+                LIMIT %s
+                """
+                params.extend([query, limit])
+            else:
+                sql = f"""
+                SELECT
+                    a.id,
+                    LEFT(a.prompt, 200) as prompt_snippet,
+                    LEFT(a.response, 200) as response_snippet,
+                    a.provider,
+                    a.model,
+                    a.request_timestamp,
+                    a.duration_ms,
+                    a.cost_total_usd,
+                    a.tags,
+                    a.context_uuid,
+                    c.name as context_name,
+                    0 as rank
+                FROM ai_chats a
+                JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                WHERE {where_clause}
+                ORDER BY a.request_timestamp DESC
+                LIMIT %s
+                """
+                params.append(limit)
+
+            cursor.execute(sql, params)
+            results = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            chats = []
+            for r in results:
+                chats.append({
+                    "id": str(r["id"]),
+                    "prompt_snippet": r["prompt_snippet"],
+                    "response_snippet": r["response_snippet"],
+                    "provider": r["provider"],
+                    "model": r["model"],
+                    "request_timestamp": str(r["request_timestamp"]),
+                    "duration_ms": r["duration_ms"],
+                    "cost_total_usd": float(r["cost_total_usd"]) if r["cost_total_usd"] else None,
+                    "tags": r["tags"] or [],
+                    "context_uuid": str(r["context_uuid"]),
+                    "context_name": r["context_name"],
+                })
+
+            return {"chats": chats, "count": len(chats)}
+
+        except psycopg2.Error as e:
+            return {"error": f"Database error: {str(e)}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def view_chat(
+        chat_id: str,
+        include_history: bool = False,
+    ) -> dict:
+        """
+        View a single AI chat by UUID.
+
+        Args:
+            chat_id: Chat UUID (supports 8-character partial UUIDs)
+            include_history: Include conversation history leading to this chat
+
+        Returns:
+            Dictionary with chat details (prompt, response, metadata)
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+            if len(chat_id) == 8:
+                cursor.execute("""
+                    SELECT a.*, c.name as context_name
+                    FROM ai_chats a
+                    JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                    WHERE CAST(a.id AS TEXT) LIKE %s
+                """, [f"{chat_id}%"])
+                results = cursor.fetchall()
+
+                if not results:
+                    cursor.close()
+                    conn.close()
+                    return {"error": f"No chat found with ID starting with: {chat_id}"}
+                elif len(results) > 1:
+                    cursor.close()
+                    conn.close()
+                    matches = [{"id": str(r["id"]), "provider": r["provider"], "model": r["model"]} for r in results]
+                    return {"error": "Multiple chats found", "matches": matches}
+                else:
+                    result = results[0]
+            else:
+                cursor.execute("""
+                    SELECT a.*, c.name as context_name
+                    FROM ai_chats a
+                    JOIN ai_chat_contexts c ON a.context_uuid = c.context_uuid
+                    WHERE a.id = %s::uuid
+                """, [chat_id])
+                result = cursor.fetchone()
+
+                if not result:
+                    cursor.close()
+                    conn.close()
+                    return {"error": f"No chat found with ID: {chat_id}"}
+
+            cursor.close()
+            conn.close()
+
+            chat_data = {
+                "id": str(result["id"]),
+                "context_uuid": str(result["context_uuid"]),
+                "context_name": result["context_name"],
+                "prompt": result["prompt"],
+                "response": result["response"],
+                "provider": result["provider"],
+                "model": result["model"],
+                "request_timestamp": str(result["request_timestamp"]),
+                "response_timestamp": str(result["response_timestamp"]) if result["response_timestamp"] else None,
+                "duration_ms": result["duration_ms"],
+                "tokens_input": result["tokens_input"],
+                "tokens_output": result["tokens_output"],
+                "cost_total_usd": float(result["cost_total_usd"]) if result["cost_total_usd"] else None,
+                "tags": result["tags"] or [],
+            }
+
+            if include_history:
+                history = build_conversation_history(str(result["id"]), include_forward=False, debug=False)
+                if history:
+                    chat_data["history"] = [
+                        {
+                            "id": str(h["id"]),
+                            "prompt": h["prompt"],
+                            "response": h["response"],
+                            "provider": h["provider"],
+                            "model": h["model"],
+                            "request_timestamp": str(h["request_timestamp"]),
+                        }
+                        for h in history
+                    ]
+
+            return chat_data
+
+        except psycopg2.Error as e:
+            return {"error": f"Database error: {str(e)}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def search_contexts(
+        query: str,
+        limit: int = 10,
+    ) -> dict:
+        """
+        Search AI chat contexts (conversations) by name, summary, or tags.
+
+        Args:
+            query: Search query string (use "*" for all contexts)
+            limit: Maximum number of results (default: 10)
+
+        Returns:
+            Dictionary with 'contexts' list and 'count'
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+            if query and query != "*":
+                sql = """
+                SELECT
+                    c.context_uuid,
+                    c.name,
+                    c.summary,
+                    c.tags,
+                    c.created_at,
+                    c.updated_at,
+                    COUNT(a.id) as chat_count,
+                    MAX(a.request_timestamp) as last_chat_time
+                FROM ai_chat_contexts c
+                LEFT JOIN ai_chats a ON c.context_uuid = a.context_uuid
+                WHERE
+                    c.name ILIKE %s OR
+                    c.summary ILIKE %s OR
+                    to_tsvector('english', COALESCE(c.summary, '')) @@ plainto_tsquery('english', %s)
+                GROUP BY c.context_uuid
+                ORDER BY last_chat_time DESC NULLS LAST
+                LIMIT %s
+                """
+                search_pattern = f"%{query}%"
+                cursor.execute(sql, [search_pattern, search_pattern, query, limit])
+            else:
+                sql = """
+                SELECT
+                    c.context_uuid,
+                    c.name,
+                    c.summary,
+                    c.tags,
+                    c.created_at,
+                    c.updated_at,
+                    COUNT(a.id) as chat_count,
+                    MAX(a.request_timestamp) as last_chat_time
+                FROM ai_chat_contexts c
+                LEFT JOIN ai_chats a ON c.context_uuid = a.context_uuid
+                GROUP BY c.context_uuid
+                ORDER BY last_chat_time DESC NULLS LAST
+                LIMIT %s
+                """
+                cursor.execute(sql, [limit])
+
+            results = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            contexts = []
+            for r in results:
+                contexts.append({
+                    "context_uuid": str(r["context_uuid"]),
+                    "name": r["name"],
+                    "summary": r["summary"],
+                    "tags": r["tags"] or [],
+                    "created_at": str(r["created_at"]) if r["created_at"] else None,
+                    "updated_at": str(r["updated_at"]) if r["updated_at"] else None,
+                    "chat_count": r["chat_count"],
+                    "last_chat_time": str(r["last_chat_time"]) if r["last_chat_time"] else None,
+                })
+
+            return {"contexts": contexts, "count": len(contexts)}
+
+        except psycopg2.Error as e:
+            return {"error": f"Database error: {str(e)}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def view_context(
+        context_id: str,
+        include_summary: bool = True,
+    ) -> dict:
+        """
+        View entire conversation context with all chats.
+
+        Args:
+            context_id: Context UUID, partial UUID (8+ chars), or context name
+            include_summary: Include context summary if available
+
+        Returns:
+            Dictionary with context info and list of chats
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            resolved_uuid = resolve_context_id(context_id, debug=False)
+            if not resolved_uuid:
+                return {"error": f"Could not resolve context: {context_id}"}
+
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+            cursor.execute("""
+                SELECT context_uuid, name, summary, tags, created_at, updated_at
+                FROM ai_chat_contexts
+                WHERE context_uuid = %s::uuid
+            """, [resolved_uuid])
+            context_info = cursor.fetchone()
+
+            if not context_info:
+                cursor.close()
+                conn.close()
+                return {"error": f"Context not found: {context_id}"}
+
+            cursor.execute("""
+                SELECT id, prompt, response, provider, model, request_timestamp,
+                       duration_ms, tokens_input, tokens_output, cost_total_usd, tags
+                FROM ai_chats
+                WHERE context_uuid = %s::uuid
+                ORDER BY request_timestamp ASC
+            """, [resolved_uuid])
+            chats = cursor.fetchall()
+
+            cursor.close()
+            conn.close()
+
+            context_data = {
+                "context_uuid": str(context_info["context_uuid"]),
+                "name": context_info["name"],
+                "tags": context_info["tags"] or [],
+                "created_at": str(context_info["created_at"]) if context_info["created_at"] else None,
+                "updated_at": str(context_info["updated_at"]) if context_info["updated_at"] else None,
+                "chat_count": len(chats),
+            }
+
+            if include_summary and context_info["summary"]:
+                context_data["summary"] = context_info["summary"]
+
+            context_data["chats"] = [
+                {
+                    "id": str(c["id"]),
+                    "prompt": c["prompt"],
+                    "response": c["response"],
+                    "provider": c["provider"],
+                    "model": c["model"],
+                    "request_timestamp": str(c["request_timestamp"]),
+                    "duration_ms": c["duration_ms"],
+                    "tokens_input": c["tokens_input"],
+                    "tokens_output": c["tokens_output"],
+                    "cost_total_usd": float(c["cost_total_usd"]) if c["cost_total_usd"] else None,
+                    "tags": c["tags"] or [],
+                }
+                for c in chats
+            ]
+
+            return context_data
+
+        except psycopg2.Error as e:
+            return {"error": f"Database error: {str(e)}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def chat(
+        prompt: str,
+        model: str = "grok-4-1-fast-non-reasoning",
+        context_id: str = "",
+        tags: str = "",
+        files: str = "",
+        images: str = "",
+        store_in_db: bool = True,
+    ) -> dict:
+        """
+        Execute an AI chat request.
+
+        Args:
+            prompt: The prompt to send to the AI
+            model: Model to use (default: grok-4-1-fast-non-reasoning)
+            context_id: Optional context UUID to continue conversation
+            tags: Comma-separated tags for the chat
+            files: Comma-separated file paths to include as context
+            images: Comma-separated image paths for vision analysis
+            store_in_db: Whether to store the chat in database (default: True)
+
+        Returns:
+            Dictionary with 'response', 'chat_id', 'context_uuid', and metadata
+        """
+        try:
+            provider = get_provider_for_model(model)
+
+            cmd = [provider, "--model", model, "--no-streaming"]
+            if not store_in_db:
+                cmd.append("--no-preserve")
+
+            if files:
+                for f in files.split(","):
+                    f = f.strip()
+                    if f:
+                        cmd.extend(["-f", f])
+
+            if images:
+                for img in images.split(","):
+                    img = img.strip()
+                    if img:
+                        cmd.extend(["--image", img])
+
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            response_text = result.stdout.strip()
+
+            if result.returncode != 0:
+                return {
+                    "error": f"Provider returned error: {result.stderr}",
+                    "returncode": result.returncode,
+                }
+
+            result_data = {
+                "response": response_text,
+                "model": model,
+                "provider": provider,
+            }
+
+            if store_in_db and DB_AVAILABLE and check_db_available(debug=False):
+                tags_list = [t.strip() for t in tags.split(",")] if tags else None
+                resolved_context = resolve_context_id(context_id, debug=False) if context_id else None
+
+                new_id = store_chat_in_db(
+                    prompt=prompt,
+                    response=response_text,
+                    provider=provider,
+                    model=model,
+                    metadata={},
+                    tags=tags_list,
+                    context_id=resolved_context,
+                    debug=False,
+                    dry_run=False,
+                    show_id=False,
+                    auto_name=False,
+                )
+                if new_id:
+                    result_data["chat_id"] = new_id
+                    conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT context_uuid FROM ai_chats WHERE id = %s::uuid", [new_id])
+                    row = cursor.fetchone()
+                    if row:
+                        result_data["context_uuid"] = str(row[0])
+                    cursor.close()
+                    conn.close()
+
+            return result_data
+
+        except subprocess.TimeoutExpired:
+            return {"error": "Request timed out after 300 seconds"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def list_models() -> dict:
+        """
+        List all available AI models across providers.
+
+        Returns:
+            Dictionary with 'models' organized by provider
+        """
+        models_by_provider = {}
+        for model, provider in MODEL_PROVIDERS.items():
+            if provider not in models_by_provider:
+                models_by_provider[provider] = []
+            models_by_provider[provider].append(model)
+
+        return {"models": models_by_provider}
+
+    @mcp.tool()
+    def mcp_summarize_context(
+        context_id: str,
+        model: str = "grok-4",
+    ) -> dict:
+        """
+        Generate a summary for a conversation context.
+
+        Args:
+            context_id: Context UUID, partial UUID, or name
+            model: Model to use for summarization (default: grok-4)
+
+        Returns:
+            Dictionary with 'summary' and update status
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            resolved_uuid = resolve_context_id(context_id, debug=False)
+            if not resolved_uuid:
+                return {"error": f"Could not resolve context: {context_id}"}
+
+            success = summarize_context(resolved_uuid, model=model, debug=False)
+            if success:
+                conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT summary FROM ai_chat_contexts WHERE context_uuid = %s::uuid",
+                    [resolved_uuid]
+                )
+                row = cursor.fetchone()
+                cursor.close()
+                conn.close()
+
+                return {
+                    "success": True,
+                    "context_uuid": resolved_uuid,
+                    "summary": row[0] if row else None,
+                }
+            else:
+                return {"error": "Failed to generate summary"}
+
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def mcp_generate_context_name(
+        context_id: str,
+        model: str = "grok-4",
+    ) -> dict:
+        """
+        Generate a descriptive name for a context based on its content.
+
+        Args:
+            context_id: Context UUID, partial UUID, or name
+            model: Model to use for name generation (default: grok-4)
+
+        Returns:
+            Dictionary with 'name' and update status
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            resolved_uuid = resolve_context_id(context_id, debug=False)
+            if not resolved_uuid:
+                return {"error": f"Could not resolve context: {context_id}"}
+
+            success = generate_context_name(resolved_uuid, model=model, debug=False)
+            if success:
+                conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name FROM ai_chat_contexts WHERE context_uuid = %s::uuid",
+                    [resolved_uuid]
+                )
+                row = cursor.fetchone()
+                cursor.close()
+                conn.close()
+
+                return {
+                    "success": True,
+                    "context_uuid": resolved_uuid,
+                    "name": row[0] if row else None,
+                }
+            else:
+                return {"error": "Failed to generate name"}
+
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def mcp_format_context_for_prompt(
+        chat_ids: str,
+    ) -> dict:
+        """
+        Format chat history as context text for prompts.
+
+        Args:
+            chat_ids: Comma-separated list of chat UUIDs to include
+
+        Returns:
+            Dictionary with 'context_text' formatted for prompt inclusion
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            ids_list = [cid.strip() for cid in chat_ids.split(",") if cid.strip()]
+            if not ids_list:
+                return {"error": "No chat IDs provided"}
+
+            context_chats = get_chat_context(ids_list, debug=False)
+            if not context_chats:
+                return {"error": "No chats found for provided IDs"}
+
+            context_text = format_context_for_prompt(context_chats)
+            return {
+                "context_text": context_text,
+                "chat_count": len(context_chats),
+            }
+
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def add_context_tags(
+        context_id: str,
+        tags: str,
+    ) -> dict:
+        """
+        Add tags to a conversation context.
+
+        Args:
+            context_id: Context UUID or partial UUID
+            tags: Comma-separated list of tags to add
+
+        Returns:
+            Dictionary with updated tags list
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            resolved_uuid = resolve_context_id(context_id, debug=False)
+            if not resolved_uuid:
+                return {"error": f"Could not resolve context: {context_id}"}
+
+            tags_list = [t.strip() for t in tags.split(",") if t.strip()]
+            if not tags_list:
+                return {"error": "No tags provided"}
+
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT tags FROM ai_chat_contexts WHERE context_uuid = %s::uuid",
+                [resolved_uuid]
+            )
+            row = cursor.fetchone()
+            existing_tags = row[0] if row and row[0] else []
+
+            new_tags = list(set(existing_tags + tags_list))
+
+            cursor.execute(
+                "UPDATE ai_chat_contexts SET tags = %s, updated_at = NOW() WHERE context_uuid = %s::uuid",
+                [new_tags, resolved_uuid]
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            return {
+                "success": True,
+                "context_uuid": resolved_uuid,
+                "tags": new_tags,
+            }
+
+        except psycopg2.Error as e:
+            return {"error": f"Database error: {str(e)}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def set_context_name(
+        context_id: str,
+        name: str,
+    ) -> dict:
+        """
+        Set the name of a conversation context.
+
+        Args:
+            context_id: Context UUID or partial UUID
+            name: New name for the context
+
+        Returns:
+            Dictionary with update status
+        """
+        if not DB_AVAILABLE:
+            return {"error": "Database dependencies not available"}
+
+        if not check_db_available(debug=False):
+            return {"error": "Could not connect to AI chats database"}
+
+        try:
+            resolved_uuid = resolve_context_id(context_id, debug=False)
+            if not resolved_uuid:
+                return {"error": f"Could not resolve context: {context_id}"}
+
+            conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "UPDATE ai_chat_contexts SET name = %s, updated_at = NOW() WHERE context_uuid = %s::uuid",
+                [name, resolved_uuid]
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            return {
+                "success": True,
+                "context_uuid": resolved_uuid,
+                "name": name,
+            }
+
+        except psycopg2.Error as e:
+            return {"error": f"Database error: {str(e)}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    return mcp
+
+
+def run_mcp_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = MCP_HTTP_PORT) -> int:
+    """
+    Run the MCP server with specified transport.
+
+    Args:
+        transport: Transport type ('stdio' or 'http')
+        host: Host to bind for HTTP transport
+        port: Port to bind for HTTP transport
+
+    Returns:
+        Exit code (0 for success, 1 for error)
+    """
+    if not MCP_AVAILABLE:
+        print("Error: mcp package required for MCP server.", file=sys.stderr)
+        print("Install with: pip install 'mcp[cli]'", file=sys.stderr)
+        return 1
+
+    mcp = create_mcp_server(host=host, port=port)
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport="streamable-http")
+
+    return 0
+
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -3438,6 +4287,14 @@ For more information, see: ~/Documents/notes/02_areas/repos/dotfiles/aipy.md
     helper_group = parser.add_argument_group("🤖 AI Helper")
     helper_group.add_argument("--helper", metavar="GOAL",
                              help="Use AI to suggest the correct aipy command for your goal")
+
+    # ━━━ MCP SERVER ━━━
+    mcp_group = parser.add_argument_group("🔌 MCP Server")
+    mcp_exclusive = mcp_group.add_mutually_exclusive_group()
+    mcp_exclusive.add_argument("--mcp", action="store_true",
+                               help="Run as MCP server (stdio transport)")
+    mcp_exclusive.add_argument("--mcp-http", action="store_true",
+                               help=f"Run as MCP server (HTTP transport on port {MCP_HTTP_PORT})")
 
     return parser.parse_args()
 
@@ -5351,7 +6208,13 @@ def start_repl(args):
 
 def main():
     args = parse_arguments()
-    
+
+    # Handle MCP server mode (before any other operations)
+    if getattr(args, 'mcp', False):
+        sys.exit(run_mcp_server(transport="stdio"))
+    elif getattr(args, 'mcp_http', False):
+        sys.exit(run_mcp_server(transport="http", host="127.0.0.1", port=MCP_HTTP_PORT))
+
     # Handle web server mode - redirect to aipy-serve for backward compatibility
     if args.serve:
         try:
