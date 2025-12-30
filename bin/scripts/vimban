@@ -4672,6 +4672,9 @@ def cmd_edit(args: argparse.Namespace, config: Config) -> int:
 
     if getattr(args, 'status', None):
         updates['status'] = args.status
+        # Auto-set end_date when moving to done
+        if args.status == 'done':
+            updates['end_date'] = date.today().isoformat()
     if getattr(args, 'priority', None):
         updates['priority'] = args.priority
     if getattr(args, 'progress', None) is not None:
@@ -4782,8 +4785,8 @@ def cmd_move(args: argparse.Namespace, config: Config) -> int:
     metadata['updated'] = datetime.now().isoformat()
     metadata['version'] = metadata.get('version', 0) + 1
 
-    # Set end_date if completing
-    if new_status == 'done' and getattr(args, 'resolve', False):
+    # Set end_date if completing (always set when moving to done)
+    if new_status == 'done':
         metadata['end_date'] = date.today().isoformat()
 
     # Set start_date if starting
@@ -4994,6 +4997,20 @@ def cmd_dashboard(args: argparse.Namespace, config: Config) -> int:
     return EXIT_SUCCESS
 
 
+def _fix_missing_end_date(ticket: Ticket) -> None:
+    """
+    Fix a done ticket that's missing end_date by using updated date.
+
+    Updates both the file frontmatter and the in-memory ticket object.
+    """
+    if ticket.filepath and ticket.updated:
+        content: str = ticket.filepath.read_text()
+        metadata, body = parse_frontmatter(content)
+        metadata['end_date'] = ticket.updated.date().isoformat()
+        ticket.filepath.write_text(dump_frontmatter(metadata, body))
+        ticket.end_date = ticket.updated.date()
+
+
 def cmd_kanban(args: argparse.Namespace, config: Config) -> int:
     """
     Display kanban board view of tickets.
@@ -5023,11 +5040,33 @@ def cmd_kanban(args: argparse.Namespace, config: Config) -> int:
         user = os.environ.get('USER', '')
         tickets = [t for t in tickets if t.assignee and user.lower() in str(t.assignee).lower()]
 
+    # Handle --done-last filtering
+    done_last = getattr(args, 'done_last', None)
+    if done_last is not None:
+        if done_last > 0:
+            # Filter done tickets by end_date, with fallback to updated date
+            cutoff_date = date.today() - timedelta(days=done_last)
+            filtered_tickets: list[Ticket] = []
+            for t in tickets:
+                if t.status != 'done':
+                    filtered_tickets.append(t)
+                elif t.end_date and t.end_date >= cutoff_date:
+                    filtered_tickets.append(t)
+                elif t.end_date is None and t.updated and t.updated.date() >= cutoff_date:
+                    # Fix frontmatter: set end_date from updated date
+                    _fix_missing_end_date(t)
+                    filtered_tickets.append(t)
+            tickets = filtered_tickets
+        # If done_last == 0, show all done (no filtering needed)
+
     # Parse statuses to display
     statuses: Optional[list[str]] = None
     status_arg = getattr(args, 'status', None)
     if status_arg:
         statuses = [s.strip() for s in status_arg.split(',')]
+    elif done_last is not None:
+        # Auto-include done column when --done-last is specified
+        statuses = ['backlog', 'ready', 'in_progress', 'blocked', 'review', 'delegated', 'done']
 
     # Get output options
     fmt = getattr(args, 'format', 'plain')
@@ -7762,6 +7801,8 @@ Environment Variables:
     kanban_parser.add_argument('--hide-empty', action='store_true', help='Hide empty columns')
     kanban_parser.add_argument('--compact', action='store_true', help='Compact card display')
     kanban_parser.add_argument('-w', '--width', type=int, help='Column width (default: auto)')
+    kanban_parser.add_argument('--done-last', type=int, default=None, metavar='DAYS',
+                               help='Show done tasks from last DAYS (0=all done)')
     # Note: uses global -f/--format from parent parser
 
     # search

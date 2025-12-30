@@ -75,6 +75,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Any, Callable
@@ -114,6 +115,7 @@ fallback_list_tickets = vimban.fallback_list_tickets
 find_ticket = vimban.find_ticket
 find_person = vimban.find_person
 parse_frontmatter = vimban.parse_frontmatter
+dump_frontmatter = vimban.dump_frontmatter
 STATUSES = vimban.STATUSES
 TICKET_TYPES = vimban.TICKET_TYPES
 PARA_TYPES = vimban.PARA_TYPES
@@ -491,6 +493,7 @@ class TUIConfig:
 
     # Filter defaults
     filter_exclude_done: bool = True
+    done_last_days: Optional[int] = 7  # None = hide all done, 0 = all done, N = last N days
 
     @classmethod
     def load(cls) -> "TUIConfig":
@@ -550,7 +553,20 @@ class TUIConfig:
             split_show_body=data.get('split', {}).get('show_body', True),
             split_render_markdown=data.get('split', {}).get('render_markdown', True),
             filter_exclude_done=data.get('filters', {}).get('exclude_done', True),
+            done_last_days=data.get('filters', {}).get('done_last_days', 7),
         )
+
+    def get_kanban_columns(self) -> list[str]:
+        """
+        Get effective kanban columns, auto-adding 'done' if done_last_days is set.
+
+        Returns:
+            List of status columns to display in kanban view
+        """
+        columns: list[str] = self.kanban_columns.copy()
+        if self.done_last_days is not None and 'done' not in columns:
+            columns.append('done')
+        return columns
 
 
 # ============================================================================
@@ -619,10 +635,21 @@ class StateManager:
         """Load tickets and people from filesystem."""
         # Build filter dict
         filters: dict[str, Any] = {}
-        if self.tui_config.filter_exclude_done:
+
+        # Handle done_last_days filtering
+        # None = exclude done and cancelled
+        # 0 = show all done
+        # N > 0 = show done from last N days
+        if self.tui_config.done_last_days is None:
             # Exclude done and cancelled by filtering for active statuses
             active_statuses: list[str] = [
                 s for s in STATUSES if s not in ['done', 'cancelled']
+            ]
+            filters['status'] = ','.join(active_statuses)
+        else:
+            # Include done but exclude cancelled
+            active_statuses: list[str] = [
+                s for s in STATUSES if s != 'cancelled'
             ]
             filters['status'] = ','.join(active_statuses)
 
@@ -638,6 +665,22 @@ class StateManager:
             filters,
             exclude_types=['person']
         )
+
+        # Filter done tickets by end_date if done_last_days > 0
+        # Falls back to updated date if end_date is missing, and fixes the frontmatter
+        if self.tui_config.done_last_days is not None and self.tui_config.done_last_days > 0:
+            cutoff_date: date = date.today() - timedelta(days=self.tui_config.done_last_days)
+            filtered_tickets: list[Ticket] = []
+            for t in self.state.tickets:
+                if t.status != 'done':
+                    filtered_tickets.append(t)
+                elif t.end_date and t.end_date >= cutoff_date:
+                    filtered_tickets.append(t)
+                elif t.end_date is None and t.updated and t.updated.date() >= cutoff_date:
+                    # Fix frontmatter: set end_date from updated date
+                    self._fix_missing_end_date(t)
+                    filtered_tickets.append(t)
+            self.state.tickets = filtered_tickets
 
         # Sort tickets by due date (None at end)
         self.state.tickets.sort(
@@ -681,6 +724,19 @@ class StateManager:
         """Reload all data from filesystem."""
         self._load_data()
         self.clamp_selection()
+
+    def _fix_missing_end_date(self, ticket: Ticket) -> None:
+        """
+        Fix a done ticket that's missing end_date by using updated date.
+
+        Updates both the file frontmatter and the in-memory ticket object.
+        """
+        if ticket.filepath and ticket.updated:
+            content: str = ticket.filepath.read_text()
+            metadata, body = parse_frontmatter(content)
+            metadata['end_date'] = ticket.updated.date().isoformat()
+            ticket.filepath.write_text(dump_frontmatter(metadata, body))
+            ticket.end_date = ticket.updated.date()
 
     def switch_view(self, direction: int = 1) -> None:
         """
@@ -739,7 +795,7 @@ class StateManager:
             self.state.selected_col = 0
         elif self.state.current_layout == LayoutType.KANBAN:
             # Clamp column to visible columns
-            columns: list[str] = self.tui_config.kanban_columns
+            columns: list[str] = self.tui_config.get_kanban_columns()
             max_col: int = max(0, len(columns) - 1)
             self.state.selected_col = max(0, min(self.state.selected_col, max_col))
 
@@ -763,7 +819,7 @@ class StateManager:
             return None
 
         if self.state.current_layout == LayoutType.KANBAN:
-            columns: list[str] = self.tui_config.kanban_columns
+            columns: list[str] = self.tui_config.get_kanban_columns()
             if not columns:
                 return None
             current_status: str = columns[self.state.selected_col]
@@ -1385,7 +1441,7 @@ class KanbanRenderer:
 
     def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
         """Render the kanban board within the given bounds."""
-        columns: list[str] = self.config.kanban_columns
+        columns: list[str] = self.config.get_kanban_columns()
         if not columns:
             return
 
@@ -2075,7 +2131,7 @@ class VimbanTUI:
         if self.state.current_view == ViewType.PEOPLE:
             max_row: int = len(self.state.people) - 1
         elif self.state.current_layout == LayoutType.KANBAN:
-            columns: list[str] = self.tui_config.kanban_columns
+            columns: list[str] = self.tui_config.get_kanban_columns()
             if columns:
                 status: str = columns[self.state.selected_col]
                 max_row = len(self.state.kanban_board.get(status, [])) - 1
@@ -2521,6 +2577,14 @@ Examples:
         help='Initial view (overrides config)'
     )
 
+    parser.add_argument(
+        '--done-last',
+        type=int,
+        default=None,
+        metavar='DAYS',
+        help='Show done tasks completed within DAYS (default: 7, 0=all)'
+    )
+
     return parser.parse_args()
 
 
@@ -2546,6 +2610,8 @@ def main(stdscr: Any, args: argparse.Namespace) -> int:
         tui_config.default_layout = LayoutType(args.layout)
     if args.view:
         tui_config.default_view = ViewType(args.view)
+    if args.done_last is not None:
+        tui_config.done_last_days = args.done_last
 
     # Create and run TUI
     tui: VimbanTUI = VimbanTUI(stdscr, vimban_config, tui_config)
