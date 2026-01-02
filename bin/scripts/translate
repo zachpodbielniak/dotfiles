@@ -1,0 +1,326 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_GENERAL_ERROR=1
+readonly EXIT_USAGE_ERROR=2
+readonly EXIT_NO_INPUT=3
+readonly EXIT_CLIPBOARD_ERROR=4
+
+# Defaults
+lang_in=""
+lang_out="English"
+show_both=false
+use_markdown=false
+clipboard_paste=false
+clipboard_copy=false
+input_text=""
+CLIPBOARD_PASTE_CMD=""
+CLIPBOARD_COPY_CMD=""
+
+usage () {
+    cat << 'EOF'
+translate - AI-powered language translation
+
+USAGE:
+    translate [OPTIONS] [TEXT...]
+    echo "text" | translate [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    --license               Show license information
+    -l, --lang-in LANG      Input language (default: auto-detect)
+    -L, --lang-out LANG     Output language (default: English)
+    --both                  Show both input and translated text with languages
+    --markdown              Format output as markdown
+    -c, --clipboard-paste   Read input text from clipboard
+    -C, --clipboard-copy    Copy translated output to clipboard
+
+EXAMPLES:
+    # Translate Spanish to English (auto-detect)
+    translate "Hola, como estas?"
+
+    # Translate English to French
+    translate -L French "Hello, how are you?"
+
+    # Translate with known input language
+    translate -l Spanish -L German "Buenos dias"
+
+    # Pipe text through translate
+    echo "Bonjour le monde" | translate
+
+    # Show both input and output with markdown formatting
+    translate --both --markdown "Guten Tag"
+
+    # Translate clipboard contents and copy result back
+    translate -c -C
+
+    # Translate clipboard to French
+    translate -c -L French
+
+EOF
+}
+
+error_exit () {
+    local exit_code="${1}"
+    local message="${2}"
+    printf "Error: %s\n" "${message}" >&2
+    exit "${exit_code}"
+}
+
+# Detect clipboard commands based on display server
+detect_clipboard_cmds () {
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]] || [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]
+    then
+        CLIPBOARD_PASTE_CMD="wl-paste"
+        CLIPBOARD_COPY_CMD="wl-copy"
+    elif [[ -n "${DISPLAY:-}" ]] || [[ "${XDG_SESSION_TYPE:-}" == "x11" ]]
+    then
+        CLIPBOARD_PASTE_CMD="xclip -selection clipboard -o"
+        CLIPBOARD_COPY_CMD="xclip -selection clipboard"
+    else
+        error_exit "${EXIT_CLIPBOARD_ERROR}" "Unable to detect display server. Set XDG_SESSION_TYPE or ensure DISPLAY/WAYLAND_DISPLAY is set."
+    fi
+
+    # Verify the required tool exists
+    local clipboard_tool="${CLIPBOARD_PASTE_CMD%% *}"
+    if ! command -v "${clipboard_tool}" &>/dev/null
+    then
+        if [[ "${clipboard_tool}" == "wl-paste" ]]
+        then
+            error_exit "${EXIT_CLIPBOARD_ERROR}" "wl-paste/wl-copy required for Wayland clipboard. Install wl-clipboard."
+        else
+            error_exit "${EXIT_CLIPBOARD_ERROR}" "xclip required for X11 clipboard. Install xclip."
+        fi
+    fi
+}
+
+# Build the prompt based on flags
+build_prompt () {
+    local text="${1}"
+    local prompt=""
+
+    if [[ "${show_both}" == true ]] && [[ "${use_markdown}" == true ]]
+    then
+        # Mode 4: --both --markdown
+        prompt="You are a translator. Translate the following text to ${lang_out}.
+"
+        if [[ -z "${lang_in}" ]]
+        then
+            prompt+="Detect the input language.
+"
+        else
+            prompt+="The input is in ${lang_in}.
+"
+        fi
+        prompt+="
+Output in this exact markdown format (no code blocks):
+**Input ([detected or specified language]):** [original text]
+
+**Output (${lang_out}):** [translated text]
+
+CRITICAL: Use only the format above. No extra explanations.
+
+Text:
+${text}"
+
+    elif [[ "${show_both}" == true ]]
+    then
+        # Mode 3: --both only
+        prompt="You are a translator. Translate the following text to ${lang_out}.
+"
+        if [[ -z "${lang_in}" ]]
+        then
+            prompt+="Detect the input language.
+"
+        else
+            prompt+="The input is in ${lang_in}.
+"
+        fi
+        prompt+="
+Output in this exact plain text format:
+Input ([detected or specified language]): [original text]
+Output (${lang_out}): [translated text]
+
+CRITICAL: Use only the format above. No code blocks, quotes, or extra text.
+
+Text:
+${text}"
+
+    elif [[ "${use_markdown}" == true ]]
+    then
+        # Mode 2: --markdown only
+        prompt="You are a translator. Translate the following text to ${lang_out}.
+"
+        if [[ -z "${lang_in}" ]]
+        then
+            prompt+="First detect the input language.
+"
+        else
+            prompt+="The input is in ${lang_in}.
+"
+        fi
+        prompt+="
+Output in this exact markdown format (no code blocks):
+**${lang_out}:** [translated text here]
+
+CRITICAL: Use only the format above. No explanations or extra text.
+
+Text to translate:
+${text}"
+
+    else
+        # Mode 1: Default (no flags)
+        prompt="You are a translator. Translate the following text to ${lang_out}.
+
+CRITICAL RULES:
+- Output ONLY the translated text, nothing else
+- Do NOT include explanations, notes, or commentary
+- Do NOT wrap in quotes, backticks, or code blocks
+- Do NOT prefix with language labels or \"Translation:\"
+- Just the raw translated text
+"
+        if [[ -z "${lang_in}" ]]
+        then
+            prompt+="
+Auto-detect the input language.
+"
+        else
+            prompt+="
+The input is in ${lang_in}.
+"
+        fi
+        prompt+="
+Text to translate:
+${text}"
+    fi
+
+    printf "%s" "${prompt}"
+}
+
+# Parse arguments
+positional_args=()
+
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            usage
+            exit "${EXIT_SUCCESS}"
+            ;;
+        --license)
+            echo "AGPLv3 - GNU Affero General Public License v3.0"
+            echo "See: https://www.gnu.org/licenses/agpl-3.0.html"
+            exit "${EXIT_SUCCESS}"
+            ;;
+        -l|--lang-in)
+            if [[ -z "${2:-}" ]]
+            then
+                error_exit "${EXIT_USAGE_ERROR}" "--lang-in requires a language argument"
+            fi
+            lang_in="${2}"
+            shift 2
+            ;;
+        -L|--lang-out)
+            if [[ -z "${2:-}" ]]
+            then
+                error_exit "${EXIT_USAGE_ERROR}" "--lang-out requires a language argument"
+            fi
+            lang_out="${2}"
+            shift 2
+            ;;
+        --both)
+            show_both=true
+            shift
+            ;;
+        --markdown)
+            use_markdown=true
+            shift
+            ;;
+        -c|--clipboard-paste)
+            clipboard_paste=true
+            shift
+            ;;
+        -C|--clipboard-copy)
+            clipboard_copy=true
+            shift
+            ;;
+        -*)
+            error_exit "${EXIT_USAGE_ERROR}" "Unknown option: ${1}"
+            ;;
+        *)
+            positional_args+=("${1}")
+            shift
+            ;;
+    esac
+done
+
+# Get input text from clipboard, positional args, or stdin
+if [[ "${clipboard_paste}" == true ]]
+then
+    detect_clipboard_cmds
+    input_text=$(eval "${CLIPBOARD_PASTE_CMD}" 2>/dev/null) || true
+    if [[ -z "${input_text}" ]]
+    then
+        error_exit "${EXIT_CLIPBOARD_ERROR}" "Clipboard is empty or could not be read."
+    fi
+elif [[ ${#positional_args[@]} -gt 0 ]]
+then
+    input_text="${positional_args[*]}"
+elif [[ ! -t 0 ]]
+then
+    # Stdin is piped - read with timeout to avoid hanging
+    if read -t 1 -r first_line
+    then
+        # Got first line, now read the rest
+        rest=$(cat 2>/dev/null || true)
+        if [[ -n "${rest}" ]]
+        then
+            input_text="${first_line}"$'\n'"${rest}"
+        else
+            input_text="${first_line}"
+        fi
+    fi
+fi
+
+# Validate we have input - show help if none provided
+if [[ -z "${input_text}" ]]
+then
+    usage
+    exit "${EXIT_NO_INPUT}"
+fi
+
+# Build and execute the translation
+prompt=$(build_prompt "${input_text}")
+output=$(printf "%s" "${prompt}" | aipy --no-preserve --hide-model)
+
+# Output the translation
+printf "%s\n" "${output}"
+
+# Copy to clipboard if requested
+if [[ "${clipboard_copy}" == true ]]
+then
+    # Only call detect if we haven't already (from clipboard_paste)
+    if [[ -z "${CLIPBOARD_COPY_CMD}" ]]
+    then
+        detect_clipboard_cmds
+    fi
+    printf "%s" "${output}" | eval "${CLIPBOARD_COPY_CMD}"
+fi
