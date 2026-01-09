@@ -1,0 +1,331 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+show_help () {
+    cat <<'EOF'
+filter_link - vim-filter style link expansion
+
+USAGE:
+    filter_link [options]           Expand both tickets and URLs (default)
+    filter_link pick|fzf [options]  Interactive fzf picker for tickets
+
+OPTIONS:
+    -h, --help      Show this help
+    --license       Show license information
+    --no-fetch      Skip URL title fetching (faster)
+    --markdown      Use markdown links for tickets instead of transclusion
+    --tickets-only  Only expand ticket IDs (skip URLs)
+    --urls-only     Only expand URLs (skip tickets)
+
+EXAMPLES:
+    echo "PROJ-00001 https://github.com" | filter_link
+    echo "PROJ-00001" | filter_link --tickets-only
+    echo "https://github.com" | filter_link --urls-only --no-fetch
+    filter_link pick
+
+VIM USAGE:
+    :.!filter_link            " Expand tickets and URLs on current line
+    :'<,'>!filter_link        " Expand in selection
+    :r !filter_link pick      " Insert link via fzf picker
+EOF
+}
+
+show_license () {
+    cat <<'EOF'
+filter_link - vim-filter style link expansion
+Copyright (C) 2025 Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+# Expand ticket IDs in a single line
+# Args: <line> <use_markdown>
+# Returns: line with ticket IDs replaced by links
+expand_tickets_in_line () {
+    local line="${1}"
+    local use_markdown="${2:-false}"
+    local result="${line}"
+
+    local link_format="--transclusion"
+    if [[ "${use_markdown}" == "true" ]]
+    then
+        link_format="--markdown"
+    fi
+
+    # Extract all ticket IDs from the line
+    local ticket_ids
+    ticket_ids=$(echo "${line}" | grep -oE '(PROJ|BUG|RESEARCH|AREA|RESOURCE|MTG|JNL|RCP|PERSON)-[0-9]+' || true)
+
+    if [[ -n "${ticket_ids}" ]]
+    then
+        while IFS= read -r ticket_id
+        do
+            if [[ -z "${ticket_id}" ]]
+            then
+                continue
+            fi
+
+            # Get the link for this ticket ID
+            local link
+            link=$(vimban generate-link "${ticket_id}" "${link_format}" 2>/dev/null || true)
+
+            if [[ -n "${link}" ]]
+            then
+                # Replace the ticket ID with the link
+                result="${result//${ticket_id}/${link}}"
+            fi
+        done <<< "${ticket_ids}"
+    fi
+
+    echo "${result}"
+}
+
+# Fetch page title from URL
+# Returns empty string if fetch fails
+fetch_title () {
+    local url="${1}"
+    local title
+
+    # Fetch with timeout, extract title tag content
+    # Use -L to follow redirects, -s for silent, --max-time for timeout
+    title=$(curl -sL --max-time 5 "${url}" 2>/dev/null \
+        | grep -oP '(?<=<title>)[^<]+' \
+        | head -1 \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    # Decode HTML entities first
+    if [[ -n "${title}" ]]
+    then
+        title=$(echo "${title}" | perl -MHTML::Entities -pe 'decode_entities($_);' 2>/dev/null || echo "${title}")
+    fi
+
+    # Clean up common title patterns (site name separators)
+    # Handle: | - · — :: >> and similar separators
+    # Keep the first meaningful segment
+    if [[ -n "${title}" ]]
+    then
+        title=$(echo "${title}" \
+            | sed 's/ *[|·—–:] .*//g' \
+            | sed 's/ *- [^-]*$//g' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    fi
+
+    echo "${title}"
+}
+
+# Wrap bare URLs in a single line as markdown links
+# Args: <line> <no_fetch>
+# Returns: line with URLs wrapped
+wrap_urls_in_line () {
+    local line="${1}"
+    local no_fetch="${2:-false}"
+
+    # Check if line contains any URLs at all (quick check)
+    if ! echo "${line}" | grep -qE 'https?://'
+    then
+        echo "${line}"
+        return
+    fi
+
+    # Process URLs in the line
+    if [[ "${no_fetch}" == "true" ]]
+    then
+        # No fetch mode: use URL as link text
+        echo "${line}" | perl -pe '
+            s{(https?://[^\s)\]>]+)}{
+                my $url = $1;
+                my $before = substr($`, -1, 1) // "";
+                # Skip if preceded by ( or [ or < (already in link syntax)
+                if ($before =~ /[(\[<]/ || $` =~ /\]\($/) {
+                    $url
+                } else {
+                    "[$url]($url)"
+                }
+            }ge'
+    else
+        # Fetch mode: get title for each URL
+        local result="${line}"
+        local urls
+
+        # Extract URLs from line
+        urls=$(echo "${line}" | grep -oP 'https?://[^\s)\]>]+' || true)
+
+        if [[ -n "${urls}" ]]
+        then
+            while IFS= read -r url
+            do
+                if [[ -z "${url}" ]]
+                then
+                    continue
+                fi
+
+                # Check if URL is already in a markdown link (preceded by '(' or '[')
+                # Simple heuristic: check if the URL appears after "]("
+                if echo "${line}" | grep -qF "](${url})"
+                then
+                    continue
+                fi
+
+                local title
+                title=$(fetch_title "${url}")
+
+                local link_text="${title}"
+                if [[ -z "${link_text}" ]]
+                then
+                    link_text="${url}"
+                fi
+
+                # Escape special characters in URL for sed
+                local escaped_url
+                escaped_url=$(echo "${url}" | sed 's/[&/\]/\\&/g')
+                local escaped_text
+                escaped_text=$(echo "${link_text}" | sed 's/[&/\]/\\&/g')
+                result=$(echo "${result}" | sed "s|${escaped_url}|[${escaped_text}](${url})|g")
+            done <<< "${urls}"
+        fi
+
+        echo "${result}"
+    fi
+}
+
+# Unified expansion: handles both tickets and URLs
+# This is the default behavior when no subcommand is given
+expand_all () {
+    local no_fetch="false"
+    local use_markdown="false"
+    local tickets_only="false"
+    local urls_only="false"
+
+    # Parse flags
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            --no-fetch)
+                no_fetch="true"
+                shift
+                ;;
+            --markdown)
+                use_markdown="true"
+                shift
+                ;;
+            --tickets-only)
+                tickets_only="true"
+                shift
+                ;;
+            --urls-only)
+                urls_only="true"
+                shift
+                ;;
+            *)
+                # Ignore unknown flags in default mode
+                shift
+                ;;
+        esac
+    done
+
+    # Read stdin line by line
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        local result="${line}"
+
+        # Step 1: Expand ticket IDs (unless --urls-only)
+        if [[ "${urls_only}" != "true" ]]
+        then
+            result=$(expand_tickets_in_line "${result}" "${use_markdown}")
+        fi
+
+        # Step 2: Wrap bare URLs (unless --tickets-only)
+        if [[ "${tickets_only}" != "true" ]]
+        then
+            result=$(wrap_urls_in_line "${result}" "${no_fetch}")
+        fi
+
+        echo "${result}"
+    done
+}
+
+# Interactive fzf picker for tickets
+# Outputs transclusion link for selected ticket
+pick_ticket () {
+    local link_format="--transclusion"
+
+    # Parse options
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            --markdown)
+                link_format="--markdown"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local selected
+    selected=$(vimban list --status backlog,ready,in_progress,review,blocked --limit 100 2>/dev/null \
+        | fzf --preview 'vimban show {1} 2>/dev/null' \
+        | awk '{print $1}')
+
+    if [[ -n "${selected}" ]]
+    then
+        vimban generate-link "${selected}" "${link_format}" 2>/dev/null
+    fi
+}
+
+# Main dispatch
+case "${1:-}" in
+    pick|fzf)
+        shift
+        pick_ticket "$@"
+        ;;
+    expand)
+        # Legacy: tickets only
+        shift
+        expand_all --tickets-only "$@"
+        ;;
+    url)
+        # Legacy: URLs only
+        shift
+        expand_all --urls-only "$@"
+        ;;
+    -h|--help)
+        show_help
+        ;;
+    --license)
+        show_license
+        ;;
+    *)
+        # Default: expand both tickets and URLs
+        expand_all "$@"
+        ;;
+esac
