@@ -1,0 +1,409 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# ==============================================================================
+# prusa_cli - PrusaSlicer CLI Wrapper
+# ==============================================================================
+# A command-line wrapper for PrusaSlicer that auto-detects installation method
+# (flatpak or system binary) and provides convenient preset management for
+# slicing 3D models.
+#
+# Optimized for: Ender 3 V2 Neo with Sprite (direct drive) extruder
+# ==============================================================================
+
+CONFIG_DIR="${HOME}/.config/prusa_cli"
+DEFAULT_CONFIG="default.ini"
+VERBOSE=false
+DRY_RUN=false
+
+show_help () {
+    cat <<'EOF'
+prusa_cli - PrusaSlicer CLI wrapper for easy slicing
+
+USAGE:
+    prusa_cli -i <input_file> [options]
+    prusa_cli -l|--list
+    prusa_cli -h|--help
+
+OPTIONS:
+    -i, --input FILE     Input STL/3MF file to slice (required for slicing)
+    -o, --output FILE    Output G-code file (default: input filename with .gcode)
+    -c, --config FILE    Config file to use (default: default.ini)
+    -p, --profile HEIGHT Use layer height profile: 0.16, 0.20, 0.24, 0.28
+    -l, --list           List available config files
+    -v, --verbose        Show verbose output
+    --dry-run            Show command without executing
+    -h, --help           Show this help
+    --license            Show license information
+
+PROFILES:
+    0.16    Quality - finer layers, slower print
+    0.20    Standard - balanced (default)
+    0.24    Speed - faster print, slightly less detail
+    0.28    Draft - rapid prototyping
+
+EXAMPLES:
+    prusa_cli -i model.stl                      Slice with default 0.20mm
+    prusa_cli -i model.stl -p 0.16              Use quality profile
+    prusa_cli -i model.stl -o custom.gcode      Specify output filename
+    prusa_cli -i model.stl -c vase.ini          Use vase mode config
+    prusa_cli -l                                List available configs
+    prusa_cli -i model.stl --dry-run            Show command without running
+
+CONFIG DIRECTORY:
+    ${HOME}/.config/prusa_cli/
+EOF
+}
+
+show_license () {
+    cat <<'EOF'
+prusa_cli - PrusaSlicer CLI wrapper
+Copyright (C) 2026 Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+# Log a message if verbose mode is enabled
+# Args: message
+log_verbose () {
+    if [[ "${VERBOSE}" == "true" ]]
+    then
+        echo "[INFO] ${1}" >&2
+    fi
+}
+
+# Log an error message to stderr
+# Args: message
+log_error () {
+    echo "[ERROR] ${1}" >&2
+}
+
+# Detect PrusaSlicer installation and return the command to run it
+# Returns: command string via stdout
+# Exit: 1 if not found
+detect_prusaslicer () {
+    # Check for user flatpak first (most common for Silverblue/immutable)
+    if flatpak list --user 2>/dev/null | grep -q "com.prusa3d.PrusaSlicer"
+    then
+        log_verbose "Found PrusaSlicer as user flatpak"
+        echo "flatpak run --user com.prusa3d.PrusaSlicer"
+        return 0
+    fi
+
+    # Check for system flatpak
+    if flatpak list 2>/dev/null | grep -q "com.prusa3d.PrusaSlicer"
+    then
+        log_verbose "Found PrusaSlicer as system flatpak"
+        echo "flatpak run com.prusa3d.PrusaSlicer"
+        return 0
+    fi
+
+    # Check for system binary (various names)
+    if command -v prusa-slicer &>/dev/null
+    then
+        log_verbose "Found PrusaSlicer as system binary: prusa-slicer"
+        echo "prusa-slicer"
+        return 0
+    fi
+
+    if command -v prusaslicer &>/dev/null
+    then
+        log_verbose "Found PrusaSlicer as system binary: prusaslicer"
+        echo "prusaslicer"
+        return 0
+    fi
+
+    if command -v PrusaSlicer &>/dev/null
+    then
+        log_verbose "Found PrusaSlicer as system binary: PrusaSlicer"
+        echo "PrusaSlicer"
+        return 0
+    fi
+
+    log_error "PrusaSlicer not found. Install via flatpak or system package."
+    return 1
+}
+
+# List available config files in the config directory
+list_configs () {
+    if [[ ! -d "${CONFIG_DIR}" ]]
+    then
+        log_error "Config directory not found: ${CONFIG_DIR}"
+        echo "Run 'just stow' to create the config directory and symlink configs."
+        exit 1
+    fi
+
+    echo "Available configs in ${CONFIG_DIR}:"
+    echo ""
+
+    local found=false
+    for config_file in "${CONFIG_DIR}"/*.ini
+    do
+        if [[ -f "${config_file}" ]]
+        then
+            found=true
+            local basename
+            basename=$(basename "${config_file}")
+
+            # Mark default config
+            if [[ "${basename}" == "${DEFAULT_CONFIG}" ]]
+            then
+                echo "  ${basename} (default)"
+            else
+                echo "  ${basename}"
+            fi
+        fi
+    done
+
+    if [[ "${found}" == "false" ]]
+    then
+        echo "  (no config files found)"
+        echo ""
+        echo "Create config files in ${CONFIG_DIR}/ to get started."
+    fi
+}
+
+# Resolve profile shorthand to config filename
+# Args: profile (0.16, 0.20, 0.24, 0.28)
+# Returns: config filename via stdout
+resolve_profile () {
+    local profile="${1}"
+
+    case "${profile}" in
+        0.16|.16|16)
+            echo "0.16mm.ini"
+            ;;
+        0.20|.20|20|0.2|.2)
+            echo "0.20mm.ini"
+            ;;
+        0.24|.24|24)
+            echo "0.24mm.ini"
+            ;;
+        0.28|.28|28)
+            echo "0.28mm.ini"
+            ;;
+        *)
+            log_error "Unknown profile: ${profile}"
+            echo "Valid profiles: 0.16, 0.20, 0.24, 0.28"
+            exit 1
+            ;;
+    esac
+}
+
+# Generate output filename from input filename
+# Args: input_file
+# Returns: output filename with .gcode extension
+generate_output_filename () {
+    local input_file="${1}"
+    local basename
+    basename=$(basename "${input_file}")
+
+    # Remove extension and add .gcode
+    echo "${basename%.*}.gcode"
+}
+
+# Main slicing function
+# Args: input_file, output_file, config_file
+do_slice () {
+    local input_file="${1}"
+    local output_file="${2}"
+    local config_file="${3}"
+
+    # Validate input file exists
+    if [[ ! -f "${input_file}" ]]
+    then
+        log_error "Input file not found: ${input_file}"
+        exit 1
+    fi
+
+    # Validate config file exists
+    local config_path="${CONFIG_DIR}/${config_file}"
+    if [[ ! -f "${config_path}" ]]
+    then
+        log_error "Config file not found: ${config_path}"
+        echo "Available configs:"
+        list_configs
+        exit 1
+    fi
+
+    # Detect PrusaSlicer
+    local prusa_cmd
+    prusa_cmd=$(detect_prusaslicer)
+
+    # Build the command
+    local full_cmd="${prusa_cmd} --export-gcode --load \"${config_path}\" \"${input_file}\" -o \"${output_file}\""
+
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        echo "Would execute:"
+        echo "  ${full_cmd}"
+        return 0
+    fi
+
+    log_verbose "Running: ${full_cmd}"
+    log_verbose "Config: ${config_file}"
+    log_verbose "Input: ${input_file}"
+    log_verbose "Output: ${output_file}"
+
+    # Execute the command
+    # shellcheck disable=SC2086
+    ${prusa_cmd} --export-gcode --load "${config_path}" "${input_file}" -o "${output_file}" 2>&1 | \
+        grep -vE "(^Message:|^Gtk-Message:|^$)" || true
+
+    if [[ -f "${output_file}" ]]
+    then
+        echo "Slicing complete: ${output_file}"
+    else
+        log_error "Slicing may have failed - output file not found"
+        exit 1
+    fi
+}
+
+# Parse command line arguments
+main () {
+    local input_file=""
+    local output_file=""
+    local config_file="${DEFAULT_CONFIG}"
+    local list_mode=false
+
+    # No arguments - show help
+    if [[ $# -eq 0 ]]
+    then
+        show_help
+        exit 0
+    fi
+
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --license)
+                show_license
+                exit 0
+                ;;
+            -l|--list)
+                list_mode=true
+                shift
+                ;;
+            -i|--input)
+                if [[ -z "${2:-}" ]]
+                then
+                    log_error "Missing argument for -i/--input"
+                    exit 1
+                fi
+                input_file="${2}"
+                shift 2
+                ;;
+            -o|--output)
+                if [[ -z "${2:-}" ]]
+                then
+                    log_error "Missing argument for -o/--output"
+                    exit 1
+                fi
+                output_file="${2}"
+                shift 2
+                ;;
+            -c|--config)
+                if [[ -z "${2:-}" ]]
+                then
+                    log_error "Missing argument for -c/--config"
+                    exit 1
+                fi
+                config_file="${2}"
+                shift 2
+                ;;
+            -p|--profile)
+                if [[ -z "${2:-}" ]]
+                then
+                    log_error "Missing argument for -p/--profile"
+                    exit 1
+                fi
+                config_file=$(resolve_profile "${2}")
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: ${1}"
+                echo "Use -h for help"
+                exit 1
+                ;;
+            *)
+                # Treat positional argument as input file if not set
+                if [[ -z "${input_file}" ]]
+                then
+                    input_file="${1}"
+                else
+                    log_error "Unexpected argument: ${1}"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Handle list mode
+    if [[ "${list_mode}" == "true" ]]
+    then
+        list_configs
+        exit 0
+    fi
+
+    # Require input file for slicing
+    if [[ -z "${input_file}" ]]
+    then
+        log_error "Input file required. Use -i <file> or pass as positional argument."
+        echo "Use -h for help"
+        exit 1
+    fi
+
+    # Generate output filename if not specified
+    if [[ -z "${output_file}" ]]
+    then
+        output_file=$(generate_output_filename "${input_file}")
+        log_verbose "Auto-generated output filename: ${output_file}"
+    fi
+
+    # Do the slicing
+    do_slice "${input_file}" "${output_file}" "${config_file}"
+}
+
+main "$@"
