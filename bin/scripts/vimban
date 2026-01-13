@@ -803,11 +803,73 @@ class RecipeType(SpecializedType):
         )
 
 
+class MentorshipType(SpecializedType):
+    """Mentorship meeting type for tracking mentor/mentee sessions."""
+
+    @classmethod
+    def get_config(cls) -> SpecializedTypeConfig:
+        return SpecializedTypeConfig(
+            name="mentorship",
+            parent="area",
+            prefix="MNTR",
+            base_topic="work/mentorship",
+            sequence_file=".sequence_mentorship",
+            has_status=True,
+            template_name="mentorship.md",
+        )
+
+    @classmethod
+    def get_filename(cls, title: str, **kwargs) -> str:
+        """
+        Filename format: {person_name}_{YYYYMMDD}.md
+
+        Args:
+            title: Meeting title (unused, kept for interface compatibility)
+            **kwargs: Must include 'person_name' and optionally 'date'
+
+        Returns:
+            Filename string like 'john_smith_20250113.md'
+        """
+        person_name = kwargs.get("person_name", "unknown")
+        meeting_date = kwargs.get("date")
+        if meeting_date is None:
+            meeting_date = datetime.now()
+        elif isinstance(meeting_date, str):
+            meeting_date = datetime.strptime(meeting_date, "%Y-%m-%d")
+
+        date_str = meeting_date.strftime("%Y%m%d")
+        safe_name = re.sub(r'[^\w\s-]', '', person_name).strip().lower()
+        safe_name = re.sub(r'[-\s]+', '_', safe_name)[:30]
+        return f"{safe_name}_{date_str}.md"
+
+    @classmethod
+    def get_template_replacements(cls, **kwargs) -> dict[str, str]:
+        """
+        Get template placeholder replacements for mentorship meetings.
+
+        Args:
+            **kwargs: Must include 'date' (optional, defaults to today)
+
+        Returns:
+            Dictionary of placeholder -> value mappings
+        """
+        meeting_date = kwargs.get("date")
+        if meeting_date is None:
+            meeting_date = datetime.now()
+        elif isinstance(meeting_date, str):
+            meeting_date = datetime.strptime(meeting_date, "%Y-%m-%d")
+
+        return {
+            "{{DATE}}": meeting_date.strftime("%Y-%m-%d"),
+        }
+
+
 # Registry of all specialized types
 SPECIALIZED_TYPE_REGISTRY: dict[str, type[SpecializedType]] = {
     "meeting": MeetingType,
     "journal": JournalType,
     "recipe": RecipeType,
+    "mentorship": MentorshipType,
 }
 
 # Convenience lists derived from registry
@@ -5874,6 +5936,323 @@ def cmd_people(args: argparse.Namespace, config: Config) -> int:
 
 
 # ============================================================================
+# MENTOR COMMAND
+# ============================================================================
+def cmd_mentor_new(args: argparse.Namespace, config: Config) -> int:
+    """
+    Create a new mentor meeting record.
+
+    Creates a mentorship ticket linked to a person, opens in $EDITOR.
+    By default, assumes you are the mentor. Use --mentored-by to flip.
+
+    Args:
+        args: Parsed arguments with person, mentored_by, date, no_edit
+        config: Vimban configuration
+
+    Returns:
+        Exit code
+    """
+    person_ref = args.person
+    mentored_by = getattr(args, 'mentored_by', False)
+    meeting_date_str = getattr(args, 'date', None)
+    no_edit = getattr(args, 'no_edit', False)
+    fmt = getattr(args, 'format', 'plain')
+
+    # Resolve person reference
+    people_dirs = get_people_dirs(args, config)
+    person_link: Optional[TransclusionLink] = None
+    person_name: str = person_ref
+
+    for people_dir in people_dirs:
+        if people_dir.exists():
+            person_link = resolve_person_reference(person_ref, people_dir)
+            if person_link:
+                # Get the person's display name from the file
+                person_path = config.directory / person_link.path
+                if person_path.exists():
+                    content = person_path.read_text()
+                    metadata, _ = parse_frontmatter(content)
+                    person_name = metadata.get('name', person_ref)
+                break
+
+    if not person_link:
+        error(f"Person not found: {person_ref}", EXIT_FILE_NOT_FOUND)
+
+    # Parse meeting date
+    meeting_date: Optional[datetime] = None
+    if meeting_date_str:
+        try:
+            meeting_date = datetime.strptime(meeting_date_str, "%Y-%m-%d")
+        except ValueError:
+            error(f"Invalid date format: {meeting_date_str}. Use YYYY-MM-DD", EXIT_INVALID_ARGS)
+    else:
+        meeting_date = datetime.now()
+
+    # Generate title based on direction
+    if mentored_by:
+        title = f"Mentoring Session with {person_name}"
+    else:
+        title = f"Mentor Meeting with {person_name}"
+
+    # Get mentorship type configuration
+    mentorship_type = MentorshipType
+    type_config = mentorship_type.get_config()
+
+    # Generate unique ID
+    ticket_id = next_id(config.directory, prefix=type_config.prefix)
+
+    # Get user's person reference (self)
+    my_person_link: Optional[TransclusionLink] = None
+    my_name = os.environ.get('USER', 'unknown')
+    for people_dir in people_dirs:
+        if people_dir.exists():
+            my_person_link = resolve_person_reference(my_name, people_dir)
+            if my_person_link:
+                break
+
+    # Determine assignee (mentee) and reporter (mentor)
+    if mentored_by:
+        # Person is the mentor, I am the mentee
+        assignee_link = my_person_link
+        reporter_link = person_link
+    else:
+        # I am the mentor, person is the mentee
+        assignee_link = person_link
+        reporter_link = my_person_link
+
+    # Load and fill template
+    template = load_template(type_config.template_name.replace('.md', ''))
+
+    # Fill standard template fields
+    content = fill_template(
+        template,
+        ticket_id=ticket_id,
+        title=title,
+        assignee=assignee_link,
+        reporter=reporter_link,
+        priority=config.default_priority,
+        status=config.default_status,
+    )
+
+    # Apply type-specific replacements (like {{DATE}})
+    type_replacements = mentorship_type.get_template_replacements(date=meeting_date)
+    for placeholder, value in type_replacements.items():
+        content = content.replace(placeholder, value)
+
+    # Add the person to relates_to
+    # Update the relates_to field in frontmatter to include person link
+    # Quote the transclusion link to avoid YAML tag interpretation
+    relates_to_replacement = f'relates_to:\n  - "{person_link}"'
+    content = content.replace("relates_to: []", relates_to_replacement)
+
+    # Determine output path
+    filename = mentorship_type.get_filename(
+        title,
+        person_name=person_name,
+        date=meeting_date
+    )
+    output_dir = mentorship_type.get_base_path(config.directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / filename
+
+    # Write the file
+    output_path.write_text(content)
+
+    # Open in editor unless --no-edit
+    if not no_edit:
+        editor = os.environ.get('EDITOR', 'vim')
+        subprocess.run([editor, str(output_path)])
+
+    # Output result
+    if fmt == 'json':
+        result = {
+            'id': ticket_id,
+            'title': title,
+            'path': str(output_path),
+            'person': person_name,
+            'direction': 'mentored_by' if mentored_by else 'mentoring',
+        }
+        print(json.dumps(result, indent=2))
+    elif fmt == 'yaml':
+        result = {
+            'id': ticket_id,
+            'title': title,
+            'path': str(output_path),
+            'person': person_name,
+            'direction': 'mentored_by' if mentored_by else 'mentoring',
+        }
+        print(yaml.dump(result, default_flow_style=False))
+    else:
+        print(f"Created {ticket_id}: {title}")
+        print(f"  Path: {output_path}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_mentor_list(args: argparse.Namespace, config: Config) -> int:
+    """
+    List mentor meetings, optionally filtered by person.
+
+    Args:
+        args: Parsed arguments with optional person filter
+        config: Vimban configuration
+
+    Returns:
+        Exit code
+    """
+    person_filter = getattr(args, 'person', None)
+    mentored_by = getattr(args, 'mentored_by', False)
+    fmt = getattr(args, 'format', 'plain')
+    no_color = getattr(args, 'no_color', False)
+    colors = Colors(enabled=not no_color)
+
+    # Find all mentorship tickets
+    mentorship_dir = config.directory / "02_areas" / "work" / "mentorship"
+
+    if not mentorship_dir.exists():
+        if fmt == 'json':
+            print(json.dumps({'meetings': [], 'count': 0}))
+        elif fmt == 'yaml':
+            print(yaml.dump({'meetings': [], 'count': 0}))
+        else:
+            print("No mentorship meetings found.")
+        return EXIT_SUCCESS
+
+    meetings: list[dict] = []
+
+    for meeting_file in sorted(mentorship_dir.glob('*.md'), reverse=True):
+        try:
+            ticket = Ticket.from_file(meeting_file)
+            if ticket.type != 'mentorship':
+                continue
+
+            # Filter by person if specified
+            if person_filter:
+                person_match = False
+                # Check both assignee (mentee) and reporter (mentor)
+                if mentored_by:
+                    # Looking for meetings where person is mentor (reporter)
+                    if ticket.reporter and person_filter.lower() in str(ticket.reporter).lower():
+                        person_match = True
+                else:
+                    # Looking for meetings where person is mentee (assignee)
+                    if ticket.assignee and person_filter.lower() in str(ticket.assignee).lower():
+                        person_match = True
+
+                if not person_match:
+                    continue
+
+            meetings.append({
+                'id': ticket.id,
+                'title': ticket.title,
+                'date': ticket.created.strftime('%Y-%m-%d') if ticket.created else '',
+                'assignee': str(ticket.assignee) if ticket.assignee else '',
+                'reporter': str(ticket.reporter) if ticket.reporter else '',
+                'status': ticket.status,
+                'path': str(meeting_file),
+            })
+
+        except Exception:
+            continue
+
+    # Output
+    if fmt == 'json':
+        print(json.dumps({'meetings': meetings, 'count': len(meetings)}, indent=2))
+    elif fmt == 'yaml':
+        print(yaml.dump({'meetings': meetings, 'count': len(meetings)}, default_flow_style=False))
+    else:
+        if not meetings:
+            print("No mentorship meetings found.")
+            return EXIT_SUCCESS
+
+        # Group by person (assignee for mentoring, reporter for mentored_by)
+        grouped: dict[str, list[dict]] = {}
+        for m in meetings:
+            key = m['assignee'] if not mentored_by else m['reporter']
+            # Extract just the name from the transclusion link
+            # Strip transclusion markers ![[...]] and quotes
+            key = key.strip('"').replace('![[', '').replace(']]', '')
+            if '/' in key:
+                key = key.split('/')[-1].replace('.md', '').replace('_', ' ').title()
+            if not key:
+                key = 'Unknown'
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(m)
+
+        for person, person_meetings in grouped.items():
+            print(f"\n{colors.BOLD}{person}{colors.END}")
+            print("-" * len(person))
+            for m in person_meetings:
+                status_color = colors.status_color(m['status'])
+                print(f"  {m['id']} [{status_color}{m['status']}{colors.END}] {m['date']} - {m['title']}")
+
+        print(f"\nTotal: {len(meetings)} meeting(s)")
+
+    return EXIT_SUCCESS
+
+
+def cmd_mentor_show(args: argparse.Namespace, config: Config) -> int:
+    """
+    Show details of a specific mentor meeting.
+
+    Args:
+        args: Parsed arguments with meeting ID
+        config: Vimban configuration
+
+    Returns:
+        Exit code
+    """
+    meeting_id = args.meeting_id
+    fmt = getattr(args, 'format', 'plain')
+
+    # Find the meeting
+    ticket_path = find_ticket(meeting_id, config, args)
+
+    if not ticket_path:
+        error(f"Meeting not found: {meeting_id}", EXIT_FILE_NOT_FOUND)
+
+    try:
+        ticket = Ticket.from_file(ticket_path)
+    except Exception as e:
+        error(f"Error loading meeting: {e}", EXIT_GENERAL_ERROR)
+
+    if ticket.type != 'mentorship':
+        error(f"{meeting_id} is not a mentorship meeting (type: {ticket.type})", EXIT_INVALID_ARGS)
+
+    # Set ticket attribute for cmd_show compatibility
+    args.ticket = meeting_id
+
+    # Delegate to show command
+    return cmd_show(args, config)
+
+
+def cmd_mentor(args: argparse.Namespace, config: Config) -> int:
+    """
+    Mentor command dispatcher.
+
+    Args:
+        args: Parsed arguments with mentor_command
+        config: Vimban configuration
+
+    Returns:
+        Exit code
+    """
+    mentor_cmd = getattr(args, 'mentor_command', None)
+
+    if mentor_cmd == 'new':
+        return cmd_mentor_new(args, config)
+    elif mentor_cmd == 'list':
+        return cmd_mentor_list(args, config)
+    elif mentor_cmd == 'show':
+        return cmd_mentor_show(args, config)
+    else:
+        error("No mentor subcommand specified. Use: new, list, show")
+
+    return EXIT_GENERAL_ERROR
+
+
+# ============================================================================
 # CONVERT COMMAND
 # ============================================================================
 def has_valid_vimban_frontmatter(filepath: Path) -> bool:
@@ -7898,6 +8277,120 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
         except Exception as e:
             return {"error": str(e)}
 
+    @mcp.tool()
+    def create_mentor_meeting(
+        person: str,
+        notes: str = "",
+        mentored_by: bool = False,
+        meeting_date: str = "",
+    ) -> dict:
+        """
+        Create a mentor meeting record.
+
+        Args:
+            person: Person reference (name, filename, or transclusion link)
+            notes: Optional initial notes for the meeting
+            mentored_by: If True, you are the mentee (person is your mentor)
+            meeting_date: Meeting date (YYYY-MM-DD, default: today)
+
+        Returns:
+            Created meeting details or error
+        """
+        try:
+            args = argparse.Namespace(
+                person=person,
+                mentored_by=mentored_by,
+                date=meeting_date if meeting_date else None,
+                no_edit=True,
+                format='json',
+                work=False,
+                personal=False,
+            )
+
+            # Capture stdout for the result
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            try:
+                result_code = cmd_mentor_new(args, config)
+                output = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+
+            if result_code == EXIT_SUCCESS:
+                try:
+                    result = json.loads(output)
+                    # If notes provided, add them to the file
+                    if notes and 'path' in result:
+                        meeting_path = Path(result['path'])
+                        if meeting_path.exists():
+                            content = meeting_path.read_text()
+                            # Add notes to the "Topics Discussed" section
+                            content = content.replace(
+                                "## Topics Discussed\n<!-- Key topics covered in this session -->",
+                                f"## Topics Discussed\n<!-- Key topics covered in this session -->\n\n{notes}"
+                            )
+                            meeting_path.write_text(content)
+                    return result
+                except json.JSONDecodeError:
+                    return {"error": "Failed to parse result", "raw": output}
+            return {"error": "Failed to create mentor meeting"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    def list_mentor_meetings(
+        person: str = "",
+        mentored_by: bool = False,
+        limit: int = 20,
+    ) -> dict:
+        """
+        List mentor meetings, optionally filtered by person.
+
+        Args:
+            person: Filter by person (name or reference)
+            mentored_by: If True, filter by mentor instead of mentee
+            limit: Maximum number of meetings to return
+
+        Returns:
+            List of mentor meetings or error
+        """
+        try:
+            args = argparse.Namespace(
+                person=person if person else None,
+                mentored_by=mentored_by,
+                format='json',
+                no_color=True,
+                work=False,
+                personal=False,
+            )
+
+            # Capture stdout for the result
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            try:
+                result_code = cmd_mentor_list(args, config)
+                output = sys.stdout.getvalue()
+            finally:
+                sys.stdout = old_stdout
+
+            if result_code == EXIT_SUCCESS:
+                try:
+                    result = json.loads(output)
+                    # Apply limit
+                    if 'meetings' in result and len(result['meetings']) > limit:
+                        result['meetings'] = result['meetings'][:limit]
+                        result['count'] = len(result['meetings'])
+                    return result
+                except json.JSONDecodeError:
+                    return {"error": "Failed to parse result", "raw": output}
+            return {"meetings": [], "count": 0}
+        except Exception as e:
+            return {"error": str(e)}
+
     return mcp
 
 
@@ -8239,6 +8732,28 @@ Environment Variables:
     people_search = people_subparsers.add_parser('search', help='Search people')
     people_search.add_argument('query', help='Search query')
 
+    # mentor
+    mentor_parser = subparsers.add_parser('mentor', help='Mentor meeting management')
+    mentor_subparsers = mentor_parser.add_subparsers(dest='mentor_command')
+
+    # mentor new
+    mentor_new = mentor_subparsers.add_parser('new', help='Create mentor meeting')
+    mentor_new.add_argument('person', help='Person reference (mentee by default)')
+    mentor_new.add_argument('--mentored-by', action='store_true',
+                            help='You are the mentee (person is your mentor)')
+    mentor_new.add_argument('--date', help='Meeting date (YYYY-MM-DD, default: today)')
+    mentor_new.add_argument('--no-edit', action='store_true', help="Don't open editor")
+
+    # mentor list
+    mentor_list = mentor_subparsers.add_parser('list', help='List mentor meetings')
+    mentor_list.add_argument('person', nargs='?', help='Filter by person')
+    mentor_list.add_argument('--mentored-by', action='store_true',
+                             help='Filter by mentor (instead of mentee)')
+
+    # mentor show
+    mentor_show = mentor_subparsers.add_parser('show', help='Show mentor meeting details')
+    mentor_show.add_argument('meeting_id', help='Meeting ID (e.g., MNTR-1)')
+
     # convert
     convert_parser = subparsers.add_parser('convert', help='Convert/ingest files')
     convert_subparsers = convert_parser.add_subparsers(dest='convert_cmd')
@@ -8275,7 +8790,7 @@ Environment Variables:
     tui_parser.add_argument('--layout', choices=['kanban', 'list', 'split'],
                             help='Initial layout (overrides config)')
     tui_parser.add_argument('--view',
-                            choices=['tickets', 'people', 'kanban', 'dashboard', 'reports'],
+                            choices=['tickets', 'people', 'kanban', 'dashboard', 'reports', 'mentorship'],
                             help='Initial view (overrides config)')
 
     return parser
@@ -8340,6 +8855,7 @@ def main() -> int:
         'report': cmd_report,
         'sync': cmd_sync,
         'people': cmd_people,
+        'mentor': cmd_mentor,
         'convert': cmd_convert,
         'completion': cmd_completion,
         'comment': cmd_comment,

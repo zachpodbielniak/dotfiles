@@ -158,6 +158,7 @@ class ViewType(Enum):
     KANBAN = "kanban"
     DASHBOARD = "dashboard"
     REPORTS = "reports"
+    MENTORSHIP = "mentorship"
 
 
 class LayoutType(Enum):
@@ -594,6 +595,7 @@ class AppState:
     tickets: list[Ticket] = field(default_factory=list)
     people: list[Person] = field(default_factory=list)
     kanban_board: dict[str, list[Ticket]] = field(default_factory=dict)
+    mentorship_meetings: list[Ticket] = field(default_factory=list)
 
     # Filter state
     status_filter: Optional[list[str]] = None
@@ -693,6 +695,9 @@ class StateManager:
         # Load people
         self._load_people()
 
+        # Load mentorship meetings
+        self._load_mentorship_meetings()
+
     def _build_kanban_board(self) -> None:
         """Organize tickets into kanban columns by status."""
         self.state.kanban_board = {status: [] for status in STATUSES}
@@ -719,6 +724,29 @@ class StateManager:
 
         # Sort by name
         self.state.people.sort(key=lambda p: p.name.lower())
+
+    def _load_mentorship_meetings(self) -> None:
+        """Load all mentorship meetings from the mentorship directory."""
+        mentorship_dir: Path = (
+            self.vimban_config.directory / "02_areas" / "work" / "mentorship"
+        )
+        self.state.mentorship_meetings = []
+
+        if not mentorship_dir.exists():
+            return
+
+        for md_file in sorted(mentorship_dir.glob('*.md'), reverse=True):
+            try:
+                ticket: Ticket = Ticket.from_file(md_file)
+                if ticket.type == 'mentorship':
+                    self.state.mentorship_meetings.append(ticket)
+            except (ValueError, yaml.YAMLError):
+                continue
+
+        # Sort by created date (newest first)
+        self.state.mentorship_meetings.sort(
+            key=lambda t: t.created or datetime.min, reverse=True
+        )
 
     def refresh_data(self) -> None:
         """Reload all data from filesystem."""
@@ -793,6 +821,10 @@ class StateManager:
             max_row: int = max(0, len(self.state.people) - 1)
             self.state.selected_row = max(0, min(self.state.selected_row, max_row))
             self.state.selected_col = 0
+        elif self.state.current_view == ViewType.MENTORSHIP:
+            max_row: int = max(0, len(self.state.mentorship_meetings) - 1)
+            self.state.selected_row = max(0, min(self.state.selected_row, max_row))
+            self.state.selected_col = 0
         elif self.state.current_layout == LayoutType.KANBAN:
             # Clamp column to visible columns
             columns: list[str] = self.tui_config.get_kanban_columns()
@@ -816,6 +848,11 @@ class StateManager:
         if self.state.current_view == ViewType.PEOPLE:
             if 0 <= self.state.selected_row < len(self.state.people):
                 return self.state.people[self.state.selected_row]
+            return None
+
+        if self.state.current_view == ViewType.MENTORSHIP:
+            if 0 <= self.state.selected_row < len(self.state.mentorship_meetings):
+                return self.state.mentorship_meetings[self.state.selected_row]
             return None
 
         if self.state.current_layout == LayoutType.KANBAN:
@@ -1829,6 +1866,135 @@ class PeopleRenderer:
                 self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
 
 
+class MentorshipRenderer:
+    """
+    Renders mentorship meetings grouped by person (mentee).
+
+    Shows mentor meetings in a grouped list format with person name headers
+    and chronological meeting entries underneath.
+    """
+
+    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig):
+        self.stdscr: Any = stdscr
+        self.state: AppState = state
+        self.config: TUIConfig = config
+
+    def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
+        """
+        Render the mentorship view within the given bounds.
+
+        Groups meetings by person (mentee/assignee) and displays
+        them chronologically within each group.
+        """
+        meetings: list[Ticket] = self.state.mentorship_meetings
+
+        if not meetings:
+            try:
+                self.stdscr.addstr(
+                    start_y + 1, start_x,
+                    "No mentorship meetings found. Press 'M' to create one."[:width - 1]
+                )
+            except curses.error:
+                pass
+            return
+
+        # Group meetings by person (assignee = mentee)
+        grouped: dict[str, list[Ticket]] = {}
+        for meeting in meetings:
+            if meeting.assignee:
+                # Extract person name from transclusion link
+                person_key: str = str(meeting.assignee)
+                if '/' in person_key:
+                    person_key = person_key.split('/')[-1].replace('.md', '').replace(']]', '')
+                person_key = person_key.replace('_', ' ').title()
+                person_key = person_key.replace('![[', '')
+            else:
+                person_key = "Unknown"
+
+            if person_key not in grouped:
+                grouped[person_key] = []
+            grouped[person_key].append(meeting)
+
+        # Sort meetings within each group by date (newest first)
+        for person in grouped:
+            grouped[person].sort(key=lambda t: t.created or datetime.min, reverse=True)
+
+        # Render grouped meetings
+        y: int = start_y
+        visible_rows: int = height - 1
+        row_count: int = 0
+        flat_items: list[tuple[str, Optional[Ticket]]] = []  # For navigation
+
+        # Flatten for rendering with headers
+        for person in sorted(grouped.keys()):
+            flat_items.append((person, None))  # Header
+            for meeting in grouped[person]:
+                flat_items.append((person, meeting))
+
+        # Apply scroll offset
+        start_idx: int = self.state.scroll_offset
+        selected_flat_idx: int = self.state.selected_row
+
+        for idx, (person, meeting) in enumerate(flat_items[start_idx:]):
+            if row_count >= visible_rows:
+                break
+
+            actual_idx: int = start_idx + idx
+            is_selected: bool = actual_idx == selected_flat_idx and meeting is not None
+
+            if meeting is None:
+                # Person header
+                try:
+                    self.stdscr.attron(curses.A_BOLD)
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_TITLE))
+                    header: str = f"\n{person}"
+                    self.stdscr.addstr(y, start_x, header[:width - 1])
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_TITLE))
+                    self.stdscr.attroff(curses.A_BOLD)
+                    y += 1
+                    # Separator
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+                    self.stdscr.addstr(y, start_x, "-" * min(len(person), width - 1))
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+                except curses.error:
+                    pass
+            else:
+                # Meeting row
+                if is_selected:
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+                # Format: ID [status] date - title
+                date_str: str = meeting.created.strftime('%Y-%m-%d') if meeting.created else ''
+                status_str: str = meeting.status or ''
+                title_str: str = meeting.title or ''
+
+                # Truncate title to fit
+                id_len: int = len(meeting.id) if meeting.id else 0
+                prefix_len: int = id_len + len(status_str) + len(date_str) + 10
+                max_title: int = width - prefix_len - 4
+                if len(title_str) > max_title:
+                    title_str = title_str[:max_title - 3] + "..."
+
+                row: str = f"  {meeting.id} [{status_str}] {date_str} - {title_str}"
+
+                try:
+                    # Color the status
+                    self.stdscr.addstr(y, start_x, f"  {meeting.id} [")
+                    status_pair: int = ThemeManager.get_status_pair(status_str)
+                    self.stdscr.attron(curses.color_pair(status_pair))
+                    self.stdscr.addstr(status_str)
+                    self.stdscr.attroff(curses.color_pair(status_pair))
+                    self.stdscr.addstr(f"] {date_str} - {title_str}"[:width - len(f"  {meeting.id} [{status_str}]") - 1])
+                except curses.error:
+                    pass
+
+                if is_selected:
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+            y += 1
+            row_count += 1
+
+
 # ============================================================================
 # MAIN TUI CLASS
 # ============================================================================
@@ -1868,6 +2034,9 @@ class VimbanTUI:
             stdscr, self.state_manager.state, tui_config, self.md_renderer
         )
         self.people_renderer: PeopleRenderer = PeopleRenderer(
+            stdscr, self.state_manager.state, tui_config
+        )
+        self.mentorship_renderer: MentorshipRenderer = MentorshipRenderer(
             stdscr, self.state_manager.state, tui_config
         )
 
@@ -1953,6 +2122,8 @@ class VimbanTUI:
             self._draw_help(content_start_y, 0, content_height, width)
         elif self.state.current_view == ViewType.PEOPLE:
             self.people_renderer.render(content_start_y, 0, content_height, width)
+        elif self.state.current_view == ViewType.MENTORSHIP:
+            self.mentorship_renderer.render(content_start_y, 0, content_height, width)
         elif self.state.current_view == ViewType.DASHBOARD:
             self._draw_dashboard(content_start_y, 0, content_height, width)
         elif self.state.current_view == ViewType.REPORTS:
@@ -2222,7 +2393,10 @@ class VimbanTUI:
             self._action_edit_metadata()
 
         elif key == ord('M'):
-            self._action_move_location()
+            if state.current_view == ViewType.MENTORSHIP:
+                self._action_new_mentor_meeting()
+            else:
+                self._action_move_location()
 
         elif key == ord('i'):
             self._action_info()
@@ -2460,6 +2634,53 @@ class VimbanTUI:
             self.state_manager.set_status(f"Moved {item_id}")
         else:
             self.state_manager.set_status("Move cancelled or failed", is_error=True)
+
+    def _action_new_mentor_meeting(self) -> None:
+        """Create a new mentor meeting by prompting for person."""
+        # Get list of people for selection
+        if not self.state.people:
+            self.state_manager.set_status("No people found. Create people first.", is_error=True)
+            return
+
+        # Build person choices
+        person_names: list[str] = [p.name for p in self.state.people]
+
+        # Use fzf to select person
+        curses.endwin()
+
+        try:
+            # Create input for fzf
+            input_data: str = '\n'.join(person_names)
+            result = subprocess.run(
+                ['fzf', '--prompt=Select person: '],
+                input=input_data,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                self.stdscr.refresh()
+                curses.doupdate()
+                self.state_manager.set_status("Cancelled", is_error=False)
+                return
+
+            selected_person: str = result.stdout.strip()
+
+            # Run vimban mentor new
+            cmd: list[str] = [
+                'vimban', '--directory', str(self.vimban_config.directory),
+                'mentor', 'new', selected_person
+            ]
+            subprocess.run(cmd)
+
+        finally:
+            # Restore curses
+            self.stdscr.refresh()
+            curses.doupdate()
+
+        # Refresh data
+        self.state_manager.refresh_data()
+        self.state_manager.set_status(f"Created mentor meeting with {selected_person}")
 
     def _action_info(self) -> None:
         """Show info dialog with metadata for the selected item."""
@@ -3020,7 +3241,7 @@ Examples:
     parser.add_argument(
         '--view',
         type=str,
-        choices=['tickets', 'people', 'kanban', 'dashboard', 'reports'],
+        choices=['tickets', 'people', 'kanban', 'dashboard', 'reports', 'mentorship'],
         help='Initial view (overrides config)'
     )
 
