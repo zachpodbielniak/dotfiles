@@ -1,4 +1,4 @@
-#!/bin/bash 
+#!/bin/bash
 
 # dotfiles - Personal configuration files and scripts
 # Copyright (C) 2025  Zach Podbielniak
@@ -18,64 +18,317 @@
 
 set -euo pipefail
 
-declare -a words
+# --- Constants ---
+readonly VERSION="1.1.0"
+readonly SCRIPT_NAME="${0##*/}"
+readonly DICT_API="https://api.dictionaryapi.dev/api/v2/entries/en"
+readonly URBAN_API="https://api.urbandictionary.com/v0/define"
 
-# if no args read from stdin
-if [ ${#} -eq 0 ]; then
-    while IFS= read -r entry
-    do 
-        words+=("${entry}")
-    done
-else
-    # shift arg by arg and append to the words
-    while [[ ${#} -gt 0 ]]
-    do 
-        words+=("${1}")
-        shift
-    done
-fi
+# --- Flags ---
+use_urban=false
 
-# check word
-if [[ "${words}" == "" ]]
-then 
-    echo "Usage: ${0} <word0> <word1>...<wordn>"
-    echo "or"
-    echo "echo <word0> <word1>...<wordn> | ${0}"
-    exit 1
-fi
+# --- Helper Functions ---
 
+# Display help message with usage examples
+show_help () {
+    cat <<EOF
+${SCRIPT_NAME} v${VERSION} - Look up word definitions
 
-# pass in word as arg 1
-get_single_def() {
-    local word="${1}"
+USAGE:
+    ${SCRIPT_NAME} [OPTIONS] <word> [word...]
+    echo <word> | ${SCRIPT_NAME} [OPTIONS]
 
-    # do api call
-    web_request=$(curl --silent "https://api.dictionaryapi.dev/api/v2/entries/en/${word}")
+OPTIONS:
+    -h, --help              Show this help message
+    --license               Show license information (AGPLv3)
+    -u, --urban-dictionary  Use Urban Dictionary instead of standard dictionary
 
-    # check for yq/jq and use whichever for output
-    if [[ $(type yq 2>/dev/null >/dev/null) -eq 0 ]]
+EXAMPLES:
+    # Get definition for a single word
+    ${SCRIPT_NAME} ubiquitous
+
+    # Get definitions for multiple words
+    ${SCRIPT_NAME} ephemeral serendipity mellifluous
+
+    # Look up slang on Urban Dictionary
+    ${SCRIPT_NAME} -u yeet
+    ${SCRIPT_NAME} --urban-dictionary bruh
+
+    # Process words from standard input
+    echo "eloquent verbose" | ${SCRIPT_NAME}
+
+    # Save definitions to a file
+    ${SCRIPT_NAME} parsimonious laconic > vocab.md
+
+    # Process a list of words from a file
+    cat word_list.txt | ${SCRIPT_NAME}
+
+    # Urban Dictionary from stdin
+    echo "skibidi" | ${SCRIPT_NAME} -u
+EOF
+}
+
+# Display AGPLv3 license information
+show_license () {
+    cat <<EOF
+${SCRIPT_NAME} - Look up word definitions
+Copyright (C) 2025 Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+# Check for required dependencies
+check_dependencies () {
+    if ! command -v curl &>/dev/null
     then
-        defs=$(yq -p json .[].meanings[].definitions[].definition <<< "${web_request}")
-    elif [[ $(type jq 2>/dev/null >/dev/null) -eq 0 ]]
-    then 
-        defs=$(jq .[].meanings[].definitions[].definition <<< "${web_request}")
-    else 
-        echo "${0} requires yq or jq. install either"
+        echo "Error: curl is required but not installed" >&2
         exit 1
     fi
 
-    # parse the yq/jq output and format it in md/norg friendly format
-    echo "${word}:"
-    while read -r line; do
-        quotes_removed=$(sed 's/"//g' <<< ${line})
-        echo "- ${quotes_removed}"
-    done <<< "${defs}"
-    echo "" 
+    if ! command -v yq &>/dev/null && ! command -v jq &>/dev/null
+    then
+        echo "Error: ${SCRIPT_NAME} requires yq or jq for JSON processing" >&2
+        exit 1
+    fi
 }
 
-# iterate all words
-for word in ${words[@]}
-do 
-    get_single_def "${word}"
+# Parse JSON using yq (preferred) or jq
+# Arguments:
+#   $1 - jq/yq filter expression
+#   stdin - JSON data
+parse_json () {
+    local filter="${1}"
+
+    if command -v yq &>/dev/null
+    then
+        yq -p json "${filter}"
+    else
+        jq -r "${filter}"
+    fi
+}
+
+# Get definition from standard dictionary API (dictionaryapi.dev)
+# Arguments:
+#   $1 - word to look up
+get_standard_def () {
+    local word="${1}"
+    local response
+    local defs
+
+    # Make API request
+    if ! response=$(curl --silent --fail --max-time 10 "${DICT_API}/${word}" 2>/dev/null)
+    then
+        echo "Error: Failed to fetch definition for '${word}' (network error)" >&2
+        return 1
+    fi
+
+    # Check for "word not found" response
+    if echo "${response}" | grep -q '"title":"No Definitions Found"'
+    then
+        echo "Error: No definition found for '${word}'" >&2
+        return 1
+    fi
+
+    # Check for empty response
+    if [[ -z "${response}" ]]
+    then
+        echo "Error: Empty response for '${word}'" >&2
+        return 1
+    fi
+
+    # Parse definitions from response
+    defs=$(echo "${response}" | parse_json '.[].meanings[].definitions[].definition')
+
+    # Check if we got any definitions
+    if [[ -z "${defs}" ]]
+    then
+        echo "Error: Could not parse definitions for '${word}'" >&2
+        return 1
+    fi
+
+    # Output formatted definitions
+    echo "${word}:"
+    while IFS= read -r line
+    do
+        # Remove surrounding quotes if present
+        local clean_line="${line#\"}"
+        clean_line="${clean_line%\"}"
+        echo "- ${clean_line}"
+    done <<< "${defs}"
+    echo ""
+}
+
+# Get definition from Urban Dictionary API
+# Arguments:
+#   $1 - word/phrase to look up
+get_urban_def () {
+    local word="${1}"
+    local encoded_word
+    local response
+    local count
+
+    # URL encode the word (handle spaces and special chars)
+    encoded_word=$(printf '%s' "${word}" | sed 's/ /%20/g; s/!/%21/g; s/"/%22/g; s/#/%23/g; s/\$/%24/g; s/&/%26/g; s/'\''/%27/g; s/(/%28/g; s/)/%29/g; s/+/%2B/g')
+
+    # Make API request
+    if ! response=$(curl --silent --fail --max-time 10 "${URBAN_API}?term=${encoded_word}" 2>/dev/null)
+    then
+        echo "Error: Failed to fetch Urban Dictionary definition for '${word}' (network error)" >&2
+        return 1
+    fi
+
+    # Check for empty response
+    if [[ -z "${response}" ]]
+    then
+        echo "Error: Empty response for '${word}'" >&2
+        return 1
+    fi
+
+    # Check if list is empty (no definitions found)
+    count=$(echo "${response}" | parse_json '.list | length')
+    if [[ "${count}" == "0" ]]
+    then
+        echo "Error: No Urban Dictionary definition found for '${word}'" >&2
+        return 1
+    fi
+
+    # Output formatted definitions (limit to top 3 for readability)
+    echo "${word} (Urban Dictionary):"
+
+    # Extract top 3 definitions and examples
+    local i=0
+    local max_defs=3
+    while [[ ${i} -lt ${max_defs} ]] && [[ ${i} -lt ${count} ]]
+    do
+        local definition
+        local example
+
+        definition=$(echo "${response}" | parse_json ".list[${i}].definition" | tr -d '[]')
+        example=$(echo "${response}" | parse_json ".list[${i}].example" | tr -d '[]')
+
+        # Clean up the definition (remove quotes if present)
+        definition="${definition#\"}"
+        definition="${definition%\"}"
+
+        echo "- ${definition}"
+
+        # Add example if available and not empty
+        if [[ -n "${example}" ]] && [[ "${example}" != "null" ]] && [[ "${example}" != "\"\"" ]]
+        then
+            example="${example#\"}"
+            example="${example%\"}"
+            echo "  Example: \"${example}\""
+        fi
+
+        ((i++))
+    done
+    echo ""
+}
+
+# --- Argument Parsing ---
+declare -a words=()
+
+# Parse options first
+while [[ ${#} -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --license)
+            show_license
+            exit 0
+            ;;
+        -u|--urban-dictionary)
+            use_urban=true
+            shift
+            ;;
+        --)
+            # End of options, rest are words
+            shift
+            words+=("${@}")
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option '${1}'" >&2
+            echo "Use '${SCRIPT_NAME} --help' for usage information" >&2
+            exit 1
+            ;;
+        *)
+            # Not an option, treat as a word
+            words+=("${1}")
+            shift
+            ;;
+    esac
 done
 
+# If no words provided as arguments, read from stdin
+if [[ ${#words[@]} -eq 0 ]]
+then
+    # Check if stdin is a terminal (no piped input)
+    if [[ -t 0 ]]
+    then
+        show_help
+        exit 1
+    fi
+
+    # Read words from stdin
+    while IFS= read -r entry
+    do
+        # Handle multiple words on one line
+        for word in ${entry}
+        do
+            words+=("${word}")
+        done
+    done
+fi
+
+# Validate we have at least one word
+if [[ ${#words[@]} -eq 0 ]]
+then
+    echo "Error: No words provided" >&2
+    show_help
+    exit 1
+fi
+
+# --- Main Logic ---
+check_dependencies
+
+# Track if any lookups failed
+had_errors=false
+
+# Iterate all words and call appropriate function
+for word in "${words[@]}"
+do
+    # Skip empty words
+    if [[ -z "${word}" ]]
+    then
+        continue
+    fi
+
+    if [[ "${use_urban}" == "true" ]]
+    then
+        get_urban_def "${word}" || had_errors=true
+    else
+        get_standard_def "${word}" || had_errors=true
+    fi
+done
+
+# Exit with error if any lookups failed
+if [[ "${had_errors}" == "true" ]]
+then
+    exit 1
+fi
