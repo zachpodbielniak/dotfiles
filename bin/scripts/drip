@@ -1,0 +1,1423 @@
+#!/usr/bin/python3
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+Dividend Reinvestment Calculator (DRIP)
+=======================================
+Calculate and compare dividend investment outcomes with and without
+reinvestment, supporting various growth scenarios and NAV discounts.
+
+Usage:
+  drip --principal 10000 --price 50 --yield 4 --years 10
+  drip --shares 200 --price 50 --dividend 0.50 --frequency monthly
+  drip --principal 5000 --price 25 --yield 8 --drip-discount 5 --years 10
+  drip --principal 10000 --price 100 --yield 4 --years 10 --scenarios "3,5,7"
+  drip --principal 5000 --price 28 --nav 25 --yield 8 --drip-at-nav --years 10
+"""
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, asdict
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from typing import List, Dict, Optional, Any
+
+
+AGPLV3_LICENSE: str = """
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+
+@dataclass
+class ProjectionPeriod:
+    """Data for a single projection period"""
+    period: int
+    year: Decimal
+    price: Decimal
+    nav: Decimal  # Net Asset Value (may differ from market price for CEFs)
+    div_per_share: Decimal
+    no_drip_shares: Decimal
+    no_drip_income: Decimal
+    no_drip_value: Decimal
+    no_drip_cumulative_div: Decimal
+    no_drip_yoc: Decimal
+    drip_shares: Decimal
+    drip_income: Decimal
+    drip_value: Decimal
+    drip_cumulative_div: Decimal
+    drip_yoc: Decimal
+    drip_purchase_price: Decimal  # Price used for DRIP purchases (NAV or market)
+    contribution: Decimal  # Cash contribution this period (monthly + yearly if applicable)
+    cumulative_contributions: Decimal  # Total contributions to date (not including initial)
+
+
+@dataclass
+class Summary:
+    """Summary statistics for DRIP analysis"""
+    initial_investment: Decimal
+    initial_shares: Decimal
+    initial_price: Decimal
+    initial_nav: Decimal  # Initial NAV (same as price if not specified)
+    annual_yield: Decimal
+    div_per_share_per_payment: Decimal
+    price_growth: Decimal
+    div_growth: Decimal
+    nav_growth: Decimal  # NAV growth rate (may differ from price growth)
+    drip_discount: Decimal
+    drip_at_nav: bool  # Whether DRIP purchases are made at NAV
+    years: int
+    frequency: str
+    monthly_add: Decimal  # Monthly contribution amount
+    yearly_add: Decimal  # Yearly bonus contribution amount
+
+    no_drip_final_shares: Decimal
+    no_drip_final_value: Decimal
+    no_drip_total_dividends: Decimal
+    no_drip_total_return: Decimal
+    no_drip_cagr: Decimal
+    no_drip_final_yoc: Decimal
+    no_drip_total_contributions: Decimal  # Total contributions (not including initial)
+
+    drip_final_shares: Decimal
+    drip_final_value: Decimal
+    drip_final_nav: Decimal  # Final NAV
+    drip_total_dividends: Decimal
+    drip_total_return: Decimal
+    drip_cagr: Decimal
+    drip_final_yoc: Decimal
+    drip_total_contributions: Decimal  # Total contributions (not including initial)
+
+
+def d(value: Any) -> Decimal:
+    """Convert value to Decimal with proper handling"""
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return Decimal("0")
+
+
+def fmt_money(value: Decimal) -> str:
+    """Format decimal as money string"""
+    return f"${value:,.2f}"
+
+
+def fmt_pct(value: Decimal) -> str:
+    """Format decimal as percentage string"""
+    return f"{value:.2f}%"
+
+
+def fmt_shares(value: Decimal) -> str:
+    """Format decimal as share count"""
+    return f"{value:,.2f}"
+
+
+class DRIPCalculator:
+    """
+    Core calculation engine for DRIP projections.
+
+    Handles compound growth calculations for both DRIP and non-DRIP scenarios,
+    accounting for dividend frequency, price/dividend growth rates, NAV tracking,
+    and NAV-based DRIP purchases for closed-end funds.
+    """
+
+    def __init__(
+        self,
+        initial_shares: Decimal,
+        initial_price: Decimal,
+        div_per_share_per_payment: Decimal,
+        years: int,
+        frequency: str,
+        price_growth: Decimal,
+        div_growth: Decimal,
+        drip_discount: Decimal,
+        initial_nav: Optional[Decimal] = None,
+        nav_growth: Optional[Decimal] = None,
+        drip_at_nav: bool = False,
+        monthly_add: Decimal = d(0),
+        yearly_add: Decimal = d(0)
+    ):
+        self.initial_shares: Decimal = initial_shares
+        self.initial_price: Decimal = initial_price
+        self.div_per_share_per_payment: Decimal = div_per_share_per_payment
+        self.years: int = years
+        self.frequency: str = frequency
+        self.price_growth: Decimal = price_growth / d(100)  # Convert to decimal rate
+        self.div_growth: Decimal = div_growth / d(100)  # Convert to decimal rate
+        self.drip_discount: Decimal = drip_discount / d(100)  # Convert to decimal rate
+
+        # NAV-related parameters
+        # If NAV not specified, default to market price
+        self.initial_nav: Decimal = initial_nav if initial_nav is not None else initial_price
+        # If NAV growth not specified, default to price growth rate
+        self.nav_growth: Decimal = (nav_growth / d(100)) if nav_growth is not None else self.price_growth
+        self.drip_at_nav: bool = drip_at_nav
+
+        # Contribution parameters (not converted - they're dollar amounts)
+        self.monthly_add: Decimal = monthly_add
+        self.yearly_add: Decimal = yearly_add
+
+        self.periods_per_year: int = self._get_periods_per_year()
+        self.total_periods: int = self.years * self.periods_per_year
+        self.initial_investment: Decimal = self.initial_shares * self.initial_price
+
+        self.projections: List[ProjectionPeriod] = []
+
+    def _get_periods_per_year(self) -> int:
+        """Return number of dividend payment periods per year"""
+        freq_map: Dict[str, int] = {
+            "monthly": 12,
+            "quarterly": 4,
+            "annual": 1
+        }
+        return freq_map.get(self.frequency, 4)
+
+    def calculate_projections(self) -> List[ProjectionPeriod]:
+        """
+        Calculate period-by-period projections for both DRIP and non-DRIP scenarios.
+
+        Growth rates are compounded per period (not just annually) for accuracy.
+        DRIP purchases can be made at:
+        - Market price (with optional discount)
+        - NAV (with optional discount) when --drip-at-nav is set
+
+        Contributions (monthly_add and yearly_add) are applied as follows:
+        - Monthly contributions accumulate based on months per period (1/3/12 for monthly/quarterly/annual)
+        - Yearly contributions are applied at the first period of each new year
+        - Contributions buy shares at market price (not NAV or DRIP discount)
+        """
+        no_drip_shares: Decimal = self.initial_shares
+        drip_shares: Decimal = self.initial_shares
+        no_drip_cumulative_div: Decimal = d(0)
+        drip_cumulative_div: Decimal = d(0)
+        cumulative_contributions: Decimal = d(0)
+
+        # Calculate months per period for monthly contribution accumulation
+        months_per_period: int = 12 // self.periods_per_year  # 1, 3, or 12
+
+        # Determine initial DRIP purchase price
+        if self.drip_at_nav:
+            initial_drip_price: Decimal = self.initial_nav * (d(1) - self.drip_discount)
+        else:
+            initial_drip_price = self.initial_price * (d(1) - self.drip_discount)
+
+        # Period 0 - initial state
+        initial_projection: ProjectionPeriod = ProjectionPeriod(
+            period=0,
+            year=d(0),
+            price=self.initial_price,
+            nav=self.initial_nav,
+            div_per_share=self.div_per_share_per_payment,
+            no_drip_shares=no_drip_shares,
+            no_drip_income=d(0),
+            no_drip_value=no_drip_shares * self.initial_price,
+            no_drip_cumulative_div=d(0),
+            no_drip_yoc=self._calculate_annual_yield(),
+            drip_shares=drip_shares,
+            drip_income=d(0),
+            drip_value=drip_shares * self.initial_price,
+            drip_cumulative_div=d(0),
+            drip_yoc=self._calculate_annual_yield(),
+            drip_purchase_price=initial_drip_price,
+            contribution=d(0),
+            cumulative_contributions=d(0)
+        )
+        self.projections.append(initial_projection)
+
+        # Calculate for each period
+        for period in range(1, self.total_periods + 1):
+            year: Decimal = d(period) / d(self.periods_per_year)
+
+            # Calculate current market price with compound growth
+            price: Decimal = self.initial_price * (
+                (d(1) + self.price_growth) ** year
+            )
+
+            # Calculate current NAV with compound growth (may differ from market price)
+            nav: Decimal = self.initial_nav * (
+                (d(1) + self.nav_growth) ** year
+            )
+
+            # Calculate current dividend per share with compound growth
+            div_per_share: Decimal = self.div_per_share_per_payment * (
+                (d(1) + self.div_growth) ** year
+            )
+
+            # Calculate contribution for this period
+            # Monthly contributions accumulate over the period
+            contribution: Decimal = self.monthly_add * d(months_per_period)
+
+            # Add yearly contribution at the first period of each new year
+            # (when current period is a multiple of periods_per_year)
+            if period % self.periods_per_year == 0:
+                contribution += self.yearly_add
+
+            cumulative_contributions += contribution
+
+            # Buy shares with contribution at market price (applies to both scenarios)
+            contribution_shares: Decimal = contribution / price if price > 0 else d(0)
+
+            # No-DRIP scenario: get dividends as cash, but buy shares with contributions
+            no_drip_income: Decimal = no_drip_shares * div_per_share
+            no_drip_cumulative_div += no_drip_income
+            no_drip_shares += contribution_shares  # Buy shares with contribution
+            no_drip_value: Decimal = no_drip_shares * price
+
+            # Calculate no-drip yield on cost (annual dividend / original cost basis)
+            no_drip_annual_div: Decimal = div_per_share * d(self.periods_per_year)
+            no_drip_yoc: Decimal = (no_drip_annual_div / self.initial_price) * d(100)
+
+            # DRIP scenario: reinvest dividends into new shares, plus contributions
+            drip_income: Decimal = drip_shares * div_per_share
+            drip_cumulative_div += drip_income
+
+            # DRIP purchase price: either at NAV or market price, with optional discount
+            if self.drip_at_nav:
+                drip_purchase_price: Decimal = nav * (d(1) - self.drip_discount)
+            else:
+                drip_purchase_price = price * (d(1) - self.drip_discount)
+
+            # Add shares from DRIP (dividends) and contributions
+            drip_new_shares: Decimal = drip_income / drip_purchase_price if drip_purchase_price > 0 else d(0)
+            drip_shares += drip_new_shares + contribution_shares  # DRIP + contribution
+            # Portfolio value is always based on market price
+            drip_value: Decimal = drip_shares * price
+
+            # Calculate drip yield on cost (based on original cost basis per share)
+            drip_yoc: Decimal = (no_drip_annual_div / self.initial_price) * d(100)
+
+            projection: ProjectionPeriod = ProjectionPeriod(
+                period=period,
+                year=year.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                price=price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                nav=nav.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                div_per_share=div_per_share.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+                no_drip_shares=no_drip_shares.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                no_drip_income=no_drip_income.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                no_drip_value=no_drip_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                no_drip_cumulative_div=no_drip_cumulative_div.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                no_drip_yoc=no_drip_yoc.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                drip_shares=drip_shares.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                drip_income=drip_income.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                drip_value=drip_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                drip_cumulative_div=drip_cumulative_div.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                drip_yoc=drip_yoc.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                drip_purchase_price=drip_purchase_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                contribution=contribution.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                cumulative_contributions=cumulative_contributions.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            )
+            self.projections.append(projection)
+
+        return self.projections
+
+    def _calculate_annual_yield(self) -> Decimal:
+        """Calculate initial annual yield percentage"""
+        annual_div: Decimal = self.div_per_share_per_payment * d(self.periods_per_year)
+        return (annual_div / self.initial_price) * d(100)
+
+    def _calculate_cagr(self, final_value: Decimal) -> Decimal:
+        """
+        Calculate Compound Annual Growth Rate.
+
+        CAGR = ((final_value / initial_value) ^ (1/years)) - 1
+        """
+        if self.initial_investment <= 0 or self.years <= 0:
+            return d(0)
+        ratio: Decimal = final_value / self.initial_investment
+        cagr: Decimal = (ratio ** (d(1) / d(self.years))) - d(1)
+        return cagr * d(100)
+
+    def get_summary(self) -> Summary:
+        """Generate summary statistics from projections"""
+        if not self.projections:
+            self.calculate_projections()
+
+        final: ProjectionPeriod = self.projections[-1]
+
+        # Total cost basis = initial investment + all contributions
+        total_cost_basis: Decimal = self.initial_investment + final.cumulative_contributions
+
+        # Calculate total returns (final value - total cost basis)
+        # For no-drip, include cash dividends received
+        no_drip_total_return: Decimal = (
+            final.no_drip_value + final.no_drip_cumulative_div - total_cost_basis
+        )
+        drip_total_return: Decimal = final.drip_value - total_cost_basis
+
+        # Calculate effective final value for CAGR (include cash dividends for no-drip)
+        no_drip_effective_final: Decimal = final.no_drip_value + final.no_drip_cumulative_div
+        drip_effective_final: Decimal = final.drip_value
+
+        return Summary(
+            initial_investment=self.initial_investment.quantize(Decimal("0.01")),
+            initial_shares=self.initial_shares.quantize(Decimal("0.01")),
+            initial_price=self.initial_price.quantize(Decimal("0.01")),
+            initial_nav=self.initial_nav.quantize(Decimal("0.01")),
+            annual_yield=self._calculate_annual_yield().quantize(Decimal("0.01")),
+            div_per_share_per_payment=self.div_per_share_per_payment.quantize(Decimal("0.0001")),
+            price_growth=(self.price_growth * d(100)).quantize(Decimal("0.01")),
+            div_growth=(self.div_growth * d(100)).quantize(Decimal("0.01")),
+            nav_growth=(self.nav_growth * d(100)).quantize(Decimal("0.01")),
+            drip_discount=(self.drip_discount * d(100)).quantize(Decimal("0.01")),
+            drip_at_nav=self.drip_at_nav,
+            years=self.years,
+            frequency=self.frequency,
+            monthly_add=self.monthly_add.quantize(Decimal("0.01")),
+            yearly_add=self.yearly_add.quantize(Decimal("0.01")),
+            no_drip_final_shares=final.no_drip_shares,
+            no_drip_final_value=final.no_drip_value,
+            no_drip_total_dividends=final.no_drip_cumulative_div,
+            no_drip_total_return=no_drip_total_return.quantize(Decimal("0.01")),
+            no_drip_cagr=self._calculate_cagr(no_drip_effective_final).quantize(Decimal("0.01")),
+            no_drip_final_yoc=final.no_drip_yoc,
+            no_drip_total_contributions=final.cumulative_contributions,
+            drip_final_shares=final.drip_shares,
+            drip_final_value=final.drip_value,
+            drip_final_nav=final.nav,
+            drip_total_dividends=final.drip_cumulative_div,
+            drip_total_return=drip_total_return.quantize(Decimal("0.01")),
+            drip_cagr=self._calculate_cagr(drip_effective_final).quantize(Decimal("0.01")),
+            drip_final_yoc=final.drip_yoc,
+            drip_total_contributions=final.cumulative_contributions
+        )
+
+    def get_yearly_projections(self) -> List[ProjectionPeriod]:
+        """Return only year-end projections (filter out mid-year periods)"""
+        yearly: List[ProjectionPeriod] = []
+        for proj in self.projections:
+            # Include period 0 and year-end periods
+            if proj.period == 0 or proj.period % self.periods_per_year == 0:
+                yearly.append(proj)
+        return yearly
+
+
+class OutputFormatter:
+    """
+    Handle multiple output formats for DRIP projections and summaries.
+
+    Supports plain text, markdown, YAML, and JSON output formats.
+    """
+
+    def format(
+        self,
+        fmt: str,
+        projections: List[ProjectionPeriod],
+        summary: Summary,
+        granularity: str,
+        summary_only: bool,
+        show_yoc: bool,
+        compare: bool,
+        periods_per_year: int
+    ) -> str:
+        """Route to appropriate format method"""
+        # Filter projections based on granularity and calculate annual income
+        annual_income_map: Dict[int, tuple] = {}  # period -> (no_drip_annual, drip_annual)
+
+        if granularity == "yearly":
+            filtered: List[ProjectionPeriod] = []
+            prev_no_drip_cumul: Decimal = d(0)
+            prev_drip_cumul: Decimal = d(0)
+
+            for proj in projections:
+                if proj.period == 0 or proj.period % periods_per_year == 0:
+                    # Calculate annual income as difference in cumulative dividends
+                    no_drip_annual: Decimal = proj.no_drip_cumulative_div - prev_no_drip_cumul
+                    drip_annual: Decimal = proj.drip_cumulative_div - prev_drip_cumul
+                    annual_income_map[proj.period] = (no_drip_annual, drip_annual)
+                    prev_no_drip_cumul = proj.no_drip_cumulative_div
+                    prev_drip_cumul = proj.drip_cumulative_div
+                    filtered.append(proj)
+            projections = filtered
+
+        if fmt == "markdown":
+            return self._format_markdown(projections, summary, summary_only, show_yoc, compare, annual_income_map)
+        elif fmt == "yaml":
+            return self._format_yaml(projections, summary, summary_only)
+        elif fmt == "json":
+            return self._format_json(projections, summary, summary_only)
+        else:
+            return self._format_plain(projections, summary, summary_only, show_yoc, compare, annual_income_map)
+
+    def _format_plain(
+        self,
+        projections: List[ProjectionPeriod],
+        summary: Summary,
+        summary_only: bool,
+        show_yoc: bool,
+        compare: bool,
+        annual_income_map: Optional[Dict[int, tuple]] = None
+    ) -> str:
+        """Format output as plain text table"""
+        lines: List[str] = []
+
+        if not summary_only:
+            # Build header
+            if compare:
+                headers: List[str] = ["Year", "Price", "Shares(NoDRIP)", "Shares(DRIP)",
+                                      "Div/Share", "Income(NoDRIP)", "Income(DRIP)"]
+                if show_yoc:
+                    headers.append("YoC")
+                headers.extend(["Value(NoDRIP)", "Value(DRIP)"])
+            else:
+                headers = ["Year", "Price", "Shares", "Div/Share", "Income", "Cumul.Div"]
+                if show_yoc:
+                    headers.append("YoC")
+                headers.append("Value")
+
+            # Calculate column widths
+            rows: List[List[str]] = []
+            for p in projections:
+                # Use annual income from map if available, otherwise use period income
+                if annual_income_map and p.period in annual_income_map:
+                    no_drip_income: Decimal = annual_income_map[p.period][0]
+                    drip_income: Decimal = annual_income_map[p.period][1]
+                else:
+                    no_drip_income = p.no_drip_income
+                    drip_income = p.drip_income
+
+                if compare:
+                    row: List[str] = [
+                        str(int(p.year)) if p.year == int(p.year) else str(p.year),
+                        fmt_money(p.price),
+                        fmt_shares(p.no_drip_shares),
+                        fmt_shares(p.drip_shares),
+                        f"${p.div_per_share:.4f}",
+                        fmt_money(no_drip_income),
+                        fmt_money(drip_income)
+                    ]
+                    if show_yoc:
+                        row.append(fmt_pct(p.drip_yoc))
+                    row.extend([fmt_money(p.no_drip_value), fmt_money(p.drip_value)])
+                else:
+                    # DRIP view only
+                    row = [
+                        str(int(p.year)) if p.year == int(p.year) else str(p.year),
+                        fmt_money(p.price),
+                        fmt_shares(p.drip_shares),
+                        f"${p.div_per_share:.4f}",
+                        fmt_money(drip_income),
+                        fmt_money(p.drip_cumulative_div)
+                    ]
+                    if show_yoc:
+                        row.append(fmt_pct(p.drip_yoc))
+                    row.append(fmt_money(p.drip_value))
+                rows.append(row)
+
+            # Calculate column widths
+            widths: List[int] = [len(h) for h in headers]
+            for row in rows:
+                for i, cell in enumerate(row):
+                    widths[i] = max(widths[i], len(cell))
+
+            # Format header
+            header_line: str = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+            separator: str = "-|-".join("-" * w for w in widths)
+            lines.append(header_line)
+            lines.append(separator)
+
+            # Format rows
+            for row in rows:
+                line: str = " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+                lines.append(line)
+
+            lines.append("")
+
+        # Add summary
+        lines.append(self._format_summary_plain(summary, compare))
+
+        return "\n".join(lines)
+
+    def _format_summary_plain(self, summary: Summary, compare: bool) -> str:
+        """Format summary section as plain text"""
+        lines: List[str] = []
+        lines.append(f"=== {summary.years}-Year DRIP Analysis Summary ===")
+        lines.append("")
+        lines.append(
+            f"Initial Investment: {fmt_money(summary.initial_investment)} "
+            f"({fmt_shares(summary.initial_shares)} shares @ {fmt_money(summary.initial_price)})"
+        )
+
+        # Show NAV info if it differs from market price or DRIP at NAV is enabled
+        if summary.drip_at_nav or summary.initial_nav != summary.initial_price:
+            premium_discount: Decimal = ((summary.initial_price / summary.initial_nav) - d(1)) * d(100)
+            pd_label: str = "premium" if premium_discount > 0 else "discount"
+            lines.append(
+                f"Initial NAV: {fmt_money(summary.initial_nav)} "
+                f"({abs(float(premium_discount)):.1f}% {pd_label} to NAV)"
+            )
+
+        freq_label: str = {"monthly": "monthly", "quarterly": "quarterly", "annual": "annually"}.get(
+            summary.frequency, summary.frequency
+        )
+        lines.append(
+            f"Dividend Yield: {fmt_pct(summary.annual_yield)} "
+            f"(${summary.div_per_share_per_payment:.4f}/share {freq_label})"
+        )
+
+        # Build growth line with optional NAV growth
+        growth_parts: List[str] = [f"Price Growth: {fmt_pct(summary.price_growth)}/year"]
+        if summary.nav_growth != summary.price_growth:
+            growth_parts.append(f"NAV Growth: {fmt_pct(summary.nav_growth)}/year")
+        growth_parts.append(f"Dividend Growth: {fmt_pct(summary.div_growth)}/year")
+        lines.append(" | ".join(growth_parts))
+
+        # Show DRIP purchase info
+        if summary.drip_at_nav:
+            if summary.drip_discount > 0:
+                lines.append(f"DRIP: Purchases at NAV with {fmt_pct(summary.drip_discount)} discount")
+            else:
+                lines.append(f"DRIP: Purchases at NAV")
+        elif summary.drip_discount > 0:
+            lines.append(f"DRIP Discount: {fmt_pct(summary.drip_discount)}")
+
+        # Show contribution info if any contributions are configured
+        if summary.monthly_add > 0 or summary.yearly_add > 0:
+            contrib_parts: List[str] = []
+            if summary.monthly_add > 0:
+                contrib_parts.append(f"Monthly: {fmt_money(summary.monthly_add)}")
+            if summary.yearly_add > 0:
+                contrib_parts.append(f"Yearly Bonus: {fmt_money(summary.yearly_add)}")
+            lines.append(f"Contributions: {' | '.join(contrib_parts)}")
+            lines.append(f"Total Contributed: {fmt_money(summary.drip_total_contributions)}")
+        lines.append("")
+
+        if compare:
+            # Side by side comparison
+            col1_w: int = 20
+            col2_w: int = 16
+            col3_w: int = 16
+            col4_w: int = 22
+
+            lines.append(
+                f"{'':>{col1_w}}{'No DRIP':>{col2_w}}{'DRIP':>{col3_w}}{'Difference':>{col4_w}}"
+            )
+
+            # Final Shares
+            share_diff: Decimal = summary.drip_final_shares - summary.no_drip_final_shares
+            share_diff_pct: Decimal = (share_diff / summary.no_drip_final_shares * d(100)) if summary.no_drip_final_shares > 0 else d(0)
+            lines.append(
+                f"{'Final Shares:':<{col1_w}}"
+                f"{fmt_shares(summary.no_drip_final_shares):>{col2_w}}"
+                f"{fmt_shares(summary.drip_final_shares):>{col3_w}}"
+                f"{'+' + fmt_shares(share_diff) + ' (+' + fmt_pct(share_diff_pct) + ')':>{col4_w}}"
+            )
+
+            # Final Value
+            value_diff: Decimal = summary.drip_final_value - summary.no_drip_final_value
+            value_diff_pct: Decimal = (value_diff / summary.no_drip_final_value * d(100)) if summary.no_drip_final_value > 0 else d(0)
+            lines.append(
+                f"{'Final Value:':<{col1_w}}"
+                f"{fmt_money(summary.no_drip_final_value):>{col2_w}}"
+                f"{fmt_money(summary.drip_final_value):>{col3_w}}"
+                f"{'+' + fmt_money(value_diff) + ' (+' + fmt_pct(value_diff_pct) + ')':>{col4_w}}"
+            )
+
+            # Total Dividends
+            div_diff: Decimal = summary.drip_total_dividends - summary.no_drip_total_dividends
+            div_diff_pct: Decimal = (div_diff / summary.no_drip_total_dividends * d(100)) if summary.no_drip_total_dividends > 0 else d(0)
+            lines.append(
+                f"{'Total Dividends:':<{col1_w}}"
+                f"{fmt_money(summary.no_drip_total_dividends):>{col2_w}}"
+                f"{fmt_money(summary.drip_total_dividends):>{col3_w}}"
+                f"{'+' + fmt_money(div_diff) + ' (+' + fmt_pct(div_diff_pct) + ')':>{col4_w}}"
+            )
+
+            # Total Return
+            ret_diff: Decimal = summary.drip_total_return - summary.no_drip_total_return
+            ret_diff_pct: Decimal = (ret_diff / summary.no_drip_total_return * d(100)) if summary.no_drip_total_return > 0 else d(0)
+            lines.append(
+                f"{'Total Return:':<{col1_w}}"
+                f"{fmt_money(summary.no_drip_total_return):>{col2_w}}"
+                f"{fmt_money(summary.drip_total_return):>{col3_w}}"
+                f"{'+' + fmt_money(ret_diff) + ' (+' + fmt_pct(ret_diff_pct) + ')':>{col4_w}}"
+            )
+
+            # CAGR
+            cagr_diff: Decimal = summary.drip_cagr - summary.no_drip_cagr
+            lines.append(
+                f"{'CAGR:':<{col1_w}}"
+                f"{fmt_pct(summary.no_drip_cagr):>{col2_w}}"
+                f"{fmt_pct(summary.drip_cagr):>{col3_w}}"
+                f"{'+' + fmt_pct(cagr_diff):>{col4_w}}"
+            )
+
+            # Final YoC
+            yoc_diff: Decimal = summary.drip_final_yoc - summary.no_drip_final_yoc
+            lines.append(
+                f"{'Final YoC:':<{col1_w}}"
+                f"{fmt_pct(summary.no_drip_final_yoc):>{col2_w}}"
+                f"{fmt_pct(summary.drip_final_yoc):>{col3_w}}"
+                f"{'+' + fmt_pct(yoc_diff):>{col4_w}}"
+            )
+        else:
+            # DRIP only summary
+            lines.append(f"Final Shares: {fmt_shares(summary.drip_final_shares)}")
+            lines.append(f"Final Value: {fmt_money(summary.drip_final_value)}")
+            lines.append(f"Total Dividends Reinvested: {fmt_money(summary.drip_total_dividends)}")
+            lines.append(f"Total Return: {fmt_money(summary.drip_total_return)}")
+            lines.append(f"CAGR: {fmt_pct(summary.drip_cagr)}")
+            lines.append(f"Final Yield on Cost: {fmt_pct(summary.drip_final_yoc)}")
+
+        return "\n".join(lines)
+
+    def _format_markdown(
+        self,
+        projections: List[ProjectionPeriod],
+        summary: Summary,
+        summary_only: bool,
+        show_yoc: bool,
+        compare: bool,
+        annual_income_map: Optional[Dict[int, tuple]] = None
+    ) -> str:
+        """Format output as markdown table"""
+        lines: List[str] = []
+
+        if not summary_only:
+            # Build header
+            if compare:
+                headers: List[str] = ["Year", "Price", "Shares(NoDRIP)", "Shares(DRIP)",
+                                      "Div/Share", "Income(NoDRIP)", "Income(DRIP)"]
+                if show_yoc:
+                    headers.append("YoC")
+                headers.extend(["Value(NoDRIP)", "Value(DRIP)"])
+            else:
+                headers = ["Year", "Price", "Shares", "Div/Share", "Income", "Cumul.Div"]
+                if show_yoc:
+                    headers.append("YoC")
+                headers.append("Value")
+
+            # Header row
+            lines.append("| " + " | ".join(headers) + " |")
+            # Alignment row (right-align numbers)
+            lines.append("| " + " | ".join(["---:" for _ in headers]) + " |")
+
+            # Data rows
+            for p in projections:
+                # Use annual income from map if available, otherwise use period income
+                if annual_income_map and p.period in annual_income_map:
+                    no_drip_income: Decimal = annual_income_map[p.period][0]
+                    drip_income: Decimal = annual_income_map[p.period][1]
+                else:
+                    no_drip_income = p.no_drip_income
+                    drip_income = p.drip_income
+
+                if compare:
+                    row: List[str] = [
+                        str(int(p.year)) if p.year == int(p.year) else str(p.year),
+                        fmt_money(p.price),
+                        fmt_shares(p.no_drip_shares),
+                        fmt_shares(p.drip_shares),
+                        f"${p.div_per_share:.4f}",
+                        fmt_money(no_drip_income),
+                        fmt_money(drip_income)
+                    ]
+                    if show_yoc:
+                        row.append(fmt_pct(p.drip_yoc))
+                    row.extend([fmt_money(p.no_drip_value), fmt_money(p.drip_value)])
+                else:
+                    row = [
+                        str(int(p.year)) if p.year == int(p.year) else str(p.year),
+                        fmt_money(p.price),
+                        fmt_shares(p.drip_shares),
+                        f"${p.div_per_share:.4f}",
+                        fmt_money(drip_income),
+                        fmt_money(p.drip_cumulative_div)
+                    ]
+                    if show_yoc:
+                        row.append(fmt_pct(p.drip_yoc))
+                    row.append(fmt_money(p.drip_value))
+
+                lines.append("| " + " | ".join(row) + " |")
+
+            lines.append("")
+
+        # Summary in markdown
+        lines.append(f"## {summary.years}-Year DRIP Analysis Summary")
+        lines.append("")
+        lines.append(
+            f"**Initial Investment:** {fmt_money(summary.initial_investment)} "
+            f"({fmt_shares(summary.initial_shares)} shares @ {fmt_money(summary.initial_price)})"
+        )
+
+        # Show NAV info if relevant
+        if summary.drip_at_nav or summary.initial_nav != summary.initial_price:
+            premium_discount: Decimal = ((summary.initial_price / summary.initial_nav) - d(1)) * d(100)
+            pd_label: str = "premium" if premium_discount > 0 else "discount"
+            lines.append(
+                f"**Initial NAV:** {fmt_money(summary.initial_nav)} "
+                f"({abs(float(premium_discount)):.1f}% {pd_label})"
+            )
+
+        lines.append(f"**Dividend Yield:** {fmt_pct(summary.annual_yield)}")
+        lines.append(f"**Price Growth:** {fmt_pct(summary.price_growth)}/year")
+        if summary.nav_growth != summary.price_growth:
+            lines.append(f"**NAV Growth:** {fmt_pct(summary.nav_growth)}/year")
+        lines.append(f"**Dividend Growth:** {fmt_pct(summary.div_growth)}/year")
+
+        if summary.drip_at_nav:
+            if summary.drip_discount > 0:
+                lines.append(f"**DRIP:** Purchases at NAV with {fmt_pct(summary.drip_discount)} discount")
+            else:
+                lines.append(f"**DRIP:** Purchases at NAV")
+        elif summary.drip_discount > 0:
+            lines.append(f"**DRIP Discount:** {fmt_pct(summary.drip_discount)}")
+
+        # Show contribution info if any contributions are configured
+        if summary.monthly_add > 0 or summary.yearly_add > 0:
+            contrib_parts: List[str] = []
+            if summary.monthly_add > 0:
+                contrib_parts.append(f"Monthly: {fmt_money(summary.monthly_add)}")
+            if summary.yearly_add > 0:
+                contrib_parts.append(f"Yearly Bonus: {fmt_money(summary.yearly_add)}")
+            lines.append(f"**Contributions:** {' | '.join(contrib_parts)}")
+            lines.append(f"**Total Contributed:** {fmt_money(summary.drip_total_contributions)}")
+        lines.append("")
+
+        if compare:
+            lines.append("| Metric | No DRIP | DRIP | Difference |")
+            lines.append("| :--- | ---: | ---: | ---: |")
+
+            share_diff: Decimal = summary.drip_final_shares - summary.no_drip_final_shares
+            lines.append(f"| Final Shares | {fmt_shares(summary.no_drip_final_shares)} | {fmt_shares(summary.drip_final_shares)} | +{fmt_shares(share_diff)} |")
+
+            value_diff: Decimal = summary.drip_final_value - summary.no_drip_final_value
+            lines.append(f"| Final Value | {fmt_money(summary.no_drip_final_value)} | {fmt_money(summary.drip_final_value)} | +{fmt_money(value_diff)} |")
+
+            div_diff: Decimal = summary.drip_total_dividends - summary.no_drip_total_dividends
+            lines.append(f"| Total Dividends | {fmt_money(summary.no_drip_total_dividends)} | {fmt_money(summary.drip_total_dividends)} | +{fmt_money(div_diff)} |")
+
+            cagr_diff: Decimal = summary.drip_cagr - summary.no_drip_cagr
+            lines.append(f"| CAGR | {fmt_pct(summary.no_drip_cagr)} | {fmt_pct(summary.drip_cagr)} | +{fmt_pct(cagr_diff)} |")
+        else:
+            lines.append(f"| Metric | Value |")
+            lines.append(f"| :--- | ---: |")
+            lines.append(f"| Final Shares | {fmt_shares(summary.drip_final_shares)} |")
+            lines.append(f"| Final Value | {fmt_money(summary.drip_final_value)} |")
+            lines.append(f"| Total Dividends | {fmt_money(summary.drip_total_dividends)} |")
+            lines.append(f"| CAGR | {fmt_pct(summary.drip_cagr)} |")
+            lines.append(f"| Final YoC | {fmt_pct(summary.drip_final_yoc)} |")
+
+        return "\n".join(lines)
+
+    def _format_yaml(
+        self,
+        projections: List[ProjectionPeriod],
+        summary: Summary,
+        summary_only: bool
+    ) -> str:
+        """Format output as YAML"""
+        data: Dict[str, Any] = {
+            "parameters": {
+                "initial_investment": float(summary.initial_investment),
+                "initial_shares": float(summary.initial_shares),
+                "initial_price": float(summary.initial_price),
+                "initial_nav": float(summary.initial_nav),
+                "annual_yield_pct": float(summary.annual_yield),
+                "div_per_share_per_payment": float(summary.div_per_share_per_payment),
+                "price_growth_pct": float(summary.price_growth),
+                "nav_growth_pct": float(summary.nav_growth),
+                "div_growth_pct": float(summary.div_growth),
+                "drip_discount_pct": float(summary.drip_discount),
+                "drip_at_nav": summary.drip_at_nav,
+                "years": summary.years,
+                "frequency": summary.frequency,
+                "monthly_add": float(summary.monthly_add),
+                "yearly_add": float(summary.yearly_add)
+            },
+            "summary": {
+                "no_drip": {
+                    "final_shares": float(summary.no_drip_final_shares),
+                    "final_value": float(summary.no_drip_final_value),
+                    "total_dividends": float(summary.no_drip_total_dividends),
+                    "total_return": float(summary.no_drip_total_return),
+                    "cagr_pct": float(summary.no_drip_cagr),
+                    "final_yoc_pct": float(summary.no_drip_final_yoc),
+                    "total_contributions": float(summary.no_drip_total_contributions)
+                },
+                "drip": {
+                    "final_shares": float(summary.drip_final_shares),
+                    "final_value": float(summary.drip_final_value),
+                    "final_nav": float(summary.drip_final_nav),
+                    "total_dividends": float(summary.drip_total_dividends),
+                    "total_return": float(summary.drip_total_return),
+                    "cagr_pct": float(summary.drip_cagr),
+                    "final_yoc_pct": float(summary.drip_final_yoc),
+                    "total_contributions": float(summary.drip_total_contributions)
+                },
+                "drip_advantage": float(summary.drip_final_value - summary.no_drip_final_value),
+                "drip_advantage_pct": float(
+                    (summary.drip_final_value - summary.no_drip_final_value) / summary.no_drip_final_value * d(100)
+                ) if summary.no_drip_final_value > 0 else 0.0
+            }
+        }
+
+        if not summary_only:
+            data["projections"] = []
+            for p in projections:
+                proj_data: Dict[str, Any] = {
+                    "period": p.period,
+                    "year": float(p.year),
+                    "price": float(p.price),
+                    "nav": float(p.nav),
+                    "div_per_share": float(p.div_per_share),
+                    "contribution": float(p.contribution),
+                    "cumulative_contributions": float(p.cumulative_contributions),
+                    "no_drip": {
+                        "shares": float(p.no_drip_shares),
+                        "dividend_income": float(p.no_drip_income),
+                        "cumulative_dividends": float(p.no_drip_cumulative_div),
+                        "portfolio_value": float(p.no_drip_value),
+                        "yoc_pct": float(p.no_drip_yoc)
+                    },
+                    "drip": {
+                        "shares": float(p.drip_shares),
+                        "dividend_income": float(p.drip_income),
+                        "cumulative_dividends": float(p.drip_cumulative_div),
+                        "portfolio_value": float(p.drip_value),
+                        "yoc_pct": float(p.drip_yoc),
+                        "purchase_price": float(p.drip_purchase_price)
+                    }
+                }
+                data["projections"].append(proj_data)
+
+        # Convert to YAML format manually (avoiding external dependency)
+        return self._dict_to_yaml(data)
+
+    def _dict_to_yaml(self, data: Any, indent: int = 0) -> str:
+        """Convert dictionary to YAML string without external dependencies"""
+        lines: List[str] = []
+        prefix: str = "  " * indent
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, (dict, list)):
+                    lines.append(f"{prefix}{key}:")
+                    lines.append(self._dict_to_yaml(value, indent + 1))
+                else:
+                    lines.append(f"{prefix}{key}: {self._yaml_value(value)}")
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    first: bool = True
+                    for key, value in item.items():
+                        if first:
+                            if isinstance(value, (dict, list)):
+                                lines.append(f"{prefix}- {key}:")
+                                lines.append(self._dict_to_yaml(value, indent + 2))
+                            else:
+                                lines.append(f"{prefix}- {key}: {self._yaml_value(value)}")
+                            first = False
+                        else:
+                            if isinstance(value, (dict, list)):
+                                lines.append(f"{prefix}  {key}:")
+                                lines.append(self._dict_to_yaml(value, indent + 2))
+                            else:
+                                lines.append(f"{prefix}  {key}: {self._yaml_value(value)}")
+                else:
+                    lines.append(f"{prefix}- {self._yaml_value(item)}")
+        else:
+            return f"{prefix}{self._yaml_value(data)}"
+
+        return "\n".join(lines)
+
+    def _yaml_value(self, value: Any) -> str:
+        """Format a value for YAML output"""
+        if value is None:
+            return "null"
+        elif isinstance(value, bool):
+            return "true" if value else "false"
+        elif isinstance(value, str):
+            if any(c in value for c in ":#{}[]&*!|>'\"%@`"):
+                return f'"{value}"'
+            return value
+        elif isinstance(value, (int, float, Decimal)):
+            return str(value)
+        else:
+            return str(value)
+
+    def _format_json(
+        self,
+        projections: List[ProjectionPeriod],
+        summary: Summary,
+        summary_only: bool
+    ) -> str:
+        """Format output as JSON"""
+        data: Dict[str, Any] = {
+            "parameters": {
+                "initial_investment": float(summary.initial_investment),
+                "initial_shares": float(summary.initial_shares),
+                "initial_price": float(summary.initial_price),
+                "initial_nav": float(summary.initial_nav),
+                "annual_yield_pct": float(summary.annual_yield),
+                "div_per_share_per_payment": float(summary.div_per_share_per_payment),
+                "price_growth_pct": float(summary.price_growth),
+                "nav_growth_pct": float(summary.nav_growth),
+                "div_growth_pct": float(summary.div_growth),
+                "drip_discount_pct": float(summary.drip_discount),
+                "drip_at_nav": summary.drip_at_nav,
+                "years": summary.years,
+                "frequency": summary.frequency,
+                "monthly_add": float(summary.monthly_add),
+                "yearly_add": float(summary.yearly_add)
+            },
+            "summary": {
+                "no_drip": {
+                    "final_shares": float(summary.no_drip_final_shares),
+                    "final_value": float(summary.no_drip_final_value),
+                    "total_dividends": float(summary.no_drip_total_dividends),
+                    "total_return": float(summary.no_drip_total_return),
+                    "cagr_pct": float(summary.no_drip_cagr),
+                    "final_yoc_pct": float(summary.no_drip_final_yoc),
+                    "total_contributions": float(summary.no_drip_total_contributions)
+                },
+                "drip": {
+                    "final_shares": float(summary.drip_final_shares),
+                    "final_value": float(summary.drip_final_value),
+                    "final_nav": float(summary.drip_final_nav),
+                    "total_dividends": float(summary.drip_total_dividends),
+                    "total_return": float(summary.drip_total_return),
+                    "cagr_pct": float(summary.drip_cagr),
+                    "final_yoc_pct": float(summary.drip_final_yoc),
+                    "total_contributions": float(summary.drip_total_contributions)
+                },
+                "drip_advantage": float(summary.drip_final_value - summary.no_drip_final_value),
+                "drip_advantage_pct": float(
+                    (summary.drip_final_value - summary.no_drip_final_value) / summary.no_drip_final_value * d(100)
+                ) if summary.no_drip_final_value > 0 else 0.0
+            }
+        }
+
+        if not summary_only:
+            data["projections"] = []
+            for p in projections:
+                proj_data: Dict[str, Any] = {
+                    "period": p.period,
+                    "year": float(p.year),
+                    "price": float(p.price),
+                    "nav": float(p.nav),
+                    "div_per_share": float(p.div_per_share),
+                    "contribution": float(p.contribution),
+                    "cumulative_contributions": float(p.cumulative_contributions),
+                    "no_drip": {
+                        "shares": float(p.no_drip_shares),
+                        "dividend_income": float(p.no_drip_income),
+                        "cumulative_dividends": float(p.no_drip_cumulative_div),
+                        "portfolio_value": float(p.no_drip_value),
+                        "yoc_pct": float(p.no_drip_yoc)
+                    },
+                    "drip": {
+                        "shares": float(p.drip_shares),
+                        "dividend_income": float(p.drip_income),
+                        "cumulative_dividends": float(p.drip_cumulative_div),
+                        "portfolio_value": float(p.drip_value),
+                        "yoc_pct": float(p.drip_yoc),
+                        "purchase_price": float(p.drip_purchase_price)
+                    }
+                }
+                data["projections"].append(proj_data)
+
+        return json.dumps(data, indent=2)
+
+
+def format_scenarios_output(
+    scenarios: List[Dict[str, Any]],
+    scenario_type: str,
+    base_params: Dict[str, Any],
+    fmt: str
+) -> str:
+    """Format multi-scenario comparison output"""
+    if fmt == "json":
+        return json.dumps({"scenarios": scenarios}, indent=2)
+
+    lines: List[str] = []
+    years: int = base_params["years"]
+
+    if fmt == "markdown":
+        lines.append(f"## {years}-Year DRIP Comparison: {scenario_type.replace('-', ' ').title()} Scenarios")
+        lines.append("")
+        lines.append(
+            f"**Initial:** {fmt_money(d(base_params['initial_investment']))} "
+            f"({fmt_shares(d(base_params['initial_shares']))} shares @ {fmt_money(d(base_params['initial_price']))}) | "
+            f"Yield: {fmt_pct(d(base_params['annual_yield']))}"
+        )
+        lines.append("")
+        lines.append("| Scenario | Final Shares | Final Value | Total Divs | CAGR | Final YoC |")
+        lines.append("| :--- | ---: | ---: | ---: | ---: | ---: |")
+        for s in scenarios:
+            lines.append(
+                f"| {s['label']} | {fmt_shares(d(s['final_shares']))} | "
+                f"{fmt_money(d(s['final_value']))} | {fmt_money(d(s['total_dividends']))} | "
+                f"{fmt_pct(d(s['cagr']))} | {fmt_pct(d(s['final_yoc']))} |"
+            )
+    else:
+        # Plain text
+        lines.append(f"=== {years}-Year DRIP Comparison: {scenario_type.replace('-', ' ').title()} Scenarios ===")
+        lines.append("")
+        lines.append(
+            f"Initial: {fmt_money(d(base_params['initial_investment']))} "
+            f"({fmt_shares(d(base_params['initial_shares']))} shares @ {fmt_money(d(base_params['initial_price']))}) | "
+            f"Yield: {fmt_pct(d(base_params['annual_yield']))}"
+        )
+        lines.append("")
+
+        # Build table
+        headers: List[str] = ["Scenario", "Final Shares", "Final Value", "Total Divs", "CAGR", "Final YoC"]
+        rows: List[List[str]] = []
+        for s in scenarios:
+            rows.append([
+                s['label'],
+                fmt_shares(d(s['final_shares'])),
+                fmt_money(d(s['final_value'])),
+                fmt_money(d(s['total_dividends'])),
+                fmt_pct(d(s['cagr'])),
+                fmt_pct(d(s['final_yoc']))
+            ])
+
+        widths: List[int] = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        header_line: str = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+        separator: str = "-|-".join("-" * w for w in widths)
+        lines.append(header_line)
+        lines.append(separator)
+        for row in rows:
+            lines.append(" | ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+
+    return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments with detailed help"""
+    parser = argparse.ArgumentParser(
+        prog="drip",
+        description="Dividend Reinvestment Calculator - Compare DRIP vs non-DRIP investment outcomes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic 10-year projection with $10,000 at 4% yield
+  drip --principal 10000 --price 100 --yield 4 --years 10
+
+  # Monthly dividends with 5% price growth and 3% dividend growth
+  drip --shares 100 --price 50 --dividend 0.20 --frequency monthly \\
+       --price-growth 5 --div-growth 3 --years 5
+
+  # CEF with 5% NAV discount on DRIP purchases (8% yield)
+  drip --principal 5000 --price 25 --yield 8 --drip-discount 5 --years 10
+
+  # Compare multiple dividend growth scenarios
+  drip --principal 10000 --price 100 --yield 4 --years 10 --scenarios "3,5,7"
+
+  # Compare price growth scenarios
+  drip --principal 10000 --price 100 --yield 4 --scenarios "0,3,5,7" \\
+       --scenario-type price-growth
+
+  # Output in different formats
+  drip --principal 10000 --price 100 --yield 4 --years 5 --format markdown
+  drip --principal 10000 --price 100 --yield 4 --years 5 --format yaml
+  drip --principal 10000 --price 100 --yield 4 --years 5 --format json
+
+  # Summary only (no detailed table)
+  drip --principal 10000 --price 100 --yield 4 --years 20 --summary-only
+
+  # Side-by-side DRIP vs no-DRIP comparison
+  drip --principal 10000 --price 100 --yield 4 --years 10 --compare
+
+  # CEF trading at premium, DRIP purchases at NAV
+  drip --principal 5000 --price 28 --nav 25 --yield 8 --drip-at-nav --years 10
+
+  # CEF with NAV growing at different rate than market price
+  drip --principal 5000 --price 28 --nav 25 --yield 8 --drip-at-nav \\
+       --price-growth 3 --nav-growth 5 --years 10
+
+  # Monthly contributions of $750
+  drip --principal 10000 --price 100 --yield 4 --years 10 --monthly-add 750
+
+  # Monthly contributions plus yearly bonus
+  drip --principal 10000 --price 100 --yield 4 --years 10 \\
+       --monthly-add 500 --yearly-add 5000
+"""
+    )
+
+    # Required inputs (mutually exclusive groups)
+    input_group = parser.add_argument_group("Input Parameters")
+    principal_group = input_group.add_mutually_exclusive_group(required=True)
+    principal_group.add_argument(
+        "--principal", type=float, metavar="AMOUNT",
+        help="Initial investment amount ($)"
+    )
+    principal_group.add_argument(
+        "--shares", type=float, metavar="COUNT",
+        help="Initial number of shares (alternative to --principal)"
+    )
+
+    input_group.add_argument(
+        "--price", type=float, required=True, metavar="PRICE",
+        help="Current share price ($)"
+    )
+
+    div_group = input_group.add_mutually_exclusive_group(required=True)
+    div_group.add_argument(
+        "--yield", dest="dividend_yield", type=float, metavar="PCT",
+        help="Annual dividend yield (%%)"
+    )
+    div_group.add_argument(
+        "--dividend", type=float, metavar="AMOUNT",
+        help="Dividend per share per payment ($)"
+    )
+
+    # Growth parameters
+    growth_group = parser.add_argument_group("Growth Parameters")
+    growth_group.add_argument(
+        "--price-growth", type=float, default=0.0, metavar="PCT",
+        help="Annual share price growth rate (%%) (default: 0)"
+    )
+    growth_group.add_argument(
+        "--div-growth", type=float, default=0.0, metavar="PCT",
+        help="Annual dividend growth rate (%%) (default: 0)"
+    )
+    growth_group.add_argument(
+        "--drip-discount", type=float, default=0.0, metavar="PCT",
+        help="DRIP discount (%%) - shares purchased at discount (default: 0)"
+    )
+
+    # NAV parameters for CEFs
+    nav_group = parser.add_argument_group("NAV Parameters (for CEFs)")
+    nav_group.add_argument(
+        "--nav", type=float, metavar="PRICE",
+        help="Net Asset Value per share (defaults to market price if not specified)"
+    )
+    nav_group.add_argument(
+        "--nav-growth", type=float, metavar="PCT",
+        help="Annual NAV growth rate (%%) (defaults to --price-growth if not specified)"
+    )
+    nav_group.add_argument(
+        "--drip-at-nav", action="store_true",
+        help="DRIP purchases made at NAV instead of market price"
+    )
+
+    # Contribution parameters
+    contrib_group = parser.add_argument_group("Contribution Parameters")
+    contrib_group.add_argument(
+        "--monthly-add", type=float, default=0.0, metavar="AMOUNT",
+        help="Monthly contribution amount ($) to add new shares (default: 0)"
+    )
+    contrib_group.add_argument(
+        "--yearly-add", type=float, default=0.0, metavar="AMOUNT",
+        help="Yearly bonus contribution ($) added at year-end (default: 0)"
+    )
+
+    # Time and output parameters
+    output_group = parser.add_argument_group("Time & Output Parameters")
+    output_group.add_argument(
+        "--years", type=int, default=10, metavar="N",
+        help="Projection period in years (default: 10)"
+    )
+    output_group.add_argument(
+        "--frequency", choices=["monthly", "quarterly", "annual"],
+        default="quarterly",
+        help="Dividend frequency (default: quarterly)"
+    )
+    output_group.add_argument(
+        "--granularity", choices=["monthly", "yearly"], default="yearly",
+        help="Output detail level (default: yearly)"
+    )
+    output_group.add_argument(
+        "--format", choices=["plain", "markdown", "yaml", "json"],
+        default="plain",
+        help="Output format (default: plain)"
+    )
+
+    # Multi-scenario comparison
+    scenario_group = parser.add_argument_group("Multi-Scenario Comparison")
+    scenario_group.add_argument(
+        "--scenarios", type=str, metavar="VALUES",
+        help="Compare multiple scenarios (comma-separated, e.g., '3,5,7')"
+    )
+    scenario_group.add_argument(
+        "--scenario-type", choices=["price-growth", "div-growth", "yield"],
+        default="div-growth",
+        help="Parameter to vary for scenarios (default: div-growth)"
+    )
+
+    # Additional options
+    options_group = parser.add_argument_group("Additional Options")
+    options_group.add_argument(
+        "--summary-only", action="store_true",
+        help="Only show final summary, not full table"
+    )
+    options_group.add_argument(
+        "--compare", action="store_true",
+        help="Show side-by-side DRIP vs no-DRIP comparison"
+    )
+    options_group.add_argument(
+        "--no-yoc", action="store_true",
+        help="Disable yield-on-cost column in output"
+    )
+    options_group.add_argument(
+        "--license", action="store_true",
+        help="Show AGPLv3 license information"
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Main entry point for drip calculator"""
+    args: argparse.Namespace = parse_args()
+
+    if args.license:
+        print(AGPLV3_LICENSE)
+        sys.exit(0)
+
+    # Calculate initial shares from principal or use directly
+    if args.principal is not None:
+        initial_shares: Decimal = d(args.principal) / d(args.price)
+        initial_investment: Decimal = d(args.principal)
+    else:
+        initial_shares = d(args.shares)
+        initial_investment = initial_shares * d(args.price)
+
+    # Calculate dividend per share per payment from yield or use directly
+    periods_per_year: int = {"monthly": 12, "quarterly": 4, "annual": 1}[args.frequency]
+
+    if args.dividend_yield is not None:
+        annual_div: Decimal = d(args.price) * (d(args.dividend_yield) / d(100))
+        div_per_share_per_payment: Decimal = annual_div / d(periods_per_year)
+        annual_yield: Decimal = d(args.dividend_yield)
+    else:
+        div_per_share_per_payment = d(args.dividend)
+        annual_div = div_per_share_per_payment * d(periods_per_year)
+        annual_yield = (annual_div / d(args.price)) * d(100)
+
+    # Handle multi-scenario comparison
+    if args.scenarios:
+        scenario_values: List[float] = [float(x.strip()) for x in args.scenarios.split(",")]
+        scenarios: List[Dict[str, Any]] = []
+
+        base_params: Dict[str, Any] = {
+            "initial_investment": float(initial_investment),
+            "initial_shares": float(initial_shares),
+            "initial_price": args.price,
+            "annual_yield": float(annual_yield),
+            "years": args.years
+        }
+
+        for val in scenario_values:
+            # Override the appropriate parameter
+            calc_price_growth: Decimal = d(args.price_growth)
+            calc_div_growth: Decimal = d(args.div_growth)
+            calc_div_per_share: Decimal = div_per_share_per_payment
+
+            if args.scenario_type == "price-growth":
+                calc_price_growth = d(val)
+                label: str = f"{val}% Price Grow"
+            elif args.scenario_type == "div-growth":
+                calc_div_growth = d(val)
+                label = f"{val}% Div Grow"
+            else:  # yield
+                new_annual_div: Decimal = d(args.price) * (d(val) / d(100))
+                calc_div_per_share = new_annual_div / d(periods_per_year)
+                label = f"{val}% Yield"
+
+            calculator: DRIPCalculator = DRIPCalculator(
+                initial_shares=initial_shares,
+                initial_price=d(args.price),
+                div_per_share_per_payment=calc_div_per_share,
+                years=args.years,
+                frequency=args.frequency,
+                price_growth=calc_price_growth,
+                div_growth=calc_div_growth,
+                drip_discount=d(args.drip_discount),
+                initial_nav=d(args.nav) if args.nav is not None else None,
+                nav_growth=d(args.nav_growth) if args.nav_growth is not None else None,
+                drip_at_nav=args.drip_at_nav,
+                monthly_add=d(args.monthly_add),
+                yearly_add=d(args.yearly_add)
+            )
+
+            calculator.calculate_projections()
+            summary: Summary = calculator.get_summary()
+
+            scenarios.append({
+                "label": label,
+                "value": val,
+                "final_shares": float(summary.drip_final_shares),
+                "final_value": float(summary.drip_final_value),
+                "total_dividends": float(summary.drip_total_dividends),
+                "cagr": float(summary.drip_cagr),
+                "final_yoc": float(summary.drip_final_yoc)
+            })
+
+        output: str = format_scenarios_output(scenarios, args.scenario_type, base_params, args.format)
+        print(output)
+        sys.exit(0)
+
+    # Single scenario calculation
+    calculator = DRIPCalculator(
+        initial_shares=initial_shares,
+        initial_price=d(args.price),
+        div_per_share_per_payment=div_per_share_per_payment,
+        years=args.years,
+        frequency=args.frequency,
+        price_growth=d(args.price_growth),
+        div_growth=d(args.div_growth),
+        drip_discount=d(args.drip_discount),
+        initial_nav=d(args.nav) if args.nav is not None else None,
+        nav_growth=d(args.nav_growth) if args.nav_growth is not None else None,
+        drip_at_nav=args.drip_at_nav,
+        monthly_add=d(args.monthly_add),
+        yearly_add=d(args.yearly_add)
+    )
+
+    projections: List[ProjectionPeriod] = calculator.calculate_projections()
+    summary = calculator.get_summary()
+
+    formatter: OutputFormatter = OutputFormatter()
+    output = formatter.format(
+        fmt=args.format,
+        projections=projections,
+        summary=summary,
+        granularity=args.granularity,
+        summary_only=args.summary_only,
+        show_yoc=not args.no_yoc,
+        compare=args.compare,
+        periods_per_year=periods_per_year
+    )
+    print(output)
+
+
+if __name__ == "__main__":
+    main()
