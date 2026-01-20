@@ -1,0 +1,1083 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# ==============================================================================
+# dbox_from_devcontainer - Convert VS Code devcontainer.json to distrobox
+# ==============================================================================
+#
+# Converts VS Code devcontainer.json configurations to distrobox containers,
+# mapping devcontainer properties to their distrobox equivalents.
+#
+# Usage:
+#   dbox_from_devcontainer [OPTIONS] [PATH]
+#
+# Arguments:
+#   PATH    Directory containing .devcontainer/ or devcontainer.json (default: .)
+#
+# Options:
+#   --name NAME      Override container name
+#   -d, --dry-run    Print commands without executing
+#   --skip-build     Skip Dockerfile builds, require pre-built image
+#   --skip-features  Skip devcontainer features without warning
+#   --skip-lifecycle Skip lifecycle commands (postCreateCommand, etc.)
+#   -e, --enter      Enter container after creation
+#   -f, --force      Remove existing container with same name
+#   -v, --verbose    Enable verbose output
+#   --debug          Enable debug logging
+#   -h, --help       Show help message
+#   --license        Show AGPLv3 license
+#
+# Examples:
+#   dbox_from_devcontainer                    # Use current directory
+#   dbox_from_devcontainer /path/to/project   # Specify project path
+#   dbox_from_devcontainer --dry-run          # Preview commands
+#   dbox_from_devcontainer --name mybox -e    # Custom name, enter after create
+#
+# ==============================================================================
+
+# Configuration
+DEBUG_MODE=false
+VERBOSE_MODE=false
+DRY_RUN=false
+SKIP_BUILD=false
+SKIP_FEATURES=false
+SKIP_LIFECYCLE=false
+ENTER_AFTER_CREATE=false
+FORCE_REMOVE=false
+CUSTOM_NAME=""
+TARGET_PATH="."
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_GENERAL_ERROR=1
+readonly EXIT_USAGE_ERROR=2
+readonly EXIT_FILE_NOT_FOUND=3
+readonly EXIT_PARSE_ERROR=4
+readonly EXIT_BUILD_ERROR=5
+readonly EXIT_DISTROBOX_ERROR=6
+readonly EXIT_DEPENDENCY_ERROR=7
+readonly EXIT_LIFECYCLE_ERROR=8
+
+# Colors for output (if terminal supports it)
+if [[ -t 1 ]]; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[0;33m'
+    readonly BLUE='\033[0;34m'
+    readonly CYAN='\033[0;36m'
+    readonly NC='\033[0m' # No Color
+else
+    readonly RED=''
+    readonly GREEN=''
+    readonly YELLOW=''
+    readonly BLUE=''
+    readonly CYAN=''
+    readonly NC=''
+fi
+
+# ==============================================================================
+# Utility Functions
+# ==============================================================================
+
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $*"
+}
+
+log_debug() {
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        echo -e "${CYAN}[DEBUG]${NC} $*" >&2
+    fi
+}
+
+log_verbose() {
+    if [[ "$VERBOSE_MODE" == "true" ]] || [[ "$DEBUG_MODE" == "true" ]]; then
+        echo -e "${CYAN}[VERBOSE]${NC} $*" >&2
+    fi
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $*"
+}
+
+show_help() {
+    cat << 'EOF'
+dbox_from_devcontainer - Convert VS Code devcontainer.json to distrobox
+
+USAGE:
+    dbox_from_devcontainer [OPTIONS] [PATH]
+
+ARGUMENTS:
+    PATH    Directory containing .devcontainer/ or devcontainer.json
+            (default: current directory)
+
+OPTIONS:
+    --name NAME      Override container name (otherwise derived from devcontainer)
+    -d, --dry-run    Print commands without executing them
+    --skip-build     Skip Dockerfile builds, require a pre-built image
+    --skip-features  Skip devcontainer features without warning
+    --skip-lifecycle Skip lifecycle commands (postCreateCommand, etc.)
+    -e, --enter      Enter the container after creation
+    -f, --force      Remove existing container with same name before creating
+    -v, --verbose    Enable verbose output
+    --debug          Enable debug logging (more verbose than -v)
+    -h, --help       Show this help message
+    --license        Show AGPLv3 license information
+
+EXAMPLES:
+    # Convert devcontainer in current directory
+    dbox_from_devcontainer
+
+    # Convert devcontainer in specific project
+    dbox_from_devcontainer /path/to/project
+
+    # Preview commands without executing
+    dbox_from_devcontainer --dry-run
+
+    # Custom container name, enter after creation
+    dbox_from_devcontainer --name mydev -e
+
+    # Force recreate existing container
+    dbox_from_devcontainer --force
+
+SUPPORTED DEVCONTAINER PROPERTIES:
+    Direct mappings:
+        name                    -> --name (sanitized)
+        image                   -> --image
+        init: true              -> --init
+        hostRequirements.gpu    -> --nvidia
+
+    Translated mappings:
+        containerEnv            -> --additional-flags "--env KEY=VAL"
+        mounts                  -> --volume "source:target:mode"
+        privileged              -> --additional-flags "--privileged"
+        capAdd                  -> --additional-flags "--cap-add=..."
+        securityOpt             -> --additional-flags "--security-opt=..."
+        runArgs                 -> --additional-flags "..."
+
+    Lifecycle commands (run after container creation):
+        onCreateCommand         -> distrobox enter NAME -- <cmd>
+        postCreateCommand       -> distrobox enter NAME -- <cmd>
+        postStartCommand        -> WARNING (no direct equivalent)
+        postAttachCommand       -> WARNING (no direct equivalent)
+
+    Dockerfile builds:
+        build.dockerfile        -> podman build -t dbox-<name>:latest ...
+        build.context           -> build context directory
+        build.args              -> --build-arg KEY=VAL
+        build.target            -> --target
+
+UNSUPPORTED PROPERTIES:
+    dockerComposeFile   -> ERROR (not supported, use single container)
+    features            -> WARN (may need custom image)
+    forwardPorts        -> INFO (not needed, distrobox shares network)
+    remoteUser          -> INFO (distrobox manages user mapping)
+
+DEPENDENCIES:
+    Required: yq, distrobox, podman (or docker)
+
+EOF
+}
+
+show_license() {
+    cat << 'EOF'
+dbox_from_devcontainer - Convert VS Code devcontainer.json to distrobox
+
+Copyright (C) 2026  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+cleanup() {
+    # Cleanup temporary files if any were created
+    if [[ -n "${TEMP_BUILD_DIR:-}" ]] && [[ -d "${TEMP_BUILD_DIR}" ]]; then
+        log_debug "Cleaning up temporary directory: ${TEMP_BUILD_DIR}"
+        rm -rf "${TEMP_BUILD_DIR}"
+    fi
+}
+
+trap cleanup EXIT
+
+# ==============================================================================
+# Validation Functions
+# ==============================================================================
+
+check_dependencies() {
+    # Check for yq
+    local missing_deps=()
+
+    if ! command -v yq &>/dev/null; then
+        missing_deps+=("yq")
+    fi
+
+    if ! command -v distrobox &>/dev/null; then
+        missing_deps+=("distrobox")
+    fi
+
+    # Check for container runtime (prefer podman)
+    if ! command -v podman &>/dev/null && ! command -v docker &>/dev/null; then
+        missing_deps+=("podman (or docker)")
+    fi
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing_deps[*]}"
+        log_error "Please install them and try again."
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+
+    log_debug "All dependencies found"
+}
+
+get_container_runtime() {
+    # Prefer podman over docker
+    if command -v podman &>/dev/null; then
+        echo "podman"
+    else
+        echo "docker"
+    fi
+}
+
+find_devcontainer_json() {
+    # Find devcontainer.json in standard locations
+    # Search order:
+    #   1. <PATH>/.devcontainer/devcontainer.json
+    #   2. <PATH>/devcontainer.json
+    #   3. <PATH>/.devcontainer.json
+
+    local base_path="$1"
+    local search_paths=(
+        "${base_path}/.devcontainer/devcontainer.json"
+        "${base_path}/devcontainer.json"
+        "${base_path}/.devcontainer.json"
+    )
+
+    for path in "${search_paths[@]}"; do
+        log_debug "Checking for devcontainer.json at: ${path}"
+        if [[ -f "${path}" ]]; then
+            log_verbose "Found devcontainer.json at: ${path}"
+            echo "${path}"
+            return 0
+        fi
+    done
+
+    log_error "Could not find devcontainer.json in ${base_path}"
+    log_error "Searched locations:"
+    for path in "${search_paths[@]}"; do
+        log_error "  - ${path}"
+    done
+    return 1
+}
+
+validate_devcontainer_json() {
+    # Validate the devcontainer.json file
+    local json_file="$1"
+
+    # Check if file exists and is readable
+    if [[ ! -r "${json_file}" ]]; then
+        log_error "Cannot read devcontainer.json: ${json_file}"
+        return 1
+    fi
+
+    # Check if it's valid JSON using yq
+    if ! yq -e '.' "${json_file}" &>/dev/null; then
+        log_error "Invalid JSON in devcontainer.json: ${json_file}"
+        return 1
+    fi
+
+    # Check for unsupported dockerComposeFile
+    local compose_file
+    compose_file=$(yq -r '.dockerComposeFile // ""' "${json_file}")
+    if [[ -n "${compose_file}" ]]; then
+        log_error "dockerComposeFile is not supported by distrobox"
+        log_error "Please use a single-container devcontainer configuration"
+        return 1
+    fi
+
+    # Must have either image or build.dockerfile
+    local image dockerfile
+    image=$(yq -r '.image // ""' "${json_file}")
+    dockerfile=$(yq -r '.build.dockerfile // ""' "${json_file}")
+
+    if [[ -z "${image}" ]] && [[ -z "${dockerfile}" ]]; then
+        log_error "devcontainer.json must specify either 'image' or 'build.dockerfile'"
+        return 1
+    fi
+
+    log_debug "devcontainer.json validation passed"
+    return 0
+}
+
+# ==============================================================================
+# Parsing Functions
+# ==============================================================================
+
+parse_name() {
+    # Extract and sanitize container name from devcontainer.json
+    local json_file="$1"
+    local name
+
+    name=$(yq -r '.name // ""' "${json_file}")
+
+    if [[ -z "${name}" ]]; then
+        # Fall back to directory name
+        local dir_path
+        dir_path=$(dirname "$(dirname "${json_file}")")
+        name=$(basename "${dir_path}")
+    fi
+
+    echo "${name}"
+}
+
+sanitize_container_name() {
+    # Convert container name to valid distrobox/podman name
+    # Rules: lowercase, alphanumeric and hyphens only, max 63 chars
+    local name="$1"
+
+    echo "${name}" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9-]/-/g' \
+        | sed 's/--*/-/g' \
+        | sed 's/^-//' \
+        | sed 's/-$//' \
+        | head -c 63
+}
+
+parse_image() {
+    # Extract image name from devcontainer.json
+    local json_file="$1"
+    yq -r '.image // ""' "${json_file}"
+}
+
+parse_init() {
+    # Check if init is enabled
+    local json_file="$1"
+    local init
+
+    init=$(yq -r '.init // false' "${json_file}")
+
+    if [[ "${init}" == "true" ]]; then
+        echo "--init"
+    fi
+}
+
+parse_gpu_requirements() {
+    # Check for GPU requirements
+    local json_file="$1"
+    local gpu
+
+    gpu=$(yq -r '.hostRequirements.gpu // ""' "${json_file}")
+
+    if [[ -n "${gpu}" ]] && [[ "${gpu}" != "null" ]] && [[ "${gpu}" != "false" ]]; then
+        log_verbose "GPU requirement detected: ${gpu}"
+        echo "--nvidia"
+    fi
+}
+
+parse_container_env() {
+    # Extract container environment variables
+    local json_file="$1"
+    local env_flags=""
+
+    while IFS='=' read -r key value; do
+        [[ -z "${key}" ]] && continue
+        # Escape any special characters in value
+        value=$(printf '%s' "${value}" | sed "s/'/'\\\\''/g")
+        env_flags+="--additional-flags '--env ${key}=${value}' "
+        log_debug "Environment variable: ${key}=${value}"
+    done < <(yq -r '.containerEnv // {} | to_entries[] | "\(.key)=\(.value)"' "${json_file}" 2>/dev/null || true)
+
+    echo "${env_flags}"
+}
+
+parse_mounts() {
+    # Parse Docker mount syntax and convert to distrobox --volume
+    local json_file="$1"
+    local project_dir="$2"
+    local mounts=""
+
+    while IFS= read -r mount; do
+        [[ -z "${mount}" ]] && continue
+
+        local source="" target="" mode="rw"
+
+        # Parse mount string - format: source=X,target=Y,type=bind[,readonly]
+        # Using parameter expansion and loops instead of complex yq
+        local IFS=','
+        for part in ${mount}; do
+            case "${part}" in
+                source=*)
+                    source="${part#source=}"
+                    ;;
+                target=*)
+                    target="${part#target=}"
+                    ;;
+                readonly)
+                    mode="ro"
+                    ;;
+            esac
+        done
+
+        # Skip if source or target is missing
+        if [[ -z "${source}" ]] || [[ -z "${target}" ]]; then
+            log_warn "Invalid mount format: ${mount}"
+            continue
+        fi
+
+        # Expand ${localWorkspaceFolder} to project directory
+        source="${source//\$\{localWorkspaceFolder\}/${project_dir}}"
+        target="${target//\$\{localWorkspaceFolder\}/${project_dir}}"
+
+        # Expand ${localEnv:VAR} patterns
+        while [[ "${source}" =~ \$\{localEnv:([^}]+)\} ]]; do
+            local var_name="${BASH_REMATCH[1]}"
+            local var_value="${!var_name:-}"
+            source="${source//\$\{localEnv:${var_name}\}/${var_value}}"
+        done
+
+        mounts+="--volume '${source}:${target}:${mode}' "
+        log_debug "Mount: ${source} -> ${target} (${mode})"
+    done < <(yq -r '.mounts[]? // ""' "${json_file}" 2>/dev/null || true)
+
+    echo "${mounts}"
+}
+
+parse_privileged() {
+    # Check if privileged mode is requested
+    local json_file="$1"
+    local privileged
+
+    privileged=$(yq -r '.privileged // false' "${json_file}")
+
+    if [[ "${privileged}" == "true" ]]; then
+        log_warn "Privileged mode requested - this grants extensive container privileges"
+        echo "--additional-flags '--privileged'"
+    fi
+}
+
+parse_capabilities() {
+    # Parse capAdd for additional capabilities
+    local json_file="$1"
+    local caps=""
+
+    while IFS= read -r cap; do
+        [[ -z "${cap}" ]] && continue
+        caps+="--additional-flags '--cap-add=${cap}' "
+        log_debug "Capability: ${cap}"
+    done < <(yq -r '.capAdd[]? // ""' "${json_file}" 2>/dev/null || true)
+
+    echo "${caps}"
+}
+
+parse_security_opts() {
+    # Parse securityOpt for security options
+    local json_file="$1"
+    local opts=""
+
+    while IFS= read -r opt; do
+        [[ -z "${opt}" ]] && continue
+        opts+="--additional-flags '--security-opt=${opt}' "
+        log_debug "Security option: ${opt}"
+    done < <(yq -r '.securityOpt[]? // ""' "${json_file}" 2>/dev/null || true)
+
+    echo "${opts}"
+}
+
+parse_run_args() {
+    # Parse runArgs and filter to safe options
+    local json_file="$1"
+    local args=""
+
+    while IFS= read -r arg; do
+        [[ -z "${arg}" ]] && continue
+
+        # Filter out potentially problematic args that distrobox handles
+        case "${arg}" in
+            --name*|--hostname*|--user*)
+                log_debug "Skipping runArg (handled by distrobox): ${arg}"
+                continue
+                ;;
+            *)
+                args+="--additional-flags '${arg}' "
+                log_debug "Run argument: ${arg}"
+                ;;
+        esac
+    done < <(yq -r '.runArgs[]? // ""' "${json_file}" 2>/dev/null || true)
+
+    echo "${args}"
+}
+
+parse_lifecycle_commands() {
+    # Parse lifecycle commands into an associative array format
+    local json_file="$1"
+    local lifecycle_type="$2"  # onCreateCommand, postCreateCommand, etc.
+
+    # Check if field exists and has value
+    local has_field
+    has_field=$(yq -r ".${lifecycle_type} | . != null" "${json_file}")
+    if [[ "${has_field}" != "true" ]]; then
+        return
+    fi
+
+    local type_info
+    type_info=$(yq -r ".${lifecycle_type} | type" "${json_file}")
+
+    # Handle string command
+    if [[ "${type_info}" == "!!str" ]]; then
+        yq -r ".${lifecycle_type}" "${json_file}"
+        return
+    fi
+
+    # Handle array - this is command + args format (like Docker CMD)
+    if [[ "${type_info}" == "!!seq" ]]; then
+        yq -r ".${lifecycle_type} | join(\" \")" "${json_file}"
+        return
+    fi
+
+    # Handle object with command keys
+    if [[ "${type_info}" == "!!map" ]]; then
+        # Execute each named command in sequence
+        yq -r ".${lifecycle_type} | to_entries[] | .value" "${json_file}" | tr '\n' ' && '
+        return
+    fi
+}
+
+check_features() {
+    # Check for devcontainer features and warn
+    local json_file="$1"
+
+    local features_count
+    features_count=$(yq -r '.features | length' "${json_file}" 2>/dev/null || echo "0")
+
+    if [[ "${features_count}" -gt 0 ]]; then
+        if [[ "${SKIP_FEATURES}" == "true" ]]; then
+            log_debug "Skipping features check (--skip-features)"
+            return
+        fi
+
+        log_warn "devcontainer features detected (${features_count} feature(s))"
+        log_warn "Features are not directly supported by distrobox"
+        log_warn "You may need to install these manually or use a custom image"
+        log_warn "Features found:"
+        yq -r '.features | keys[]' "${json_file}" 2>/dev/null | while read -r feature; do
+            log_warn "  - ${feature}"
+        done
+    fi
+}
+
+check_unsupported_properties() {
+    # Check for properties that don't translate well
+    local json_file="$1"
+
+    # forwardPorts - not needed with distrobox
+    local forward_ports
+    forward_ports=$(yq -r '.forwardPorts | length' "${json_file}" 2>/dev/null || echo "0")
+    if [[ "${forward_ports}" -gt 0 ]]; then
+        log_info "forwardPorts detected - not needed with distrobox (network is shared with host)"
+    fi
+
+    # remoteUser/containerUser - managed by distrobox
+    local remote_user container_user
+    remote_user=$(yq -r '.remoteUser // ""' "${json_file}")
+    container_user=$(yq -r '.containerUser // ""' "${json_file}")
+    if [[ -n "${remote_user}" ]] || [[ -n "${container_user}" ]]; then
+        log_info "remoteUser/containerUser detected - distrobox manages user mapping automatically"
+    fi
+
+    # postStartCommand/postAttachCommand - no direct equivalent
+    local post_start post_attach
+    post_start=$(yq -r '.postStartCommand // ""' "${json_file}")
+    post_attach=$(yq -r '.postAttachCommand // ""' "${json_file}")
+    if [[ -n "${post_start}" ]] && [[ "${post_start}" != "null" ]]; then
+        log_warn "postStartCommand detected - no direct distrobox equivalent"
+        log_warn "Consider adding to shell initialization or running manually"
+    fi
+    if [[ -n "${post_attach}" ]] && [[ "${post_attach}" != "null" ]]; then
+        log_warn "postAttachCommand detected - no direct distrobox equivalent"
+        log_warn "Consider adding to shell initialization or running manually"
+    fi
+}
+
+# ==============================================================================
+# Build Functions
+# ==============================================================================
+
+parse_build_config() {
+    # Extract Dockerfile build configuration
+    local json_file="$1"
+
+    local dockerfile
+    dockerfile=$(yq -r '.build.dockerfile // ""' "${json_file}")
+
+    if [[ -n "${dockerfile}" ]]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
+build_dockerfile() {
+    # Build a Docker image from Dockerfile
+    local json_file="$1"
+    local image_name="$2"
+
+    local dockerfile context target
+    dockerfile=$(yq -r '.build.dockerfile // ""' "${json_file}")
+    context=$(yq -r '.build.context // "."' "${json_file}")
+    target=$(yq -r '.build.target // ""' "${json_file}")
+
+    # Resolve paths relative to devcontainer.json location
+    local devcontainer_dir
+    devcontainer_dir=$(dirname "${json_file}")
+
+    # Handle absolute vs relative paths
+    if [[ "${dockerfile}" != /* ]]; then
+        dockerfile="${devcontainer_dir}/${dockerfile}"
+    fi
+    if [[ "${context}" != /* ]]; then
+        context="${devcontainer_dir}/${context}"
+    fi
+
+    # Normalize paths
+    dockerfile=$(realpath "${dockerfile}" 2>/dev/null || echo "${dockerfile}")
+    context=$(realpath "${context}" 2>/dev/null || echo "${context}")
+
+    # Check if Dockerfile exists
+    if [[ ! -f "${dockerfile}" ]]; then
+        log_error "Dockerfile not found: ${dockerfile}"
+        return 1
+    fi
+
+    # Parse build args
+    local build_args=""
+    while IFS='=' read -r key value; do
+        [[ -z "${key}" ]] && continue
+        build_args+="--build-arg '${key}=${value}' "
+        log_debug "Build arg: ${key}=${value}"
+    done < <(yq -r '.build.args // {} | to_entries[] | "\(.key)=\(.value)"' "${json_file}" 2>/dev/null || true)
+
+    local runtime
+    runtime=$(get_container_runtime)
+
+    local cmd="${runtime} build -t '${image_name}:latest'"
+    [[ -n "${target}" ]] && cmd+=" --target '${target}'"
+    [[ -n "${build_args}" ]] && cmd+=" ${build_args}"
+    cmd+=" -f '${dockerfile}' '${context}'"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] ${cmd}"
+        return 0
+    fi
+
+    log_info "Building image: ${image_name}:latest"
+    log_verbose "Dockerfile: ${dockerfile}"
+    log_verbose "Context: ${context}"
+
+    if ! eval "${cmd}"; then
+        log_error "Failed to build Dockerfile"
+        return 1
+    fi
+
+    log_success "Image built successfully: ${image_name}:latest"
+    return 0
+}
+
+# ==============================================================================
+# Execution Functions
+# ==============================================================================
+
+generate_distrobox_command() {
+    # Generate the full distrobox create command
+    local json_file="$1"
+    local container_name="$2"
+    local image="$3"
+    local project_dir="$4"
+
+    local cmd="distrobox create"
+
+    # Core options
+    cmd+=" --name '${container_name}'"
+    cmd+=" --image '${image}'"
+
+    # Init system
+    local init_flag
+    init_flag=$(parse_init "${json_file}")
+    [[ -n "${init_flag}" ]] && cmd+=" ${init_flag}"
+
+    # GPU support
+    local gpu_flag
+    gpu_flag=$(parse_gpu_requirements "${json_file}")
+    [[ -n "${gpu_flag}" ]] && cmd+=" ${gpu_flag}"
+
+    # Environment variables
+    local env_flags
+    env_flags=$(parse_container_env "${json_file}")
+    [[ -n "${env_flags}" ]] && cmd+=" ${env_flags}"
+
+    # Mounts
+    local mount_flags
+    mount_flags=$(parse_mounts "${json_file}" "${project_dir}")
+    [[ -n "${mount_flags}" ]] && cmd+=" ${mount_flags}"
+
+    # Privileged mode
+    local priv_flags
+    priv_flags=$(parse_privileged "${json_file}")
+    [[ -n "${priv_flags}" ]] && cmd+=" ${priv_flags}"
+
+    # Capabilities
+    local cap_flags
+    cap_flags=$(parse_capabilities "${json_file}")
+    [[ -n "${cap_flags}" ]] && cmd+=" ${cap_flags}"
+
+    # Security options
+    local sec_flags
+    sec_flags=$(parse_security_opts "${json_file}")
+    [[ -n "${sec_flags}" ]] && cmd+=" ${sec_flags}"
+
+    # Run arguments
+    local run_flags
+    run_flags=$(parse_run_args "${json_file}")
+    [[ -n "${run_flags}" ]] && cmd+=" ${run_flags}"
+
+    # Yes to prompts
+    cmd+=" --yes"
+
+    echo "${cmd}"
+}
+
+check_existing_container() {
+    # Check if a container with the given name already exists
+    local container_name="$1"
+
+    if distrobox list 2>/dev/null | grep -q "^${container_name} "; then
+        return 0  # Container exists
+    fi
+    return 1  # Container does not exist
+}
+
+remove_existing_container() {
+    # Remove an existing distrobox container
+    local container_name="$1"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] distrobox rm --force '${container_name}'"
+        return 0
+    fi
+
+    log_info "Removing existing container: ${container_name}"
+    if ! distrobox rm --force "${container_name}"; then
+        log_error "Failed to remove existing container: ${container_name}"
+        return 1
+    fi
+
+    log_success "Removed existing container: ${container_name}"
+    return 0
+}
+
+execute_distrobox_create() {
+    # Execute the distrobox create command
+    local cmd="$1"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] ${cmd}"
+        return 0
+    fi
+
+    log_info "Creating distrobox container..."
+    log_verbose "Command: ${cmd}"
+
+    if ! eval "${cmd}"; then
+        log_error "Failed to create distrobox container"
+        return 1
+    fi
+
+    log_success "Distrobox container created successfully"
+    return 0
+}
+
+execute_lifecycle_commands() {
+    # Execute lifecycle commands after container creation
+    local json_file="$1"
+    local container_name="$2"
+
+    if [[ "${SKIP_LIFECYCLE}" == "true" ]]; then
+        log_debug "Skipping lifecycle commands (--skip-lifecycle)"
+        return 0
+    fi
+
+    local lifecycle_types=("onCreateCommand" "postCreateCommand")
+
+    for lifecycle_type in "${lifecycle_types[@]}"; do
+        local cmd
+        cmd=$(parse_lifecycle_commands "${json_file}" "${lifecycle_type}")
+
+        if [[ -z "${cmd}" ]]; then
+            continue
+        fi
+
+        log_info "Running ${lifecycle_type}..."
+        log_verbose "Command: ${cmd}"
+
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            echo "[DRY-RUN] distrobox enter '${container_name}' -- bash -c '${cmd}'"
+            continue
+        fi
+
+        if ! distrobox enter "${container_name}" -- bash -c "${cmd}"; then
+            log_error "Failed to execute ${lifecycle_type}"
+            log_error "Command was: ${cmd}"
+            return 1
+        fi
+
+        log_success "${lifecycle_type} completed"
+    done
+
+    return 0
+}
+
+enter_container() {
+    # Enter the container after creation
+    local container_name="$1"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] distrobox enter '${container_name}'"
+        return 0
+    fi
+
+    log_info "Entering container: ${container_name}"
+    exec distrobox enter "${container_name}"
+}
+
+# ==============================================================================
+# Argument Parsing
+# ==============================================================================
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit $EXIT_SUCCESS
+                ;;
+            --license)
+                show_license
+                exit $EXIT_SUCCESS
+                ;;
+            -d|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --name)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--name requires a value"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                CUSTOM_NAME="$2"
+                shift 2
+                ;;
+            --skip-build)
+                SKIP_BUILD=true
+                shift
+                ;;
+            --skip-features)
+                SKIP_FEATURES=true
+                shift
+                ;;
+            --skip-lifecycle)
+                SKIP_LIFECYCLE=true
+                shift
+                ;;
+            -e|--enter)
+                ENTER_AFTER_CREATE=true
+                shift
+                ;;
+            -f|--force)
+                FORCE_REMOVE=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE_MODE=true
+                shift
+                ;;
+            --debug)
+                DEBUG_MODE=true
+                VERBOSE_MODE=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                echo "Use -h or --help for usage information"
+                exit $EXIT_USAGE_ERROR
+                ;;
+            *)
+                TARGET_PATH="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# Main Function
+# ==============================================================================
+
+main() {
+    parse_arguments "$@"
+
+    log_debug "Configuration:"
+    log_debug "  DRY_RUN=${DRY_RUN}"
+    log_debug "  VERBOSE_MODE=${VERBOSE_MODE}"
+    log_debug "  DEBUG_MODE=${DEBUG_MODE}"
+    log_debug "  SKIP_BUILD=${SKIP_BUILD}"
+    log_debug "  SKIP_FEATURES=${SKIP_FEATURES}"
+    log_debug "  SKIP_LIFECYCLE=${SKIP_LIFECYCLE}"
+    log_debug "  ENTER_AFTER_CREATE=${ENTER_AFTER_CREATE}"
+    log_debug "  FORCE_REMOVE=${FORCE_REMOVE}"
+    log_debug "  CUSTOM_NAME=${CUSTOM_NAME}"
+    log_debug "  TARGET_PATH=${TARGET_PATH}"
+
+    # Check dependencies
+    check_dependencies
+
+    # Resolve target path
+    TARGET_PATH=$(realpath "${TARGET_PATH}" 2>/dev/null || echo "${TARGET_PATH}")
+    log_verbose "Target path: ${TARGET_PATH}"
+
+    # Find devcontainer.json
+    local json_file
+    if ! json_file=$(find_devcontainer_json "${TARGET_PATH}"); then
+        exit $EXIT_FILE_NOT_FOUND
+    fi
+
+    # Validate devcontainer.json
+    if ! validate_devcontainer_json "${json_file}"; then
+        exit $EXIT_PARSE_ERROR
+    fi
+
+    # Get project directory (parent of devcontainer.json or .devcontainer folder)
+    local project_dir
+    if [[ "${json_file}" == *".devcontainer/devcontainer.json" ]]; then
+        project_dir=$(dirname "$(dirname "${json_file}")")
+    else
+        project_dir=$(dirname "${json_file}")
+    fi
+    project_dir=$(realpath "${project_dir}")
+    log_verbose "Project directory: ${project_dir}"
+
+    # Check for unsupported properties and features
+    check_unsupported_properties "${json_file}"
+    check_features "${json_file}"
+
+    # Determine container name
+    local raw_name container_name
+    if [[ -n "${CUSTOM_NAME}" ]]; then
+        raw_name="${CUSTOM_NAME}"
+    else
+        raw_name=$(parse_name "${json_file}")
+    fi
+    container_name=$(sanitize_container_name "${raw_name}")
+    log_info "Container name: ${container_name}"
+
+    # Check for existing container
+    if check_existing_container "${container_name}"; then
+        if [[ "${FORCE_REMOVE}" == "true" ]]; then
+            if ! remove_existing_container "${container_name}"; then
+                exit $EXIT_DISTROBOX_ERROR
+            fi
+        else
+            log_error "Container '${container_name}' already exists"
+            log_error "Use --force to remove and recreate, or --name to specify a different name"
+            exit $EXIT_DISTROBOX_ERROR
+        fi
+    fi
+
+    # Determine image
+    local image
+    local has_build
+    has_build=$(parse_build_config "${json_file}")
+
+    if [[ "${has_build}" == "true" ]]; then
+        if [[ "${SKIP_BUILD}" == "true" ]]; then
+            log_error "Dockerfile build required but --skip-build specified"
+            log_error "Either provide a pre-built image or remove --skip-build"
+            exit $EXIT_BUILD_ERROR
+        fi
+
+        # Build the image
+        local build_image_name="dbox-${container_name}"
+        if ! build_dockerfile "${json_file}" "${build_image_name}"; then
+            exit $EXIT_BUILD_ERROR
+        fi
+        image="${build_image_name}:latest"
+    else
+        image=$(parse_image "${json_file}")
+        if [[ -z "${image}" ]]; then
+            log_error "No image specified in devcontainer.json"
+            exit $EXIT_PARSE_ERROR
+        fi
+    fi
+    log_info "Image: ${image}"
+
+    # Generate distrobox command
+    local distrobox_cmd
+    distrobox_cmd=$(generate_distrobox_command "${json_file}" "${container_name}" "${image}" "${project_dir}")
+
+    # Execute distrobox create
+    if ! execute_distrobox_create "${distrobox_cmd}"; then
+        exit $EXIT_DISTROBOX_ERROR
+    fi
+
+    # Execute lifecycle commands
+    if ! execute_lifecycle_commands "${json_file}" "${container_name}"; then
+        exit $EXIT_LIFECYCLE_ERROR
+    fi
+
+    # Summary
+    if [[ "${DRY_RUN}" != "true" ]]; then
+        log_success "Container '${container_name}' is ready"
+        log_info "Enter with: distrobox enter ${container_name}"
+    fi
+
+    # Enter container if requested
+    if [[ "${ENTER_AFTER_CREATE}" == "true" ]]; then
+        enter_container "${container_name}"
+    fi
+
+    exit $EXIT_SUCCESS
+}
+
+main "$@"
