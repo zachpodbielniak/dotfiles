@@ -76,6 +76,7 @@ dep_dirs:
     mkdir -p $HOME/.config/containers/systemd
 
     mkdir -p $HOME/.config/ncmpcpp
+    mkdir -p $HOME/.config/neomutt
     mkdir -p $HOME/.config/mpd
     mkdir -p $HOME/.config/tmux/plugins
 
