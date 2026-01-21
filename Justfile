@@ -68,6 +68,7 @@ dep_dirs:
     mkdir -p $HOME/bin/export
 
     mkdir -p $HOME/.config
+    mkdir -p $HOME/.config/autostart
     mkdir -p $HOME/.config/btop
     mkdir -p $HOME/.config/mpd
     mkdir -p $HOME/.config/rofi
