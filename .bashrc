@@ -132,6 +132,9 @@ alias dbhi="distrobox-host-exec"
 _have nvim && alias less="nvim +Man!"
 _have bat && alias cat="bat --theme='Catppuccin Mocha' --paging=never"
 
+# mutt alias 
+_have neomutt && alias mutt="neomutt" && alias m="mutt" 
+
 # common things
 alias flatpak="flatpak --user"
 alias gpia="curl https://icanhazip.com"
