@@ -162,7 +162,7 @@ _vimban_completions () {
     local cur prev words cword
     _init_completion || return
 
-    local commands="init create list show generate-link get-link get-id edit move link comment dashboard kanban search validate report people sync convert completion tui"
+    local commands="init create list show generate-link get-link get-id edit move link comment comments dashboard kanban search validate report people sync convert completion tui"
     local types="epic story task sub-task research bug area resource meeting journal recipe"
     local statuses="backlog ready in_progress blocked review delegated done cancelled"
     local priorities="critical high medium low"
@@ -385,6 +385,23 @@ _vimban_completions () {
                     ;;
                 *)
                     COMPREPLY=($(compgen -W "--reply-to --print --print-full --new-id-output -e --edit --dry-run -f --format" -- "${cur}"))
+                    ;;
+            esac
+            ;;
+        comments)
+            case "${prev}" in
+                -u|--user)
+                    local pdir="${VIMBAN_DIR:-${HOME}/Documents/notes}/${VIMBAN_PEOPLE_DIR:-02_areas/work/people}"
+                    if [[ -d "${pdir}" ]]
+                    then
+                        COMPREPLY=($(compgen -W "$(find "${pdir}" -name '*.md' -exec basename {} .md \;)" -- "${cur}"))
+                    fi
+                    ;;
+                -f|--format)
+                    COMPREPLY=($(compgen -W "${formats}" -- "${cur}"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "-u --user --days --limit --reverse -f --format" -- "${cur}"))
                     ;;
             esac
             ;;
@@ -6749,6 +6766,166 @@ def cmd_tui(args: argparse.Namespace, config: Config) -> int:
     return result.returncode
 
 
+def cmd_comments(args: argparse.Namespace, config: Config) -> int:
+    """
+    List recent comments across all tickets.
+
+    Supports filtering by user (-u/--user), days (--days), and sorting.
+    Default sort is newest first.
+    """
+    no_color = getattr(args, 'no_color', False)
+    colors = Colors(enabled=not no_color)
+    fmt = getattr(args, 'format', 'plain')
+
+    # Get filter options
+    user_filter = getattr(args, 'user', None)
+    if user_filter:
+        user_filter = user_filter.lower()
+    days = getattr(args, 'days', None)
+    reverse_sort = getattr(args, 'reverse', False)
+    limit = getattr(args, 'limit', None)
+
+    # Calculate cutoff date if --days specified
+    cutoff_date = None
+    if days is not None:
+        cutoff_date = datetime.now() - timedelta(days=days)
+
+    # Collect all comments across tickets
+    all_comments: list[tuple[str, str, Path, Comment]] = []  # (ticket_id, ticket_title, path, comment)
+
+    # Find all markdown files
+    for md_file in config.directory.rglob('*.md'):
+        try:
+            content = md_file.read_text()
+            metadata, _ = parse_frontmatter(content)
+
+            # Skip files without vimban frontmatter
+            if not metadata.get('id') or not metadata.get('type'):
+                continue
+
+            # Skip person files (they have comments but we focus on tickets)
+            if metadata.get('type') == 'person':
+                continue
+
+            ticket_id = metadata.get('id', '').strip('"')
+            ticket_title = metadata.get('title', md_file.stem)
+
+            comments = parse_comments(content)
+            for comment in comments:
+                # Filter by user
+                if user_filter:
+                    author_match = comment.author and user_filter in comment.author.lower()
+                    # Also check replies for user matches
+                    reply_match = any(
+                        a and user_filter in a.lower()
+                        for _, _, a in comment.replies
+                    )
+                    if not author_match and not reply_match:
+                        continue
+
+                # Filter by date
+                if cutoff_date:
+                    # Check comment timestamp
+                    if comment.timestamp < cutoff_date:
+                        # Still check replies - they might be newer
+                        recent_replies = [
+                            (ts, c, a) for ts, c, a in comment.replies
+                            if ts >= cutoff_date
+                        ]
+                        if not recent_replies:
+                            continue
+
+                all_comments.append((ticket_id, ticket_title, md_file, comment))
+
+        except (ValueError, yaml.YAMLError):
+            continue
+
+    # Sort by timestamp (newest first by default)
+    def get_latest_timestamp(item: tuple) -> datetime:
+        """Get the most recent timestamp from comment or its replies."""
+        _, _, _, comment = item
+        timestamps = [comment.timestamp]
+        timestamps.extend(ts for ts, _, _ in comment.replies)
+        return max(timestamps)
+
+    all_comments.sort(key=get_latest_timestamp, reverse=not reverse_sort)
+
+    # Apply limit
+    if limit:
+        all_comments = all_comments[:limit]
+
+    if not all_comments:
+        print("No comments found")
+        return EXIT_SUCCESS
+
+    # Format output
+    if fmt == 'json':
+        data = []
+        for ticket_id, ticket_title, path, comment in all_comments:
+            entry = comment.to_dict()
+            entry['ticket_id'] = ticket_id
+            entry['ticket_title'] = ticket_title
+            entry['filepath'] = str(path)
+            data.append(entry)
+        print(json.dumps(data, indent=2, default=str))
+        return EXIT_SUCCESS
+
+    if fmt == 'yaml':
+        data = []
+        for ticket_id, ticket_title, path, comment in all_comments:
+            entry = comment.to_dict()
+            entry['ticket_id'] = ticket_id
+            entry['ticket_title'] = ticket_title
+            entry['filepath'] = str(path)
+            data.append(entry)
+        print(yaml.dump(data, default_flow_style=False, allow_unicode=True))
+        return EXIT_SUCCESS
+
+    # Plain or md format
+    lines = []
+    for ticket_id, ticket_title, path, comment in all_comments:
+        # Header with ticket info
+        author_part = f" by {comment.author}" if comment.author else ""
+        if fmt == 'md':
+            lines.append(f"### [{ticket_id}] {ticket_title}")
+            lines.append(f"**Comment #{comment.id}**{author_part} ({comment.timestamp.isoformat()})")
+            lines.append("")
+            for content_line in comment.content.split('\n'):
+                lines.append(f"> {content_line}" if content_line else ">")
+            if comment.replies:
+                for ts, reply, reply_author in comment.replies:
+                    reply_author_part = f" by {reply_author}" if reply_author else ""
+                    lines.append(f"#### Reply{reply_author_part} ({ts.isoformat()})")
+                    for reply_line in reply.split('\n'):
+                        lines.append(f">> {reply_line}" if reply_line else ">>")
+            lines.append("")
+        else:
+            # Plain format
+            lines.append(
+                f"{colors.BOLD}[{ticket_id}]{colors.END} {ticket_title}"
+            )
+            lines.append(
+                f"  {colors.CYAN}#{comment.id}{author_part}{colors.END} "
+                f"{colors.DIM}({comment.timestamp.strftime('%Y-%m-%d %H:%M')}){colors.END}"
+            )
+            # Indent comment content
+            for content_line in comment.content.split('\n'):
+                lines.append(f"    {content_line}")
+            if comment.replies:
+                for ts, reply, reply_author in comment.replies:
+                    reply_author_part = f" by {reply_author}" if reply_author else ""
+                    lines.append(
+                        f"    {colors.CYAN}↳ Reply{reply_author_part}{colors.END} "
+                        f"{colors.DIM}({ts.strftime('%Y-%m-%d %H:%M')}){colors.END}"
+                    )
+                    for reply_line in reply.split('\n'):
+                        lines.append(f"      {reply_line}")
+            lines.append("")
+
+    print('\n'.join(lines))
+    return EXIT_SUCCESS
+
+
 def cmd_comment(args: argparse.Namespace, config: Config) -> int:
     """
     Add or view comments on tickets and people.
@@ -8741,6 +8918,19 @@ Environment Variables:
     comment_parser.add_argument('--dry-run', action='store_true',
                                 help='Preview without writing')
 
+    # comments (list recent comments across tickets)
+    comments_parser = subparsers.add_parser('comments', help='List recent comments across tickets')
+    comments_parser.add_argument('-u', '--user', metavar='NAME',
+                                 help='Filter by comment author')
+    comments_parser.add_argument('--days', type=int, metavar='N',
+                                 help='Show comments from the last N days')
+    comments_parser.add_argument('--limit', type=int, metavar='N',
+                                 help='Limit number of comments shown')
+    comments_parser.add_argument('--reverse', action='store_true',
+                                 help='Sort oldest first (default: newest first)')
+    comments_parser.add_argument('-f', '--format', choices=['plain', 'md', 'yaml', 'json'],
+                                 default='plain', help='Output format')
+
     # dashboard
     dashboard_parser = subparsers.add_parser('dashboard', help='Generate dashboard')
     dashboard_parser.add_argument('type', nargs='?', default='daily',
@@ -8971,6 +9161,7 @@ def main() -> int:
         'convert': cmd_convert,
         'completion': cmd_completion,
         'comment': cmd_comment,
+        'comments': cmd_comments,
         'tui': cmd_tui,
     }
 
