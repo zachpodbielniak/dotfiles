@@ -63,6 +63,7 @@ _path_prepend \
     "${HOME}/bin/starship" \
     "${HOME}/.cabal/bin" \
     "${HOME}/.nimble/bin" \
+    "${HOME}/.npm-global/bin/" \
     "${HOME}/bin/nim/bin" \
     "${HOME}/bin/scripts" \
     "${HOME}/bin/export"
