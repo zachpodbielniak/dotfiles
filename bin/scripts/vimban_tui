@@ -74,6 +74,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from enum import Enum
@@ -130,6 +131,7 @@ DEFAULT_DIR = vimban.DEFAULT_DIR
 VERSION: str = "0.1.0"
 MIN_WIDTH: int = 80
 MIN_HEIGHT: int = 24
+AUTO_REFRESH_INTERVAL: int = 30  # seconds
 
 LICENSE_TEXT: str = """vimban_tui - Curses-based TUI for vimban ticket management
 Copyright (C) 2025  Zach Podbielniak
@@ -236,6 +238,15 @@ class ThemeManager:
     PAIR_MD_CODE: int = 31
     PAIR_MD_QUOTE: int = 32
     PAIR_MD_LINK: int = 33
+    # Assignee colors (40-47)
+    PAIR_ASSIGNEE_0: int = 40
+    PAIR_ASSIGNEE_1: int = 41
+    PAIR_ASSIGNEE_2: int = 42
+    PAIR_ASSIGNEE_3: int = 43
+    PAIR_ASSIGNEE_4: int = 44
+    PAIR_ASSIGNEE_5: int = 45
+    PAIR_ASSIGNEE_6: int = 46
+    PAIR_ASSIGNEE_7: int = 47
 
     @classmethod
     def apply_theme(cls) -> None:
@@ -283,6 +294,16 @@ class ThemeManager:
         curses.init_pair(cls.PAIR_MD_QUOTE, c["overlay0"], -1)
         curses.init_pair(cls.PAIR_MD_LINK, c["sapphire"], -1)
 
+        # Assignee colors (distinct, high-contrast colors)
+        curses.init_pair(cls.PAIR_ASSIGNEE_0, c["rosewater"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_1, c["flamingo"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_2, c["pink"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_3, c["mauve"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_4, c["peach"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_5, c["teal"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_6, c["sapphire"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_7, c["lavender"], -1)
+
     @classmethod
     def get_status_pair(cls, status: str) -> int:
         """Get the color pair index for a status."""
@@ -308,6 +329,18 @@ class ThemeManager:
             "low": cls.PAIR_PRIORITY_LOW,
         }
         return priority_pairs.get(priority, cls.PAIR_PRIORITY_MEDIUM)
+
+    @classmethod
+    def get_assignee_pair(cls, assignee_name: str) -> int:
+        """Get the color pair index for an assignee (consistent by name hash)."""
+        if not assignee_name:
+            return cls.PAIR_PRIORITY_MEDIUM  # fallback to default text color
+        # Special case for clawdbot - use pink
+        if assignee_name.lower() == "clawdbot":
+            return cls.PAIR_ASSIGNEE_2  # pink
+        # Use hash to consistently map same name to same color
+        color_idx: int = hash(assignee_name.lower()) % 8
+        return cls.PAIR_ASSIGNEE_0 + color_idx
 
 
 # ============================================================================
@@ -1525,13 +1558,17 @@ class ListRenderer:
                 col_width = col_widths.get(col_name, 10)
                 value: str = self._get_column_value(ticket, col_name)
 
-                # Apply color for status/priority
+                # Apply color for status/priority/assignee
                 if not is_selected:
                     if col_name == "status":
                         pair: int = ThemeManager.get_status_pair(ticket.status)
                         self.stdscr.attron(curses.color_pair(pair))
                     elif col_name == "priority":
                         pair = ThemeManager.get_priority_pair(ticket.priority)
+                        self.stdscr.attron(curses.color_pair(pair))
+                    elif col_name == "assignee" and ticket.assignee:
+                        assignee_name: str = Path(ticket.assignee.path).stem
+                        pair = ThemeManager.get_assignee_pair(assignee_name)
                         self.stdscr.attron(curses.color_pair(pair))
 
                 try:
@@ -1541,6 +1578,8 @@ class ListRenderer:
 
                 if not is_selected:
                     if col_name in ("status", "priority"):
+                        self.stdscr.attroff(curses.color_pair(pair))
+                    elif col_name == "assignee" and ticket.assignee:
                         self.stdscr.attroff(curses.color_pair(pair))
 
                 x += col_width + 1
@@ -1666,21 +1705,39 @@ class KanbanRenderer:
         # Line 3: Priority and assignee (if not compact)
         if height >= 4:
             priority_short: str = ticket.priority[:4]
+            priority_text: str = f" [{priority_short}]"
             assignee_str: str = ""
+            assignee_name: str = ""
             if ticket.assignee:
-                assignee_str = f"@{Path(ticket.assignee.path).stem}"[:width - 8]
+                assignee_name = Path(ticket.assignee.path).stem
+                assignee_str = f" @{assignee_name}"[:width - len(priority_text) - 1]
 
+            # Draw priority with priority color
             if not selected:
                 pair: int = ThemeManager.get_priority_pair(ticket.priority)
                 self.stdscr.attron(curses.color_pair(pair))
 
             try:
-                self.stdscr.addstr(y + 2, x, f" [{priority_short}] {assignee_str}")
+                self.stdscr.addstr(y + 2, x, priority_text)
             except curses.error:
                 pass
 
             if not selected:
                 self.stdscr.attroff(curses.color_pair(pair))
+
+            # Draw assignee with assignee-specific color
+            if assignee_str:
+                if not selected:
+                    assignee_pair: int = ThemeManager.get_assignee_pair(assignee_name)
+                    self.stdscr.attron(curses.color_pair(assignee_pair))
+
+                try:
+                    self.stdscr.addstr(y + 2, x + len(priority_text), assignee_str)
+                except curses.error:
+                    pass
+
+                if not selected:
+                    self.stdscr.attroff(curses.color_pair(assignee_pair))
 
         if selected:
             self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
@@ -2048,6 +2105,9 @@ class VimbanTUI:
         self.stdscr.keypad(True)
         self.stdscr.timeout(100)  # 100ms timeout for non-blocking input
 
+        # Auto-refresh timer
+        self._last_refresh_time: float = time.monotonic()
+
     @property
     def state(self) -> AppState:
         """Shortcut to access app state."""
@@ -2072,6 +2132,13 @@ class VimbanTUI:
 
             # Handle input
             key = self.stdscr.getch()
+
+            # Auto-refresh on timer
+            current_time: float = time.monotonic()
+            if current_time - self._last_refresh_time >= AUTO_REFRESH_INTERVAL:
+                self.state_manager.refresh_data()
+                self._last_refresh_time = current_time
+
             if key == -1:  # Timeout, no key pressed
                 continue
 
@@ -2335,6 +2402,7 @@ class VimbanTUI:
             state.show_help = True
         elif key == ord('R'):
             self.state_manager.refresh_data()
+            self._last_refresh_time = time.monotonic()
             self.state_manager.set_status("Data refreshed")
         elif key == ord('\t'):  # TAB
             self.state_manager.switch_layout()
