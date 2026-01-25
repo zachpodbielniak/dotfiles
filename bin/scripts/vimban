@@ -974,11 +974,13 @@ TRANSCLUSION_PATTERN = re.compile(r'!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
 MARKDOWN_LINK_PATTERN = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 
 # Comment patterns (headers with quote block bodies)
+# Optional 'by <author>' before timestamp: ### Comment #1 by clawdbot (2026-01-24...)
 COMMENT_HEADER_PATTERN = re.compile(
-    r'^### Comment #(\d+) \(([^)]+)\)\s*$'
+    r'^### Comment #(\d+)(?: by ([^\(]+))? \(([^)]+)\)\s*$'
 )
+# Optional 'by <author>' before timestamp: #### Reply by clawdbot (2026-01-24...)
 REPLY_HEADER_PATTERN = re.compile(
-    r'^#### Reply \(([^)]+)\)\s*$'
+    r'^#### Reply(?: by ([^\(]+))? \(([^)]+)\)\s*$'
 )
 
 
@@ -1450,12 +1452,13 @@ class Comment:
 
     Comments support single-level threading where the parent comment
     can have multiple replies. Each comment has an auto-incremented ID
-    and timestamp.
+    and timestamp, with optional author attribution.
     """
     id: int
     timestamp: datetime
     content: str
-    replies: list[tuple[datetime, str]] = field(default_factory=list)
+    author: Optional[str] = None
+    replies: list[tuple[datetime, str, Optional[str]]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """
@@ -1464,15 +1467,18 @@ class Comment:
         Returns:
             Dictionary with string values suitable for display
         """
-        return {
+        result: dict = {
             'id': self.id,
             'timestamp': self.timestamp.isoformat(),
             'content': self.content,
             'replies': [
-                {'timestamp': ts.isoformat(), 'content': c}
-                for ts, c in self.replies
+                {'timestamp': ts.isoformat(), 'content': c, 'author': a}
+                for ts, c, a in self.replies
             ],
         }
+        if self.author:
+            result['author'] = self.author
+        return result
 
 
 # ============================================================================
@@ -2584,6 +2590,7 @@ def parse_comments(content: str) -> list[Comment]:
     current_content: list[str] = []
     in_reply: bool = False
     reply_timestamp: Optional[datetime] = None
+    reply_author: Optional[str] = None
     reply_content: list[str] = []
 
     for line in lines:
@@ -2594,14 +2601,18 @@ def parse_comments(content: str) -> list[Comment]:
             if current_comment is not None:
                 if in_reply and reply_timestamp:
                     current_comment.replies.append(
-                        (reply_timestamp, '\n'.join(reply_content).strip())
+                        (reply_timestamp, '\n'.join(reply_content).strip(), reply_author)
                     )
                 current_comment.content = '\n'.join(current_content).strip()
                 comments.append(current_comment)
 
             # Start new comment
+            # Regex groups: (1)=id, (2)=author (optional), (3)=timestamp
             comment_id = int(comment_match.group(1))
-            timestamp_str = comment_match.group(2)
+            comment_author = comment_match.group(2)
+            if comment_author:
+                comment_author = comment_author.strip()
+            timestamp_str = comment_match.group(3)
             try:
                 timestamp = datetime.fromisoformat(timestamp_str)
             except ValueError:
@@ -2611,11 +2622,13 @@ def parse_comments(content: str) -> list[Comment]:
                 id=comment_id,
                 timestamp=timestamp,
                 content='',
+                author=comment_author,
                 replies=[]
             )
             current_content = []
             in_reply = False
             reply_content = []
+            reply_author = None
             continue
 
         # Check for reply header
@@ -2624,10 +2637,14 @@ def parse_comments(content: str) -> list[Comment]:
             # Save previous reply if exists
             if in_reply and reply_timestamp:
                 current_comment.replies.append(
-                    (reply_timestamp, '\n'.join(reply_content).strip())
+                    (reply_timestamp, '\n'.join(reply_content).strip(), reply_author)
                 )
 
-            timestamp_str = reply_match.group(1)
+            # Regex groups: (1)=author (optional), (2)=timestamp
+            reply_author = reply_match.group(1)
+            if reply_author:
+                reply_author = reply_author.strip()
+            timestamp_str = reply_match.group(2)
             try:
                 reply_timestamp = datetime.fromisoformat(timestamp_str)
             except ValueError:
@@ -2660,7 +2677,7 @@ def parse_comments(content: str) -> list[Comment]:
     if current_comment is not None:
         if in_reply and reply_timestamp:
             current_comment.replies.append(
-                (reply_timestamp, '\n'.join(reply_content).strip())
+                (reply_timestamp, '\n'.join(reply_content).strip(), reply_author)
             )
         current_comment.content = '\n'.join(current_content).strip()
         comments.append(current_comment)
@@ -2776,15 +2793,19 @@ def format_comment_output(
     if fmt == 'md':
         lines = []
         for c in filtered:
-            lines.append(f"### Comment #{c.id} ({c.timestamp.isoformat()})")
+            # Format: ### Comment #N by author (timestamp) or ### Comment #N (timestamp)
+            author_part = f" by {c.author}" if c.author else ""
+            lines.append(f"### Comment #{c.id}{author_part} ({c.timestamp.isoformat()})")
             lines.append("")
             # Prefix each line of content with > (quote block)
             for content_line in c.content.split('\n'):
                 lines.append(f"> {content_line}" if content_line else ">")
             lines.append("")
             if include_threads and c.replies:
-                for ts, reply in c.replies:
-                    lines.append(f"#### Reply ({ts.isoformat()})")
+                for ts, reply, reply_author in c.replies:
+                    # Format: #### Reply by author (timestamp) or #### Reply (timestamp)
+                    reply_author_part = f" by {reply_author}" if reply_author else ""
+                    lines.append(f"#### Reply{reply_author_part} ({ts.isoformat()})")
                     lines.append("")
                     # Prefix each line of reply with >> (double quote block)
                     for reply_line in reply.split('\n'):
@@ -2795,15 +2816,19 @@ def format_comment_output(
     # Plain format
     lines = []
     for c in filtered:
+        # Format: #N by author (timestamp) or #N (timestamp)
+        author_part = f" by {c.author}" if c.author else ""
         lines.append(
-            f"{colors.BOLD}#{c.id}{colors.END} "
+            f"{colors.BOLD}#{c.id}{author_part}{colors.END} "
             f"{colors.DIM}({c.timestamp.strftime('%Y-%m-%d %H:%M')}){colors.END}"
         )
         lines.append(c.content)
         if include_threads and c.replies:
-            for ts, reply in c.replies:
+            for ts, reply, reply_author in c.replies:
+                # Format: ↳ Reply by author (timestamp) or ↳ Reply (timestamp)
+                reply_author_part = f" by {reply_author}" if reply_author else ""
                 lines.append(
-                    f"  {colors.CYAN}↳ Reply{colors.END} "
+                    f"  {colors.CYAN}↳ Reply{reply_author_part}{colors.END} "
                     f"{colors.DIM}({ts.strftime('%Y-%m-%d %H:%M')}){colors.END}"
                 )
                 # Indent reply content
@@ -2859,7 +2884,8 @@ def ensure_comment_section(content: str) -> str:
 def insert_comment(
     filepath: Path,
     text: str,
-    reply_to: Optional[int] = None
+    reply_to: Optional[int] = None,
+    author: Optional[str] = None
 ) -> int:
     """
     Insert a comment into a file.
@@ -2871,6 +2897,7 @@ def insert_comment(
         filepath: Path to the markdown file
         text: Comment text
         reply_to: Comment ID to reply to (None for new comment)
+        author: Optional author attribution for the comment
 
     Returns:
         Comment ID (new ID for top-level, parent ID for reply)
@@ -2885,6 +2912,9 @@ def insert_comment(
 
     timestamp = datetime.now().isoformat()
 
+    # Format author part for header (e.g., " by clawdbot" or "")
+    author_part = f" by {author}" if author else ""
+
     if reply_to is not None:
         # Adding a reply to existing comment
         comments = parse_comments(content)
@@ -2898,11 +2928,12 @@ def insert_comment(
 
         # Find the end of the parent comment or its last reply
         # and insert the reply there
-        reply_markdown = f"\n#### Reply ({timestamp})\n\n{reply_text}\n"
+        reply_markdown = f"\n#### Reply{author_part} ({timestamp})\n\n{reply_text}\n"
 
         # Find the comment header and insert before the next comment or end marker
+        # Pattern handles optional 'by <author>' in existing comments
         pattern = re.compile(
-            rf'(### Comment #{reply_to} \([^)]+\).*?)'
+            rf'(### Comment #{reply_to}(?: by [^\(]+)? \([^)]+\).*?)'
             rf'(?=### Comment #|<!-- VIMBAN:COMMENTS:END -->)',
             re.DOTALL
         )
@@ -2921,7 +2952,7 @@ def insert_comment(
         comment_lines = [f"> {line}" if line else ">" for line in text.split('\n')]
         comment_text = '\n'.join(comment_lines)
 
-        comment_markdown = f"### Comment #{new_id} ({timestamp})\n\n{comment_text}\n\n"
+        comment_markdown = f"### Comment #{new_id}{author_part} ({timestamp})\n\n{comment_text}\n\n"
 
         # Insert before the end marker
         content = content.replace(
@@ -6803,11 +6834,14 @@ def cmd_comment(args: argparse.Namespace, config: Config) -> int:
             return EXIT_SUCCESS
 
     reply_to = getattr(args, 'reply_to', None)
+    user = getattr(args, 'user', None)
 
     # Handle --dry-run
     if getattr(args, 'dry_run', False):
         print("=== DRY RUN ===")
         print(f"Target: {target_path}")
+        if user:
+            print(f"Author: {user}")
         if reply_to:
             print(f"Reply to: #{reply_to}")
         else:
@@ -6818,7 +6852,7 @@ def cmd_comment(args: argparse.Namespace, config: Config) -> int:
 
     # Insert comment
     try:
-        comment_id = insert_comment(target_path, text, reply_to=reply_to)
+        comment_id = insert_comment(target_path, text, reply_to=reply_to, author=user)
     except ValueError as e:
         error(str(e), EXIT_VALIDATION_ERROR)
 
@@ -7489,6 +7523,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
         target: str,
         text: str,
         reply_to: int = 0,
+        author: str = "",
     ) -> dict:
         """
         Add a comment to a ticket or person.
@@ -7497,6 +7532,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
             target: Ticket ID or person reference
             text: Comment text (supports markdown)
             reply_to: Reply to comment #N (0 = top-level comment)
+            author: Optional author attribution for the comment
 
         Returns:
             Comment ID or error
@@ -7521,7 +7557,8 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
                 return {"error": f"Target not found: {target}"}
 
             reply_arg = reply_to if reply_to > 0 else None
-            comment_id = insert_comment(target_path, text, reply_to=reply_arg)
+            author_arg = author if author else None
+            comment_id = insert_comment(target_path, text, reply_to=reply_arg, author=author_arg)
 
             return {"success": True, "comment_id": comment_id}
         except Exception as e:
@@ -7532,6 +7569,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
         target: str,
         comment_range: str = "all",
         include_threads: bool = False,
+        author: str = "",
     ) -> dict:
         """
         Get comments from a ticket or person.
@@ -7540,6 +7578,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
             target: Ticket ID or person reference
             comment_range: Range to fetch (e.g., 'all', '1,2-5,9')
             include_threads: Include reply threads
+            author: Filter by author (partial match, case-insensitive)
 
         Returns:
             List of comments or error
@@ -7573,12 +7612,24 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
             ids = parse_comment_range(comment_range, max_id)
 
             result_comments = []
+            author_filter = author.lower() if author else ""
             for c in comments:
                 if c.id in ids:
+                    # Filter by author if specified
+                    if author_filter:
+                        comment_author = (c.author or "").lower()
+                        if author_filter not in comment_author:
+                            continue
+
                     comment_dict = c.to_dict()
-                    if include_threads:
-                        replies = [r.to_dict() for r in comments if r.reply_to == c.id]
-                        comment_dict['replies'] = replies
+                    if not include_threads:
+                        comment_dict.pop('replies', None)
+                    elif author_filter:
+                        # Filter replies by author too
+                        comment_dict['replies'] = [
+                            r for r in comment_dict.get('replies', [])
+                            if author_filter in (r.get('author') or "").lower()
+                        ]
                     result_comments.append(comment_dict)
 
             return {"comments": result_comments, "count": len(result_comments)}
@@ -8685,6 +8736,8 @@ Environment Variables:
                                 help='Output only new comment ID (for scripting)')
     comment_parser.add_argument('-e', '--edit', action='store_true',
                                 help='Edit comment in $EDITOR before saving')
+    comment_parser.add_argument('-u', '--user', metavar='NAME',
+                                help='Author attribution for the comment')
     comment_parser.add_argument('--dry-run', action='store_true',
                                 help='Preview without writing')
 
