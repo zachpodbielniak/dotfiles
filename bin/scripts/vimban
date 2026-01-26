@@ -136,6 +136,7 @@ EXIT_INVALID_ARGS: int = 2
 EXIT_FILE_NOT_FOUND: int = 3
 EXIT_VALIDATION_ERROR: int = 4
 EXIT_KRAFNA_ERROR: int = 5
+EXIT_GIT_ERROR: int = 6
 
 # License text for --license flag
 LICENSE_TEXT: str = """vimban - Markdown-native ticket/kanban management system
@@ -162,7 +163,7 @@ _vimban_completions () {
     local cur prev words cword
     _init_completion || return
 
-    local commands="init create list show generate-link get-link get-id edit move link comment comments dashboard kanban search validate report people sync convert completion tui"
+    local commands="init create list show generate-link get-link get-id edit move link comment comments dashboard kanban search validate report people sync commit convert completion tui"
     local types="epic story task sub-task research bug area resource meeting journal recipe"
     local statuses="backlog ready in_progress blocked review delegated done cancelled"
     local priorities="critical high medium low"
@@ -484,6 +485,9 @@ _vimban_completions () {
                     COMPREPLY=($(compgen -W "--provider --dry-run --push --pull" -- "${cur}"))
                     ;;
             esac
+            ;;
+        commit)
+            COMPREPLY=($(compgen -W "-m --message --no-pull --no-push --dry-run -A --all" -- "${cur}"))
             ;;
         people)
             local pcmd=""
@@ -5836,6 +5840,225 @@ def cmd_sync(args: argparse.Namespace, config: Config) -> int:
     return EXIT_SUCCESS
 
 
+def _is_vimban_file(filepath: Path) -> bool:
+    """
+    Check if a file is a vimban-managed ticket file.
+
+    Looks for YAML frontmatter with an 'id' field matching vimban
+    ID patterns (PROJ-*, BUG-*, MTG-*, etc.).
+
+    Args:
+        filepath: Path to the markdown file to check
+
+    Returns:
+        True if file has vimban frontmatter with valid ID
+    """
+    if not filepath.exists() or filepath.suffix != '.md':
+        return False
+
+    try:
+        content: str = filepath.read_text()
+    except (OSError, IOError):
+        return False
+
+    # Check for YAML frontmatter
+    if not content.startswith('---'):
+        return False
+
+    # Find end of frontmatter
+    end_idx: int = content.find('---', 3)
+    if end_idx == -1:
+        return False
+
+    frontmatter: str = content[3:end_idx]
+
+    # Look for id field with vimban pattern
+    # Patterns: PROJ-*, BUG-*, RESEARCH-*, AREA-*, RESOURCE-*,
+    #           MTG-*, MNTR-*, JNL-*, RCP-*, PERSON-*
+    id_pattern: re.Pattern = re.compile(
+        r'^id:\s*["\']?'
+        r'(PROJ|BUG|RESEARCH|AREA|RESOURCE|MTG|MNTR|JNL|RCP|PERSON)-\d+',
+        re.MULTILINE
+    )
+    return bool(id_pattern.search(frontmatter))
+
+
+def _find_vimban_files(directory: Path) -> list[Path]:
+    """
+    Find all vimban-managed files in a directory.
+
+    Recursively searches for markdown files with vimban frontmatter.
+
+    Args:
+        directory: Root directory to search
+
+    Returns:
+        List of paths to vimban-managed files
+    """
+    vimban_files: list[Path] = []
+
+    for md_file in directory.rglob('*.md'):
+        # Skip hidden directories and .vimban config
+        if any(part.startswith('.') for part in md_file.parts):
+            continue
+        if _is_vimban_file(md_file):
+            vimban_files.append(md_file)
+
+    return vimban_files
+
+
+def cmd_commit(args: argparse.Namespace, config: Config) -> int:
+    """
+    Pull, commit, and push vimban changes to git remote.
+
+    By default: pulls from remote, stages only vimban-managed ticket
+    files, creates a commit with either an auto-generated or
+    user-provided message, and pushes to the configured remote.
+
+    Use --all to stage all files in the directory instead.
+
+    Args:
+        args: Parsed command line arguments
+        config: Vimban configuration object
+
+    Returns:
+        Exit code indicating success or failure
+    """
+    # Check git availability
+    if not shutil.which('git'):
+        error("git is not installed or not in PATH", EXIT_GIT_ERROR)
+
+    directory: Path = config.directory
+    verbose: bool = getattr(args, 'verbose', False)
+    message: str = getattr(args, 'message', None)
+    no_pull: bool = getattr(args, 'no_pull', False)
+    no_push: bool = getattr(args, 'no_push', False)
+    dry_run: bool = getattr(args, 'dry_run', False)
+    stage_all: bool = getattr(args, 'all', False)
+
+    # Verify git repository
+    git_dir: Path = directory / '.git'
+    if not git_dir.exists():
+        error(f"'{directory}' is not a git repository", EXIT_GIT_ERROR)
+
+    # Generate commit message if not provided
+    if not message:
+        timestamp: str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        message = f"vimban: sync {timestamp}"
+
+    # Find vimban files if not staging all
+    vimban_files: list[Path] = []
+    if not stage_all:
+        vimban_files = _find_vimban_files(directory)
+        if not vimban_files:
+            print("No vimban files found")
+            return EXIT_SUCCESS
+
+    if dry_run:
+        print("=== DRY RUN ===")
+        print(f"Directory: {directory}")
+        print(f"Pull: {'no' if no_pull else 'yes'}")
+        print(f"Stage: {'all files' if stage_all else f'{len(vimban_files)} vimban files'}")
+        print(f"Message: {message}")
+        print(f"Push: {'no' if no_push else 'yes'}")
+        if not stage_all:
+            print("\nFiles to stage:")
+            for f in vimban_files:
+                print(f"  {f.relative_to(directory)}")
+        return EXIT_SUCCESS
+
+    # Check if remote is configured (needed for pull/push)
+    remote_result: subprocess.CompletedProcess = subprocess.run(
+        ['git', 'remote'],
+        cwd=directory,
+        capture_output=True,
+        text=True
+    )
+    has_remote: bool = bool(remote_result.stdout.strip())
+
+    # Pull first if remote exists and not disabled
+    if not no_pull and has_remote:
+        info("Pulling from remote", verbose)
+        pull_result: subprocess.CompletedProcess = subprocess.run(
+            ['git', 'pull', '--rebase', '--autostash'],
+            cwd=directory,
+            capture_output=True,
+            text=True
+        )
+        if pull_result.returncode != 0:
+            error(f"git pull failed: {pull_result.stderr.strip()}", EXIT_GIT_ERROR)
+        if verbose and pull_result.stdout.strip():
+            print(pull_result.stdout.strip())
+
+    # Stage changes
+    if stage_all:
+        info(f"Staging all changes in {directory}", verbose)
+        result: subprocess.CompletedProcess = subprocess.run(
+            ['git', 'add', '-A'],
+            cwd=directory,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            error(f"git add failed: {result.stderr.strip()}", EXIT_GIT_ERROR)
+    else:
+        info(f"Staging {len(vimban_files)} vimban files", verbose)
+        # Stage each vimban file individually
+        for vimban_file in vimban_files:
+            result = subprocess.run(
+                ['git', 'add', str(vimban_file)],
+                cwd=directory,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                warn(f"Failed to stage {vimban_file}: {result.stderr.strip()}")
+
+    # Check if there are changes to commit
+    status_result: subprocess.CompletedProcess = subprocess.run(
+        ['git', 'status', '--porcelain'],
+        cwd=directory,
+        capture_output=True,
+        text=True
+    )
+    if not status_result.stdout.strip():
+        print("No changes to commit")
+        return EXIT_SUCCESS
+
+    # Create commit
+    info(f"Creating commit: {message}", verbose)
+    commit_result: subprocess.CompletedProcess = subprocess.run(
+        ['git', 'commit', '-m', message],
+        cwd=directory,
+        capture_output=True,
+        text=True
+    )
+    if commit_result.returncode != 0:
+        error(f"git commit failed: {commit_result.stderr.strip()}", EXIT_GIT_ERROR)
+
+    print(f"Committed: {message}")
+
+    # Push if remote exists and not disabled
+    if not no_push:
+        if not has_remote:
+            warn("No remote configured, skipping push")
+            return EXIT_SUCCESS
+
+        info("Pushing to remote", verbose)
+        push_result: subprocess.CompletedProcess = subprocess.run(
+            ['git', 'push'],
+            cwd=directory,
+            capture_output=True,
+            text=True
+        )
+        if push_result.returncode != 0:
+            error(f"git push failed: {push_result.stderr.strip()}", EXIT_GIT_ERROR)
+
+        print("Pushed to remote")
+
+    return EXIT_SUCCESS
+
+
 def cmd_people_list(args: argparse.Namespace, config: Config) -> int:
     """List all people from work and/or personal directories."""
     people_dirs = get_people_dirs(args, config)
@@ -8993,6 +9216,14 @@ Environment Variables:
     sync_parser.add_argument('--push', action='store_true', help='Push local changes')
     sync_parser.add_argument('--pull', action='store_true', help='Pull external changes')
 
+    # commit
+    commit_parser = subparsers.add_parser('commit', help='Pull, commit, and push vimban changes')
+    commit_parser.add_argument('-m', '--message', help='Commit message (default: auto-generated timestamp)')
+    commit_parser.add_argument('--no-pull', action='store_true', help='Skip pulling from remote')
+    commit_parser.add_argument('--no-push', action='store_true', help='Skip pushing to remote')
+    commit_parser.add_argument('--dry-run', action='store_true', help='Preview without making changes')
+    commit_parser.add_argument('-A', '--all', action='store_true', help='Stage all files (default: only vimban files)')
+
     # people
     people_parser = subparsers.add_parser('people', help='People management')
     people_subparsers = people_parser.add_subparsers(dest='people_command')
@@ -9156,6 +9387,7 @@ def main() -> int:
         'validate': cmd_validate,
         'report': cmd_report,
         'sync': cmd_sync,
+        'commit': cmd_commit,
         'people': cmd_people,
         'mentor': cmd_mentor,
         'convert': cmd_convert,
