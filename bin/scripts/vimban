@@ -2462,7 +2462,8 @@ def krafna_query(query: str, directory: Path) -> list[dict]:
 def fallback_list_tickets(
     directory: Path,
     filters: dict,
-    exclude_types: Optional[list[str]] = None
+    exclude_types: Optional[list[str]] = None,
+    include_archived: bool = False
 ) -> list[Ticket]:
     """
     List tickets without Krafna (fallback method).
@@ -2473,6 +2474,7 @@ def fallback_list_tickets(
         directory: Directory to search
         filters: Dictionary of filter criteria
         exclude_types: List of types to exclude (default: ['person'])
+        include_archived: If False, exclude files under 04_archives/ (default: False)
 
     Returns:
         List of matching Ticket objects
@@ -2484,6 +2486,9 @@ def fallback_list_tickets(
 
     # Find all markdown files
     for md_file in directory.rglob('*.md'):
+        # Skip archived files unless explicitly included
+        if not include_archived and '/04_archives/' in str(md_file):
+            continue
         try:
             content = md_file.read_text()
             metadata, _ = parse_frontmatter(content)
@@ -4618,11 +4623,29 @@ def cmd_list(args: argparse.Namespace, config: Config) -> int:
             if specialized_path not in search_paths:
                 search_paths.append(specialized_path)
 
+    # Add archive search paths when --archived is specified
+    include_archived = getattr(args, 'archived', False)
+    if include_archived:
+        if getattr(args, 'work', False):
+            archive_path = config.directory / '04_archives' / '01_projects' / 'work'
+            if archive_path.exists():
+                search_paths.append(archive_path)
+        elif getattr(args, 'personal', False):
+            archive_path = config.directory / '04_archives' / '01_projects' / 'personal'
+            if archive_path.exists():
+                search_paths.append(archive_path)
+        else:
+            # Both scopes
+            for scope in ['work', 'personal']:
+                archive_path = config.directory / '04_archives' / '01_projects' / scope
+                if archive_path.exists():
+                    search_paths.append(archive_path)
+
     # Collect tickets from all search paths
     tickets: list[Ticket] = []
     for search_path in search_paths:
         if search_path.exists():
-            path_tickets = fallback_list_tickets(search_path, filters, exclude_types)
+            path_tickets = fallback_list_tickets(search_path, filters, exclude_types, include_archived)
             tickets.extend(path_tickets)
 
     # Apply additional filters
@@ -5312,6 +5335,146 @@ def cmd_move_location(args: argparse.Namespace, config: Config) -> int:
         updated_count: int = 0
         for ref_file, location in references:
             if update_path_references(ref_file, old_rel_path, new_rel_path, location):
+                updated_count += 1
+                ref_rel = str(ref_file.relative_to(config.directory))
+                print(f"  Updated reference in: {ref_rel} ({location})")
+
+        print(f"\nUpdated {updated_count} reference(s).")
+
+    return EXIT_SUCCESS
+
+
+def cmd_archive(args: argparse.Namespace, config: Config) -> int:
+    """
+    Archive a completed or cancelled ticket.
+
+    Moves the ticket file to 04_archives/01_projects/<personal_or_work>/<status>/
+    based on the ticket's current location and status.
+    """
+    ticket_ref: Optional[str] = getattr(args, 'ticket', None)
+    dry_run: bool = getattr(args, 'dry_run', False)
+
+    # Select ticket if not provided
+    if not ticket_ref:
+        if not shutil.which('fzf'):
+            error("fzf is required for interactive ticket selection", EXIT_INVALID_ARGS)
+
+        # Get search paths and collect only done/cancelled tickets
+        search_paths: list[Path] = get_search_paths(args, config)
+        tickets: list[Ticket] = []
+        for search_path in search_paths:
+            if search_path.exists():
+                path_tickets: list[Ticket] = fallback_list_tickets(
+                    search_path,
+                    {'status': 'done,cancelled'},
+                    include_archived=False
+                )
+                tickets.extend(path_tickets)
+
+        if not tickets:
+            error("No done/cancelled tickets found to archive", EXIT_FILE_NOT_FOUND)
+
+        # Format for fzf: ID | status | type | title | path
+        lines: list[str] = []
+        for t in tickets:
+            rel_path: str = str(t.filepath.relative_to(config.directory))
+            line: str = f"{t.id}\t{t.status}\t{t.type}\t{t.title}\t{rel_path}"
+            lines.append(line)
+
+        # Run fzf
+        fzf_cmd: list[str] = [
+            'fzf',
+            '--header', 'ID\tStatus\tType\tTitle\tPath',
+            '--preview', 'vimban show {1} --content',
+            '--preview-window', 'right:50%:wrap',
+            '--delimiter', '\t',
+        ]
+
+        result = subprocess.run(
+            fzf_cmd,
+            input='\n'.join(lines),
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            return EXIT_SUCCESS  # User cancelled
+
+        ticket_ref = result.stdout.strip().split('\t')[0]
+
+    # Find ticket file
+    ticket_path: Optional[Path] = find_ticket(ticket_ref, config, args)
+    if not ticket_path:
+        error(f"Ticket not found: {ticket_ref}", EXIT_FILE_NOT_FOUND)
+
+    # Load ticket to get status
+    content: str = ticket_path.read_text()
+    metadata, _ = parse_frontmatter(content)
+    status: str = metadata.get('status', 'unknown')
+
+    # Validate status is archivable
+    archivable_statuses: list[str] = ['done', 'cancelled']
+    if status not in archivable_statuses:
+        error(f"Cannot archive ticket with status '{status}'. Must be one of: {', '.join(archivable_statuses)}", EXIT_VALIDATION_ERROR)
+
+    # Determine scope (personal or work) from current path
+    rel_path: str = str(ticket_path.relative_to(config.directory))
+    scope: str = 'personal'  # default
+    if '/work/' in rel_path or rel_path.startswith('01_projects/work'):
+        scope = 'work'
+    elif '/personal/' in rel_path or rel_path.startswith('01_projects/personal'):
+        scope = 'personal'
+
+    # Calculate archive destination
+    archive_dir: Path = config.directory / '04_archives' / '01_projects' / scope / status
+    new_file_path: Path = archive_dir / ticket_path.name
+    new_rel_path: str = str(new_file_path.relative_to(config.directory))
+
+    # Check if already archived
+    if '/04_archives/' in rel_path:
+        print(f"Ticket is already archived: {rel_path}")
+        return EXIT_SUCCESS
+
+    # Check if file already exists at destination
+    if new_file_path.exists():
+        error(f"File already exists at destination: {new_rel_path}", EXIT_VALIDATION_ERROR)
+
+    # Find files that reference this path
+    references: list[tuple[Path, str]] = find_files_referencing_path(rel_path, config, exclude_file=ticket_path)
+
+    # Dry-run output
+    if dry_run:
+        print(f"Would archive: {rel_path} -> {new_rel_path}")
+        if references:
+            print(f"\nWould update {len(references)} reference(s):")
+            for ref_file, location in references:
+                ref_rel: str = str(ref_file.relative_to(config.directory))
+                print(f"  - {ref_rel} ({location})")
+        else:
+            print("\nNo references to update.")
+        return EXIT_SUCCESS
+
+    # Create archive directory if needed (with 00_index.md)
+    if not archive_dir.exists():
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        index_file: Path = archive_dir / '00_index.md'
+        if not index_file.exists():
+            index_file.touch()
+        print(f"Created archive directory: {archive_dir.relative_to(config.directory)}")
+
+    # Move the file
+    try:
+        shutil.move(str(ticket_path), str(new_file_path))
+    except OSError as e:
+        error(f"Failed to move file: {e}", EXIT_GENERAL_ERROR)
+
+    print(f"Archived: {rel_path} -> {new_rel_path}")
+
+    # Update references
+    if references:
+        updated_count: int = 0
+        for ref_file, location in references:
+            if update_path_references(ref_file, rel_path, new_rel_path, location):
                 updated_count += 1
                 ref_rel = str(ref_file.relative_to(config.directory))
                 print(f"  Updated reference in: {ref_rel} ({location})")
@@ -9030,6 +9193,10 @@ Environment Variables:
     scope_group.add_argument('--personal', action='store_true',
                              help='Operate on personal tickets (01_projects/personal/)')
 
+    # Archive inclusion flag (global)
+    parser.add_argument('--archived', action='store_true',
+                        help='Include items from 04_archives/ (excluded by default)')
+
     # Subparsers
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -9145,6 +9312,11 @@ Environment Variables:
     moveloc_parser.add_argument('destination', nargs='?', help='Destination directory (fzf picker if omitted)')
     moveloc_parser.add_argument('--dry-run', action='store_true', help='Preview changes without executing')
     moveloc_parser.add_argument('--no-update-refs', action='store_true', help='Skip updating references in other files')
+
+    # archive
+    archive_parser = subparsers.add_parser('archive', help='Archive a completed/cancelled ticket')
+    archive_parser.add_argument('ticket', nargs='?', help='Ticket ID or path (fzf picker if omitted)')
+    archive_parser.add_argument('--dry-run', action='store_true', help='Preview changes without executing')
 
     # link
     link_parser = subparsers.add_parser('link', help='Link tickets')
@@ -9415,6 +9587,7 @@ def main() -> int:
         'edit': cmd_edit,
         'move': cmd_move,
         'move-location': cmd_move_location,
+        'archive': cmd_archive,
         'link': cmd_link,
         'dashboard': cmd_dashboard,
         'kanban': cmd_kanban,
