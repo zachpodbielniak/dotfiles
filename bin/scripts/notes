@@ -34,7 +34,9 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
 import stat
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -163,17 +165,41 @@ def get_file_stats(file_path):
             'created': datetime.now(tz=timezone.utc)
         }
 
+def make_json_serializable(obj):
+    """Convert non-JSON-serializable objects to JSON-safe representations.
+
+    Handles date, datetime, and other special types.
+    """
+    from datetime import date, datetime as dt
+
+    if isinstance(obj, (date, dt)):
+        # Convert dates and datetimes to ISO format strings
+        return obj.isoformat() if hasattr(obj, 'isoformat') else str(obj)
+    elif isinstance(obj, dict):
+        # Recursively process dictionary values
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        # Recursively process list/tuple items
+        return [make_json_serializable(item) for item in obj]
+    elif isinstance(obj, set):
+        # Convert sets to lists
+        return [make_json_serializable(item) for item in obj]
+    else:
+        # Return as-is for JSON-serializable types
+        return obj
+
+
 def sync_note_to_db(conn, file_path, notes_dir, debug=False):
     """Sync a single note file to the database.
-    
+
     Returns: tuple (success, action, error_msg) where action is 'added', 'updated', 'skipped', 'ignored', or 'error'
     """
     relative_path = get_relative_path(file_path, notes_dir)
     para = get_para_category(file_path)
     category = extract_category_from_path(file_path)
-    
+
     content, metadata = read_file_content(file_path)
-    
+
     # Skip if content couldn't be read
     if content is None:
         filename = Path(file_path).name
@@ -181,14 +207,17 @@ def sync_note_to_db(conn, file_path, notes_dir, debug=False):
         if filename == '00_index.md' or filename.startswith('._'):
             return True, 'ignored', None
         return False, 'error', f"Failed to read file: {relative_path}"
-    
+
     file_stats = get_file_stats(file_path)
-    
+
     # Extract tags from metadata
     tags = metadata.get('tags', [])
     if isinstance(tags, str):
         tags = [tags]
-    
+
+    # Make metadata JSON-serializable (convert dates, etc.)
+    metadata_safe = make_json_serializable(metadata)
+
     # Prepare data for database
     note_data = {
         'path': relative_path,
@@ -199,7 +228,7 @@ def sync_note_to_db(conn, file_path, notes_dir, debug=False):
         'last_modified': file_stats['modified'],
         'created_at': file_stats['created'],
         'accessed_at': file_stats['accessed'],
-        'metadata': json.dumps(metadata),
+        'metadata': json.dumps(metadata_safe),
         'tags': tags
     }
     
@@ -359,35 +388,44 @@ def sync_all_notes(notes_dir, debug=False, quiet=False):
                 if len(error_details) > 20:
                     print(f"    ... and {len(error_details) - 20} more errors")
 
-def search_notes(query, para=None, category=None, tags=None, limit=20, offset=0, order_by='last_modified', debug=False):
-    """Search notes in the database."""
+def search_notes(query, para=None, category=None, tags=None, limit=20, offset=0, order_by='last_modified', search_content=True, debug=False):
+    """Search notes in the database.
+
+    Args:
+        query: Search query string
+        search_content: If True, search in content. If False, search in path/filename.
+    """
     conn = psycopg2.connect(**NOTES_DB_CONFIG)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
+
     # Build query
     sql_parts = []
     params = []
-    
-    # Full text search
+
+    # Search by content or path depending on search_content flag
     if query:
-        sql_parts.append("to_tsvector('english', content) @@ plainto_tsquery('english', %s)")
+        if search_content:
+            sql_parts.append("to_tsvector('english', content) @@ plainto_tsquery('english', %s)")
+        else:
+            sql_parts.append("path ILIKE %s")
+            query = f"%{query}%"
         params.append(query)
-    
+
     # PARA filter
     if para:
         sql_parts.append("para = %s")
         params.append(para)
-    
+
     # Category filter
     if category:
         sql_parts.append("category = %s")
         params.append(category)
-    
+
     # Tags filter
     if tags:
         sql_parts.append("%s::text[] && tags")
         params.append(tags)
-    
+
     # Build final query
     where_clause = " AND ".join(sql_parts) if sql_parts else "1=1"
     
@@ -440,41 +478,83 @@ def fzf_select_note(results, notes_dir, show_content=False):
     if not results:
         print("No notes found.")
         return None
-    
+
     # Format results for fzf
     fzf_input = []
     for i, note in enumerate(results):
         modified = note['last_modified'].strftime('%Y-%m-%d %H:%M') if note['last_modified'] else 'Unknown'
-        line = f"{i:3d} | {note['id']:>6} | {note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}"
-        if show_content and note.get('snippet'):
-            # Add content snippet on next line, indented
-            snippet = note['snippet'].replace('\n', ' ').strip()[:80]
-            if snippet:
-                line += f"\n          {snippet}..."
+        line = f"{i:3d} | {note['id'][:8]} | {note['para']:10s} | {note['category'] or 'None':20s} | {modified} | {note['path']}"
         fzf_input.append(line)
-    
-    # Run fzf with multi-line support if showing content
-    fzf_args = ['fzf', '--ansi', '--no-sort', '--reverse', '--tiebreak=index']
-    if show_content:
-        fzf_args.extend(['--multi-line', '--no-mouse'])
-    
+
+    # Create preview script to show note content
+    # The notes_dir is escaped to handle spaces and special chars
+    preview_script = f"""#!/bin/bash
+# Extract the file path from the last field of the display line
+display_line="${{1}}"
+relative_path=$(echo "$display_line" | awk -F ' | ' '{{print $NF}}')
+
+# Build the full path
+notes_dir={shlex.quote(notes_dir)}
+full_path="$notes_dir/$relative_path"
+
+if [ -f "$full_path" ]; then
+    bat --theme='Catppuccin Mocha' --style=numbers "$full_path" 2>/dev/null || head -50 "$full_path"
+else
+    echo "File not found: $full_path"
+fi
+"""
+
+    # Write preview script to temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+        f.write(preview_script)
+        preview_file = f.name
+
+    os.chmod(preview_file, 0o755)
+
+    # Run fzf with preview
+    fzf_args = [
+        'fzf',
+        '--ansi',
+        '--no-sort',
+        '--reverse',
+        '--tiebreak=index',
+        '--preview', f'{preview_file} {{}}',
+        '--preview-window', 'down:50%:wrap'
+    ]
+
     try:
-        proc = subprocess.Popen(
-            fzf_args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True
-        )
-        stdout, _ = proc.communicate('\n'.join(fzf_input))
-        
-        if proc.returncode == 0 and stdout.strip():
-            # Extract index from selected line
-            selected_index = int(stdout.strip().split('|')[0].strip())
-            return results[selected_index]
+        # Create temp file with fzf input
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write('\n'.join(fzf_input))
+            input_file = f.name
+
+        try:
+            # Use subprocess.run with stdin from temp file and capture output
+            # This allows fzf to work even when stdout is piped to another program
+            result = subprocess.run(
+                fzf_args,
+                stdin=open(input_file, 'r'),
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                selected_index = int(result.stdout.strip().split('|')[0].strip())
+                return results[selected_index]
+
+        finally:
+            os.unlink(input_file)
+
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Error: fzf not found. Install fzf to use interactive selection.")
         return None
-    
+    finally:
+        # Clean up preview script
+        try:
+            os.unlink(preview_file)
+        except:
+            pass
+
     return None
 
 def open_note_in_editor(note_path, notes_dir):
@@ -592,6 +672,7 @@ def view_command(args):
         results = search_notes(
             query=args.query if hasattr(args, 'query') else None,
             limit=100,
+            search_content=True,
             debug=args.debug
         )
         
@@ -610,6 +691,34 @@ def view_command(args):
             # Add separator between multiple files
             if len(args.identifiers) > 1 and identifier != args.identifiers[-1]:
                 print("\n" + "="*80 + "\n")
+
+def dump_command(args):
+    """Handle the dump command - dump note content to stdout."""
+    # If using fzf, search and select first
+    if args.fzf:
+        results = search_notes(
+            query=args.query if hasattr(args, 'query') else None,
+            limit=100,
+            search_content=True,
+            debug=args.debug
+        )
+
+        selected = fzf_select_note(results, args.notes_dir, show_content=True)
+        if not selected:
+            return
+
+        # Replace identifiers with the selected note's ID
+        args.identifiers = [str(selected['id'])]
+
+    # Dump each identifier
+    for identifier in args.identifiers:
+        content = view_note(identifier, args.notes_dir, render=args.render)
+        if content:
+            # For dump, just output the raw content without extra formatting
+            if args.render:
+                print(content, end='')
+            else:
+                print(content, end='')
 
 def stats_command(args):
     """Show database statistics."""
@@ -685,6 +794,7 @@ def list_command(args):
         tags=args.tags,
         limit=args.limit,
         order_by=args.sort,
+        search_content=getattr(args, 'content', False),
         debug=args.debug
     )
     
@@ -787,7 +897,7 @@ def main():
                              help='Sort order')
     search_parser.add_argument('--json', action='store_true', help='Output as JSON')
     search_parser.add_argument('--fzf', action='store_true', help='Use fzf for interactive selection')
-    search_parser.add_argument('--content', action='store_true', help='Show content snippets in search results')
+    search_parser.add_argument('--content', action='store_true', help='Search in note content (default: search by filename/path)')
     search_parser.add_argument('--md-table', action='store_true', help='Output as markdown table')
     search_parser.add_argument('--render', action='store_true', help='Render as formatted markdown output')
     search_parser.add_argument('--shorten', action='store_true', help='Shorten UUIDs to 8 characters')
@@ -802,7 +912,14 @@ def main():
     view_parser.add_argument('--render', action='store_true', help='Render as formatted markdown')
     view_parser.add_argument('--fzf', action='store_true', help='Use fzf to select note to view')
     view_parser.add_argument('--content', action='store_true', help='Show content snippets in fzf selection')
-    
+
+    # Dump command
+    dump_parser = subparsers.add_parser('dump', help='Dump note content to stdout')
+    dump_parser.add_argument('identifiers', nargs='*', help='Note IDs or file paths to dump')
+    dump_parser.add_argument('-q', '--query', help='Search query (with --fzf)')
+    dump_parser.add_argument('--render', action='store_true', help='Render as formatted markdown')
+    dump_parser.add_argument('--fzf', action='store_true', help='Use fzf to select note to dump')
+
     args = parser.parse_args()
     
     # Default to search with fzf if no command specified
@@ -830,11 +947,12 @@ def main():
             tags=args.tags,
             limit=args.limit if not args.fzf else 100,  # Get more results for fzf
             order_by=args.sort,
+            search_content=args.content,
             debug=args.debug
         )
-        
+
         if args.fzf:
-            selected = fzf_select_note(results, args.notes_dir, show_content=args.content)
+            selected = fzf_select_note(results, args.notes_dir, show_content=True)
             if selected:
                 open_note_in_editor(selected['path'], args.notes_dir)
         else:
@@ -849,6 +967,13 @@ def main():
             print("Error: Must provide at least one identifier or use --fzf", file=sys.stderr)
             sys.exit(1)
         view_command(args)
+
+    elif args.command == 'dump':
+        # Validate arguments
+        if not args.identifiers and not args.fzf:
+            print("Error: Must provide at least one identifier or use --fzf", file=sys.stderr)
+            sys.exit(1)
+        dump_command(args)
 
 if __name__ == '__main__':
     main()

@@ -1,0 +1,694 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+bw_to_pass - Synchronize Bitwarden passwords to the Unix pass password manager.
+
+This script fetches login items from Bitwarden and inserts them into pass,
+preserving the folder structure. Each pass entry contains the password on
+line 1, followed by metadata (username, URL, TOTP, notes).
+
+Usage:
+    bw_to_pass [options]
+
+Examples:
+    bw_to_pass                  # Sync all passwords
+    bw_to_pass --dry-run        # Show what would be synced
+    bw_to_pass -v               # Verbose output during sync
+
+Requirements:
+    - bw (Bitwarden CLI) installed and logged in
+    - pass (password-store) initialized with GPG key
+"""
+
+import argparse
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import Any, Optional
+
+
+# Bitwarden item type constants
+BW_TYPE_LOGIN: int = 1
+
+
+def print_error(msg: str) -> None:
+    """Print error message to stderr."""
+    print(f"Error: {msg}", file=sys.stderr)
+
+
+def print_verbose(msg: str, verbose: bool) -> None:
+    """Print message only if verbose mode is enabled."""
+    if verbose:
+        print(msg)
+
+
+def run_command(
+    cmd: list[str],
+    input_data: Optional[str] = None,
+    capture_output: bool = True
+) -> subprocess.CompletedProcess:
+    """
+    Run a command and return the result.
+
+    Uses subprocess.run with explicit argument list (no shell=True)
+    for security. Input data can be piped to stdin if provided.
+
+    Args:
+        cmd: Command and arguments as a list
+        input_data: Optional string to pipe to stdin
+        capture_output: Whether to capture stdout/stderr
+
+    Returns:
+        CompletedProcess instance with return code, stdout, stderr
+    """
+    return subprocess.run(
+        cmd,
+        input=input_data,
+        capture_output=capture_output,
+        text=True
+    )
+
+
+def get_vault_status() -> dict[str, Any]:
+    """
+    Check Bitwarden vault status using 'bw status'.
+
+    Returns a dictionary with vault state information including
+    whether the vault is locked, unlocked, or unauthenticated.
+
+    Returns:
+        Dictionary with status information from bw status command
+
+    Raises:
+        RuntimeError: If bw command fails or returns invalid JSON
+    """
+    result: subprocess.CompletedProcess = run_command(["bw", "status"])
+
+    if result.returncode != 0:
+        raise RuntimeError(f"bw status failed: {result.stderr}")
+
+    try:
+        status: dict[str, Any] = json.loads(result.stdout)
+        return status
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse bw status output: {e}")
+
+
+def unlock_vault(password: str) -> str:
+    """
+    Unlock the Bitwarden vault and return the session key.
+
+    Runs 'bw unlock --raw --passwordenv' with the password passed via
+    environment variable. This avoids issues with bw's interactive prompt.
+    The --raw flag outputs only the session key without extra text.
+
+    Args:
+        password: Master password for Bitwarden vault
+
+    Returns:
+        Session key string for use with subsequent bw commands
+
+    Raises:
+        RuntimeError: If unlock fails (wrong password, etc.)
+    """
+    # Use --passwordenv to pass password via environment variable
+    # This avoids interactive prompt issues with inquirer/readline
+    env: dict[str, str] = os.environ.copy()
+    env["BW_PASSWORD"] = password
+
+    result: subprocess.CompletedProcess = subprocess.run(
+        ["bw", "unlock", "--raw", "--passwordenv", "BW_PASSWORD"],
+        capture_output=True,
+        text=True,
+        env=env
+    )
+
+    if result.returncode != 0:
+        error_msg: str = result.stderr.strip() if result.stderr else "Unknown error"
+        raise RuntimeError(f"Failed to unlock vault: {error_msg}")
+
+    session_key: str = result.stdout.strip()
+    if not session_key:
+        raise RuntimeError("bw unlock returned empty session key")
+
+    return session_key
+
+
+def sync_vault(session: str) -> bool:
+    """
+    Sync local vault with Bitwarden server.
+
+    Runs 'bw sync' to ensure we have the latest data before
+    exporting passwords.
+
+    Args:
+        session: Session key from unlock_vault()
+
+    Returns:
+        True if sync succeeded, False otherwise
+    """
+    result: subprocess.CompletedProcess = run_command(
+        ["bw", "sync", "--session", session]
+    )
+    return result.returncode == 0
+
+
+def fetch_folders(session: str) -> dict[str, str]:
+    """
+    Fetch all folders from Bitwarden.
+
+    Returns a mapping of folder ID to folder name. Folder names
+    may contain '/' for nested folders (e.g., 'Finance/Banking').
+
+    Args:
+        session: Session key from unlock_vault()
+
+    Returns:
+        Dictionary mapping folder_id -> folder_name
+
+    Raises:
+        RuntimeError: If bw list folders fails
+    """
+    result: subprocess.CompletedProcess = run_command(
+        ["bw", "list", "folders", "--session", session]
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"bw list folders failed: {result.stderr}")
+
+    try:
+        folders_list: list[dict[str, Any]] = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse folders JSON: {e}")
+
+    folders: dict[str, str] = {}
+    for folder in folders_list:
+        folder_id: str = folder.get("id", "")
+        folder_name: str = folder.get("name", "")
+        if folder_id and folder_name:
+            folders[folder_id] = folder_name
+
+    return folders
+
+
+def fetch_items(session: str) -> list[dict[str, Any]]:
+    """
+    Fetch all items from Bitwarden and filter to login type.
+
+    Only returns items with type=1 (login items). Secure notes,
+    cards, and identities are excluded.
+
+    Args:
+        session: Session key from unlock_vault()
+
+    Returns:
+        List of login item dictionaries
+
+    Raises:
+        RuntimeError: If bw list items fails
+    """
+    result: subprocess.CompletedProcess = run_command(
+        ["bw", "list", "items", "--session", session]
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"bw list items failed: {result.stderr}")
+
+    try:
+        all_items: list[dict[str, Any]] = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse items JSON: {e}")
+
+    # Filter to login items only (type == 1)
+    login_items: list[dict[str, Any]] = [
+        item for item in all_items
+        if item.get("type") == BW_TYPE_LOGIN
+    ]
+
+    return login_items
+
+
+def sanitize_name(name: str) -> str:
+    """
+    Sanitize entry or folder segment name for filesystem safety.
+
+    This sanitizes individual path segments (not full paths).
+    Characters that could cause filesystem issues are replaced
+    with underscores.
+
+    Args:
+        name: Original name from Bitwarden
+
+    Returns:
+        Sanitized name safe for use as a filename
+    """
+    if not name:
+        return "unnamed"
+
+    # Replace problematic characters with underscore
+    # Note: We don't replace '/' here because folder names may contain
+    # nested paths which we want to preserve
+    sanitized: str = name
+    sanitized = sanitized.replace("\\", "_")
+    sanitized = sanitized.replace(":", "_")
+    sanitized = sanitized.replace("\0", "_")
+
+    # Collapse multiple spaces and strip whitespace
+    sanitized = re.sub(r"\s+", " ", sanitized)
+    sanitized = sanitized.strip()
+
+    if not sanitized:
+        return "unnamed"
+
+    return sanitized
+
+
+def sanitize_item_name(name: str) -> str:
+    """
+    Sanitize item name, replacing '/' since items shouldn't create subdirs.
+
+    Unlike folder names which preserve '/' for nesting, item names
+    should not contain path separators.
+
+    Args:
+        name: Item name from Bitwarden
+
+    Returns:
+        Sanitized item name
+    """
+    sanitized: str = sanitize_name(name)
+    # Item names should not contain path separators
+    sanitized = sanitized.replace("/", "_")
+    return sanitized
+
+
+def build_pass_path(
+    item: dict[str, Any],
+    folders: dict[str, str]
+) -> str:
+    """
+    Build the full pass path for an item.
+
+    Combines the folder path (if any) with the item name.
+    Folder names may contain '/' for nesting which is preserved.
+
+    Examples:
+        - Item "Gmail" in folder "Email" -> "Email/Gmail"
+        - Item "Bank" in folder "Finance/Banking" -> "Finance/Banking/Bank"
+        - Item "SSH Key" with no folder -> "SSH_Key"
+
+    Args:
+        item: Bitwarden item dictionary
+        folders: Mapping of folder_id -> folder_name
+
+    Returns:
+        Full path for the pass entry
+    """
+    item_name: str = sanitize_item_name(item.get("name", "unnamed"))
+    folder_id: Optional[str] = item.get("folderId")
+
+    if folder_id and folder_id in folders:
+        folder_name: str = sanitize_name(folders[folder_id])
+        return f"{folder_name}/{item_name}"
+
+    return item_name
+
+
+def check_pass_entry_exists(path: str) -> bool:
+    """
+    Check if a pass entry already exists at the given path.
+
+    Uses 'pass show' and checks the return code. A non-zero
+    return code indicates the entry doesn't exist.
+
+    Args:
+        path: Pass entry path to check
+
+    Returns:
+        True if entry exists, False otherwise
+    """
+    result: subprocess.CompletedProcess = run_command(
+        ["pass", "show", path]
+    )
+    return result.returncode == 0
+
+
+def get_unique_path(base_path: str, used_paths: set[str]) -> str:
+    """
+    Get a unique pass path, handling duplicates.
+
+    If the base path is already used (either in pass store or
+    in this sync session), appends _2, _3, etc. until unique.
+
+    Args:
+        base_path: Desired pass path
+        used_paths: Set of paths already used in this sync session
+
+    Returns:
+        Unique path (may be same as base_path if not duplicate)
+    """
+    if base_path not in used_paths and not check_pass_entry_exists(base_path):
+        return base_path
+
+    counter: int = 2
+    while True:
+        candidate: str = f"{base_path}_{counter}"
+        if candidate not in used_paths and not check_pass_entry_exists(candidate):
+            return candidate
+        counter += 1
+        # Safety limit to prevent infinite loop
+        if counter > 1000:
+            raise RuntimeError(f"Too many duplicates for path: {base_path}")
+
+
+def format_pass_entry(item: dict[str, Any]) -> str:
+    """
+    Format a Bitwarden item as a pass multiline entry.
+
+    Format:
+        <password>
+        username: <username>
+        url: <url>
+        totp: <otpauth://...>
+        notes: <notes>
+
+    Empty fields are omitted. The password must be on line 1
+    for pass clipboard functionality to work correctly.
+
+    Args:
+        item: Bitwarden login item dictionary
+
+    Returns:
+        Formatted entry content string
+    """
+    login: dict[str, Any] = item.get("login", {})
+
+    password: str = login.get("password", "") or ""
+    username: str = login.get("username", "") or ""
+    totp: str = login.get("totp", "") or ""
+    notes: str = item.get("notes", "") or ""
+
+    # Get the first URI if available
+    uris: list[dict[str, Any]] = login.get("uris", []) or []
+    url: str = ""
+    if uris and len(uris) > 0:
+        url = uris[0].get("uri", "") or ""
+
+    lines: list[str] = [password]
+
+    if username:
+        lines.append(f"username: {username}")
+
+    if url:
+        lines.append(f"url: {url}")
+
+    if totp:
+        lines.append(f"totp: {totp}")
+
+    if notes:
+        # Prefix multiline notes properly
+        lines.append(f"notes: {notes}")
+
+    return "\n".join(lines)
+
+
+def insert_to_pass(
+    path: str,
+    content: str,
+    dry_run: bool = False,
+    verbose: bool = False
+) -> bool:
+    """
+    Insert an entry into the pass store.
+
+    Uses 'pass insert -m -f' to insert multiline content and
+    force overwrite of existing entries.
+
+    Args:
+        path: Pass entry path
+        content: Formatted entry content
+        dry_run: If True, don't actually insert
+        verbose: If True, print detailed output
+
+    Returns:
+        True if successful (or dry_run), False on failure
+    """
+    if dry_run:
+        print_verbose(f"  Would insert: {path}", verbose)
+        return True
+
+    result: subprocess.CompletedProcess = run_command(
+        ["pass", "insert", "-m", "-f", path],
+        input_data=content
+    )
+
+    if result.returncode != 0:
+        error_msg: str = result.stderr.strip() if result.stderr else "Unknown error"
+        print_error(f"Failed to insert '{path}': {error_msg}")
+        return False
+
+    print_verbose(f"  Inserted: {path}", verbose)
+    return True
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        Namespace with parsed arguments
+    """
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        prog="bw_to_pass",
+        description="Synchronize Bitwarden passwords to the Unix pass password manager.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    bw_to_pass                  Sync all Bitwarden passwords to pass
+    bw_to_pass --dry-run        Show what would be synced without changes
+    bw_to_pass -v               Verbose output during sync
+    bw_to_pass -n -v            Dry run with verbose output
+
+Pass Entry Format:
+    Each entry stores the password on line 1, followed by metadata:
+        <password>
+        username: user@example.com
+        url: https://example.com
+        totp: otpauth://totp/...
+        notes: Additional notes
+
+Requirements:
+    - bw (Bitwarden CLI) must be installed and logged in
+    - pass (password-store) must be initialized with a GPG key
+"""
+    )
+
+    parser.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes"
+    )
+
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show detailed progress output"
+    )
+
+    parser.add_argument(
+        "--license",
+        action="store_true",
+        help="Show license information and exit"
+    )
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    """
+    Main entry point for bw_to_pass.
+
+    Orchestrates the full sync process:
+    1. Parse arguments and check prerequisites
+    2. Authenticate with Bitwarden
+    3. Fetch folders and items
+    4. Insert each item into pass
+    5. Print summary
+
+    Returns:
+        Exit code: 0 for success, 1 for errors
+    """
+    args: argparse.Namespace = parse_arguments()
+
+    # Handle --license flag
+    if args.license:
+        print("GNU Affero General Public License v3.0 or later")
+        print("https://www.gnu.org/licenses/agpl-3.0.html")
+        return 0
+
+    dry_run: bool = args.dry_run
+    verbose: bool = args.verbose
+
+    print("Bitwarden to Pass Sync")
+    print("=" * 22)
+    print()
+
+    # Check vault status
+    print("Checking vault status...")
+    try:
+        status: dict[str, Any] = get_vault_status()
+    except RuntimeError as e:
+        print_error(str(e))
+        print_error("Is the 'bw' CLI installed and in your PATH?")
+        return 1
+
+    vault_status: str = status.get("status", "unauthenticated")
+    print_verbose(f"  Vault status: {vault_status}", verbose)
+
+    if vault_status == "unauthenticated":
+        print_error("Not logged in to Bitwarden. Run 'bw login' first.")
+        return 1
+
+    # Unlock vault if locked
+    session: str = ""
+    if vault_status == "locked":
+        print("Vault is locked. Please enter your master password.")
+        password: str = getpass.getpass("Master Password: ")
+
+        print("Unlocking vault...")
+        try:
+            session = unlock_vault(password)
+            print_verbose("  Vault unlocked successfully.", verbose)
+        except RuntimeError as e:
+            print_error(str(e))
+            return 1
+    else:
+        # Vault is unlocked, but we still need a session key
+        # This shouldn't normally happen as sessions expire, but handle it
+        print("Vault is already unlocked. Please enter your master password to get session key.")
+        password = getpass.getpass("Master Password: ")
+        try:
+            session = unlock_vault(password)
+        except RuntimeError as e:
+            print_error(str(e))
+            return 1
+
+    # Sync with server
+    print("Syncing with Bitwarden server...")
+    if not sync_vault(session):
+        print_error("Failed to sync vault with server.")
+        return 1
+    print_verbose("  Sync complete.", verbose)
+
+    # Fetch folders
+    print("Fetching folders...")
+    try:
+        folders: dict[str, str] = fetch_folders(session)
+        print(f"  Found {len(folders)} folders.")
+    except RuntimeError as e:
+        print_error(str(e))
+        return 1
+
+    # Fetch items
+    print("Fetching items...")
+    try:
+        items: list[dict[str, Any]] = fetch_items(session)
+        print(f"  Found {len(items)} login items.")
+    except RuntimeError as e:
+        print_error(str(e))
+        return 1
+
+    if not items:
+        print("\nNo login items to sync.")
+        return 0
+
+    print()
+    if dry_run:
+        print("DRY RUN - No changes will be made.")
+        print()
+
+    # Process each item
+    synced: int = 0
+    skipped: int = 0
+    failed: int = 0
+    used_paths: set[str] = set()
+    errors: list[str] = []
+
+    for i, item in enumerate(items, 1):
+        item_name: str = item.get("name", "unnamed")
+        login: dict[str, Any] = item.get("login", {})
+        password: str = login.get("password", "") or ""
+
+        # Skip items without passwords
+        if not password:
+            print_verbose(f"[{i}/{len(items)}] Skipping (no password): {item_name}", verbose)
+            skipped += 1
+            continue
+
+        # Build pass path
+        base_path: str = build_pass_path(item, folders)
+        try:
+            pass_path: str = get_unique_path(base_path, used_paths)
+        except RuntimeError as e:
+            print_error(f"[{i}/{len(items)}] {e}")
+            errors.append(f"{item_name}: {e}")
+            failed += 1
+            continue
+
+        used_paths.add(pass_path)
+
+        # Format and insert entry
+        content: str = format_pass_entry(item)
+
+        if dry_run:
+            print(f"[{i}/{len(items)}] Would insert: {pass_path}")
+            synced += 1
+        else:
+            print_verbose(f"[{i}/{len(items)}] Inserting: {pass_path}", verbose)
+            if insert_to_pass(pass_path, content, dry_run, verbose):
+                synced += 1
+            else:
+                errors.append(f"{item_name}: Failed to insert")
+                failed += 1
+
+    # Print summary
+    print()
+    print("Summary:")
+    print(f"  Total items: {len(items)}")
+    if dry_run:
+        print(f"  Would sync: {synced}")
+    else:
+        print(f"  Synced: {synced}")
+    print(f"  Skipped (no password): {skipped}")
+    print(f"  Failed: {failed}")
+
+    if errors:
+        print()
+        print("Errors:")
+        for error in errors:
+            print(f"  - {error}")
+
+    return 1 if failed > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

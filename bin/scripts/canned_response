@@ -1,4 +1,4 @@
-#!/bin/bash 
+#!/bin/bash
 
 # dotfiles - Personal configuration files and scripts
 # Copyright (C) 2025  Zach Podbielniak
@@ -18,11 +18,269 @@
 
 set -euo pipefail
 
-cr_dir="${HOME}/.config/canned_reponses/cr.yaml"
-yq .responses[].name < "${cr_dir}" | \
-    fzf -i --height=100% --preview="yq '.responses[] | select(.name == \"{}\").text' < \"${cr_dir}\"" --tmux center | \
-    sed -z 's/\n//g' | \
-    xargs -0 -I % bash -c "yq '.responses[] | select(.name == \"%\").text' < ${cr_dir}" | \
-    xargs -0 -I % echo -e '%' | \
-    wl-copy
+# Configuration
+cr_file="${HOME}/.config/canned_reponses/cr.yaml"
+UNDEFINED_VALUE="UNDEFINED"
+
+# Help function
+print_help() {
+    cat <<'EOF'
+canned_response - Select and expand canned responses with variable substitution
+
+Usage:
+  canned_response [OPTIONS]
+
+Options:
+  -p, --prompt NAME          Select a prompt by name (skips fzf selection)
+                             Example: canned_response -p prompt_story_template
+
+  -v, --value KEY=VALUE      Set a variable value (can be used multiple times)
+                             Example: canned_response -v hero=Aragorn -v theme=medieval
+
+  -u, --undefined-val VAL    Override the undefined variable placeholder
+                             Default: UNDEFINED
+                             Example: canned_response -u "[FILL_ME_IN]"
+
+  -c, --confirm              Open vipe editor to confirm/edit all variables
+                             regardless of whether they are predefined
+                             Example: canned_response -c
+
+  -s, --stdout               Output to stdout instead of clipboard
+                             Useful for pipelines and integration with other tools
+                             Example: canned_response -p prompt_code_review -s
+
+  -h, --help                 Show this help message
+
+Description:
+  Displays a searchable list of canned responses using fzf. Supports variable
+  expansion using ${VAR_NAME} syntax within response text.
+
+  Variable Resolution Order:
+  1. Command-line arguments (--value)
+  2. YAML-defined variables in the response
+  3. User input via vipe editor (if variables remain undefined)
+
+Examples:
+  # Basic usage - select response with fzf and substitute predefined variables
+  canned_response
+
+  # Select a prompt directly by name (no fzf)
+  canned_response -p prompt_story_template
+
+  # Override variables from command line
+  canned_response -p prompt_story_template -v hero=Aragorn -v theme=medieval
+
+  # Output to stdout instead of clipboard (good for pipelines)
+  canned_response -p prompt_code_review -s
+
+  # Pipe prompt output to other tools
+  canned_response -p prompt_generate_code -v task_description="parse JSON" -s | wc -c
+
+  # Change undefined variable placeholder
+  canned_response -p prompt_generate_code -u "[TODO]"
+
+  # Confirm/edit all variables in vipe, even if predefined
+  canned_response -p prompt_code_review -c
+
+  # Combine multiple options
+  canned_response -p prompt_generate_tests -v language=Go -v test_framework=testing -s
+
+EOF
+}
+
+# Function to determine clipboard command based on display server
+get_clipboard_command() {
+    if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        echo "wl-copy"
+    else
+        echo "xclip -sel clipboard"
+    fi
+}
+
+# Parse command-line arguments
+declare -A cli_variables
+confirm_variables=false
+prompt_name=""
+output_stdout=false
+
+while [[ $# -gt 0 ]]; do
+    case "${1}" in
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        -p|--prompt)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --prompt requires a prompt name argument" >&2
+                exit 1
+            fi
+            prompt_name="${2}"
+            shift 2
+            ;;
+        -v|--value)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --value requires a key=value argument" >&2
+                exit 1
+            fi
+            key="${2%%=*}"
+            value="${2#*=}"
+            cli_variables["${key}"]="${value}"
+            shift 2
+            ;;
+        -u|--undefined-val)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --undefined-val requires a value argument" >&2
+                exit 1
+            fi
+            UNDEFINED_VALUE="${2}"
+            shift 2
+            ;;
+        -c|--confirm)
+            confirm_variables=true
+            shift
+            ;;
+        -s|--stdout)
+            output_stdout=true
+            shift
+            ;;
+        *)
+            echo "Error: Unknown argument '${1}'" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Function to extract variables from text (matches ${VAR_NAME})
+extract_variables() {
+    local text="${1}"
+    grep -oP '\$\{\K[^}]+(?=\})' <<<"${text}" | sort -u
+}
+
+# Function to get value for a variable
+get_variable_value() {
+    local key="${1}"
+    local response_name="${2}"
+
+    # Check CLI variables first
+    if [[ -v cli_variables["${key}"] ]]; then
+        echo "${cli_variables[${key}]}"
+        return 0
+    fi
+
+    # Check YAML variables section for this response
+    local yaml_value=$(yq ".responses[] | select(.name == \"${response_name}\") | .variables[] | select(.key == \"${key}\") | .value" < "${cr_file}" 2>/dev/null)
+    if [[ -n "${yaml_value}" && "${yaml_value}" != "null" ]]; then
+        echo "${yaml_value}"
+        return 0
+    fi
+
+    # Return undefined marker
+    echo "${UNDEFINED_VALUE}"
+    return 0
+}
+
+# Function to substitute variables in text
+substitute_variables() {
+    local text="${1}"
+    local response_name="${2}"
+    local result="${text}"
+
+    local vars=$(extract_variables "${text}")
+    while IFS= read -r var; do
+        [[ -z "${var}" ]] && continue
+        local value=$(get_variable_value "${var}" "${response_name}")
+        result="${result//\$\{${var}\}/${value}}"
+    done <<<"${vars}"
+
+    echo "${result}"
+}
+
+# Function to build variable YAML for vipe editing
+build_variables_yaml() {
+    local response_name="${1}"
+    local text="${2}"
+
+    local vars=$(extract_variables "${text}")
+    local yaml_content="variables:"
+
+    while IFS= read -r var; do
+        [[ -z "${var}" ]] && continue
+        local value=$(get_variable_value "${var}" "${response_name}")
+        yaml_content+="
+- key: ${var}
+  value: ${value}"
+    done <<<"${vars}"
+
+    echo "${yaml_content}"
+}
+
+# Function to extract variables from vipe-edited YAML
+extract_variables_from_yaml() {
+    local yaml_content="${1}"
+    yq '.variables[] | "\(.key)=\(.value)"' <<<"${yaml_content}"
+}
+
+# Main flow: Select a canned response
+if [[ -n "${prompt_name}" ]]; then
+    # Prompt name was provided via -p flag, use it directly
+    selected_name="${prompt_name}"
+
+    # Verify the prompt exists
+    response_text=$(yq ".responses[] | select(.name == \"${selected_name}\") | .text" < "${cr_file}" 2>/dev/null)
+    if [[ -z "${response_text}" ]] || [[ "${response_text}" == "null" ]]; then
+        echo "Error: Prompt '${selected_name}' not found" >&2
+        exit 1
+    fi
+else
+    # Use fzf to select a prompt
+    selected_name=$(yq .responses[].name < "${cr_file}" | \
+        fzf -i --height=100% --preview="yq '.responses[] | select(.name == \"{}\").text' < \"${cr_file}\"" --tmux center)
+
+    if [[ -z "${selected_name}" ]]; then
+        exit 0
+    fi
+
+    # Get the response text
+    response_text=$(yq ".responses[] | select(.name == \"${selected_name}\") | .text" < "${cr_file}")
+fi
+
+# Extract variables from the response text
+variables=$(extract_variables "${response_text}")
+
+# Check if there are undefined variables that need user input
+has_undefined=false
+while IFS= read -r var; do
+    [[ -z "${var}" ]] && continue
+    value=$(get_variable_value "${var}" "${selected_name}")
+    if [[ "${value}" == "${UNDEFINED_VALUE}" ]]; then
+        has_undefined=true
+        break
+    fi
+done <<<"${variables}"
+
+# If there are undefined variables or --confirm flag is set, open vipe for user to define/confirm them
+if [[ "${has_undefined}" == true ]] || [[ "${confirm_variables}" == true ]]; then
+    variables_yaml=$(build_variables_yaml "${selected_name}" "${response_text}")
+    edited_yaml=$(echo "${variables_yaml}" | vipe)
+
+    # Extract variables from edited YAML and update cli_variables
+    while IFS='=' read -r key value; do
+        [[ -z "${key}" ]] && continue
+        cli_variables["${key}"]="${value}"
+    done < <(extract_variables_from_yaml "${edited_yaml}")
+fi
+
+# Perform variable substitution
+final_text=$(substitute_variables "${response_text}" "${selected_name}")
+
+# Output to clipboard or stdout depending on the flag
+if [[ "${output_stdout}" == true ]]; then
+    # Output to stdout
+    echo -e "${final_text}"
+else
+    # Output to clipboard using the appropriate command for the display server
+    clipboard_cmd=$(get_clipboard_command)
+    echo -e "${final_text}" | eval "${clipboard_cmd}"
+fi
 

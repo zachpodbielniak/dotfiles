@@ -18,32 +18,36 @@
 set -euo pipefail
 
 # Configuration
-POOL_NAME="dpool"
 RETENTION_DAYS=14
 DEBUG=false
 DRY_RUN=false
 SSH_SUDO=false
+LOCAL_SUDO=false
 FORCE_SEND=false
 REMOTE_CLEANUP=false
 SEND_HOSTS_OVERRIDE=""
 DATASETS_OVERRIDE=""
 
-# Datasets to snapshot (add new datasets here)
+# Local send targets (associative array)
+# Format: source_dataset -> target_dataset
+declare -A LOCAL_SEND_TARGETS=(
+    ["apool/app_data"]="dpool/backup/apool/app_data"
+)
+
+# Datasets to snapshot (full dataset paths)
 SNAPSHOT_DATASETS=(
-    "app_data"
-    "backup"
-    "home"
-    "media"
-    "software"
+    "dpool/backup"
+    "dpool/home"
+    "dpool/media"
+    "dpool/software"
 )
 
 # Datasets to send to remote (subset of snapshot datasets)
 SEND_DATASETS=(
-    "app_data"
-    "backup"
-    "home"
-    "media"
-    "software"
+    "dpool/backup"
+    "dpool/home"
+    "dpool/media"
+    "dpool/software"
 )
 
 # Remote hosts and their target pools
@@ -83,18 +87,20 @@ execute_command() {
         done
         return "${PIPESTATUS[0]}"
     else
-        eval "${cmd}"
+        # Run command in isolated bash process
+        bash -c "${cmd}"
+        return $?
     fi
 }
 
 ssh_command() {
     local ssh_target="$1"
     local remote_cmd="$2"
-    
+
     if [[ "${SSH_SUDO}" == "true" ]]; then
-        echo "ssh '${ssh_target}' 'sudo ${remote_cmd}'"
+        echo "ssh '${ssh_target}' \"sudo ${remote_cmd}\""
     else
-        echo "ssh '${ssh_target}' '${remote_cmd}'"
+        echo "ssh '${ssh_target}' \"${remote_cmd}\""
     fi
 }
 
@@ -134,6 +140,7 @@ COMMANDS:
     snapshot        Create recursive snapshots for all configured datasets
     cleanup         Remove snapshots older than retention period
     send            Send incremental snapshots to remote hosts
+    local_send      Send incremental snapshots between local pools
     all             Run snapshot, cleanup, and send operations
     list            List existing snapshots
     status          Show replication status
@@ -143,19 +150,20 @@ OPTIONS:
     -d, --debug            Enable debug logging
     -n, --dry-run          Show what would be done without executing
     -s, --ssh-sudo         Use sudo for remote ZFS commands
+    --local-sudo           Use sudo for local ZFS commands (local_send only)
     --force-send           Force resend by destroying current remote snapshot first
     --remote-cleanup       Also cleanup old snapshots on remote hosts
     --send-hosts HOSTS     Override remote targets (comma-separated: user@host:pool,user@host2:pool2)
-    --datasets DATASETS    Override datasets to operate on (comma-separated: dataset1,dataset2)
+    --datasets DATASETS    Override datasets to operate on (comma-separated: pool1/dataset1,pool2/dataset2)
     -h, --help             Show this help message
 
 CONFIGURATION:
-    Pool: ${POOL_NAME}
     Snapshot datasets: ${SNAPSHOT_DATASETS[*]}
     Send datasets: ${SEND_DATASETS[*]}
     Remote targets: ${REMOTE_TARGETS[*]}
+    Local send targets: ${!LOCAL_SEND_TARGETS[*]} -> ${LOCAL_SEND_TARGETS[*]}
 
-EXAMPLES:
+ EXAMPLES:
     $(basename "$0") snapshot                    # Create snapshots
     $(basename "$0") --dry-run all              # Show what 'all' would do
     $(basename "$0") --debug --retention 7 all  # Run all with 7-day retention and debug
@@ -163,8 +171,12 @@ EXAMPLES:
     $(basename "$0") --force-send send          # Force resend by destroying remote snapshots
     $(basename "$0") --remote-cleanup cleanup   # Clean local and remote snapshots
     $(basename "$0") --send-hosts "user@host1:pool1,user@host2:pool2" send  # Override targets
-    $(basename "$0") --datasets "app_data,media" snapshot                  # Snapshot only specific datasets
-    $(basename "$0") --datasets "home" send                               # Send only home dataset
+    $(basename "$0") --datasets "dpool/app_data,dpool/media" snapshot     # Snapshot only specific datasets
+    $(basename "$0") --datasets "dpool/home" send                         # Send only home dataset
+    $(basename "$0") --datasets "dpool/vms" cleanup                      # Clean only VM snapshots
+    $(basename "$0") local_send                  # Send between local pools
+    $(basename "$0") --dry-run local_send        # Show what local_send would do
+    $(basename "$0") --local-sudo local_send     # Use sudo for local ZFS commands
     $(basename "$0") cleanup                     # Clean old snapshots
     $(basename "$0") send                        # Send to remotes
 EOF
@@ -174,7 +186,7 @@ get_snapshot_name() {
     local dataset="$1"
     local date_stamp
     date_stamp=$(date '+%Y-%m-%d')
-    echo "${POOL_NAME}/${dataset}@${date_stamp}"
+    echo "${dataset}@${date_stamp}"
 }
 
 get_cutoff_date() {
@@ -202,15 +214,84 @@ create_snapshots() {
         snapshot_name=$(get_snapshot_name "${dataset}")
         
         log_info "Creating snapshot: ${snapshot_name}"
-        log_debug "Dataset: ${POOL_NAME}/${dataset}"
+        log_debug "Dataset: ${dataset}"
         
         if execute_command "zfs snapshot -r '${snapshot_name}'"; then
             log_info "Successfully created snapshot: ${snapshot_name}"
         else
-            log_error "Failed to create snapshot: ${snapshot_name}"
-            return 1
+            log_info "Recursive snapshot failed for ${dataset}, walking dataset tree individually"
+            
+            # Get all child datasets under this dataset
+            local all_datasets
+            if all_datasets=$(zfs list -H -r -o name "${dataset}" 2>/dev/null); then
+                    while IFS= read -r child_dataset; do
+                        if [[ -n "${child_dataset}" ]]; then
+                            local child_snapshot
+                            child_snapshot="${child_dataset}@$(date '+%Y-%m-%d')"
+                        
+                        if zfs list "${child_snapshot}" >/dev/null 2>&1; then
+                            log_debug "Snapshot ${child_snapshot} already exists"
+                        else
+                            if execute_command "zfs snapshot '${child_snapshot}'"; then
+                                log_debug "Successfully created snapshot: ${child_snapshot}"
+                            else
+                                log_error "Failed to create snapshot: ${child_snapshot}"
+                            fi
+                        fi
+                    fi
+                done <<< "${all_datasets}"
+            else
+                log_error "Failed to list datasets under ${dataset}"
+                return 1
+            fi
         fi
     done
+    
+    # Also create snapshots for local send source datasets
+    if [[ ${#LOCAL_SEND_TARGETS[@]} -gt 0 ]]; then
+        log_info "Creating snapshots for ${#LOCAL_SEND_TARGETS[@]} local send source datasets"
+        local date_stamp
+        date_stamp=$(date '+%Y-%m-%d')
+        
+        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+            local source_snapshot="${source_dataset}@${date_stamp}"
+            
+            if zfs list "${source_snapshot}" >/dev/null 2>&1; then
+                log_debug "Snapshot ${source_snapshot} already exists"
+                continue
+            fi
+            
+            log_info "Creating snapshot: ${source_snapshot}"
+            if execute_command "zfs snapshot -r '${source_snapshot}'"; then
+                log_info "Successfully created snapshot: ${source_snapshot}"
+            else
+                log_info "Recursive snapshot failed for ${source_dataset}, walking dataset tree individually"
+                
+                # Get all child datasets under this dataset
+                local all_datasets
+                if all_datasets=$(zfs list -H -r -o name "${source_dataset}" 2>/dev/null); then
+                    while IFS= read -r child_dataset; do
+                        if [[ -n "${child_dataset}" ]]; then
+                            local child_snapshot="${child_dataset}@${date_stamp}"
+                            
+                            if zfs list "${child_snapshot}" >/dev/null 2>&1; then
+                                log_debug "Snapshot ${child_snapshot} already exists"
+                            else
+                                if execute_command "zfs snapshot '${child_snapshot}'"; then
+                                    log_debug "Successfully created snapshot: ${child_snapshot}"
+                                else
+                                    log_error "Failed to create snapshot: ${child_snapshot}"
+                                fi
+                            fi
+                        fi
+                    done <<< "${all_datasets}"
+                else
+                    log_error "Failed to list datasets under ${source_dataset}"
+                    return 1
+                fi
+            fi
+        done
+    fi
 }
 
 cleanup_old_snapshots() {
@@ -228,11 +309,11 @@ cleanup_old_snapshots() {
     log_info "Removing snapshots older than ${RETENTION_DAYS} days (before ${cutoff_date})"
     
     for dataset in "${effective_datasets[@]}"; do
-        log_debug "Checking snapshots for dataset: ${POOL_NAME}/${dataset}"
+        log_debug "Checking snapshots for dataset: ${dataset}"
         
         local snapshots
-        if ! snapshots=$(zfs list -H -t snapshot -o name -S creation "${POOL_NAME}/${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$"); then
-            log_debug "No date-based snapshots found for ${POOL_NAME}/${dataset}"
+        if ! snapshots=$(zfs list -H -t snapshot -o name -S creation "${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$"); then
+            log_debug "No date-based snapshots found for ${dataset}"
             continue
         fi
         
@@ -256,6 +337,93 @@ cleanup_old_snapshots() {
             fi
         done <<< "${snapshots}"
     done
+    
+    # Also cleanup local send source and target datasets (only if not using dataset override, or if override includes related datasets)
+    if [[ ${#LOCAL_SEND_TARGETS[@]} -gt 0 ]]; then
+        local should_cleanup_local_send=false
+
+        if [[ -z "${DATASETS_OVERRIDE}" ]]; then
+            # No override specified, cleanup all local send datasets
+            should_cleanup_local_send=true
+        else
+            # Check if any effective datasets are local send sources or targets
+            for dataset in "${effective_datasets[@]}"; do
+                # Check if dataset is a local send source
+                if [[ " ${!LOCAL_SEND_TARGETS[*]} " =~ ${dataset} ]]; then
+                    should_cleanup_local_send=true
+                    break
+                fi
+                # Check if dataset is a local send target
+                for target_dataset in "${LOCAL_SEND_TARGETS[@]}"; do
+                    if [[ "${target_dataset}" == "${dataset}" ]]; then
+                        should_cleanup_local_send=true
+                        break 2
+                    fi
+                done
+            done
+        fi
+
+        if [[ "${should_cleanup_local_send}" == "true" ]]; then
+            log_info "Cleaning up snapshots for local send datasets"
+
+            for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+                local target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+            
+            # Cleanup source dataset snapshots
+            log_debug "Checking snapshots for local send source dataset: ${source_dataset}"
+            local snapshots
+            if ! snapshots=$(zfs list -H -t snapshot -o name -S creation "${source_dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$"); then
+                log_debug "No date-based snapshots found for ${source_dataset}"
+            else
+                while IFS= read -r snapshot; do
+                    if [[ -z "${snapshot}" ]]; then
+                        continue
+                    fi
+                    
+                    local snap_date
+                    snap_date=$(echo "${snapshot}" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' || echo "")
+                    
+                    if [[ -n "${snap_date}" && "${snap_date}" < "${cutoff_date}" ]]; then
+                        log_info "Removing old local send source snapshot: ${snapshot}"
+                        if execute_command "zfs destroy -r '${snapshot}'"; then
+                            log_debug "Successfully removed: ${snapshot}"
+                        else
+                            log_error "Failed to remove: ${snapshot}"
+                        fi
+                    else
+                        log_debug "Keeping source snapshot: ${snapshot} (date: ${snap_date})"
+                    fi
+                done <<< "${snapshots}"
+            fi
+            
+            # Cleanup target dataset snapshots
+            log_debug "Checking snapshots for local send target dataset: ${target_dataset}"
+            if ! snapshots=$(zfs list -H -t snapshot -o name -S creation "${target_dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$"); then
+                log_debug "No date-based snapshots found for ${target_dataset}"
+            else
+                while IFS= read -r snapshot; do
+                    if [[ -z "${snapshot}" ]]; then
+                        continue
+                    fi
+                    
+                    local snap_date
+                    snap_date=$(echo "${snapshot}" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' || echo "")
+                    
+                    if [[ -n "${snap_date}" && "${snap_date}" < "${cutoff_date}" ]]; then
+                        log_info "Removing old local send target snapshot: ${snapshot}"
+                        if execute_command "zfs destroy -r '${snapshot}'"; then
+                            log_debug "Successfully removed: ${snapshot}"
+                        else
+                            log_error "Failed to remove: ${snapshot}"
+                        fi
+                    else
+                        log_debug "Keeping target snapshot: ${snapshot} (date: ${snap_date})"
+                    fi
+                done <<< "${snapshots}"
+            fi
+        done
+        fi
+    fi
 }
 
 remote_cleanup_old_snapshots() {
@@ -279,31 +447,47 @@ remote_cleanup_old_snapshots() {
         mapfile -t effective_datasets < <(get_effective_datasets "send")
         
         for dataset in "${effective_datasets[@]}"; do
+            # Extract just the dataset name without the source pool for remote operations
+            local dataset_name="${dataset#*/}"
+            
             log_debug "Checking remote snapshots for dataset: ${dataset}"
+            log_debug "Remote dataset name: ${dataset_name}"
             
             local remote_snapshots
             if [[ "${remote_target}" == *":"* ]]; then
                 local ssh_target="${remote_target%:*}"
                 local remote_pool="${remote_target#*:}"
                 # Use direct SSH without sudo for listing (read-only operation)
-                remote_snapshots=$(ssh "${ssh_target}" "zfs list -H -t snapshot -o name -S creation '${remote_pool}/${dataset}' 2>/dev/null | grep '@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$'" || echo "")
+                if remote_snapshots=$(ssh "${ssh_target}" "zfs list -H -t snapshot -o name -S creation '${remote_pool}/${dataset_name}' 2>/dev/null | grep '@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$'" 2>/dev/null); then
+                    log_debug "Successfully retrieved remote snapshots for ${remote_target}/${dataset_name}"
+                else
+                    log_error "Failed to list remote snapshots for ${remote_target}/${dataset_name}"
+                    continue
+                fi
             else
-                remote_snapshots=$(zfs list -H -t snapshot -o name -S creation "${remote_target}/${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" || echo "")
+                if ! remote_snapshots=$(zfs list -H -t snapshot -o name -S creation "${remote_target}/${dataset_name}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" 2>/dev/null); then
+                    log_error "Failed to list snapshots for ${remote_target}/${dataset_name}"
+                    continue
+                fi
             fi
             
             if [[ -z "${remote_snapshots}" ]]; then
-                log_debug "No date-based snapshots found for ${remote_target}/${dataset}"
+                log_debug "No date-based snapshots found for ${remote_target}/${dataset_name}"
                 continue
             fi
-            
-            while IFS= read -r snapshot; do
+
+            # Split remote_snapshots into an array
+            local snapshot_array
+            mapfile -t snapshot_array <<< "${remote_snapshots}"
+
+            for snapshot in "${snapshot_array[@]}"; do
                 if [[ -z "${snapshot}" ]]; then
                     continue
                 fi
-                
+
                 local snap_date
                 snap_date=$(echo "${snapshot}" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' || echo "")
-                
+
                 if [[ -n "${snap_date}" && "${snap_date}" < "${cutoff_date}" ]]; then
                     log_info "Removing old remote snapshot: ${snapshot}"
                     if [[ "${remote_target}" == *":"* ]]; then
@@ -325,7 +509,7 @@ remote_cleanup_old_snapshots() {
                 else
                     log_debug "Keeping remote snapshot: ${snapshot} (date: ${snap_date})"
                 fi
-            done <<< "${remote_snapshots}"
+            done
         done
     done
 }
@@ -335,18 +519,26 @@ get_latest_snapshot() {
     local remote_dataset="$2"
     local remote_target="$3"
     
-    log_debug "Finding latest common snapshot between ${POOL_NAME}/${dataset} and ${remote_target}/${remote_dataset}"
+    log_debug "Finding latest common snapshot between ${dataset} and ${remote_target}/${remote_dataset}"
     
     local local_snapshots remote_snapshots
-    local_snapshots=$(zfs list -H -t snapshot -o name -s creation "${POOL_NAME}/${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" || echo "")
+    local_snapshots=$(zfs list -H -t snapshot -o name -s creation "${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" || echo "")
     
     if [[ "${remote_target}" == *":"* ]]; then
         local ssh_target="${remote_target%:*}"
         local remote_pool="${remote_target#*:}"
         # Use direct SSH without sudo for listing (read-only operation)
-        remote_snapshots=$(ssh "${ssh_target}" "zfs list -H -t snapshot -o name -s creation '${remote_pool}/${remote_dataset}' 2>/dev/null | grep '@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$'" || echo "")
+        if ! remote_snapshots=$(ssh "${ssh_target}" "zfs list -H -t snapshot -o name -s creation '${remote_pool}/${remote_dataset}' 2>/dev/null | grep '@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$'" 2>/dev/null); then
+            log_debug "Failed to list remote snapshots for ${remote_target}/${remote_dataset}"
+            echo ""
+            return
+        fi
     else
-        remote_snapshots=$(zfs list -H -t snapshot -o name -s creation "${remote_target}/${remote_dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" || echo "")
+        if ! remote_snapshots=$(zfs list -H -t snapshot -o name -s creation "${remote_target}/${remote_dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" 2>/dev/null); then
+            log_debug "Failed to list snapshots for ${remote_target}/${remote_dataset}"
+            echo ""
+            return
+        fi
     fi
     
     if [[ -z "${remote_snapshots}" ]]; then
@@ -377,6 +569,44 @@ get_latest_snapshot() {
     echo "${latest_common}"
 }
 
+get_latest_snapshot_local() {
+    local source_dataset="$1"
+    local target_dataset="$2"
+    
+    log_debug "Finding latest common snapshot between ${source_dataset} and ${target_dataset}"
+    
+    local source_snapshots target_snapshots
+    source_snapshots=$(zfs list -H -t snapshot -o name -s creation "${source_dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" || echo "")
+    target_snapshots=$(zfs list -H -t snapshot -o name -s creation "${target_dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" || echo "")
+    
+    if [[ -z "${target_snapshots}" ]]; then
+        log_debug "No target snapshots found, will do initial send"
+        echo ""
+        return
+    fi
+    
+    local latest_common=""
+    while IFS= read -r source_snap; do
+        if [[ -z "${source_snap}" ]]; then
+            continue
+        fi
+        
+        local snap_suffix="${source_snap#*@}"
+        while IFS= read -r target_snap; do
+            if [[ -z "${target_snap}" ]]; then
+                continue
+            fi
+            
+            if [[ "${target_snap}" == *"@${snap_suffix}" ]]; then
+                latest_common="${source_snap}"
+                log_debug "Found common snapshot: ${latest_common}"
+            fi
+        done <<< "${target_snapshots}"
+    done <<< "${source_snapshots}"
+    
+    echo "${latest_common}"
+}
+
 send_to_remote() {
     local effective_targets
     mapfile -t effective_targets < <(get_effective_remote_targets)
@@ -397,7 +627,11 @@ send_to_remote() {
             local current_snapshot
             current_snapshot=$(get_snapshot_name "${dataset}")
             
+            # Extract just the dataset name without the source pool for remote operations
+            local dataset_name="${dataset#*/}"
+            
             log_debug "Processing dataset: ${dataset}"
+            log_debug "Dataset name for remote: ${dataset_name}"
             log_debug "Current snapshot: ${current_snapshot}"
             
             if ! zfs list "${current_snapshot}" >/dev/null 2>&1; then
@@ -406,7 +640,7 @@ send_to_remote() {
             fi
             
             local latest_common
-            latest_common=$(get_latest_snapshot "${dataset}" "${dataset}" "${remote_target}")
+            latest_common=$(get_latest_snapshot "${dataset}" "${dataset_name}" "${remote_target}")
             
             local send_cmd
             if [[ -n "${latest_common}" ]]; then
@@ -418,13 +652,15 @@ send_to_remote() {
                             local ssh_target="${remote_target%:*}"
                             local remote_pool="${remote_target#*:}"
                             local destroy_cmd
-                            destroy_cmd=$(ssh_command "${ssh_target}" "zfs destroy -r ${remote_pool}/${dataset}@$(echo ${current_snapshot} | cut -d'@' -f2)")
+                            snapshot_suffix=$(echo "${current_snapshot}" | cut -d'@' -f2)
+                            destroy_cmd=$(ssh_command "${ssh_target}" "zfs destroy -r ${remote_pool}/${dataset_name}@${snapshot_suffix}")
                             if ! execute_command "${destroy_cmd}"; then
                                 log_error "Failed to destroy remote snapshot for force send"
                                 continue
                             fi
                         else
-                            if ! execute_command "zfs destroy -r ${remote_target}/${dataset}@$(echo ${current_snapshot} | cut -d'@' -f2)"; then
+                            snapshot_suffix=$(echo "${current_snapshot}" | cut -d'@' -f2)
+                            if ! execute_command "zfs destroy -r ${remote_target}/${dataset_name}@${snapshot_suffix}"; then
                                 log_error "Failed to destroy remote snapshot for force send"
                                 continue
                             fi
@@ -435,13 +671,13 @@ send_to_remote() {
                             log_info "[DRY-RUN] Would find previous common snapshot after destroy"
                             latest_common=""  # Simulate no common snapshots for demonstration
                         else
-                            latest_common=$(get_latest_snapshot "${dataset}" "${dataset}" "${remote_target}")
+                            latest_common=$(get_latest_snapshot "${dataset}" "${dataset_name}" "${remote_target}")
                         fi
                         if [[ -z "${latest_common}" ]]; then
                             log_info "No common snapshots after force destroy, will do initial send"
                         fi
                     else
-                        log_info "Remote ${remote_target}/${dataset} is already up-to-date with ${current_snapshot}"
+                        log_info "Remote ${remote_target}/${dataset_name} is already up-to-date with ${current_snapshot}"
                         continue
                     fi
                 fi
@@ -451,20 +687,20 @@ send_to_remote() {
                         local ssh_target="${remote_target%:*}"
                         local remote_pool="${remote_target#*:}"
                         local ssh_recv_cmd
-                        ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset}")
+                        ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset_name}")
                         send_cmd="zfs send -w -R -I '${latest_common}' '${current_snapshot}' | ${ssh_recv_cmd}"
                     else
-                        send_cmd="zfs send -w -R -I '${latest_common}' '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset}'"
+                        send_cmd="zfs send -w -R -I '${latest_common}' '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset_name}'"
                     fi
                 else
                     if [[ "${remote_target}" == *":"* ]]; then
                         local ssh_target="${remote_target%:*}"
                         local remote_pool="${remote_target#*:}"
                         local ssh_recv_cmd
-                        ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset}")
+                        ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset_name}")
                         send_cmd="zfs send -w -R '${current_snapshot}' | ${ssh_recv_cmd}"
                     else
-                        send_cmd="zfs send -w -R '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset}'"
+                        send_cmd="zfs send -w -R '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset_name}'"
                     fi
                 fi
             else
@@ -473,10 +709,10 @@ send_to_remote() {
                     local ssh_target="${remote_target%:*}"
                     local remote_pool="${remote_target#*:}"
                     local ssh_recv_cmd
-                    ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset}")
+                    ssh_recv_cmd=$(ssh_command "${ssh_target}" "zfs receive -F ${remote_pool}/${dataset_name}")
                     send_cmd="zfs send -w -R '${current_snapshot}' | ${ssh_recv_cmd}"
                 else
-                    send_cmd="zfs send -w -R '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset}'"
+                    send_cmd="zfs send -w -R '${current_snapshot}' | zfs receive -F '${remote_target}/${dataset_name}'"
                 fi
             fi
             
@@ -488,6 +724,86 @@ send_to_remote() {
                 log_error "Failed to send ${dataset} to ${remote_target}"
             fi
         done
+    done
+}
+
+local_send_to_local() {
+    log_info "Performing local send operations for ${#LOCAL_SEND_TARGETS[@]} configured targets"
+    
+    for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+        local target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+        log_info "Processing local send: ${source_dataset} -> ${target_dataset}"
+        
+        # Find the latest snapshot for the source dataset
+        local date_stamp
+        date_stamp=$(date '+%Y-%m-%d')
+        local source_snapshot="${source_dataset}@${date_stamp}"
+        
+        log_debug "Looking for source snapshot: ${source_snapshot}"
+        if ! zfs list "${source_snapshot}" >/dev/null 2>&1; then
+            log_error "Snapshot ${source_snapshot} does not exist. Run 'snapshot' command first."
+            continue
+        fi
+        
+        # Find latest common snapshot
+        local latest_common
+        latest_common=$(get_latest_snapshot_local "${source_dataset}" "${target_dataset}")
+        
+        local send_cmd
+        local zfs_send_prefix=""
+        local zfs_recv_prefix=""
+        
+        if [[ "${LOCAL_SUDO}" == "true" ]]; then
+            zfs_send_prefix="sudo "
+            zfs_recv_prefix="sudo "
+        fi
+        
+        if [[ -n "${latest_common}" ]]; then
+            # Check if target is already up-to-date
+            if [[ "${latest_common}" == "${source_snapshot}" ]]; then
+                if [[ "${FORCE_SEND}" == "true" ]]; then
+                    log_info "Force send enabled: destroying local target snapshot ${source_snapshot} to resend"
+                    local target_snap_suffix
+                    target_snap_suffix=$(echo "${source_snapshot}" | cut -d'@' -f2)
+                    if ! execute_command "${zfs_recv_prefix}zfs destroy -r '${target_dataset}@${target_snap_suffix}'"; then
+                        log_error "Failed to destroy local target snapshot for force send"
+                        continue
+                    fi
+                    # After destroying, find new latest common snapshot
+                    if [[ "${DRY_RUN}" == "true" ]]; then
+                        log_info "[DRY-RUN] Would find previous common snapshot after destroy"
+                        latest_common=""
+                    else
+                        latest_common=$(get_latest_snapshot_local "${source_dataset}" "${target_dataset}")
+                    fi
+                    if [[ -z "${latest_common}" ]]; then
+                        log_info "No common snapshots after force destroy, will do initial send"
+                    fi
+                else
+                    log_info "Local target ${target_dataset} is already up-to-date with ${source_snapshot}"
+                    continue
+                fi
+            fi
+            
+            if [[ -n "${latest_common}" ]]; then
+                log_info "Incremental send from ${latest_common} to ${source_snapshot}"
+                send_cmd="${zfs_send_prefix}zfs send -w -R -I '${latest_common}' '${source_snapshot}' | ${zfs_recv_prefix}zfs receive -F '${target_dataset}'"
+            else
+                log_info "Initial send of ${source_snapshot}"
+                send_cmd="${zfs_send_prefix}zfs send -w -R '${source_snapshot}' | ${zfs_recv_prefix}zfs receive -F '${target_dataset}'"
+            fi
+        else
+            log_info "Initial send of ${source_snapshot}"
+            send_cmd="${zfs_send_prefix}zfs send -w -R '${source_snapshot}' | ${zfs_recv_prefix}zfs receive -F '${target_dataset}'"
+        fi
+        
+        log_debug "Local send command: ${send_cmd}"
+        
+        if execute_command "${send_cmd}"; then
+            log_info "Successfully sent ${source_dataset} to ${target_dataset}"
+        else
+            log_error "Failed to send ${source_dataset} to ${target_dataset}"
+        fi
     done
 }
 
@@ -503,8 +819,8 @@ list_snapshots() {
     
     for dataset in "${effective_datasets[@]}"; do
         echo ""
-        echo "=== ${POOL_NAME}/${dataset} ==="
-        if ! zfs list -t snapshot -o name,creation,used "${POOL_NAME}/${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$"; then
+        echo "=== ${dataset} ==="
+        if ! zfs list -t snapshot -o name,creation,used "${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$"; then
             echo "No date-based snapshots found"
         fi
     done
@@ -515,11 +831,11 @@ show_status() {
     
     echo ""
     echo "=== Configuration ==="
-    echo "Pool: ${POOL_NAME}"
     echo "Retention: ${RETENTION_DAYS} days"
     echo "Snapshot datasets: ${SNAPSHOT_DATASETS[*]}"
     echo "Send datasets: ${SEND_DATASETS[*]}"
     echo "Remote targets: ${REMOTE_TARGETS[*]}"
+    echo "Local send targets: ${!LOCAL_SEND_TARGETS[*]} -> ${LOCAL_SEND_TARGETS[*]}"
     
     echo ""
     echo "=== Latest Snapshots ==="
@@ -528,13 +844,35 @@ show_status() {
     
     for dataset in "${effective_datasets[@]}"; do
         local latest
-        latest=$(zfs list -H -t snapshot -o name,creation -S creation "${POOL_NAME}/${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" | head -1 || echo "None")
+        latest=$(zfs list -H -t snapshot -o name,creation -S creation "${dataset}" 2>/dev/null | grep "@[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" | head -1 || echo "None")
         echo "${dataset}: ${latest}"
     done
     
     echo ""
     echo "=== Pool Status ==="
-    zfs list "${POOL_NAME}" 2>/dev/null || echo "Pool ${POOL_NAME} not found"
+    # Check status of all pools mentioned in configuration
+    local pools_to_check=()
+    for dataset in "${SNAPSHOT_DATASETS[@]}" "${SEND_DATASETS[@]}"; do
+        local pool="${dataset%%/*}"
+        if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+            pools_to_check+=("${pool}")
+        fi
+    done
+    for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+        local pool="${source_dataset%%/*}"
+        if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+            pools_to_check+=("${pool}")
+        fi
+        local target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+        pool="${target_dataset%%/*}"
+        if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+            pools_to_check+=("${pool}")
+        fi
+    done
+    
+    for pool in "${pools_to_check[@]}"; do
+        zfs list "${pool}" 2>/dev/null && echo "Pool ${pool}: Available" || echo "Pool ${pool}: Not found"
+    done
 }
 
 # Parse command line arguments
@@ -554,6 +892,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -s|--ssh-sudo)
             SSH_SUDO=true
+            shift
+            ;;
+        --local-sudo)
+            LOCAL_SUDO=true
             shift
             ;;
         --force-send)
@@ -576,7 +918,7 @@ while [[ $# -gt 0 ]]; do
             show_usage
             exit 0
             ;;
-        snapshot|cleanup|send|all|list|status)
+        snapshot|cleanup|send|local_send|all|list|status)
             COMMAND="$1"
             shift
             ;;
@@ -607,14 +949,123 @@ if ! command -v zfs >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check if pool exists
-if ! zfs list "${POOL_NAME}" >/dev/null 2>&1; then
-    log_error "Pool ${POOL_NAME} not found"
+# Check if pools exist
+missing_pools=()
+pools_to_check=()
+
+# Determine which pools are actually needed based on command and overrides
+case "${COMMAND}" in
+    snapshot|cleanup)
+        # For snapshot/cleanup operations, check pools from effective snapshot datasets
+        effective_snapshot_datasets=()
+        mapfile -t effective_snapshot_datasets < <(get_effective_datasets "snapshot")
+        for dataset in "${effective_snapshot_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    send)
+        # For send operations, check pools from effective send datasets
+        effective_send_datasets=()
+        mapfile -t effective_send_datasets < <(get_effective_datasets "send")
+        for dataset in "${effective_send_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    all)
+        # For all operations, check pools from both effective snapshot and send datasets
+        effective_snapshot_datasets=()
+        mapfile -t effective_snapshot_datasets < <(get_effective_datasets "snapshot")
+        for dataset in "${effective_snapshot_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        effective_send_datasets=()
+        mapfile -t effective_send_datasets < <(get_effective_datasets "send")
+        for dataset in "${effective_send_datasets[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    local_send)
+        # For local_send, check pools from LOCAL_SEND_TARGETS
+        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+            pool="${source_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+            target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+            pool="${target_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    list|status)
+        # For list/status, check all configured pools
+        for dataset in "${SNAPSHOT_DATASETS[@]}" "${SEND_DATASETS[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+            pool="${source_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+            target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+            pool="${target_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+    *)
+        # For unknown commands, check all configured pools
+        for dataset in "${SNAPSHOT_DATASETS[@]}" "${SEND_DATASETS[@]}"; do
+            pool="${dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        for source_dataset in "${!LOCAL_SEND_TARGETS[@]}"; do
+            pool="${source_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+            target_dataset="${LOCAL_SEND_TARGETS[$source_dataset]}"
+            pool="${target_dataset%%/*}"
+            if [[ ! " ${pools_to_check[*]} " =~ ${pool} ]]; then
+                pools_to_check+=("${pool}")
+            fi
+        done
+        ;;
+esac
+
+# Check each required pool
+for pool in "${pools_to_check[@]}"; do
+    if ! zfs list "${pool}" >/dev/null 2>&1; then
+        missing_pools+=("${pool}")
+    fi
+done
+
+if [[ ${#missing_pools[@]} -gt 0 ]]; then
+    log_error "Pools not found: ${missing_pools[*]}"
     exit 1
 fi
 
 log_debug "Starting zfs_mgr with command: ${COMMAND}"
-log_debug "Configuration: pool=${POOL_NAME}, retention=${RETENTION_DAYS}, debug=${DEBUG}, dry_run=${DRY_RUN}, ssh_sudo=${SSH_SUDO}, force_send=${FORCE_SEND}, remote_cleanup=${REMOTE_CLEANUP}, send_hosts_override=${SEND_HOSTS_OVERRIDE}, datasets_override=${DATASETS_OVERRIDE}"
+log_debug "Configuration: retention=${RETENTION_DAYS}, debug=${DEBUG}, dry_run=${DRY_RUN}, ssh_sudo=${SSH_SUDO}, local_sudo=${LOCAL_SUDO}, force_send=${FORCE_SEND}, remote_cleanup=${REMOTE_CLEANUP}, send_hosts_override=${SEND_HOSTS_OVERRIDE}, datasets_override=${DATASETS_OVERRIDE}"
 
 # Execute command
 case "${COMMAND}" in
@@ -629,6 +1080,9 @@ case "${COMMAND}" in
         ;;
     send)
         send_to_remote
+        ;;
+    local_send)
+        local_send_to_local
         ;;
     all)
         create_snapshots

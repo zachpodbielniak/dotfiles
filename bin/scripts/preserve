@@ -1,0 +1,564 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Default values
+ALGORITHMS=("b2sum")
+OPERATION=""
+DRY_RUN=false
+VERBOSE=false
+PARALLEL=false
+RECURSIVE=false
+STDIN_MODE=false
+FILES=()
+
+# Supported algorithms (GNU coreutils checksum commands)
+SUPPORTED_ALGORITHMS=("md5" "sha1" "sha224" "sha256" "sha384" "sha512" "b2sum" "cksum")
+
+# Function to display help
+show_help() {
+    cat << EOF
+preserve - Embed, read, and verify file checksums in extended attributes
+
+USAGE:
+    preserve [OPTIONS] OPERATION [FILES...]
+
+OPERATIONS:
+    --embed         Embed checksums into file extended attributes
+    --read          Read checksums from file extended attributes
+    --verify        Verify checksums against current file content
+    --update        Update checksums if file has changed (stores previous values)
+
+OPTIONS:
+    -a, --algorithm ALGO    Checksum algorithm(s) (default: b2sum)
+                           Supports: md5, sha1, sha224, sha256, sha384, sha512, b2sum, cksum
+                           Use comma-separated for multiple: -a sha256,sha512
+    -r, --recursive         Recursively process directories (all arguments treated as directories)
+    --stdin                 Read file paths from stdin (one per line)
+    --parallel              Process files in parallel
+    --dry-run               Show what would be done without making changes
+    --verbose               Show detailed output
+    -h, --help              Show this help message
+
+EXAMPLES:
+    # Embed default b2sum checksums
+    preserve --embed file.txt
+    preserve --embed *.txt
+
+    # Use different algorithm
+    preserve --embed -a sha256 file.txt
+
+    # Multiple algorithms
+    preserve --embed -a sha256,b2sum file.txt
+
+    # Recursive directory processing
+    preserve --embed -r /path/to/directory
+    preserve --embed -r ~/Documents ~/Music  # Process multiple directories
+
+    # Read checksums
+    preserve --read file.txt
+
+    # Verify checksums
+    preserve --verify file.txt
+
+    # Process from stdin
+    find /path -name "*.txt" | preserve --stdin --embed
+
+    # Parallel processing with verbose output
+    preserve --embed --parallel --verbose -r /big/directory
+
+    # Update checksums for changed files
+    preserve --update file.txt
+    preserve --update -r /important/files
+
+REQUIREMENTS:
+    - attr package (for getfattr/setfattr commands)
+    - GNU coreutils (for checksum commands)
+
+XATTR FORMAT:
+    Checksums are stored as: user.checksum.<algorithm>
+    Example: user.checksum.sha512
+
+EOF
+}
+
+log_info() {
+    echo "[INFO] $@"
+}
+
+log_error() {
+    echo "[ERROR] $@"
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "[VERBOSE] $@"
+    fi
+}
+
+# Function to validate algorithm
+validate_algorithm() {
+    local algo="$1"
+    for supported in "${SUPPORTED_ALGORITHMS[@]}"; do
+        if [[ "$algo" == "$supported" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function to get checksum command for algorithm
+get_checksum_command() {
+    local algo="$1"
+    case "$algo" in
+        md5) echo "md5sum" ;;
+        sha1) echo "sha1sum" ;;
+        sha224) echo "sha224sum" ;;
+        sha256) echo "sha256sum" ;;
+        sha384) echo "sha384sum" ;;
+        sha512) echo "sha512sum" ;;
+        b2sum) echo "b2sum" ;;
+        cksum) echo "cksum" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Function to calculate checksum for file
+calculate_checksum() {
+    local file="$1"
+    local algo="$2"
+    local cmd=$(get_checksum_command "$algo")
+
+    if [[ -z "$cmd" ]]; then
+        log_error "Unsupported algorithm: $algo"
+        return 1
+    fi
+
+    # Calculate checksum
+    local result
+    if [[ "$cmd" == "cksum" ]]; then
+        # cksum has different output format
+        result=$($cmd "$file" 2>/dev/null | awk '{print $1}')
+    else
+        result=$($cmd "$file" 2>/dev/null | awk '{print $1}')
+    fi
+
+    if [[ -z "$result" ]]; then
+        log_error "Failed to calculate $algo checksum for $file"
+        return 1
+    fi
+
+    echo "$result"
+}
+
+# Function to embed checksum in xattr
+embed_checksum() {
+    local file="$1"
+    local algo="$2"
+
+    if [[ ! -f "$file" ]]; then
+        log_error "File not found: $file"
+        return 1
+    fi
+
+    local checksum=$(calculate_checksum "$file" "$algo")
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+
+    # Get file metadata
+    local file_size=$(stat -c %s "$file" 2>/dev/null || echo "0")
+    local file_mtime=$(stat -c %Y "$file" 2>/dev/null || echo "0")
+    local current_time=$(date +%s)
+
+    local xattr_checksum="user.checksum.$algo"
+    local xattr_size="user.checksum.size"
+    local xattr_mtime="user.checksum.mtime"
+    local xattr_ctime="user.checksum.ctime"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "DRY RUN: would set xattr $xattr_checksum=$checksum on $file"
+        log_info "DRY RUN: would set xattr $xattr_size=$file_size on $file"
+        log_info "DRY RUN: would set xattr $xattr_mtime=$file_mtime on $file"
+        log_info "DRY RUN: would set xattr $xattr_ctime=$current_time on $file"
+        return 0
+    fi
+
+    # Set all xattrs
+    local success=true
+
+    if ! setfattr -n "$xattr_checksum" -v "$checksum" "$file" 2>/dev/null; then
+        log_error "Failed to set checksum xattr on $file"
+        success=false
+    fi
+
+    if ! setfattr -n "$xattr_size" -v "$file_size" "$file" 2>/dev/null; then
+        log_error "Failed to set size xattr on $file"
+        success=false
+    fi
+
+    if ! setfattr -n "$xattr_mtime" -v "$file_mtime" "$file" 2>/dev/null; then
+        log_error "Failed to set mtime xattr on $file"
+        success=false
+    fi
+
+    if ! setfattr -n "$xattr_ctime" -v "$current_time" "$file" 2>/dev/null; then
+        log_error "Failed to set ctime xattr on $file"
+        success=false
+    fi
+
+    if [[ "$success" == true ]]; then
+        log_verbose "Embedded $algo checksum and metadata in $file"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to read checksum from xattr
+read_checksum() {
+    local file="$1"
+    local algo="$2"
+
+    if [[ ! -f "$file" ]]; then
+        log_error "File not found: $file"
+        return 1
+    fi
+
+    local xattr_name="user.checksum.$algo"
+
+    local checksum
+    checksum=$(getfattr -n "$xattr_name" "$file" 2>/dev/null | grep "^$xattr_name=" | cut -d'=' -f2 | tr -d '"')
+
+    if [[ -z "$checksum" ]]; then
+        if [[ "$VERBOSE" == true ]]; then
+            log_info "No $algo checksum found in xattr for $file"
+        fi
+        return 1
+    fi
+
+    echo "$checksum"
+}
+
+# Function to verify checksum
+verify_checksum() {
+    local file="$1"
+    local algo="$2"
+
+    local stored_checksum=$(read_checksum "$file" "$algo")
+    if [[ $? -ne 0 || -z "$stored_checksum" ]]; then
+        echo "$file: NO_CHECKSUM_STORED"
+        return 1
+    fi
+
+    local current_checksum=$(calculate_checksum "$file" "$algo")
+    if [[ $? -ne 0 ]]; then
+        echo "$file: CALCULATION_FAILED"
+        return 1
+    fi
+
+    if [[ "$stored_checksum" == "$current_checksum" ]]; then
+        echo "$file: OK"
+        log_verbose "$file: checksum matches"
+        return 0
+    else
+        echo "$file: FAILED"
+        log_verbose "$file: checksum mismatch - stored: $stored_checksum, current: $current_checksum"
+        return 1
+    fi
+}
+
+# Function to update checksum if file has changed
+update_checksum() {
+    local file="$1"
+    local algo="$2"
+
+    if [[ ! -f "$file" ]]; then
+        log_error "File not found: $file"
+        return 1
+    fi
+
+    # Get current file metadata
+    local current_size=$(stat -c %s "$file" 2>/dev/null || echo "0")
+    local current_mtime=$(stat -c %Y "$file" 2>/dev/null || echo "0")
+
+    # Get stored metadata
+    local stored_size=$(getfattr -n "user.checksum.size" "$file" 2>/dev/null | grep "^user.checksum.size=" | cut -d'=' -f2 | tr -d '"')
+    local stored_mtime=$(getfattr -n "user.checksum.mtime" "$file" 2>/dev/null | grep "^user.checksum.mtime=" | cut -d'=' -f2 | tr -d '"')
+
+    # Check if file has changed
+    if [[ -z "$stored_size" || -z "$stored_mtime" ]]; then
+        log_verbose "$file: No stored metadata found, will embed new checksum"
+        embed_checksum "$file" "$algo"
+        return $?
+    fi
+
+    if [[ "$current_size" != "$stored_size" || "$current_mtime" != "$stored_mtime" ]]; then
+        log_verbose "$file: File has changed (size: $stored_size->$current_size, mtime: $stored_mtime->$current_mtime)"
+
+        # Get current checksum
+        local stored_checksum=$(read_checksum "$file" "$algo")
+        local new_checksum=$(calculate_checksum "$file" "$algo")
+
+        if [[ $? -ne 0 ]]; then
+            log_error "Failed to calculate new checksum for $file"
+            return 1
+        fi
+
+        if [[ "$DRY_RUN" == true ]]; then
+            log_info "DRY RUN: would update $algo checksum on $file (old: $stored_checksum, new: $new_checksum)"
+            return 0
+        fi
+
+        # Store previous checksum
+        local prev_xattr="user.checksum.previous.$algo"
+        if [[ -n "$stored_checksum" ]]; then
+            setfattr -n "$prev_xattr" -v "$stored_checksum" "$file" 2>/dev/null || true
+        fi
+
+        # Update checksum and metadata
+        embed_checksum "$file" "$algo"
+
+        log_info "Updated $algo checksum for $file"
+        return 0
+    else
+        log_verbose "$file: File unchanged, no update needed"
+        return 0
+    fi
+}
+
+# Function to process a single file
+process_file() {
+    local file="$1"
+
+    case "$OPERATION" in
+        embed)
+            for algo in "${ALGORITHMS[@]}"; do
+                embed_checksum "$file" "$algo"
+            done
+            ;;
+        read)
+            for algo in "${ALGORITHMS[@]}"; do
+                local checksum=$(read_checksum "$file" "$algo")
+                if [[ -n "$checksum" ]]; then
+                    echo "$file: $algo=$checksum"
+                fi
+            done
+            ;;
+        verify)
+            local all_ok=true
+            for algo in "${ALGORITHMS[@]}"; do
+                if ! verify_checksum "$file" "$algo" >/dev/null 2>&1; then
+                    all_ok=false
+                fi
+            done
+            # Show final result
+            for algo in "${ALGORITHMS[@]}"; do
+                verify_checksum "$file" "$algo"
+            done
+            ;;
+        update)
+            for algo in "${ALGORITHMS[@]}"; do
+                update_checksum "$file" "$algo"
+            done
+            ;;
+    esac
+}
+
+# Function to find files recursively
+find_files_recursive() {
+    local path="$1"
+
+    if [[ -d "$path" ]]; then
+        find "$path" -type f
+    else
+        echo "$path"
+    fi
+}
+
+# Function to process all files
+process_all_files() {
+    local file_list=()
+
+    # Build file list based on input method
+    if [[ "$STDIN_MODE" == true ]]; then
+        # Read from stdin
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            file_list+=("$line")
+        done
+    elif [[ "$RECURSIVE" == true && ${#FILES[@]} -gt 0 ]]; then
+        # Recursive processing - treat ALL FILES as directories
+        for item in "${FILES[@]}"; do
+            if [[ -d "$item" ]]; then
+                # It's a directory, find all files recursively
+                while IFS= read -r file; do
+                    file_list+=("$file")
+                done < <(find "$item" -type f 2>/dev/null)
+            else
+                # Not a directory, but -r was specified, so skip with warning
+                log_error "Skipping '$item': not a directory (use -r only with directories)"
+            fi
+        done
+    else
+        # Direct file list
+        file_list=("${FILES[@]}")
+    fi
+
+    # Remove duplicates
+    local unique_files=()
+    local seen=()
+    for file in "${file_list[@]}"; do
+        if [[ ! " ${seen[*]} " =~ " ${file} " ]]; then
+            seen+=("$file")
+            unique_files+=("$file")
+        fi
+    done
+
+    log_info "Processing ${#unique_files[@]} file(s)"
+
+    # Process files
+    if [[ "$PARALLEL" == true ]]; then
+        # Use background jobs for parallel processing (limit to 4 concurrent)
+        local pids=()
+        local max_jobs=4
+
+        for file in "${unique_files[@]}"; do
+            # Wait if we have too many background jobs
+            while [[ ${#pids[@]} -ge $max_jobs ]]; do
+                local new_pids=()
+                for pid in "${pids[@]}"; do
+                    if kill -0 "$pid" 2>/dev/null; then
+                        new_pids+=("$pid")
+                    fi
+                done
+                pids=("${new_pids[@]}")
+
+                if [[ ${#pids[@]} -ge $max_jobs ]]; then
+                    sleep 0.1
+                fi
+            done
+
+            # Start background job
+            process_file "$file" &
+            pids+=($!)
+        done
+
+        # Wait for all background jobs to finish
+        for pid in "${pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+    else
+        # Process sequentially
+        for file in "${unique_files[@]}"; do
+            process_file "$file"
+        done
+    fi
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --embed)
+            OPERATION="embed"
+            shift
+            ;;
+        --read)
+            OPERATION="read"
+            shift
+            ;;
+        --verify)
+            OPERATION="verify"
+            shift
+            ;;
+        --update)
+            OPERATION="update"
+            shift
+            ;;
+        -a|--algorithm)
+            if [[ $# -lt 2 ]]; then
+                log_error "Option $1 requires an argument"
+                exit 1
+            fi
+            # Parse comma-separated algorithms
+            IFS=',' read -ra ALGORITHMS <<< "$2"
+            shift 2
+            ;;
+        -r|--recursive)
+            RECURSIVE=true
+            shift
+            ;;
+        --stdin)
+            STDIN_MODE=true
+            shift
+            ;;
+        --parallel)
+            PARALLEL=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            echo "Use -h or --help for usage information"
+            exit 1
+            ;;
+        *)
+            FILES+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Validate arguments
+if [[ -z "$OPERATION" ]]; then
+    log_error "No operation specified. Use --embed, --read, or --verify"
+    echo "Use -h or --help for usage information"
+    exit 1
+fi
+
+# Validate algorithms
+for algo in "${ALGORITHMS[@]}"; do
+    if ! validate_algorithm "$algo"; then
+        log_error "Unsupported algorithm: $algo"
+        log_error "Supported algorithms: ${SUPPORTED_ALGORITHMS[*]}"
+        exit 1
+    fi
+done
+
+# Check for required commands
+if ! command -v getfattr &> /dev/null || ! command -v setfattr &> /dev/null; then
+    log_error "attr package not installed. Please install it for xattr support."
+    exit 1
+fi
+
+# Parallel processing uses background jobs, no additional requirements
+
+# Process files
+process_all_files

@@ -1,0 +1,369 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# ==============================================================================
+# sanitaiz - PII Data Sanitization Tool
+# ==============================================================================
+# A play on "sanitize" + "AI" - Uses offline AI to sanitize PII from text
+#
+# Description:
+#   Wrapper around aipy that uses an offline AI model (gpt-oss:20b via ollama)
+#   to detect and redact personally identifiable information (PII) from text.
+#   Supports global PII formats (SSN, IBAN, Aadhaar, NRIC, etc.) and can
+#   optionally redact GDPR Article 9 special categories with --strict.
+#
+# Features:
+#   - Offline processing via local ollama model
+#   - Comprehensive global PII detection
+#   - Smart code detection to avoid false positives on variable names
+#   - Configurable redaction string
+#   - stdin/stdout and file-based input modes
+#
+# Dependencies:
+#   - aipy: AI command-line tool
+#   - ollama: Local LLM runtime with gpt-oss:20b model
+#
+# Usage: See show_help() or run with --help
+# ==============================================================================
+
+set -euo pipefail
+
+# Configuration defaults
+DEFAULT_MODEL="gpt-oss:20b"
+DEFAULT_REDACT_STRING="<REDACTED>"
+
+# Runtime state
+model="${DEFAULT_MODEL}"
+redact_string="${DEFAULT_REDACT_STRING}"
+strict_mode=false
+debug_mode=false
+dry_run_mode=false
+files=()
+
+show_help () {
+    cat << 'EOF'
+Usage: sanitaiz [OPTIONS] [FILE...]
+
+Sanitize PII (Personally Identifiable Information) from text using offline AI.
+
+A play on "sanitize" + "AI" - uses local AI model to detect and redact PII
+while preserving non-PII content exactly as provided.
+
+Options:
+  -h, --help                Show this help message and exit
+  --license                 Show the AGPLv3 license
+  -r, --redact-string STR   Custom redaction string (default: <REDACTED>)
+  -f, --file FILE           Input file (can be specified multiple times)
+  --model MODEL             Override AI model (default: gpt-oss:20b)
+  --strict                  Also redact GDPR Article 9 special categories
+                            (health info, religious beliefs, political opinions,
+                            ethnic origin, sexual orientation, etc.)
+  --debug                   Enable debug output
+  --dry-run                 Show what would be executed without running
+
+Input Modes:
+  stdin/stdout:  cat sensitive.txt | sanitaiz
+  File mode:     sanitaiz -f document.txt
+  Multiple:      sanitaiz -f file1.txt -f file2.txt
+
+PII Detected (Always):
+  - Names (full, first, last, maiden, aliases, nicknames)
+  - National IDs (SSN, NIN, Aadhaar, SIN, TFN, NRIC, CPF, Cedula, etc.)
+  - Passport numbers, driver's license numbers
+  - Birth dates, birth places, death dates
+  - Physical addresses (street, city, state, postal/ZIP codes)
+  - Email addresses, phone numbers (all international formats)
+  - Bank accounts (IBAN, routing, SWIFT), credit card numbers
+  - Tax IDs (EIN, VAT, ITIN, etc.)
+  - IP addresses (IPv4/IPv6), MAC addresses, device IDs
+  - Social media handles, usernames
+  - Vehicle registration, license plates
+  - Geolocation coordinates
+  - Medical record numbers, employee/student IDs
+
+PII Detected (with --strict):
+  - Health/medical information, diagnoses, treatments
+  - Religious or philosophical beliefs
+  - Political opinions or affiliations
+  - Ethnic or racial origin
+  - Sexual orientation or gender identity
+  - Trade union membership
+  - Criminal records, convictions
+
+Examples:
+  # Basic usage - pipe text through
+  cat sensitive_log.txt | sanitaiz
+
+  # Use custom redaction string
+  echo "Call John at 555-1234" | sanitaiz -r "[REMOVED]"
+
+  # Process file directly
+  sanitaiz -f customer_data.csv > sanitized_data.csv
+
+  # Strict mode for GDPR compliance
+  cat medical_notes.txt | sanitaiz --strict
+
+  # Debug mode to see what's happening
+  cat data.txt | sanitaiz --debug
+
+  # Dry run to preview command
+  sanitaiz -f data.txt --dry-run
+EOF
+}
+
+show_license () {
+    cat << 'EOF'
+sanitaiz - PII Data Sanitization Tool
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+build_prompt () {
+    # Function: build_prompt
+    # Purpose: Construct the sanitization prompt with the redaction string
+    # Arguments: None (uses global redact_string and strict_mode)
+    # Returns: Echoes the complete prompt string
+
+    local strict_section=""
+
+    if [[ "$strict_mode" == true ]]
+    then
+        strict_section="
+SPECIAL CATEGORIES TO ALSO REDACT (strict mode enabled):
+- Health/medical information, diagnoses, conditions, treatments, medications
+- Religious or philosophical beliefs and affiliations
+- Political opinions, party memberships, or affiliations
+- Ethnic or racial origin
+- Sexual orientation or gender identity
+- Trade union membership
+- Criminal records, arrests, convictions, legal proceedings
+- Genetic data references
+- Biometric data descriptions"
+    fi
+
+    cat << EOF
+You are a PII data sanitization tool. Your ONLY task is to replace personally identifiable information (PII) with the redaction marker: ${redact_string}
+
+CRITICAL INSTRUCTIONS:
+1. Output the ENTIRE input text with PII replaced by ${redact_string}
+2. Do NOT summarize, paraphrase, or modify any non-PII content
+3. Do NOT add commentary, explanations, or metadata
+4. Do NOT change formatting, whitespace, or line breaks
+5. PRESERVE all non-PII text exactly as provided
+6. When in doubt about whether something is PII, REDACT it
+7. Start your output immediately with the sanitized text - no preamble
+
+CODE AWARENESS (Important):
+- Do NOT redact programming variable names, function names, or identifiers that are clearly code syntax
+- Examples of code to PRESERVE: user_id, email_address, get_user_name(), \$phone_number, config['api_key']
+- Only redact ACTUAL PII values, not code that references PII concepts
+- If text is inside markdown code blocks (\`\`\` or \`) or appears to be source code, be extra careful to preserve code syntax
+- Placeholder text like "example@example.com" or "John Doe" in documentation should still be redacted
+
+PII TO DETECT AND REDACT (Always):
+- Names (full names, first names, last names, maiden names, aliases, nicknames)
+- National ID numbers:
+  * SSN (US): XXX-XX-XXXX
+  * NIN (UK): AB123456C
+  * Aadhaar (India): XXXX XXXX XXXX
+  * SIN (Canada): XXX-XXX-XXX
+  * TFN (Australia): XXX XXX XXX
+  * NRIC (Singapore): S1234567A
+  * CPF (Brazil): XXX.XXX.XXX-XX
+  * Cedula (Latin America): various formats
+  * And other national ID formats worldwide
+- Passport numbers, driver's license numbers
+- Birth dates, birth places, death dates
+- Physical addresses (street numbers, street names, apartment numbers, city, state/province, postal/ZIP codes, country)
+- Email addresses (actual addresses like john.doe@company.com, jane123@gmail.com)
+- Phone numbers (all formats):
+  * +1-555-123-4567
+  * (555) 123-4567
+  * 555.123.4567
+  * +44 20 7123 4567
+  * International formats
+- Fax numbers
+- Bank account numbers, IBAN, routing numbers, SWIFT/BIC codes
+- Credit/debit card numbers (full or partial): 4111-1111-1111-1111, **** **** **** 1234
+- Tax IDs (EIN, VAT, ITIN, etc.)
+- IP addresses:
+  * IPv4: 192.168.1.1, 10.0.0.1
+  * IPv6: 2001:db8::1, fe80::1
+- MAC addresses: AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF
+- Device IDs, IMEI numbers
+- Social media handles (@username when referring to a real person)
+- Usernames, user IDs, account numbers
+- Vehicle registration numbers, license plates
+- Geolocation coordinates (latitude/longitude): 40.7128, -74.0060
+- Medical record numbers (MRN), prescription numbers
+- Employee IDs, badge numbers
+- Student IDs
+- Professional license numbers (medical, legal, CPA, etc.)
+- Insurance policy numbers
+- Property records, deed numbers
+${strict_section}
+
+INPUT TEXT TO SANITIZE:
+EOF
+}
+
+# Argument parsing
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --license)
+            show_license
+            exit 0
+            ;;
+        -r|--redact-string)
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]
+            then
+                echo "Error: --redact-string requires an argument" >&2
+                exit 1
+            fi
+            redact_string="$2"
+            shift 2
+            ;;
+        -f|--file)
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]
+            then
+                echo "Error: --file requires a filename argument" >&2
+                exit 1
+            fi
+            if [[ ! -f "$2" ]]
+            then
+                echo "Error: File not found: $2" >&2
+                exit 1
+            fi
+            files+=("$2")
+            shift 2
+            ;;
+        --model)
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]
+            then
+                echo "Error: --model requires a model name argument" >&2
+                exit 1
+            fi
+            model="$2"
+            shift 2
+            ;;
+        --strict)
+            strict_mode=true
+            shift
+            ;;
+        --debug)
+            debug_mode=true
+            shift
+            ;;
+        --dry-run)
+            dry_run_mode=true
+            shift
+            ;;
+        -*)
+            echo "Error: Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+        *)
+            # Treat positional arguments as files
+            if [[ -f "$1" ]]
+            then
+                files+=("$1")
+            else
+                echo "Error: File not found: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Build the prompt
+prompt="$(build_prompt)"
+
+# Build the aipy command
+aipy_cmd=(
+    aipy
+    --no-preserve
+    --hide-model
+    --model "${model}"
+)
+
+# Add file arguments if provided
+for f in "${files[@]}"
+do
+    aipy_cmd+=(-f "$f")
+done
+
+# Add debug if enabled
+if [[ "$debug_mode" == true ]]
+then
+    aipy_cmd+=(--debug)
+fi
+
+# Handle dry-run mode
+if [[ "$dry_run_mode" == true ]]
+then
+    echo "=== DRY RUN MODE ===" >&2
+    echo "Model: ${model}" >&2
+    echo "Redact string: ${redact_string}" >&2
+    echo "Strict mode: ${strict_mode}" >&2
+    echo "Debug mode: ${debug_mode}" >&2
+    echo "Hide model output: true" >&2
+    echo "Files: ${files[*]:-<stdin>}" >&2
+    echo "" >&2
+    echo "Command that would be executed:" >&2
+    echo "  ${aipy_cmd[*]} <prompt>" >&2
+    echo "" >&2
+    echo "Prompt preview (first 500 chars):" >&2
+    echo "${prompt:0:500}..." >&2
+    exit 0
+fi
+
+# Debug output
+if [[ "$debug_mode" == true ]]
+then
+    echo "[DEBUG] sanitaiz starting" >&2
+    echo "[DEBUG] Model: ${model}" >&2
+    echo "[DEBUG] Redact string: ${redact_string}" >&2
+    echo "[DEBUG] Strict mode: ${strict_mode}" >&2
+    echo "[DEBUG] Files: ${files[*]:-<stdin>}" >&2
+    echo "[DEBUG] Command: ${aipy_cmd[*]}" >&2
+fi
+
+# Execute aipy with the prompt
+# If files were provided, aipy handles them via -f flags
+# Otherwise, stdin is passed through to aipy
+"${aipy_cmd[@]}" "${prompt}"

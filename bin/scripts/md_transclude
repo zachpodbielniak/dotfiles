@@ -1,0 +1,595 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# md_transclude - expand ![[path]] transclusions in markdown files
+set -euo pipefail
+
+# Configuration defaults
+notes_root="${NOTES_DIR:-${HOME}/Documents/notes}"
+
+# Runtime state
+pedantic_mode=false
+debug_mode=false
+max_depth=10
+
+# Cycle detection - associative array for tracking visited files
+declare -A visited_files
+
+# Regex patterns
+readonly REGEX_TRANSCLUSION='^\!\[\[(.+)\]\]$'
+readonly REGEX_HEADING_REF='^(.+)#([^L].*)$'
+readonly REGEX_LINE_RANGE='^(.+)#L([0-9]+)-L([0-9]+)$'
+readonly REGEX_SINGLE_LINE='^(.+)#L([0-9]+)$'
+readonly REGEX_HEADING='^(#{1,6})[[:space:]]+(.+)$'
+
+# Parsed ref results (set by parse_transclusion_ref)
+parsed_file=""
+parsed_anchor_type=""
+parsed_anchor_value=""
+parsed_anchor_end=""
+
+
+show_help () {
+    cat << 'EOF'
+md_transclude - expand ![[path]] transclusions in markdown files
+
+USAGE
+    md_transclude [OPTIONS] [FILE...]
+    cat file.md | md_transclude [OPTIONS]
+
+DESCRIPTION
+    Expand ![[path]] transclusions in markdown files. Supports heading
+    references, line ranges, recursive transclusion with cycle detection,
+    and wikilink conversion to standard markdown links.
+
+OPTIONS
+    -h, --help          Show this help message and exit
+    --license           Show the AGPLv3 license
+    --pedantic          Exit with error on any missing target (default: warn and passthrough)
+    --debug             Enable debug output to stderr
+    --max-depth N       Maximum recursion depth (default: 10)
+    --notes-root PATH   Override notes root directory (default: $NOTES_DIR or ~/Documents/notes)
+
+TRANSCLUSION SYNTAX
+    ![[file]]           Include entire file
+    ![[file#Heading]]   Include section under heading until next same-or-higher level
+    ![[file#L10-L20]]   Include lines 10 through 20
+    ![[file#L10]]       Include only line 10
+
+WIKILINK CONVERSION
+    [[link]]            Converted to [link](link.md)
+    [[link|text]]       Converted to [text](link.md)
+
+EXAMPLES
+    # Process a single file
+    md_transclude document.md > output.md
+
+    # Process multiple files
+    md_transclude file1.md file2.md file3.md
+
+    # Process from stdin
+    cat document.md | md_transclude
+
+    # Strict mode - fail on missing files
+    md_transclude --pedantic document.md
+
+    # Custom notes root
+    md_transclude --notes-root /path/to/notes document.md
+
+    # Transclude specific heading
+    echo '![[notes.md#Introduction]]' | md_transclude
+
+    # Transclude line range
+    echo '![[code.md#L1-L50]]' | md_transclude
+
+EXIT CODES
+    0   Success
+    1   Error (missing file in pedantic mode, cycle detected, etc.)
+EOF
+}
+
+
+show_license () {
+    cat << 'EOF'
+AGPLv3 - GNU Affero General Public License version 3
+
+md_transclude is part of dotfiles
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Full license text: https://www.gnu.org/licenses/agpl-3.0.html
+EOF
+}
+
+
+debug_log () {
+    # Print debug message to stderr if debug_mode is enabled
+    local message="${1}"
+
+    if [[ "${debug_mode}" == true ]]
+    then
+        echo "[DEBUG] ${message}" >&2
+    fi
+}
+
+
+warn () {
+    # Handle warning - stderr message or exit based on pedantic_mode
+    local message="${1}"
+
+    if [[ "${pedantic_mode}" == true ]]
+    then
+        echo "Error: ${message}" >&2
+        exit 1
+    else
+        echo "Warning: ${message}" >&2
+    fi
+}
+
+
+resolve_target () {
+    # Resolve transclusion target to absolute path
+    # Try relative to base_dir first, then notes_root
+    # Returns: echoes path or empty string if not found
+    local ref="${1}"
+    local base_dir="${2}"
+    local target=""
+
+    # Strip any anchor from ref for file resolution
+    local file_ref="${ref}"
+    if [[ "${ref}" =~ ^(.+)#.+$ ]]
+    then
+        file_ref="${BASH_REMATCH[1]}"
+    fi
+
+    debug_log "Resolving: ${file_ref} (base: ${base_dir})"
+
+    # Try relative to base_dir first
+    if [[ -n "${base_dir}" ]] && [[ -f "${base_dir}/${file_ref}" ]]
+    then
+        target="${base_dir}/${file_ref}"
+    # Then try from notes_root
+    elif [[ -f "${notes_root}/${file_ref}" ]]
+    then
+        target="${notes_root}/${file_ref}"
+    # Finally try as absolute or relative to PWD
+    elif [[ -f "${file_ref}" ]]
+    then
+        target="${file_ref}"
+    fi
+
+    if [[ -n "${target}" ]]
+    then
+        debug_log "Resolved to: ${target}"
+    else
+        debug_log "Could not resolve: ${file_ref}"
+    fi
+
+    echo "${target}"
+}
+
+
+parse_transclusion_ref () {
+    # Parse file#heading or file#L10-L20 syntax
+    # Sets global vars: parsed_file, parsed_anchor_type, parsed_anchor_value, parsed_anchor_end
+    local ref="${1}"
+
+    # Reset globals
+    parsed_file=""
+    parsed_anchor_type="none"
+    parsed_anchor_value=""
+    parsed_anchor_end=""
+
+    # Check for line range first (more specific)
+    if [[ "${ref}" =~ ${REGEX_LINE_RANGE} ]]
+    then
+        parsed_file="${BASH_REMATCH[1]}"
+        parsed_anchor_type="line_range"
+        parsed_anchor_value="${BASH_REMATCH[2]}"
+        parsed_anchor_end="${BASH_REMATCH[3]}"
+        debug_log "Parsed line range: ${parsed_file} L${parsed_anchor_value}-L${parsed_anchor_end}"
+    # Check for single line
+    elif [[ "${ref}" =~ ${REGEX_SINGLE_LINE} ]]
+    then
+        parsed_file="${BASH_REMATCH[1]}"
+        parsed_anchor_type="single_line"
+        parsed_anchor_value="${BASH_REMATCH[2]}"
+        parsed_anchor_end="${parsed_anchor_value}"
+        debug_log "Parsed single line: ${parsed_file} L${parsed_anchor_value}"
+    # Check for heading reference
+    elif [[ "${ref}" =~ ${REGEX_HEADING_REF} ]]
+    then
+        parsed_file="${BASH_REMATCH[1]}"
+        parsed_anchor_type="heading"
+        parsed_anchor_value="${BASH_REMATCH[2]}"
+        debug_log "Parsed heading ref: ${parsed_file}#${parsed_anchor_value}"
+    # No anchor - whole file
+    else
+        parsed_file="${ref}"
+        parsed_anchor_type="none"
+        debug_log "Parsed whole file: ${parsed_file}"
+    fi
+}
+
+
+extract_heading_section () {
+    # Extract content under a heading until next same-or-higher level heading
+    local file="${1}"
+    local target_heading="${2}"
+    local in_section=false
+    local target_level=0
+
+    debug_log "Extracting heading '${target_heading}' from ${file}"
+
+    while IFS= read -r line
+    do
+        if [[ "${line}" =~ ${REGEX_HEADING} ]]
+        then
+            local hashes="${BASH_REMATCH[1]}"
+            local level="${#hashes}"
+            local heading_text="${BASH_REMATCH[2]}"
+
+            # Trim trailing whitespace from heading_text for comparison
+            heading_text="${heading_text%"${heading_text##*[![:space:]]}"}"
+
+            if [[ "${in_section}" == true ]]
+            then
+                # Check if this heading ends our section
+                if [[ "${level}" -le "${target_level}" ]]
+                then
+                    # Same or higher level heading - stop
+                    debug_log "Section ended at heading: ${heading_text}"
+                    break
+                fi
+            fi
+
+            # Check if this is our target heading
+            if [[ "${heading_text}" == "${target_heading}" ]]
+            then
+                in_section=true
+                target_level="${level}"
+                debug_log "Found target heading at level ${level}"
+                echo "${line}"
+                continue
+            fi
+        fi
+
+        if [[ "${in_section}" == true ]]
+        then
+            echo "${line}"
+        fi
+    done < "${file}"
+
+    if [[ "${in_section}" == false ]]
+    then
+        warn "Heading '${target_heading}' not found in ${file}"
+        return 1
+    fi
+
+    return 0
+}
+
+
+extract_line_range () {
+    # Extract specific lines from a file
+    local file="${1}"
+    local start_line="${2}"
+    local end_line="${3}"
+
+    debug_log "Extracting lines ${start_line}-${end_line} from ${file}"
+
+    # Validate line numbers
+    if [[ "${start_line}" -lt 1 ]] || [[ "${end_line}" -lt "${start_line}" ]]
+    then
+        warn "Invalid line range: L${start_line}-L${end_line}"
+        return 1
+    fi
+
+    local total_lines
+    total_lines="$(wc -l < "${file}")"
+
+    if [[ "${start_line}" -gt "${total_lines}" ]]
+    then
+        warn "Start line ${start_line} exceeds file length (${total_lines} lines)"
+        return 1
+    fi
+
+    # Use sed to extract range
+    sed -n "${start_line},${end_line}p" "${file}"
+}
+
+
+convert_wikilinks () {
+    # Convert [[link]] and [[link|text]] to markdown links
+    local line="${1}"
+
+    # Handle [[link|display text]] format first (more specific)
+    # [[link|text]] -> [text](link.md)
+    line="$(echo "${line}" | sed -E 's/\[\[([^]|]+)\|([^]]+)\]\]/[\2](\1.md)/g')"
+
+    # Handle simple [[link]] format
+    # [[link]] -> [link](link.md)
+    line="$(echo "${line}" | sed -E 's/\[\[([^]|]+)\]\]/[\1](\1.md)/g')"
+
+    echo "${line}"
+}
+
+
+process_transclusion () {
+    # Process a single ![[ref]] transclusion with cycle detection
+    # Returns: echoes transcluded content or original syntax on failure
+    local ref="${1}"
+    local base_dir="${2}"
+    local depth="${3}"
+
+    debug_log "Processing transclusion: ![[${ref}]] (depth: ${depth})"
+
+    # Check depth limit
+    if [[ "${depth}" -ge "${max_depth}" ]]
+    then
+        warn "Maximum recursion depth (${max_depth}) exceeded for: ${ref}"
+        echo "![[${ref}]]"
+        return
+    fi
+
+    # Parse the reference
+    parse_transclusion_ref "${ref}"
+
+    # Resolve target file
+    local target
+    target="$(resolve_target "${parsed_file}" "${base_dir}")"
+
+    if [[ -z "${target}" ]]
+    then
+        warn "Target not found: ${parsed_file}"
+        echo "![[${ref}]]"
+        return
+    fi
+
+    # Get absolute path for cycle detection
+    local abs_target
+    abs_target="$(realpath "${target}" 2>/dev/null)" || abs_target="${target}"
+
+    # Check for cycle
+    if [[ -n "${visited_files[${abs_target}]:-}" ]]
+    then
+        warn "Cycle detected: ${abs_target} already visited"
+        echo "![[${ref}]]"
+        return
+    fi
+
+    # Mark as visited
+    visited_files["${abs_target}"]=1
+
+    # Extract content based on anchor type
+    local content=""
+    local extraction_failed=false
+
+    case "${parsed_anchor_type}" in
+        heading)
+            content="$(extract_heading_section "${target}" "${parsed_anchor_value}")" || extraction_failed=true
+            ;;
+        line_range|single_line)
+            content="$(extract_line_range "${target}" "${parsed_anchor_value}" "${parsed_anchor_end}")" || extraction_failed=true
+            ;;
+        none)
+            content="$(cat "${target}")"
+            ;;
+    esac
+
+    if [[ "${extraction_failed}" == true ]]
+    then
+        # Unmark before returning
+        unset 'visited_files["${abs_target}"]'
+        echo "![[${ref}]]"
+        return
+    fi
+
+    # Output transclusion markers
+    echo "<!-- transcluded: ${ref} -->"
+
+    # Recursively process the content
+    local new_base_dir
+    new_base_dir="$(dirname "${target}")"
+    expand_transclusions_content "${content}" "${new_base_dir}" "$((depth + 1))"
+
+    echo "<!-- end transclusion -->"
+
+    # Unmark after processing (allow same file in different branches)
+    unset 'visited_files["${abs_target}"]'
+}
+
+
+expand_transclusions_content () {
+    # Process all transclusions in a content string
+    local content="${1}"
+    local base_dir="${2}"
+    local depth="${3}"
+
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        # Check for transclusion
+        if [[ "${line}" =~ ${REGEX_TRANSCLUSION} ]]
+        then
+            local ref="${BASH_REMATCH[1]}"
+            process_transclusion "${ref}" "${base_dir}" "${depth}"
+        else
+            # Convert wikilinks in regular lines
+            convert_wikilinks "${line}"
+        fi
+    done <<< "${content}"
+}
+
+
+expand_transclusions () {
+    # Process all transclusions in a file
+    local file="${1}"
+    local base_dir="${2}"
+    local depth="${3}"
+
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        # Check for transclusion
+        if [[ "${line}" =~ ${REGEX_TRANSCLUSION} ]]
+        then
+            local ref="${BASH_REMATCH[1]}"
+            process_transclusion "${ref}" "${base_dir}" "${depth}"
+        else
+            # Convert wikilinks in regular lines
+            convert_wikilinks "${line}"
+        fi
+    done < "${file}"
+}
+
+
+process_file () {
+    # Process a single file argument
+    local file="${1}"
+
+    if [[ ! -f "${file}" ]]
+    then
+        warn "File not found: ${file}"
+        return 1
+    fi
+
+    debug_log "Processing file: ${file}"
+
+    local base_dir
+    base_dir="$(dirname "${file}")"
+
+    # Clear visited files for this processing run
+    visited_files=()
+
+    # Mark the original file as visited to prevent self-cycles
+    local abs_file
+    abs_file="$(realpath "${file}" 2>/dev/null)" || abs_file="${file}"
+    visited_files["${abs_file}"]=1
+
+    # Process file content
+    expand_transclusions "${file}" "${base_dir}" 0
+}
+
+
+process_stdin () {
+    # Process content from stdin
+    debug_log "Processing from stdin"
+
+    local content
+    content="$(cat)"
+
+    # Use current directory as base_dir for stdin
+    local base_dir="${PWD}"
+
+    # Clear visited files for this processing run
+    visited_files=()
+
+    # Process and output
+    expand_transclusions_content "${content}" "${base_dir}" 0
+}
+
+
+main () {
+    local files=()
+
+    # Argument parsing
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --license)
+                show_license
+                exit 0
+                ;;
+            --pedantic)
+                pedantic_mode=true
+                shift
+                ;;
+            --debug)
+                debug_mode=true
+                shift
+                ;;
+            --max-depth)
+                if [[ $# -lt 2 ]] || [[ -z "${2}" ]] || [[ "${2}" == -* ]]
+                then
+                    echo "Error: --max-depth requires an integer argument" >&2
+                    exit 1
+                fi
+                if ! [[ "${2}" =~ ^[0-9]+$ ]]
+                then
+                    echo "Error: --max-depth must be a positive integer" >&2
+                    exit 1
+                fi
+                max_depth="${2}"
+                shift 2
+                ;;
+            --notes-root)
+                if [[ $# -lt 2 ]] || [[ -z "${2}" ]] || [[ "${2}" == -* ]]
+                then
+                    echo "Error: --notes-root requires a path argument" >&2
+                    exit 1
+                fi
+                notes_root="${2}"
+                shift 2
+                ;;
+            -*)
+                echo "Error: Unknown option: ${1}" >&2
+                echo "Use --help for usage information" >&2
+                exit 1
+                ;;
+            *)
+                files+=("${1}")
+                shift
+                ;;
+        esac
+    done
+
+    # Check if stdin has data (not a terminal)
+    local has_stdin=false
+    if [[ ! -t 0 ]]
+    then
+        has_stdin=true
+    fi
+
+    # If no files specified and no stdin, error
+    if [[ ${#files[@]} -eq 0 ]] && [[ "${has_stdin}" == false ]]
+    then
+        echo "Error: No input provided. Specify files or pipe content via stdin." >&2
+        echo "Use --help for usage information" >&2
+        exit 1
+    fi
+
+    # Process stdin if available
+    if [[ "${has_stdin}" == true ]]
+    then
+        process_stdin
+    fi
+
+    # Process each file
+    for file in "${files[@]}"
+    do
+        process_file "${file}"
+    done
+}
+
+main "$@"

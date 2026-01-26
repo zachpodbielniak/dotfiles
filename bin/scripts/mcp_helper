@@ -1,0 +1,1021 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# =============================================================================
+# mcp_helper - Generate MCP server configurations for various clients
+# =============================================================================
+
+VERSION="2.0.0"
+SCRIPT_NAME="$(basename "$0")"
+
+# Temp directory for bundle creation
+TEMP_DIR=""
+
+# Server configuration globals (set by get_server_config)
+SERVER_NAME=""
+SERVER_VERSION=""
+SERVER_DESCRIPTION=""
+SERVER_COMMAND=""
+SERVER_ARGS_STDIO=""
+SERVER_ARGS_HTTP=""
+SERVER_HTTP_PORT=""
+SERVER_ENV_VARS=""
+SERVER_SOURCE_SCRIPTS=""    # Space-separated list of scripts to source before running
+SERVER_ARGS_ARRAY=()        # Array of args for complex servers (used if populated)
+
+# Custom server configuration
+CUSTOM_MODE=""              # "stdio" or "http" when using --custom/--custom-http
+CUSTOM_HTTP_ENDPOINT=""     # HTTP endpoint URL for custom servers
+CUSTOM_ARGS=()              # Array for args (supports multiple --args flags)
+
+# =============================================================================
+# CLEANUP
+# =============================================================================
+
+cleanup () {
+    if [[ -n "${TEMP_DIR}" ]] && [[ -d "${TEMP_DIR}" ]]
+    then
+        rm -rf "${TEMP_DIR}"
+    fi
+}
+
+trap cleanup EXIT
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+usage () {
+    cat <<EOF
+${SCRIPT_NAME} - Generate MCP server configurations for various clients
+
+USAGE:
+    ${SCRIPT_NAME} --<server> --<client> [options]
+    ${SCRIPT_NAME} --list
+    ${SCRIPT_NAME} -h|--help
+
+SERVER OPTIONS (known servers):
+    --aipy              Universal AI provider wrapper with chat history
+    --flashcards        Spaced repetition flashcards with AI generation
+    --rdt               Reddit terminal browser with MCP tools
+    --vimban            Markdown-native ticket and kanban management
+    --blender           Blender 3D modeling with Claude AI integration
+    --freecad           FreeCAD 3D parametric modeling via MCP
+    --monarch           Monarch MCP server for personal data management
+
+CUSTOM SERVER OPTIONS:
+    --custom <name>     Custom stdio server (requires --command)
+    --custom-http <name>
+                        Custom HTTP server (requires --http-endpoint)
+    --command <cmd>     Command to execute (required for --custom)
+    --args <args>       Space-separated args in quotes; can be repeated
+    --env <KEY=VALUE>   Environment variable (can be repeated)
+                        Example: --env TMPDIR=/tmp/custom
+    --http-endpoint <url>
+                        HTTP endpoint URL (required for --custom-http)
+    --server-version <v>
+                        Version string for .mcpb bundles (default: 1.0.0)
+    --description <text>
+                        Description for .mcpb bundles (default: Custom MCP server)
+
+CLIENT OPTIONS:
+    --claude-code       Generate for Claude Code CLI
+    --claude-desktop    Generate for Claude Desktop (.mcpb bundle)
+    --opencode          Generate for OpenCode
+
+TRANSPORT OPTIONS:
+    --http              Use HTTP transport instead of stdio (default: stdio)
+                        Uses the server's HTTP endpoint (e.g., port 5003, 5004)
+
+OUTPUT OPTIONS:
+    --config            Output config JSON snippet instead of add command
+                        (for --claude-code and --opencode)
+    --json              Output JSON config instead of .mcpb bundle
+                        (for --claude-desktop)
+    -o, --output        Write to file instead of stdout/default path
+
+GENERAL OPTIONS:
+    --list              List available server configurations
+    -h, --help          Show this help message
+    --license           Show license information
+    --version           Show version
+
+EXAMPLES:
+    # Claude Code - print add command (stdio, default)
+    ${SCRIPT_NAME} --vimban --claude-code
+    # Output: claude mcp add --transport stdio vimban -- vimban --mcp
+
+    # Claude Code - HTTP transport
+    ${SCRIPT_NAME} --vimban --claude-code --http
+    # Output: claude mcp add --transport http vimban http://127.0.0.1:5004
+
+    # Claude Code - print config snippet
+    ${SCRIPT_NAME} --vimban --claude-code --config
+    # Output: { "vimban": { "type": "stdio", "command": "vimban", "args": ["--mcp"] } }
+
+    # Claude Desktop - generate .mcpb bundle (default)
+    ${SCRIPT_NAME} --vimban --claude-desktop
+    # Creates: ./vimban.mcpb
+
+    # Claude Desktop - output JSON config
+    ${SCRIPT_NAME} --vimban --claude-desktop --json
+    # Output: { "vimban": { "command": "vimban", "args": ["--mcp"] } }
+
+    # OpenCode - print config snippet (stdio)
+    ${SCRIPT_NAME} --vimban --opencode --config
+    # Output: { "vimban": { "type": "local", "command": ["vimban", "--mcp"], "enabled": true } }
+
+    # OpenCode - HTTP config
+    ${SCRIPT_NAME} --vimban --opencode --config --http
+    # Output: { "vimban": { "type": "remote", "url": "http://127.0.0.1:5004", "enabled": true } }
+
+CUSTOM SERVER EXAMPLES:
+    # Custom stdio server (single arg)
+    ${SCRIPT_NAME} --custom my-server --command my-cmd --args "--mcp" --claude-code
+    # Output: claude mcp add --transport stdio my-server -- my-cmd --mcp
+
+    # Custom stdio server (multiple args via quoted string)
+    ${SCRIPT_NAME} --custom my-server --command my-cmd --args "--mcp --verbose" --claude-code
+    # Output: claude mcp add --transport stdio my-server -- my-cmd --mcp --verbose
+
+    # Custom stdio server (multiple --args flags)
+    ${SCRIPT_NAME} --custom my-server --command my-cmd --args "--mcp" --args "--verbose" --claude-code
+    # Output: claude mcp add --transport stdio my-server -- my-cmd --mcp --verbose
+
+    # Custom HTTP server
+    ${SCRIPT_NAME} --custom-http my-api --http-endpoint http://localhost:8080 --claude-code
+    # Output: claude mcp add --transport http my-api http://localhost:8080
+
+    # Custom with config output
+    ${SCRIPT_NAME} --custom my-server --command my-cmd --args "--mcp" --claude-code --config
+    # Output: { "my-server": { "type": "stdio", "command": "my-cmd", "args": ["--mcp"] } }
+
+    # Custom .mcpb bundle with metadata
+    ${SCRIPT_NAME} --custom my-server --command my-cmd --args "--mcp" \\
+        --server-version "2.0.0" --description "My custom server" --claude-desktop
+    # Creates: ./my-server.mcpb
+
+    # Custom server with environment variable
+    ${SCRIPT_NAME} --custom my-server --command my-cmd --args "--mcp" --env TMPDIR=/tmp/my-server --claude-code
+    # Output: claude mcp add --transport stdio -e TMPDIR=/tmp/my-server my-server -- my-cmd --mcp
+
+BLENDER EXAMPLES:
+    # Claude Code - stdio transport (default)
+    ${SCRIPT_NAME} --blender --claude-code
+    # Output: claude mcp add --transport stdio -e TMPDIR=/tmp/blender-mcp blender -- uvx blender-mcp
+
+    # Claude Code - config output
+    ${SCRIPT_NAME} --blender --claude-code --config
+    # Output: {"blender": {"type": "stdio", "command": "uvx", "args": ["blender-mcp"], "env": {"TMPDIR": "/tmp/blender-mcp"}}}
+
+    # Claude Desktop - .mcpb bundle
+    ${SCRIPT_NAME} --blender --claude-desktop
+    # Creates: ./blender.mcpb
+
+    # Claude Desktop - JSON config
+    ${SCRIPT_NAME} --blender --claude-desktop --json
+    # Output: {"blender": {"command": "uvx", "args": ["blender-mcp"], "env": {"TMPDIR": "/tmp/blender-mcp"}}}
+
+    # Note: Requires mcp-blender-container to be running first
+    #       The container creates /tmp/blender-mcp automatically
+
+EOF
+}
+
+show_license () {
+    cat <<EOF
+mcp_helper - Generate MCP server configurations for various clients
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+list_servers () {
+    cat <<EOF
+Available MCP server configurations:
+
+  aipy            Universal AI provider wrapper with chat history
+                  Command: aipy --mcp (stdio) / --mcp-http (HTTP port 5006)
+
+  flashcards      Spaced repetition flashcards with AI generation
+                  Command: flashcards-serve --mcp (stdio) / --mcp-http (HTTP port 5003)
+
+  rdt             Reddit terminal browser with MCP tools
+                  Command: rdt --mcp (stdio) / --mcp-http (HTTP port 5005)
+
+  vimban          Markdown-native ticket and kanban management
+                  Command: vimban --mcp (stdio) / --mcp-http (HTTP port 5004)
+
+  blender         Blender 3D modeling with Claude AI integration
+                  Command: uvx blender-mcp (stdio only)
+                  Environment: TMPDIR=/tmp/blender-mcp
+                  Note: Requires mcp-blender-container running
+
+  freecad         FreeCAD 3D parametric modeling via MCP
+                  Command: uvx freecad-mcp (stdio only)
+                  Note: Requires FreeCAD addon and RPC server running
+
+  monarch         Monarch MCP server for personal data management
+                  Command: uv run --with mcp[cli] --with-editable ... (stdio only)
+                  Note: Uses local editable install from source/projects
+
+To add more servers, edit the get_server_config function in this script.
+EOF
+}
+
+# =============================================================================
+# SERVER CONFIGURATIONS
+# =============================================================================
+
+# Sets global variables for server configuration
+get_server_config () {
+    local server="${1}"
+
+    case "${server}" in
+        aipy)
+            SERVER_NAME="aipy"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Universal AI provider wrapper with chat history and context management"
+            SERVER_COMMAND="aipy"
+            SERVER_ARGS_STDIO="--mcp"
+            SERVER_ARGS_HTTP="--mcp-http"
+            SERVER_HTTP_PORT="5006"
+            SERVER_SOURCE_SCRIPTS="${HOME}/.bashrc-secrets"
+            ;;
+        flashcards)
+            SERVER_NAME="flashcards"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Spaced repetition flashcards with AI generation from notes"
+            SERVER_COMMAND="flashcards-serve"
+            SERVER_ARGS_STDIO="--mcp"
+            SERVER_ARGS_HTTP="--mcp-http"
+            SERVER_HTTP_PORT="5003"
+            ;;
+        rdt)
+            SERVER_NAME="rdt"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Reddit terminal browser with MCP tools"
+            SERVER_COMMAND="rdt"
+            SERVER_ARGS_STDIO="--mcp"
+            SERVER_ARGS_HTTP="--mcp-http"
+            SERVER_HTTP_PORT="5005"
+            ;;
+        vimban)
+            SERVER_NAME="vimban"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Markdown-native ticket and kanban management"
+            SERVER_COMMAND="vimban"
+            SERVER_ARGS_STDIO="--mcp"
+            SERVER_ARGS_HTTP="--mcp-http"
+            SERVER_HTTP_PORT="5004"
+            ;;
+        blender)
+            SERVER_NAME="blender"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Blender 3D modeling with Claude AI integration via MCP"
+            SERVER_COMMAND="uvx"
+            SERVER_ARGS_STDIO="blender-mcp"
+            SERVER_ARGS_HTTP=""
+            SERVER_HTTP_PORT=""
+            SERVER_ENV_VARS="TMPDIR=/tmp/blender-mcp"
+            ;;
+        freecad)
+            SERVER_NAME="freecad"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="FreeCAD 3D parametric modeling with Claude AI integration via MCP"
+            SERVER_COMMAND="uvx"
+            SERVER_ARGS_STDIO="freecad-mcp"
+            SERVER_ARGS_HTTP=""
+            SERVER_HTTP_PORT=""
+            ;;
+        monarch)
+            SERVER_NAME="monarch"
+            SERVER_VERSION="1.0.0"
+            SERVER_DESCRIPTION="Monarch MCP server for personal data management"
+            SERVER_COMMAND="uv"
+            SERVER_ARGS_ARRAY=("run" "--with" "mcp[cli]" "--with-editable" "/var/home/zach/source/projects/monarch-mcp-server" "mcp" "run" "/var/home/zach/source/projects/monarch-mcp-server/src/monarch_mcp_server/server.py")
+            SERVER_ARGS_STDIO=""
+            SERVER_ARGS_HTTP=""
+            SERVER_HTTP_PORT=""
+            ;;
+        *)
+            echo "Error: Unknown server '${server}'" >&2
+            echo "Run '${SCRIPT_NAME} --list' to see available servers" >&2
+            return 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+# Format args as JSON array string
+# Uses SERVER_ARGS_ARRAY if set, then CUSTOM_ARGS, then falls back to SERVER_ARGS_*
+format_args_json () {
+    local http_mode="${1:-false}"
+
+    if [[ ${#SERVER_ARGS_ARRAY[@]} -gt 0 ]]
+    then
+        # Use server args array for complex servers
+        local first=true
+        printf '['
+        for arg in "${SERVER_ARGS_ARRAY[@]}"
+        do
+            [[ "${first}" == "true" ]] || printf ', '
+            printf '"%s"' "${arg}"
+            first=false
+        done
+        printf ']'
+    elif [[ ${#CUSTOM_ARGS[@]} -gt 0 ]]
+    then
+        # Use custom args array
+        local first=true
+        printf '['
+        for arg in "${CUSTOM_ARGS[@]}"
+        do
+            [[ "${first}" == "true" ]] || printf ', '
+            printf '"%s"' "${arg}"
+            first=false
+        done
+        printf ']'
+    elif [[ "${http_mode}" == "true" ]] && [[ -n "${SERVER_ARGS_HTTP}" ]]
+    then
+        printf '["%s"]' "${SERVER_ARGS_HTTP}"
+    elif [[ -n "${SERVER_ARGS_STDIO}" ]]
+    then
+        printf '["%s"]' "${SERVER_ARGS_STDIO}"
+    else
+        printf '[]'
+    fi
+}
+
+# Format args as space-separated string for shell commands
+format_args_shell () {
+    local http_mode="${1:-false}"
+
+    if [[ ${#SERVER_ARGS_ARRAY[@]} -gt 0 ]]
+    then
+        printf '%s' "${SERVER_ARGS_ARRAY[*]}"
+    elif [[ ${#CUSTOM_ARGS[@]} -gt 0 ]]
+    then
+        printf '%s' "${CUSTOM_ARGS[*]}"
+    elif [[ "${http_mode}" == "true" ]] && [[ -n "${SERVER_ARGS_HTTP}" ]]
+    then
+        printf '%s' "${SERVER_ARGS_HTTP}"
+    elif [[ -n "${SERVER_ARGS_STDIO}" ]]
+    then
+        printf '%s' "${SERVER_ARGS_STDIO}"
+    fi
+}
+
+# Get HTTP endpoint - custom or default
+get_http_endpoint () {
+    if [[ -n "${CUSTOM_HTTP_ENDPOINT}" ]]
+    then
+        printf '%s' "${CUSTOM_HTTP_ENDPOINT}"
+    else
+        printf 'http://127.0.0.1:%s' "${SERVER_HTTP_PORT}"
+    fi
+}
+
+# Format command + args as JSON array for OpenCode
+# OpenCode expects: ["command", "arg1", "arg2", ...]
+format_opencode_command_json () {
+    printf '["%s"' "${SERVER_COMMAND}"
+
+    if [[ ${#SERVER_ARGS_ARRAY[@]} -gt 0 ]]
+    then
+        for arg in "${SERVER_ARGS_ARRAY[@]}"
+        do
+            printf ', "%s"' "${arg}"
+        done
+    elif [[ ${#CUSTOM_ARGS[@]} -gt 0 ]]
+    then
+        for arg in "${CUSTOM_ARGS[@]}"
+        do
+            printf ', "%s"' "${arg}"
+        done
+    elif [[ -n "${SERVER_ARGS_STDIO}" ]]
+    then
+        printf ', "%s"' "${SERVER_ARGS_STDIO}"
+    fi
+
+    printf ']'
+}
+
+# Format env vars as Claude Code CLI flags: -e KEY1=val1 -e KEY2=val2
+format_env_flags () {
+    [[ -z "${SERVER_ENV_VARS}" ]] && return
+    local result=""
+    local env_pair
+    for env_pair in ${SERVER_ENV_VARS}
+    do
+        result="${result}-e ${env_pair} "
+    done
+    printf '%s' "${result}"
+}
+
+# Format env vars as JSON object: {"KEY1": "val1", "KEY2": "val2"}
+format_env_json () {
+    [[ -z "${SERVER_ENV_VARS}" ]] && return
+
+    local first=true
+    local key val env_pair
+
+    printf '{\n'
+    for env_pair in ${SERVER_ENV_VARS}
+    do
+        IFS='=' read -r key val <<< "${env_pair}"
+        [[ "${first}" == "true" ]] || printf ',\n'
+        printf '      "%s": "%s"' "${key}" "${val}"
+        first=false
+    done
+    printf '\n    }'
+}
+
+# Format env vars as shell exports: export KEY1="val1"; export KEY2="val2";
+format_env_shell () {
+    [[ -z "${SERVER_ENV_VARS}" ]] && return
+    local key val env_pair
+    for env_pair in ${SERVER_ENV_VARS}
+    do
+        IFS='=' read -r key val <<< "${env_pair}"
+        printf 'export %s="%s"\n' "${key}" "${val}"
+    done
+}
+
+# =============================================================================
+# CLAUDE CODE GENERATORS
+# =============================================================================
+
+generate_claude_code_command () {
+    local http_mode="${1}"
+    local args_str
+    local endpoint
+    local env_flags
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        endpoint="$(get_http_endpoint)"
+        env_flags="$(format_env_flags)"
+        echo "claude mcp add --transport http ${env_flags}${SERVER_NAME} ${endpoint}"
+    else
+        args_str="$(format_args_shell false)"
+        env_flags="$(format_env_flags)"
+        echo "claude mcp add --transport stdio ${env_flags}${SERVER_NAME} -- ${SERVER_COMMAND} ${args_str}"
+    fi
+}
+
+generate_claude_code_config () {
+    local http_mode="${1}"
+    local args_json
+    local endpoint
+    local env_json
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        endpoint="$(get_http_endpoint)"
+        env_json="$(format_env_json)"
+        if [[ -n "${env_json}" ]]
+        then
+            cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "http",
+    "url": "${endpoint}",
+    "env": ${env_json}
+  }
+}
+EOF
+        else
+            cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "http",
+    "url": "${endpoint}"
+  }
+}
+EOF
+        fi
+    else
+        args_json="$(format_args_json false)"
+        env_json="$(format_env_json)"
+        if [[ -n "${env_json}" ]]
+        then
+            cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "stdio",
+    "command": "${SERVER_COMMAND}",
+    "args": ${args_json},
+    "env": ${env_json}
+  }
+}
+EOF
+        else
+            cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "stdio",
+    "command": "${SERVER_COMMAND}",
+    "args": ${args_json}
+  }
+}
+EOF
+        fi
+    fi
+}
+
+# =============================================================================
+# CLAUDE DESKTOP GENERATORS
+# =============================================================================
+
+generate_manifest () {
+    cat <<EOF
+{
+  "manifest_version": "0.1",
+  "name": "${SERVER_NAME}",
+  "version": "${SERVER_VERSION}",
+  "description": "${SERVER_DESCRIPTION}",
+  "author": {
+    "name": "Zach Podbielniak"
+  },
+  "server": {
+    "type": "binary",
+    "entry_point": "run.sh",
+    "mcp_config": {
+      "command": "bash",
+      "args": ["\${__dirname}/run.sh"]
+    }
+  }
+}
+EOF
+}
+
+generate_run_script () {
+    local args_str
+    local env_exports
+    local source_cmds
+
+    args_str="$(format_args_shell false)"
+    env_exports="$(format_env_shell)"
+
+    # Generate source commands for scripts
+    source_cmds=""
+    if [[ -n "${SERVER_SOURCE_SCRIPTS}" ]]
+    then
+        local script
+        for script in ${SERVER_SOURCE_SCRIPTS}
+        do
+            source_cmds="${source_cmds}[[ -f \"${script}\" ]] && source \"${script}\"
+"
+        done
+    fi
+
+    cat <<EOF
+#!/bin/bash
+${source_cmds}${env_exports}exec ${SERVER_COMMAND} ${args_str}
+EOF
+}
+
+generate_claude_desktop_bundle () {
+    local output="${1}"
+
+    # Create temp directory
+    TEMP_DIR="$(mktemp -d)"
+    local bundle_dir="${TEMP_DIR}/${SERVER_NAME}"
+    mkdir -p "${bundle_dir}"
+
+    # Generate files
+    generate_manifest > "${bundle_dir}/manifest.json"
+    generate_run_script > "${bundle_dir}/run.sh"
+    chmod +x "${bundle_dir}/run.sh"
+
+    # Create ZIP bundle
+    (
+        cd "${bundle_dir}"
+        zip -q -r "${TEMP_DIR}/${SERVER_NAME}.mcpb" manifest.json run.sh
+    )
+
+    # Move to output location
+    mv "${TEMP_DIR}/${SERVER_NAME}.mcpb" "${output}"
+
+    echo "Created: ${output}" >&2
+}
+
+generate_claude_desktop_json () {
+    local http_mode="${1}"
+    local args_json
+    local env_json
+
+    args_json="$(format_args_json "${http_mode}")"
+    env_json="$(format_env_json)"
+
+    if [[ -n "${env_json}" ]]
+    then
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "command": "${SERVER_COMMAND}",
+    "args": ${args_json},
+    "env": ${env_json}
+  }
+}
+EOF
+    else
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "command": "${SERVER_COMMAND}",
+    "args": ${args_json}
+  }
+}
+EOF
+    fi
+}
+
+# =============================================================================
+# OPENCODE GENERATORS
+# =============================================================================
+
+generate_opencode_command () {
+    local http_mode="${1}"
+    local endpoint
+    local cmd_json
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        endpoint="$(get_http_endpoint)"
+        cat <<EOF
+# Add to ~/.config/opencode/opencode.json under "mcp":
+#   "${SERVER_NAME}": {
+#     "type": "remote",
+#     "url": "${endpoint}",
+#     "enabled": true
+#   }
+EOF
+    else
+        cmd_json="$(format_opencode_command_json)"
+        cat <<EOF
+# Add to ~/.config/opencode/opencode.json under "mcp":
+#   "${SERVER_NAME}": {
+#     "type": "local",
+#     "command": ${cmd_json},
+#     "enabled": true
+#   }
+EOF
+    fi
+}
+
+generate_opencode_config () {
+    local http_mode="${1}"
+    local endpoint
+    local cmd_json
+
+    if [[ "${http_mode}" == "true" ]]
+    then
+        endpoint="$(get_http_endpoint)"
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "remote",
+    "url": "${endpoint}",
+    "enabled": true
+  }
+}
+EOF
+    else
+        cmd_json="$(format_opencode_command_json)"
+        cat <<EOF
+{
+  "${SERVER_NAME}": {
+    "type": "local",
+    "command": ${cmd_json},
+    "enabled": true
+  }
+}
+EOF
+    fi
+
+    # Add note about environment variables if they are set
+    if [[ -n "${SERVER_ENV_VARS}" ]]
+    then
+        echo "# Note: OpenCode may not support environment variables in config" >&2
+        echo "# Required environment variables: ${SERVER_ENV_VARS}" >&2
+        echo "# Set them manually if needed" >&2
+    fi
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main () {
+    local server=""
+    local client=""
+    local http_mode="false"
+    local config_mode="false"
+    local json_mode="false"
+    local output_file=""
+    local output=""
+
+    if [[ $# -eq 0 ]]
+    then
+        usage
+        exit 0
+    fi
+
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --license)
+                show_license
+                exit 0
+                ;;
+            --version)
+                echo "${SCRIPT_NAME} ${VERSION}"
+                exit 0
+                ;;
+            --list)
+                list_servers
+                exit 0
+                ;;
+            --claude-code)
+                client="claude-code"
+                shift
+                ;;
+            --claude-desktop)
+                client="claude-desktop"
+                shift
+                ;;
+            --opencode)
+                client="opencode"
+                shift
+                ;;
+            --http)
+                http_mode="true"
+                shift
+                ;;
+            --config)
+                config_mode="true"
+                shift
+                ;;
+            --json)
+                json_mode="true"
+                shift
+                ;;
+            -o|--output)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: -o requires an argument" >&2
+                    exit 1
+                fi
+                output_file="${2}"
+                shift 2
+                ;;
+            --aipy|--flashcards|--rdt|--vimban|--blender|--freecad|--monarch)
+                server="${1#--}"
+                shift
+                ;;
+            --custom)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --custom requires a name argument" >&2
+                    exit 1
+                fi
+                CUSTOM_MODE="stdio"
+                SERVER_NAME="${2}"
+                shift 2
+                ;;
+            --custom-http)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --custom-http requires a name argument" >&2
+                    exit 1
+                fi
+                CUSTOM_MODE="http"
+                SERVER_NAME="${2}"
+                shift 2
+                ;;
+            --command)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --command requires an argument" >&2
+                    exit 1
+                fi
+                SERVER_COMMAND="${2}"
+                shift 2
+                ;;
+            --args)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --args requires an argument" >&2
+                    exit 1
+                fi
+                # Split space-separated args and append to array
+                local new_args
+                read -ra new_args <<< "${2}"
+                CUSTOM_ARGS+=("${new_args[@]}")
+                shift 2
+                ;;
+            --env)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --env requires KEY=VALUE argument" >&2
+                    exit 1
+                fi
+                # Validate format
+                if [[ ! "${2}" =~ ^[A-Z_][A-Z0-9_]*=.+$ ]]
+                then
+                    echo "Error: --env must be in format KEY=VALUE" >&2
+                    exit 1
+                fi
+                # Append to env vars
+                SERVER_ENV_VARS="${SERVER_ENV_VARS}${SERVER_ENV_VARS:+ }${2}"
+                shift 2
+                ;;
+            --http-endpoint)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --http-endpoint requires an argument" >&2
+                    exit 1
+                fi
+                CUSTOM_HTTP_ENDPOINT="${2}"
+                shift 2
+                ;;
+            --server-version)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --server-version requires an argument" >&2
+                    exit 1
+                fi
+                SERVER_VERSION="${2}"
+                shift 2
+                ;;
+            --description)
+                if [[ $# -lt 2 ]]
+                then
+                    echo "Error: --description requires an argument" >&2
+                    exit 1
+                fi
+                SERVER_DESCRIPTION="${2}"
+                shift 2
+                ;;
+            --*)
+                echo "Error: Unknown option '${1}'" >&2
+                echo "Run '${SCRIPT_NAME} --list' to see available servers" >&2
+                exit 1
+                ;;
+            *)
+                echo "Error: Unknown argument '${1}'" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Validate server specification
+    if [[ -n "${CUSTOM_MODE}" ]] && [[ -n "${server}" ]]
+    then
+        echo "Error: Cannot specify both --custom/--custom-http and a known server" >&2
+        exit 1
+    fi
+
+    if [[ -n "${CUSTOM_MODE}" ]]
+    then
+        # Custom server validation
+        if [[ "${CUSTOM_MODE}" == "stdio" ]]
+        then
+            if [[ -z "${SERVER_COMMAND}" ]]
+            then
+                echo "Error: --custom requires --command" >&2
+                exit 1
+            fi
+        else
+            # HTTP mode
+            if [[ -z "${CUSTOM_HTTP_ENDPOINT}" ]]
+            then
+                echo "Error: --custom-http requires --http-endpoint" >&2
+                exit 1
+            fi
+        fi
+        # Set defaults for optional fields
+        SERVER_VERSION="${SERVER_VERSION:-1.0.0}"
+        SERVER_DESCRIPTION="${SERVER_DESCRIPTION:-Custom MCP server}"
+        # Set http_mode based on CUSTOM_MODE
+        [[ "${CUSTOM_MODE}" == "http" ]] && http_mode="true"
+    elif [[ -n "${server}" ]]
+    then
+        # Get configuration for known server
+        get_server_config "${server}"
+    else
+        echo "Error: No server specified (use --custom, --custom-http, or a known server)" >&2
+        exit 1
+    fi
+
+    # Special validation for blender + HTTP mode
+    if [[ "${server}" == "blender" ]] && [[ "${http_mode}" == "true" ]]
+    then
+        echo "Error: Blender MCP server does not support HTTP transport" >&2
+        echo "Remove the --http flag to use stdio transport" >&2
+        exit 1
+    fi
+
+    # Special validation for freecad + HTTP mode
+    if [[ "${server}" == "freecad" ]] && [[ "${http_mode}" == "true" ]]
+    then
+        echo "Error: FreeCAD MCP server does not support HTTP transport" >&2
+        echo "Remove the --http flag to use stdio transport" >&2
+        exit 1
+    fi
+
+    # Special validation for monarch + HTTP mode
+    if [[ "${server}" == "monarch" ]] && [[ "${http_mode}" == "true" ]]
+    then
+        echo "Error: Monarch MCP server does not support HTTP transport" >&2
+        echo "Remove the --http flag to use stdio transport" >&2
+        exit 1
+    fi
+
+    if [[ -z "${client}" ]]
+    then
+        echo "Error: No client specified (--claude-code, --claude-desktop, or --opencode)" >&2
+        exit 1
+    fi
+
+    # Generate output based on client
+    case "${client}" in
+        claude-code)
+            if [[ "${config_mode}" == "true" ]]
+            then
+                output="$(generate_claude_code_config "${http_mode}")"
+            else
+                output="$(generate_claude_code_command "${http_mode}")"
+            fi
+            ;;
+        claude-desktop)
+            if [[ "${json_mode}" == "true" ]]
+            then
+                output="$(generate_claude_desktop_json "${http_mode}")"
+            else
+                # .mcpb bundles always use stdio (run local command)
+                local bundle_output="${output_file:-${SERVER_NAME}.mcpb}"
+                generate_claude_desktop_bundle "${bundle_output}"
+                exit 0
+            fi
+            ;;
+        opencode)
+            if [[ "${config_mode}" == "true" ]]
+            then
+                output="$(generate_opencode_config "${http_mode}")"
+            else
+                output="$(generate_opencode_command "${http_mode}")"
+            fi
+            ;;
+    esac
+
+    # Handle output
+    if [[ -n "${output_file}" ]]
+    then
+        echo "${output}" > "${output_file}"
+        echo "Written to: ${output_file}" >&2
+    else
+        echo "${output}"
+    fi
+}
+
+main "$@"

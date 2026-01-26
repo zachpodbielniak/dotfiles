@@ -57,10 +57,13 @@ _path_prepend \
     "${HOME}/.local/bin" \
     "${HOME}/.cargo/bin" \
     "/var/home/linuxbrew/.linuxbrew/bin" \
+    "/nix/var/nix/profiles/default/bin" \
     "${HOME}/perl5/bin" \
     "${HOME}/bin" \
+    "${HOME}/bin/starship" \
     "${HOME}/.cabal/bin" \
     "${HOME}/.nimble/bin" \
+    "${HOME}/.npm-global/bin/" \
     "${HOME}/bin/nim/bin" \
     "${HOME}/bin/scripts" \
     "${HOME}/bin/export"
@@ -88,7 +91,7 @@ _source "/usr/libexec/immutablue/immutablue-header.sh"
 
 
 # cd configuration / lookup for fast dir changes
-export CDPATH=".:${HOME}/Documents:${HOME}:${HOME}/Documents/notes:${HOME}/Source/Projects:${HOME}/Source/Public"
+export CDPATH=".:${HOME}/Documents:${HOME}:${HOME}/Documents/notes:${HOME}/source/projects:${HOME}/source/public"
 
 
 # bash options
@@ -130,6 +133,9 @@ alias dbhi="distrobox-host-exec"
 _have nvim && alias less="nvim +Man!"
 _have bat && alias cat="bat --theme='Catppuccin Mocha' --paging=never"
 
+# mutt alias 
+_have neomutt && alias mutt="neomutt" && alias m="mutt" 
+
 # common things
 alias flatpak="flatpak --user"
 alias gpia="curl https://icanhazip.com"
@@ -137,12 +143,17 @@ alias k="kubectl"
 alias fcd='cd $(find * -type d | fzf)'
 alias y="yazi"
 alias sv="source venv/bin/activate"
+alias c2b="clip2brain"
+alias c2ba="clip2brain --audio"
+alias vb="vimban"
+alias summarize="ai_summary_as_markdown"
+alias claude="claude_wrapper"
 
 alias cdd="cd ${HOME}/.dotfiles"
-alias cdp="cd ${HOME}/Source/Projects"
-alias cdi="cd ${HOME}/Source/Projects/immutablue"
-alias cdh="cd ${HOME}/Source/Projects/hyacinth-macaw"
-alias cdk="cd ${HOME}/Source/Projects/kuberblue"
+alias cdp="cd ${HOME}/source/projects"
+alias cdi="cd ${HOME}/source/projects/immutablue"
+alias cdh="cd ${HOME}/source/projects/hyacinth-macaw"
+alias cdk="cd ${HOME}/source/projects/kuberblue"
 
 alias cdnas="cd /var/mnt/NAS"
 alias cdnasme="cd /var/mnt/NAS/Media"
@@ -213,20 +224,12 @@ _have kubectl && source <(kubectl completion bash)
 _have fzf && eval "$(fzf --bash)"
 _have himalaya && eval "$(himalaya completion bash)"
 _have glab && eval "$(glab completion -s bash)"
+_have "${HOME}/.dotfiles/share/vimban/completion.bash" && source "${HOME}/.dotfiles/share/vimban/completion.bash"
 
 
 # Keybinds
 bind -x '"\C-o":fopen_file'
 bind -x '"\C-n":fopen_note'
-
-
-# Starship
-if command -v starship &>/dev/null
-then 
-    eval "$(starship init bash)"
-else
-    [[ -f "${HOME}/bin/starship/starship" ]] && eval "$(${HOME}/bin/starship/starship init bash)"
-fi
 
 
 # I manually set this in the path functions above
@@ -236,3 +239,18 @@ PERL_LOCAL_LIB_ROOT="${HOME}/perl5${PERL_LOCAL_LIB_ROOT:+:${PERL_LOCAL_LIB_ROOT}
 PERL_MB_OPT="--install_base \"${HOME}/perl5\""; export PERL_MB_OPT;
 PERL_MM_OPT="INSTALL_BASE=${HOME}/perl5"; export PERL_MM_OPT;
 
+
+# Starship
+# Use system starship instead of the custom binary to avoid PS0 issues
+if [[ -f "$HOME/bin/starship/starship" ]]
+then
+    eval "$($HOME/bin/starship/starship init bash)"
+elif command -v starship &>/dev/null
+then
+    eval "$(starship init bash)"
+fi
+
+if [[ -n "$KITTY_WINDOW_ID" ]]; then
+    export KITTY_WINDOW_ID
+    export KITTY_LISTEN_ON
+fi

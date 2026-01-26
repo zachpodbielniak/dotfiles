@@ -1,0 +1,881 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+claude_code_db_sync - Claude Code Stop Hook for Database Synchronization
+
+This script is invoked by claude-code's Stop hook to store conversation
+transcripts in the AI chats PostgreSQL database. It reads the session
+transcript JSONL file and stores each prompt/response pair, using the
+claude-code session_id as the context_uuid for grouping related messages.
+
+Usage:
+    This script is designed to be invoked by claude-code hooks, not directly.
+    It reads JSON from stdin containing session_id and transcript_path.
+
+Environment Variables:
+    AI_CHATS_DB_HOST     - Database host (default: 127.0.0.1)
+    AI_CHATS_DB_PORT     - Database port (default: 5432)
+    AI_CHATS_DB_NAME     - Database name (default: ai_chats)
+    AI_CHATS_DB_USER     - Database user (default: postgres)
+    AI_CHATS_DB_PASSWORD - Database password (default: empty)
+"""
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id: str = os.environ.get("CONTAINER_ID", "")
+no_dbox_check: bool = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+if not no_dbox_check and ctr_id != "dev":
+    # Re-exec into the dev container which has psycopg2 available
+    cmd: list[str] = ["distrobox", "enter", "dev", "--", *sys.argv]
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+# Now import everything else inside the dev container
+import argparse
+import hashlib
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+# Try to import database dependencies
+try:
+    import psycopg2
+    import psycopg2.extras
+    DB_AVAILABLE: bool = True
+except ImportError:
+    DB_AVAILABLE = False
+
+# Database configuration for AI chat storage (same as aipy)
+AI_CHATS_DB_CONFIG: dict[str, Any] = {
+    'host': os.environ.get('AI_CHATS_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('AI_CHATS_DB_PORT', '5432')),
+    'database': os.environ.get('AI_CHATS_DB_NAME', 'ai_chats'),
+    'user': os.environ.get('AI_CHATS_DB_USER', 'postgres'),
+    'password': os.environ.get('AI_CHATS_DB_PASSWORD', '')
+}
+
+# Provider name for claude-code conversations
+PROVIDER: str = "claude-code"
+
+# Default tags for all claude-code conversations
+DEFAULT_TAGS: list[str] = ["claude-code"]
+
+
+def debug_print(msg: str, debug: bool = False) -> None:
+    """Print debug message to stderr if debug mode is enabled."""
+    if debug:
+        print(f"[DEBUG] {msg}", file=sys.stderr)
+
+
+def check_db_available(debug: bool = False) -> bool:
+    """
+    Check if the AI chats database is available and accessible.
+
+    Returns True if we can connect to the database, False otherwise.
+    """
+    if not DB_AVAILABLE:
+        debug_print("Database dependencies not available (psycopg2)", debug)
+        return False
+
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        conn.close()
+        return True
+    except psycopg2.Error as e:
+        debug_print(f"Could not connect to AI chats database: {e}", debug)
+        return False
+
+
+def expand_path(path: str) -> Path:
+    """
+    Expand a path that may contain ~ for home directory.
+
+    Args:
+        path: A path string, possibly containing ~ for home directory
+
+    Returns:
+        Expanded Path object
+    """
+    if path.startswith("~"):
+        return Path(os.path.expanduser(path))
+    return Path(path)
+
+
+def extract_user_content(message: dict[str, Any]) -> Optional[str]:
+    """
+    Extract the text content from a user message.
+
+    User messages can have content as:
+    - A string directly
+    - An array of content blocks with type "text"
+
+    Args:
+        message: The message object from the transcript
+
+    Returns:
+        The extracted text content, or None if no text found
+    """
+    content: Any = message.get("content", "")
+
+    # Handle string content directly
+    if isinstance(content, str):
+        return content if content.strip() else None
+
+    # Handle array of content blocks
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text: str = block.get("text", "")
+                if text.strip():
+                    text_parts.append(text)
+        return "\n".join(text_parts) if text_parts else None
+
+    return None
+
+
+def extract_assistant_content(message: dict[str, Any]) -> Optional[str]:
+    """
+    Extract the text content from an assistant message.
+
+    Assistant messages have content as an array of content blocks.
+    We only extract blocks with type "text", skipping:
+    - tool_use blocks (tool invocations)
+    - tool_result blocks (tool responses)
+    - thinking blocks (internal reasoning)
+
+    Args:
+        message: The message object from the transcript
+
+    Returns:
+        The extracted text content, or None if no text found
+    """
+    content: Any = message.get("content", [])
+
+    if not isinstance(content, list):
+        return None
+
+    text_parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text: str = block.get("text", "")
+            if text.strip():
+                text_parts.append(text)
+
+    return "\n".join(text_parts) if text_parts else None
+
+
+def truncate_tool_input(input_value: Any, max_length: int = 500) -> Any:
+    """
+    Truncate tool input values that exceed the maximum length.
+
+    Recursively processes dicts and lists to truncate string values.
+    This prevents very large tool inputs (e.g., Write tool content)
+    from bloating the metadata.
+
+    Args:
+        input_value: The input value to potentially truncate
+        max_length: Maximum string length before truncation (default: 500)
+
+    Returns:
+        The truncated input value
+    """
+    if isinstance(input_value, str):
+        if len(input_value) > max_length:
+            return input_value[:max_length] + "...[truncated]"
+        return input_value
+    elif isinstance(input_value, dict):
+        return {k: truncate_tool_input(v, max_length) for k, v in input_value.items()}
+    elif isinstance(input_value, list):
+        return [truncate_tool_input(item, max_length) for item in input_value]
+    else:
+        return input_value
+
+
+def extract_tool_invocations(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Extract tool_use blocks from an assistant message.
+
+    Tool invocations contain:
+    - name: The tool being invoked (e.g., "Bash", "Read", "Grep")
+    - id: A unique identifier for the tool call
+    - input: Parameters passed to the tool
+
+    Args:
+        message: The message object from the transcript
+
+    Returns:
+        List of tool invocation dictionaries with name, id, and truncated input
+    """
+    content: Any = message.get("content", [])
+
+    if not isinstance(content, list):
+        return []
+
+    tools: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            tool_name: str = block.get("name", "unknown")
+            tool_id: str = block.get("id", "")
+            tool_input: Any = block.get("input", {})
+
+            tools.append({
+                "name": tool_name,
+                "id": tool_id,
+                "input": truncate_tool_input(tool_input)
+            })
+
+    return tools
+
+
+def parse_timestamp(timestamp_str: str) -> Optional[datetime]:
+    """
+    Parse an ISO 8601 timestamp string into a datetime object.
+
+    Args:
+        timestamp_str: ISO 8601 formatted timestamp string
+
+    Returns:
+        datetime object, or None if parsing fails
+    """
+    if not timestamp_str:
+        return None
+
+    try:
+        # Handle timestamps with Z suffix (UTC)
+        if timestamp_str.endswith("Z"):
+            timestamp_str = timestamp_str[:-1] + "+00:00"
+        return datetime.fromisoformat(timestamp_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_hash(text: str) -> str:
+    """
+    Compute SHA256 hash of the given text.
+
+    Args:
+        text: Text to hash
+
+    Returns:
+        Hexadecimal digest of the SHA256 hash
+    """
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def parse_transcript(transcript_path: Path, debug: bool = False) -> list[dict[str, Any]]:
+    """
+    Parse a claude-code transcript JSONL file and extract conversation pairs.
+
+    This function reads the transcript file line by line, extracting user
+    prompts and their corresponding assistant responses. Each pair is
+    returned with metadata including timestamps, model, and token usage.
+
+    Args:
+        transcript_path: Path to the transcript JSONL file
+        debug: Enable debug output
+
+    Returns:
+        List of conversation pair dictionaries with keys:
+        - prompt: User's prompt text
+        - response: Assistant's response text
+        - model: Model used for the response
+        - request_timestamp: When the user sent the message
+        - response_timestamp: When the assistant responded
+        - tokens_input: Input tokens used
+        - tokens_output: Output tokens used
+        - tools: List of tool invocations (name, id, truncated input)
+    """
+    if not transcript_path.exists():
+        debug_print(f"Transcript file not found: {transcript_path}", debug)
+        return []
+
+    # Parse all messages from the transcript
+    user_messages: list[dict[str, Any]] = []
+    assistant_messages: list[dict[str, Any]] = []
+
+    with open(transcript_path, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                entry: dict[str, Any] = json.loads(line)
+            except json.JSONDecodeError as e:
+                debug_print(f"Skipping invalid JSON at line {line_num}: {e}", debug)
+                continue
+
+            entry_type: str = entry.get("type", "")
+
+            if entry_type == "user":
+                # Extract user message content
+                message: dict[str, Any] = entry.get("message", {})
+                content: Optional[str] = extract_user_content(message)
+                if content:
+                    user_messages.append({
+                        "content": content,
+                        "timestamp": entry.get("timestamp"),
+                        "uuid": entry.get("uuid"),
+                        "cwd": entry.get("cwd", "")
+                    })
+
+            elif entry_type == "assistant":
+                # Extract assistant message content and tool invocations
+                message = entry.get("message", {})
+                content = extract_assistant_content(message)
+                tools = extract_tool_invocations(message)
+
+                # Get usage info
+                usage: dict[str, Any] = message.get("usage", {})
+
+                assistant_messages.append({
+                    "content": content,  # May be None if only tool_use blocks
+                    "timestamp": entry.get("timestamp"),
+                    "model": message.get("model", "unknown"),
+                    "tokens_input": usage.get("input_tokens"),
+                    "tokens_output": usage.get("output_tokens"),
+                    "uuid": entry.get("uuid"),
+                    "tools": tools  # List of tool invocations
+                })
+
+    debug_print(f"Found {len(user_messages)} user messages, {len(assistant_messages)} assistant messages", debug)
+
+    # Pair up user prompts with assistant responses
+    # Each user message should be followed by one or more assistant messages
+    # We want to capture the final text response for each user prompt
+    pairs: list[dict[str, Any]] = []
+
+    assistant_idx: int = 0
+    cwd: str = ""
+
+    for user_msg in user_messages:
+        # Track the CWD from user messages
+        if user_msg.get("cwd"):
+            cwd = user_msg["cwd"]
+
+        # Find the next assistant message(s) after this user message
+        # We want to accumulate text content until we hit the next user message
+        response_text: str = ""
+        response_model: str = "unknown"
+        response_timestamp: Optional[str] = None
+        total_input_tokens: int = 0
+        total_output_tokens: int = 0
+        accumulated_tools: list[dict[str, Any]] = []
+
+        # Look for assistant messages that follow this user message
+        while assistant_idx < len(assistant_messages):
+            asst_msg: dict[str, Any] = assistant_messages[assistant_idx]
+
+            # Check if this assistant message comes after the user message
+            # by comparing timestamps
+            user_ts: Optional[datetime] = parse_timestamp(user_msg.get("timestamp", ""))
+            asst_ts: Optional[datetime] = parse_timestamp(asst_msg.get("timestamp", ""))
+
+            if user_ts and asst_ts and asst_ts < user_ts:
+                # This assistant message is before the user message, skip it
+                assistant_idx += 1
+                continue
+
+            # This assistant message is a response to the current user message
+            if asst_msg.get("content"):
+                if response_text:
+                    response_text += "\n\n"
+                response_text += asst_msg["content"]
+
+            # Accumulate tool invocations from this assistant message
+            if asst_msg.get("tools"):
+                accumulated_tools.extend(asst_msg["tools"])
+
+            response_model = asst_msg.get("model", response_model)
+            response_timestamp = asst_msg.get("timestamp", response_timestamp)
+
+            if asst_msg.get("tokens_input"):
+                total_input_tokens += asst_msg["tokens_input"]
+            if asst_msg.get("tokens_output"):
+                total_output_tokens += asst_msg["tokens_output"]
+
+            assistant_idx += 1
+
+            # Check if the next assistant message belongs to a different user prompt
+            # by checking if there's a user message with a timestamp between them
+            if assistant_idx < len(assistant_messages):
+                next_asst_ts: Optional[datetime] = parse_timestamp(
+                    assistant_messages[assistant_idx].get("timestamp", "")
+                )
+
+                # Check if any user message falls between current and next assistant
+                for next_user_msg in user_messages:
+                    next_user_ts: Optional[datetime] = parse_timestamp(
+                        next_user_msg.get("timestamp", "")
+                    )
+                    if next_user_ts and asst_ts and next_asst_ts:
+                        if asst_ts < next_user_ts < next_asst_ts:
+                            # There's a user message between assistant messages
+                            # Stop accumulating for current user
+                            break
+                else:
+                    # No user message found between, continue accumulating
+                    continue
+                break
+
+        # Only create a pair if we have both prompt and response
+        if user_msg["content"] and response_text:
+            pair: dict[str, Any] = {
+                "prompt": user_msg["content"],
+                "response": response_text,
+                "model": response_model,
+                "request_timestamp": user_msg.get("timestamp"),
+                "response_timestamp": response_timestamp,
+                "tokens_input": total_input_tokens if total_input_tokens > 0 else None,
+                "tokens_output": total_output_tokens if total_output_tokens > 0 else None,
+                "cwd": cwd,
+                "tools": accumulated_tools  # All tool invocations for this exchange
+            }
+            pairs.append(pair)
+
+    debug_print(f"Created {len(pairs)} conversation pairs", debug)
+    return pairs
+
+
+def ensure_context_exists(
+    cursor: Any,
+    session_id: str,
+    cwd: str,
+    debug: bool = False
+) -> bool:
+    """
+    Ensure a context exists for the given session_id.
+
+    Creates a new context if one doesn't exist, using the session_id as
+    the context_uuid and naming it "claude-code: {cwd}".
+
+    Args:
+        cursor: Database cursor
+        session_id: The claude-code session ID (UUID)
+        cwd: Working directory for context naming
+        debug: Enable debug output
+
+    Returns:
+        True if context exists or was created, False on error
+    """
+    # Check if context already exists
+    cursor.execute(
+        "SELECT context_uuid FROM ai_chat_contexts WHERE context_uuid = %s",
+        [session_id]
+    )
+
+    if cursor.fetchone():
+        debug_print(f"Context already exists: {session_id}", debug)
+        return True
+
+    # Create new context with auto-generated name
+    context_name: str = f"claude-code: {cwd}" if cwd else "claude-code: <unknown>"
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO ai_chat_contexts (context_uuid, name, tags)
+            VALUES (%s, %s, %s)
+            """,
+            [session_id, context_name, DEFAULT_TAGS]
+        )
+        debug_print(f"Created new context: {session_id} ({context_name})", debug)
+        return True
+    except psycopg2.Error as e:
+        debug_print(f"Failed to create context: {e}", debug)
+        return False
+
+
+def chat_exists(
+    cursor: Any,
+    context_uuid: str,
+    prompt_hash: str,
+    debug: bool = False
+) -> bool:
+    """
+    Check if a chat with the given prompt_hash already exists in the context.
+
+    This provides idempotency - if the same prompt was already stored for
+    this context, we skip it to avoid duplicates.
+
+    Args:
+        cursor: Database cursor
+        context_uuid: The context UUID (session_id)
+        prompt_hash: SHA256 hash of the prompt
+        debug: Enable debug output
+
+    Returns:
+        True if the chat already exists, False otherwise
+    """
+    cursor.execute(
+        """
+        SELECT id FROM ai_chats
+        WHERE context_uuid = %s AND prompt_hash = %s
+        LIMIT 1
+        """,
+        [context_uuid, prompt_hash]
+    )
+    return cursor.fetchone() is not None
+
+
+def store_chat(
+    cursor: Any,
+    context_uuid: str,
+    pair: dict[str, Any],
+    transcript_path: str,
+    debug: bool = False
+) -> bool:
+    """
+    Store a single chat pair in the database.
+
+    Args:
+        cursor: Database cursor
+        context_uuid: The context UUID (session_id)
+        pair: Conversation pair dictionary from parse_transcript
+        transcript_path: Path to the transcript file (for metadata)
+        debug: Enable debug output
+
+    Returns:
+        True if stored successfully, False if skipped or error
+    """
+    prompt: str = pair["prompt"]
+    response: str = pair["response"]
+
+    # Compute hashes for deduplication
+    prompt_hash: str = compute_hash(prompt)
+    response_hash: str = compute_hash(response)
+
+    # Check for existing chat (idempotency)
+    if chat_exists(cursor, context_uuid, prompt_hash, debug):
+        debug_print(f"Skipping duplicate chat (prompt_hash: {prompt_hash[:8]}...)", debug)
+        return False
+
+    # Parse timestamps
+    request_timestamp: Optional[datetime] = parse_timestamp(pair.get("request_timestamp", ""))
+    response_timestamp: Optional[datetime] = parse_timestamp(pair.get("response_timestamp", ""))
+
+    # Calculate duration if we have both timestamps
+    duration_ms: Optional[int] = None
+    if request_timestamp and response_timestamp:
+        delta = response_timestamp - request_timestamp
+        duration_ms = int(delta.total_seconds() * 1000)
+
+    # Build metadata
+    tools: list[dict[str, Any]] = pair.get("tools", [])
+    metadata: dict[str, Any] = {
+        "cwd": pair.get("cwd", ""),
+        "transcript_path": transcript_path,
+        "tools": tools if tools else []
+    }
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO ai_chats (
+                context_uuid, prompt, response, provider, model,
+                request_timestamp, response_timestamp, duration_ms,
+                tokens_input, tokens_output,
+                prompt_hash, response_hash, tags, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                context_uuid,
+                prompt,
+                response,
+                PROVIDER,
+                pair.get("model", "unknown"),
+                request_timestamp or datetime.now(),
+                response_timestamp or datetime.now(),
+                duration_ms,
+                pair.get("tokens_input"),
+                pair.get("tokens_output"),
+                prompt_hash,
+                response_hash,
+                DEFAULT_TAGS,
+                json.dumps(metadata)
+            )
+        )
+        new_id: str = cursor.fetchone()[0]
+        debug_print(f"Stored chat: {new_id}", debug)
+        return True
+    except psycopg2.Error as e:
+        debug_print(f"Failed to store chat: {e}", debug)
+        return False
+
+
+def sync_transcript(
+    session_id: str,
+    transcript_path: Path,
+    debug: bool = False
+) -> tuple[int, int]:
+    """
+    Synchronize a transcript to the database.
+
+    This is the main entry point for processing a claude-code session.
+    It parses the transcript, ensures the context exists, and stores
+    all conversation pairs with idempotency checks.
+
+    Args:
+        session_id: The claude-code session ID (UUID)
+        transcript_path: Path to the transcript JSONL file
+        debug: Enable debug output
+
+    Returns:
+        Tuple of (stored_count, skipped_count)
+    """
+    # Parse the transcript
+    pairs: list[dict[str, Any]] = parse_transcript(transcript_path, debug)
+
+    if not pairs:
+        debug_print("No conversation pairs found in transcript", debug)
+        return (0, 0)
+
+    # Get the CWD from the first pair for context naming
+    cwd: str = pairs[0].get("cwd", "") if pairs else ""
+
+    # Connect to database
+    try:
+        conn = psycopg2.connect(**AI_CHATS_DB_CONFIG)
+        cursor = conn.cursor()
+    except psycopg2.Error as e:
+        print(f"Error: Failed to connect to database: {e}", file=sys.stderr)
+        return (0, 0)
+
+    try:
+        # Ensure context exists
+        if not ensure_context_exists(cursor, session_id, cwd, debug):
+            conn.rollback()
+            conn.close()
+            return (0, 0)
+
+        # Store each conversation pair
+        stored_count: int = 0
+        skipped_count: int = 0
+
+        for pair in pairs:
+            if store_chat(cursor, session_id, pair, str(transcript_path), debug):
+                stored_count += 1
+            else:
+                skipped_count += 1
+
+        # Commit all changes
+        conn.commit()
+
+        return (stored_count, skipped_count)
+
+    except psycopg2.Error as e:
+        print(f"Error: Database error during sync: {e}", file=sys.stderr)
+        conn.rollback()
+        return (0, 0)
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def is_valid_uuid(value: str) -> bool:
+    """
+    Check if a string is a valid UUID.
+
+    Args:
+        value: String to check
+
+    Returns:
+        True if valid UUID, False otherwise
+    """
+    uuid_pattern: str = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    return bool(re.match(uuid_pattern, value.lower()))
+
+
+def scan_all_sessions(debug: bool = False) -> list[tuple[str, Path]]:
+    """
+    Scan ~/.claude/projects for all session transcript files.
+
+    Filters out subagent files (e.g., agent-xxx) that don't have valid UUIDs.
+
+    Returns:
+        List of (session_id, transcript_path) tuples
+    """
+    claude_dir: Path = Path.home() / ".claude" / "projects"
+    sessions: list[tuple[str, Path]] = []
+
+    if not claude_dir.exists():
+        debug_print(f"Claude projects directory not found: {claude_dir}", debug)
+        return sessions
+
+    # Find all .jsonl files in project directories
+    for project_dir in claude_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            # Session ID is the filename without extension
+            session_id: str = jsonl_file.stem
+
+            # Skip subagent files that don't have valid UUIDs
+            if not is_valid_uuid(session_id):
+                debug_print(f"Skipping non-UUID session: {session_id}", debug)
+                continue
+
+            sessions.append((session_id, jsonl_file))
+            debug_print(f"Found session: {session_id}", debug)
+
+    debug_print(f"Found {len(sessions)} total sessions", debug)
+    return sessions
+
+
+def main() -> int:
+    """
+    Main entry point for the claude-code database sync hook.
+
+    Reads hook input from stdin, parses the transcript, and stores
+    conversation pairs in the database.
+
+    Returns:
+        Exit code: 0 for success, 1 for error (never 2 to avoid blocking)
+    """
+    parser = argparse.ArgumentParser(
+        description="Claude Code Stop Hook - Database Synchronization",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+This script syncs claude-code session transcripts to the AI chats database.
+
+Examples:
+    # Scan all sessions (recommended for wrapper/manual use)
+    claude_code_db_sync --scan
+
+    # Scan with debug output
+    claude_code_db_sync --scan --debug
+
+    # Read from stdin (for hook use, if hooks worked)
+    echo '{"session_id": "abc123", "transcript_path": "~/.claude/..."}' | claude_code_db_sync
+"""
+    )
+
+    parser.add_argument(
+        "--debug", "-d",
+        action="store_true",
+        help="Enable debug output to stderr"
+    )
+
+    parser.add_argument(
+        "--scan", "-s",
+        action="store_true",
+        help="Scan ~/.claude/projects for all sessions instead of reading stdin"
+    )
+
+    parser.add_argument(
+        "--license",
+        action="store_true",
+        help="Show license information and exit"
+    )
+
+    args = parser.parse_args()
+
+    if args.license:
+        print("GNU Affero General Public License v3.0 or later")
+        print("https://www.gnu.org/licenses/agpl-3.0.html")
+        return 0
+
+    debug: bool = args.debug
+
+    # Check database availability
+    if not check_db_available(debug):
+        print("Error: Database not available", file=sys.stderr)
+        return 1
+
+    # Scan mode: process all sessions from filesystem
+    if args.scan:
+        sessions: list[tuple[str, Path]] = scan_all_sessions(debug)
+
+        if not sessions:
+            print("No sessions found to sync", file=sys.stderr)
+            return 0
+
+        total_stored: int = 0
+        total_skipped: int = 0
+
+        for session_id, transcript_path in sessions:
+            debug_print(f"Processing session: {session_id}", debug)
+            stored, skipped = sync_transcript(session_id, transcript_path, debug)
+            total_stored += stored
+            total_skipped += skipped
+
+        print(f"Synced to database: stored {total_stored}, skipped {total_skipped} duplicates", file=sys.stderr)
+        return 0
+
+    # Stdin mode: read hook input from stdin (original behavior)
+    try:
+        stdin_data: str = sys.stdin.read()
+        if not stdin_data.strip():
+            debug_print("No input received from stdin", debug)
+            return 0
+
+        hook_input: dict[str, Any] = json.loads(stdin_data)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON input: {e}", file=sys.stderr)
+        return 1
+
+    # Extract required fields
+    session_id: Optional[str] = hook_input.get("session_id")
+    transcript_path_str: Optional[str] = hook_input.get("transcript_path")
+
+    if not session_id:
+        print("Error: Missing session_id in hook input", file=sys.stderr)
+        return 1
+
+    if not transcript_path_str:
+        print("Error: Missing transcript_path in hook input", file=sys.stderr)
+        return 1
+
+    # Check if this is a recursive Stop hook call
+    stop_hook_active: bool = hook_input.get("stop_hook_active", False)
+    if stop_hook_active:
+        debug_print("Stop hook already active, skipping to prevent loop", debug)
+        return 0
+
+    # Expand and validate transcript path
+    transcript_path: Path = expand_path(transcript_path_str)
+
+    if not transcript_path.exists():
+        print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return 1
+
+    debug_print(f"Processing session: {session_id}", debug)
+    debug_print(f"Transcript path: {transcript_path}", debug)
+
+    # Sync the transcript to the database
+    stored, skipped = sync_transcript(session_id, transcript_path, debug)
+
+    # Print summary to stderr
+    print(f"Synced to database: stored {stored}, skipped {skipped} duplicates", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

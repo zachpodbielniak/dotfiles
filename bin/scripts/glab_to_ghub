@@ -1,0 +1,1064 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Unset conflicting environment variables that might override glab auth
+# Note: GITHUB_TOKEN is kept as gh may use it for authentication
+unset GITLAB_TOKEN GITLAB_ACCESS_TOKEN OAUTH_TOKEN 2>/dev/null || true
+
+# ==============================================================================
+# glab_to_ghub - Mirror GitLab repositories to GitHub
+# ==============================================================================
+# Author: Zach Podbielniak
+# Version: 1.0
+# Location: ~/.dotfiles/bin/scripts/glab_to_ghub
+#
+# Description:
+# Sets up push mirrors from GitLab repositories to GitHub using the glab and gh
+# CLI tools. Creates GitHub repos if they don't exist (matching visibility),
+# then configures GitLab to push mirror to GitHub (protected branches only).
+#
+# Dependencies:
+# - glab: GitLab CLI (authenticated)
+# - gh: GitHub CLI (authenticated)
+# - yq: YAML/JSON processor
+# ==============================================================================
+
+# Configuration
+DRY_RUN=false
+DEBUG_MODE=false
+NO_CONFIRM=false
+SINGLE_REPO=""
+GITLAB_GROUPS=""
+GROUPS_LIST=false
+INCLUDE_PATTERN=""
+EXCLUDE_PATTERN=""
+UPDATE_DESCRIPTIONS=false
+
+# Counters for summary
+COUNT_PROCESSED=0
+COUNT_CREATED=0
+COUNT_MIRRORED=0
+COUNT_SKIPPED=0
+COUNT_FAILED=0
+COUNT_UPDATED=0
+
+# Cached values (populated during prerequisites check)
+GITLAB_USER=""
+GITHUB_USER=""
+GH_MIRROR_TOKEN=""
+
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+show_help () {
+    cat << 'EOF'
+glab_to_ghub - Mirror GitLab repositories to GitHub
+
+USAGE:
+    glab_to_ghub [OPTIONS]
+
+DESCRIPTION:
+    Sets up push mirrors from GitLab repositories to GitHub. For each GitLab
+    repo, if the equivalent GitHub repo doesn't exist, it creates one with
+    matching visibility (public/private). Then configures GitLab to push
+    mirror to GitHub (protected branches only, over HTTPS).
+
+OPTIONS:
+    -h, --help          Show this help message and exit
+    --license           Show license information and exit
+    --dry-run           Show what would be done without making changes
+    --debug             Show commands being executed (tokens are masked)
+    --no-confirm        Skip y/n confirmation prompts for each operation
+
+    --repo <name>       Process only this specific repo (by name)
+    --include <csv>     Whitelist: only process repos matching these patterns
+                        (comma-separated, supports glob wildcards)
+    --exclude <csv>     Blacklist: skip repos matching these patterns
+                        (comma-separated, supports glob wildcards)
+
+    --groups <csv>      Process repos from specified GitLab groups instead
+                        of personal repos (comma-separated group paths)
+    --groups-list       List available GitLab groups and exit
+
+    --update-descriptions
+                        Sync descriptions from GitLab to existing GitHub repos
+                        (does not create repos or set up mirrors)
+
+EXAMPLES:
+    # Dry run to see what would happen
+    glab_to_ghub --dry-run
+
+    # Process only specific repos (whitelist)
+    glab_to_ghub --include "nvim,dotfiles"
+
+    # Skip repos matching patterns
+    glab_to_ghub --exclude "test-*,temp-*"
+
+    # Process repos from a specific group
+    glab_to_ghub --groups immutablue
+
+    # List available groups
+    glab_to_ghub --groups-list
+
+    # Run without confirmations (for scripting)
+    glab_to_ghub --no-confirm
+
+    # Debug mode to see commands
+    glab_to_ghub --debug --dry-run
+
+    # Sync descriptions from GitLab to GitHub (existing repos only)
+    glab_to_ghub --update-descriptions
+
+    # Sync descriptions for specific repos
+    glab_to_ghub --update-descriptions --include "nvim,dotfiles"
+
+NOTES:
+    - By default, only personal repos (under your namespace) are processed
+    - Use --groups to opt-in to group repos
+    - Repos that already exist on GitHub are skipped entirely
+    - Only protected branches are mirrored (not all branches)
+    - Uses HTTPS with embedded token for mirror authentication
+    - Requires both glab and gh to be authenticated
+EOF
+}
+
+show_license () {
+    cat << 'EOF'
+GNU Affero General Public License v3.0 or later
+https://www.gnu.org/licenses/agpl-3.0.html
+EOF
+}
+
+# Mask a token for safe logging - shows first 8 chars + "..."
+mask_token () {
+    local token="${1}"
+    if [[ ${#token} -gt 8 ]]
+    then
+        echo "${token:0:8}..."
+    else
+        echo "***"
+    fi
+}
+
+# Log debug messages (only when --debug is enabled)
+debug_log () {
+    if [[ "${DEBUG_MODE}" == "true" ]]
+    then
+        local message="${1}"
+        # Mask any token that looks like a GitHub PAT
+        message=$(echo "${message}" | sed -E 's/(github_pat_[A-Za-z0-9_]{20})[A-Za-z0-9_]*/\1.../g')
+        message=$(echo "${message}" | sed -E 's/(ghp_[A-Za-z0-9]{20})[A-Za-z0-9]*/\1.../g')
+        message=$(echo "${message}" | sed -E 's/(glpat-[A-Za-z0-9_-]{20})[A-Za-z0-9_-]*/\1.../g')
+        echo "[DEBUG] ${message}" >&2
+    fi
+}
+
+# Print info message
+info () {
+    echo "  ${1}"
+}
+
+# Print success message
+success () {
+    echo "  ✓ ${1}"
+}
+
+# Print warning message
+warn () {
+    echo "  ⚠ ${1}" >&2
+}
+
+# Print error message
+error () {
+    echo "  ✗ ${1}" >&2
+}
+
+# Confirm action with y/n prompt (returns 0 for yes, 1 for no)
+# Skipped if --no-confirm is set
+confirm_action () {
+    local prompt="${1}"
+
+    if [[ "${NO_CONFIRM}" == "true" ]]
+    then
+        return 0
+    fi
+
+    local response=""
+    # Read from saved terminal fd (fd 3) or /dev/tty as fallback
+    if [[ -t 3 ]]
+    then
+        read -r -p "  ${prompt} [y/n]: " response <&3
+    elif [[ -c /dev/tty ]]
+    then
+        read -r -p "  ${prompt} [y/n]: " response < /dev/tty
+    else
+        # Non-interactive, default to no
+        return 1
+    fi
+    case "${response}" in
+        [yY]|[yY][eE][sS])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Check if a repo name matches a comma-separated list of glob patterns
+# Returns 0 if matches, 1 if not
+matches_pattern () {
+    local repo_name="${1}"
+    local patterns="${2}"
+
+    if [[ -z "${patterns}" ]]
+    then
+        return 1
+    fi
+
+    # Split patterns by comma and check each
+    local IFS=','
+    for pattern in ${patterns}
+    do
+        # Trim whitespace
+        pattern=$(echo "${pattern}" | xargs)
+        # Use bash extended globbing for pattern matching
+        # shellcheck disable=SC2053
+        if [[ "${repo_name}" == ${pattern} ]]
+        then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ==============================================================================
+# Prerequisites and Authentication
+# ==============================================================================
+
+check_prerequisites () {
+    echo "Checking prerequisites..."
+
+    # Check glab is installed
+    if ! command -v glab &>/dev/null
+    then
+        error "glab CLI not found. Install from: https://gitlab.com/gitlab-org/cli"
+        return 1
+    fi
+
+    # Check gh is installed
+    if ! command -v gh &>/dev/null
+    then
+        error "gh CLI not found. Install from: https://cli.github.com/"
+        return 1
+    fi
+
+    # Check yq is installed
+    if ! command -v yq &>/dev/null
+    then
+        error "yq not found. Install yq for YAML/JSON processing"
+        return 1
+    fi
+
+    # Check glab authentication
+    if ! glab auth status &>/dev/null
+    then
+        error "glab not authenticated. Run: glab auth login"
+        return 1
+    fi
+    GITLAB_USER=$(glab api user 2>/dev/null | yq -r '.username')
+    if [[ -z "${GITLAB_USER}" ]] || [[ "${GITLAB_USER}" == "null" ]]
+    then
+        error "Failed to get GitLab username"
+        return 1
+    fi
+    success "glab authenticated as ${GITLAB_USER}"
+
+    # Check gh authentication
+    if ! gh auth status &>/dev/null
+    then
+        error "gh not authenticated. Run: gh auth login"
+        return 1
+    fi
+    GITHUB_USER=$(gh api user 2>/dev/null | yq -r '.login')
+    if [[ -z "${GITHUB_USER}" ]] || [[ "${GITHUB_USER}" == "null" ]]
+    then
+        error "Failed to get GitHub username"
+        return 1
+    fi
+    success "gh authenticated as ${GITHUB_USER}"
+
+    # Get GitHub token for mirror URL
+    GH_MIRROR_TOKEN=$(gh auth token 2>/dev/null)
+    if [[ -z "${GH_MIRROR_TOKEN}" ]]
+    then
+        error "Failed to get GitHub token"
+        return 1
+    fi
+    debug_log "GitHub token: $(mask_token "${GH_MIRROR_TOKEN}")"
+
+    echo ""
+    return 0
+}
+
+# ==============================================================================
+# GitLab Groups
+# ==============================================================================
+
+list_gitlab_groups () {
+    echo "Available GitLab groups:"
+    echo ""
+
+    local groups_json
+    groups_json=$(glab api "groups?membership=true&per_page=100" 2>/dev/null)
+
+    if [[ -z "${groups_json}" ]] || [[ "${groups_json}" == "[]" ]]
+    then
+        echo "  No groups found (or no membership)"
+        return 0
+    fi
+
+    echo "${groups_json}" | yq -r '.[] | "  " + .full_path + " (" + .name + ")"'
+    echo ""
+}
+
+# ==============================================================================
+# Repository Functions
+# ==============================================================================
+
+# Get list of GitLab repos as JSON array
+# Output format: [{"name": "...", "visibility": "...", "path": "..."}]
+get_gitlab_repos () {
+    local repos_json=""
+
+    if [[ -n "${GITLAB_GROUPS}" ]]
+    then
+        # Process specified groups
+        local IFS=','
+        for group in ${GITLAB_GROUPS}
+        do
+            group=$(echo "${group}" | xargs)
+            debug_log "Fetching repos from group: ${group}"
+            local group_repos
+            group_repos=$(glab repo list --group "${group}" -F json --per-page 100 2>/dev/null || echo "[]")
+            if [[ -n "${repos_json}" ]]
+            then
+                # Merge arrays
+                repos_json=$(echo "${repos_json}" "${group_repos}" | yq -s 'add')
+            else
+                repos_json="${group_repos}"
+            fi
+        done
+    else
+        # Personal repos only (filter to user's namespace)
+        # glab --mine returns all repos where user is a member, including groups
+        # We filter to only repos under the user's personal namespace
+        debug_log "Fetching personal repos for ${GITLAB_USER}"
+        local all_repos
+        all_repos=$(glab repo list --mine -F json --per-page 100 2>/dev/null || echo "[]")
+        repos_json=$(echo "${all_repos}" | yq "[.[] | select(.path_with_namespace | test(\"^${GITLAB_USER}/\"))]")
+    fi
+
+    echo "${repos_json}"
+}
+
+# Cache for GitHub org access checks (avoid repeated API calls)
+declare -A GITHUB_ORG_CACHE
+
+# Check if user has write access to a GitHub org
+# Returns 0 if yes, 1 if no
+github_org_accessible () {
+    local org_name="${1}"
+
+    # Check cache first
+    if [[ -v "GITHUB_ORG_CACHE[${org_name}]" ]]
+    then
+        return "${GITHUB_ORG_CACHE[${org_name}]}"
+    fi
+
+    debug_log "Checking GitHub org access: ${org_name}"
+
+    # Check if org exists and user has permission to create repos
+    if gh api "orgs/${org_name}" --jq '.login' &>/dev/null
+    then
+        # Check if user can create repos in this org
+        local can_create
+        can_create=$(gh api "orgs/${org_name}" --jq '.members_can_create_repositories // true' 2>/dev/null)
+        if [[ "${can_create}" == "true" ]] || gh api "orgs/${org_name}/repos" --method POST --input /dev/null 2>&1 | grep -q "name.*required"
+        then
+            GITHUB_ORG_CACHE["${org_name}"]=0
+            debug_log "GitHub org ${org_name} is accessible"
+            return 0
+        fi
+    fi
+
+    GITHUB_ORG_CACHE["${org_name}"]=1
+    debug_log "GitHub org ${org_name} is not accessible"
+    return 1
+}
+
+# Get GitHub target owner for a GitLab repo
+# Returns the org name if accessible, otherwise the user's name
+# Args: gitlab_path (e.g., "immutablue/hawk-blueah" or "zachpodbielniak/nvim")
+get_github_target () {
+    local gitlab_path="${1}"
+    local gitlab_namespace="${gitlab_path%%/*}"
+
+    # If it's the user's personal namespace, use GitHub user
+    if [[ "${gitlab_namespace}" == "${GITLAB_USER}" ]]
+    then
+        echo "${GITHUB_USER}"
+        return
+    fi
+
+    # Check if matching GitHub org exists and is accessible
+    if github_org_accessible "${gitlab_namespace}"
+    then
+        echo "${gitlab_namespace}"
+    else
+        echo "${GITHUB_USER}"
+    fi
+}
+
+# Check if a GitHub repo exists
+# Returns 0 if exists, 1 if not
+# Args: repo_name, [owner] (defaults to GITHUB_USER)
+github_repo_exists () {
+    local repo_name="${1}"
+    local owner="${2:-${GITHUB_USER}}"
+    local full_name="${owner}/${repo_name}"
+
+    debug_log "Checking if GitHub repo exists: ${full_name}"
+
+    if gh repo view "${full_name}" --json name &>/dev/null
+    then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Create a GitHub repo with specified visibility and description
+# Uses exponential backoff retry (up to 10 attempts)
+# Args: repo_name, visibility (public/private), description, [owner]
+create_github_repo () {
+    local repo_name="${1}"
+    local visibility="${2}"
+    local description="${3:-}"
+    local owner="${4:-${GITHUB_USER}}"
+    local full_name="${owner}/${repo_name}"
+
+    local visibility_flag
+    if [[ "${visibility}" == "public" ]]
+    then
+        visibility_flag="--public"
+    else
+        visibility_flag="--private"
+    fi
+
+    local cmd="gh repo create ${full_name} ${visibility_flag}"
+    if [[ -n "${description}" ]]
+    then
+        cmd="${cmd} --description \"${description}\""
+    fi
+    debug_log "Command: ${cmd}"
+
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        info "Would create GitHub repo '${full_name}' as ${visibility^^}"
+        [[ -n "${description}" ]] && info "Description: ${description}"
+        return 0
+    fi
+
+    local max_attempts=10
+    local attempt=1
+    local delay=1
+    local create_result
+    local exit_code
+
+    while [[ ${attempt} -le ${max_attempts} ]]
+    do
+        if [[ -n "${description}" ]]
+        then
+            create_result=$(gh repo create "${full_name}" "${visibility_flag}" --description "${description}" 2>&1)
+            exit_code=$?
+        else
+            create_result=$(gh repo create "${full_name}" "${visibility_flag}" 2>&1)
+            exit_code=$?
+        fi
+
+        if [[ ${exit_code} -eq 0 ]]
+        then
+            success "Created GitHub repo '${full_name}' as ${visibility^^}"
+            return 0
+        fi
+
+        # Check if it's a "already exists" error - no point retrying
+        if echo "${create_result}" | grep -qi "already exists"
+        then
+            debug_log "Repo already exists, not retrying"
+            break
+        fi
+
+        if [[ ${attempt} -lt ${max_attempts} ]]
+        then
+            warn "Attempt ${attempt}/${max_attempts} failed, retrying in ${delay}s..."
+            debug_log "Error: ${create_result}"
+            sleep "${delay}"
+            # Exponential backoff: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
+            delay=$((delay * 2))
+        fi
+        ((attempt++)) || true
+    done
+
+    error "Failed to create GitHub repo '${full_name}' after ${max_attempts} attempts"
+    debug_log "Last error: ${create_result}"
+    return 1
+}
+
+# Set up GitLab push mirror to GitHub
+# Uses exponential backoff retry (up to 10 attempts)
+# Args: gitlab_path (e.g., "zachpodbielniak/nvim"), repo_name, [owner]
+setup_gitlab_mirror () {
+    local gitlab_path="${1}"
+    local repo_name="${2}"
+    local owner="${3:-${GITHUB_USER}}"
+
+    local mirror_url="https://${GITHUB_USER}:${GH_MIRROR_TOKEN}@github.com/${owner}/${repo_name}.git"
+    local masked_url="https://${GITHUB_USER}:$(mask_token "${GH_MIRROR_TOKEN}")@github.com/${owner}/${repo_name}.git"
+
+    local cmd="glab repo mirror ${gitlab_path} --direction=push --url=\"${masked_url}\" --protected-branches-only"
+    debug_log "Command: ${cmd}"
+
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        info "Would configure push mirror to ${owner}/${repo_name}"
+        return 0
+    fi
+
+    local max_attempts=10
+    local attempt=1
+    local delay=1
+    local mirror_result
+    local exit_code
+
+    while [[ ${attempt} -le ${max_attempts} ]]
+    do
+        mirror_result=$(glab repo mirror "${gitlab_path}" --direction=push --url="${mirror_url}" --protected-branches-only 2>&1)
+        exit_code=$?
+
+        if [[ ${exit_code} -eq 0 ]]
+        then
+            success "Configured push mirror to ${owner}/${repo_name}"
+            return 0
+        fi
+
+        # Check if mirror already exists - no point retrying
+        if echo "${mirror_result}" | grep -qi "already exists\|already configured"
+        then
+            debug_log "Mirror already configured, not retrying"
+            success "Push mirror already configured"
+            return 0
+        fi
+
+        if [[ ${attempt} -lt ${max_attempts} ]]
+        then
+            warn "Mirror attempt ${attempt}/${max_attempts} failed, retrying in ${delay}s..."
+            debug_log "Error: ${mirror_result}"
+            sleep "${delay}"
+            delay=$((delay * 2))
+        fi
+        ((attempt++)) || true
+    done
+
+    error "Failed to configure push mirror after ${max_attempts} attempts"
+    debug_log "Last error: ${mirror_result}"
+    return 1
+}
+
+# Update GitHub repo description
+# Args: repo_name, description, [owner]
+update_github_description () {
+    local repo_name="${1}"
+    local description="${2:-}"
+    local owner="${3:-${GITHUB_USER}}"
+    local full_name="${owner}/${repo_name}"
+
+    debug_log "Updating description for ${full_name}"
+
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        if [[ -n "${description}" ]]
+        then
+            info "Would update description: ${description}"
+        else
+            info "Would clear description (empty in GitLab)"
+        fi
+        return 0
+    fi
+
+    local edit_result
+    edit_result=$(gh repo edit "${full_name}" --description "${description}" 2>&1) && true
+
+    if [[ $? -eq 0 ]]
+    then
+        if [[ -n "${description}" ]]
+        then
+            success "Updated description"
+        else
+            success "Cleared description"
+        fi
+        return 0
+    else
+        error "Failed to update description"
+        debug_log "Error: ${edit_result}"
+        return 1
+    fi
+}
+
+# Process a single repository
+# Args: repo_name, visibility, gitlab_path, description
+process_repo () {
+    local repo_name="${1}"
+    local visibility="${2}"
+    local gitlab_path="${3}"
+    local description="${4:-}"
+
+    # Check --include filter (whitelist)
+    if [[ -n "${INCLUDE_PATTERN}" ]]
+    then
+        if ! matches_pattern "${repo_name}" "${INCLUDE_PATTERN}"
+        then
+            debug_log "Skipping ${repo_name}: does not match include pattern"
+            ((COUNT_SKIPPED++)) || true
+            return 0
+        fi
+    fi
+
+    # Check --exclude filter (blacklist)
+    if [[ -n "${EXCLUDE_PATTERN}" ]]
+    then
+        if matches_pattern "${repo_name}" "${EXCLUDE_PATTERN}"
+        then
+            info "Skipped (matches exclude pattern)"
+            ((COUNT_SKIPPED++)) || true
+            return 0
+        fi
+    fi
+
+    # Check --repo filter (single repo)
+    if [[ -n "${SINGLE_REPO}" ]] && [[ "${repo_name}" != "${SINGLE_REPO}" ]]
+    then
+        debug_log "Skipping ${repo_name}: not matching --repo filter"
+        ((COUNT_SKIPPED++)) || true
+        return 0
+    fi
+
+    ((COUNT_PROCESSED++)) || true
+
+    # Determine GitHub target (org or user) based on GitLab namespace
+    local github_target
+    github_target=$(get_github_target "${gitlab_path}")
+    if [[ "${github_target}" != "${GITHUB_USER}" ]]
+    then
+        info "Target: ${github_target} (matched GitLab group)"
+    fi
+
+    # Map GitLab visibility to GitHub
+    local gh_visibility
+    if [[ "${visibility}" == "public" ]]
+    then
+        gh_visibility="public"
+    else
+        # private or internal both become private on GitHub
+        gh_visibility="private"
+    fi
+
+    # Check if GitHub repo already exists
+    if github_repo_exists "${repo_name}" "${github_target}"
+    then
+        info "GitHub repo already exists - skipping"
+        ((COUNT_SKIPPED++)) || true
+        return 0
+    fi
+
+    info "GitHub repo does not exist"
+
+    # Create GitHub repo
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        info "Would create GitHub repo '${github_target}/${repo_name}' as ${gh_visibility^^}"
+        [[ -n "${description}" ]] && info "Description: ${description}"
+        ((COUNT_CREATED++)) || true
+    else
+        if confirm_action "Create GitHub repo '${github_target}/${repo_name}' as ${gh_visibility^^}?"
+        then
+            if create_github_repo "${repo_name}" "${gh_visibility}" "${description}" "${github_target}"
+            then
+                ((COUNT_CREATED++)) || true
+            else
+                ((COUNT_FAILED++)) || true
+                return 1
+            fi
+        else
+            info "Skipped repo creation"
+            ((COUNT_SKIPPED++)) || true
+            return 0
+        fi
+    fi
+
+    # Set up push mirror
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        setup_gitlab_mirror "${gitlab_path}" "${repo_name}" "${github_target}"
+        ((COUNT_MIRRORED++)) || true
+    else
+        if confirm_action "Set up push mirror to ${github_target}/${repo_name}?"
+        then
+            if setup_gitlab_mirror "${gitlab_path}" "${repo_name}" "${github_target}"
+            then
+                ((COUNT_MIRRORED++)) || true
+            else
+                ((COUNT_FAILED++)) || true
+                return 1
+            fi
+        else
+            info "Skipped mirror setup"
+        fi
+    fi
+
+    return 0
+}
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+main () {
+    # Parse arguments
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --license)
+                show_license
+                exit 0
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --debug)
+                DEBUG_MODE=true
+                shift
+                ;;
+            --no-confirm)
+                NO_CONFIRM=true
+                shift
+                ;;
+            --repo)
+                if [[ -z "${2:-}" ]]
+                then
+                    error "--repo requires a value"
+                    exit 1
+                fi
+                SINGLE_REPO="${2}"
+                shift 2
+                ;;
+            --groups)
+                if [[ -z "${2:-}" ]]
+                then
+                    error "--groups requires a value"
+                    exit 1
+                fi
+                GITLAB_GROUPS="${2}"
+                shift 2
+                ;;
+            --groups-list)
+                GROUPS_LIST=true
+                shift
+                ;;
+            --update-descriptions)
+                UPDATE_DESCRIPTIONS=true
+                shift
+                ;;
+            --include)
+                if [[ -z "${2:-}" ]]
+                then
+                    error "--include requires a value"
+                    exit 1
+                fi
+                INCLUDE_PATTERN="${2}"
+                shift 2
+                ;;
+            --exclude)
+                if [[ -z "${2:-}" ]]
+                then
+                    error "--exclude requires a value"
+                    exit 1
+                fi
+                EXCLUDE_PATTERN="${2}"
+                shift 2
+                ;;
+            *)
+                error "Unknown option: ${1}"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Handle --groups-list
+    if [[ "${GROUPS_LIST}" == "true" ]]
+    then
+        list_gitlab_groups
+        exit 0
+    fi
+
+    # Check prerequisites
+    if ! check_prerequisites
+    then
+        exit 1
+    fi
+
+    # Show mode
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        echo "DRY RUN - No changes will be made"
+        echo ""
+    fi
+
+    # Get GitLab repos
+    # Save stdin to fd 3 for interactive prompts inside while loops
+    exec 3<&0
+
+    echo "Fetching GitLab repositories..."
+    local repos_json
+    repos_json=$(get_gitlab_repos)
+
+    if [[ -z "${repos_json}" ]] || [[ "${repos_json}" == "[]" ]] || [[ "${repos_json}" == "null" ]]
+    then
+        echo "No repositories found"
+        exit 0
+    fi
+
+    # Extract only the fields we need (avoids massive JSON in loop)
+    # Format: path\tvisibility\tpath_with_namespace\tdescription (one per line)
+    # Uses tab delimiter since descriptions may contain pipes
+    # Uses .path (URL slug) not .name (display name) for filtering/display
+    local repos_list
+    repos_list=$(echo "${repos_json}" | yq -r '.[] | .path + "\t" + .visibility + "\t" + .path_with_namespace + "\t" + (.description // "")')
+
+    local total_repos
+    total_repos=$(echo "${repos_list}" | wc -l)
+    echo "Found ${total_repos} GitLab repositories"
+    echo ""
+
+    # Update descriptions mode
+    if [[ "${UPDATE_DESCRIPTIONS}" == "true" ]]
+    then
+        echo "Updating descriptions on existing GitHub repos..."
+        echo ""
+
+        local index=0
+        while IFS=$'\t' read -r repo_name visibility gitlab_path description
+        do
+            ((index++)) || true
+
+            # Check filters
+            if [[ -n "${SINGLE_REPO}" ]] && [[ "${repo_name}" != "${SINGLE_REPO}" ]]
+            then
+                continue
+            fi
+            if [[ -n "${INCLUDE_PATTERN}" ]] && ! matches_pattern "${repo_name}" "${INCLUDE_PATTERN}"
+            then
+                debug_log "Skipping ${repo_name}: does not match include pattern"
+                continue
+            fi
+            if [[ -n "${EXCLUDE_PATTERN}" ]] && matches_pattern "${repo_name}" "${EXCLUDE_PATTERN}"
+            then
+                debug_log "Skipping ${repo_name}: matches exclude pattern"
+                continue
+            fi
+
+            # Determine GitHub target
+            local github_target
+            github_target=$(get_github_target "${gitlab_path}")
+
+            echo "[${index}/${total_repos}] ${repo_name} -> ${github_target}"
+
+            # Only update if repo exists on GitHub
+            if ! github_repo_exists "${repo_name}" "${github_target}"
+            then
+                info "Not on GitHub - skipping"
+                ((COUNT_SKIPPED++)) || true
+                echo ""
+                continue
+            fi
+
+            ((COUNT_PROCESSED++)) || true
+
+            if update_github_description "${repo_name}" "${description}" "${github_target}"
+            then
+                ((COUNT_UPDATED++)) || true
+            else
+                ((COUNT_FAILED++)) || true
+            fi
+            echo ""
+        done <<< "${repos_list}"
+
+        # Print summary
+        echo "=============================================="
+        echo "Description Update Summary"
+        echo "=============================================="
+        echo "  Processed: ${COUNT_PROCESSED}"
+        echo "  Updated:   ${COUNT_UPDATED}"
+        echo "  Skipped:   ${COUNT_SKIPPED}"
+        echo "  Failed:    ${COUNT_FAILED}"
+
+        if [[ ${COUNT_FAILED} -gt 0 ]]
+        then
+            exit 1
+        fi
+        exit 0
+    fi
+
+    # Dry-run summary: scan all repos first to show what would happen
+    if [[ "${DRY_RUN}" == "true" ]]
+    then
+        echo "Analyzing repositories..."
+        local to_create=()
+        local to_skip_exists=()
+        local to_skip_filter=()
+
+        while IFS=$'\t' read -r repo_name visibility gitlab_path description
+        do
+            # Check filters
+            if [[ -n "${SINGLE_REPO}" ]] && [[ "${repo_name}" != "${SINGLE_REPO}" ]]
+            then
+                continue
+            fi
+            if [[ -n "${INCLUDE_PATTERN}" ]] && ! matches_pattern "${repo_name}" "${INCLUDE_PATTERN}"
+            then
+                to_skip_filter+=("${repo_name}")
+                continue
+            fi
+            if [[ -n "${EXCLUDE_PATTERN}" ]] && matches_pattern "${repo_name}" "${EXCLUDE_PATTERN}"
+            then
+                to_skip_filter+=("${repo_name} (excluded)")
+                continue
+            fi
+
+            # Determine GitHub target
+            local github_target
+            github_target=$(get_github_target "${gitlab_path}")
+
+            # Check GitHub
+            if github_repo_exists "${repo_name}" "${github_target}"
+            then
+                to_skip_exists+=("${github_target}/${repo_name}")
+            else
+                local gh_vis="private"
+                [[ "${visibility}" == "public" ]] && gh_vis="public"
+                local display="${github_target}/${repo_name} (${gh_vis})"
+                [[ -n "${description}" ]] && display="${display} - ${description}"
+                to_create+=("${display}")
+            fi
+        done <<< "${repos_list}"
+
+        echo ""
+        echo "=============================================="
+        echo "DRY RUN SUMMARY"
+        echo "=============================================="
+        echo ""
+
+        if [[ ${#to_create[@]} -gt 0 ]]
+        then
+            echo "Would CREATE and MIRROR (${#to_create[@]}):"
+            for repo in "${to_create[@]}"
+            do
+                echo "  + ${repo}"
+            done
+            echo ""
+        fi
+
+        if [[ ${#to_skip_exists[@]} -gt 0 ]]
+        then
+            echo "Would SKIP - already on GitHub (${#to_skip_exists[@]}):"
+            for repo in "${to_skip_exists[@]}"
+            do
+                echo "  - ${repo}"
+            done
+            echo ""
+        fi
+
+        if [[ ${#to_skip_filter[@]} -gt 0 ]]
+        then
+            echo "Would SKIP - filtered out (${#to_skip_filter[@]}):"
+            for repo in "${to_skip_filter[@]}"
+            do
+                echo "  ~ ${repo}"
+            done
+            echo ""
+        fi
+
+        echo "=============================================="
+        echo "Totals: ${#to_create[@]} to create, $((${#to_skip_exists[@]} + ${#to_skip_filter[@]})) to skip"
+        echo "=============================================="
+        exit 0
+    fi
+
+    # Normal run: process each repo
+    debug_log "Starting normal run processing..."
+    debug_log "repos_list has $(echo "${repos_list}" | wc -l) lines"
+    local index=0
+    while IFS=$'\t' read -r repo_name visibility gitlab_path description
+    do
+        ((index++)) || true
+        echo "[${index}/${total_repos}] ${repo_name} (${visibility})"
+        process_repo "${repo_name}" "${visibility}" "${gitlab_path}" "${description}"
+        echo ""
+    done <<< "${repos_list}"
+    debug_log "Finished processing ${index} repos"
+
+    # Print summary
+    echo "=============================================="
+    echo "Summary"
+    echo "=============================================="
+    echo "  Processed: ${COUNT_PROCESSED}"
+    echo "  Created:   ${COUNT_CREATED}"
+    echo "  Mirrored:  ${COUNT_MIRRORED}"
+    echo "  Skipped:   ${COUNT_SKIPPED}"
+    echo "  Failed:    ${COUNT_FAILED}"
+
+    if [[ ${COUNT_FAILED} -gt 0 ]]
+    then
+        exit 1
+    fi
+
+    exit 0
+}
+
+main "$@"
