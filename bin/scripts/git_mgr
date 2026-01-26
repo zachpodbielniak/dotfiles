@@ -1,0 +1,1304 @@
+#!/usr/bin/python3
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+git_mgr - Multi-repository git management tool
+
+Manages multiple git repositories with parallel execution support using a YAML
+configuration file. Supports clone, pull, fetch operations, running arbitrary
+commands, and generating configs from existing directory structures.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Callable, Any
+
+VERSION: str = "1.0.0"
+DEFAULT_CONFIG: Path = Path.home() / ".config" / "git_mgr" / "config.yaml"
+LICENSE_TEXT: str = """
+git_mgr - Multi-repository git management tool
+Copyright (C) 2026  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+""".strip()
+
+print_lock: threading.Lock = threading.Lock()
+
+
+# --- Simple YAML Parser ---
+class SimpleYamlParser:
+    """
+    Parse minimal YAML subset for git_mgr configuration.
+
+    Supports:
+    - Key-value pairs: `key: value`
+    - Lists with dash syntax: `- item`
+    - Nested dicts via indentation
+    - Comments with #
+    - Tilde expansion for paths
+    """
+
+    def __init__(self):
+        self._lines: list[str] = []
+        self._index: int = 0
+
+    def parse(self, content: str) -> dict:
+        """
+        Parse YAML content string into a dictionary.
+
+        Args:
+            content: YAML formatted string
+
+        Returns:
+            Parsed dictionary structure
+        """
+        self._lines = content.split('\n')
+        self._index = 0
+        return self._parse_dict(0)
+
+    def _current_indent(self, line: str) -> int:
+        """Calculate the indentation level of a line."""
+        return len(line) - len(line.lstrip())
+
+    def _strip_comment(self, line: str) -> str:
+        """Remove inline comments, respecting quoted strings."""
+        in_quote: bool = False
+        quote_char: str = ''
+        result: list[str] = []
+
+        for i, char in enumerate(line):
+            if char in ('"', "'") and (i == 0 or line[i-1] != '\\'):
+                if not in_quote:
+                    in_quote = True
+                    quote_char = char
+                elif char == quote_char:
+                    in_quote = False
+            elif char == '#' and not in_quote:
+                break
+            result.append(char)
+
+        return ''.join(result).rstrip()
+
+    def _parse_value(self, value_str: str) -> Any:
+        """
+        Parse a YAML value string into appropriate Python type.
+
+        Handles strings (with/without quotes), booleans, integers, floats,
+        and performs tilde expansion on paths.
+        """
+        value_str = value_str.strip()
+
+        if not value_str:
+            return None
+
+        # Handle quoted strings
+        if (value_str.startswith('"') and value_str.endswith('"')) or \
+           (value_str.startswith("'") and value_str.endswith("'")):
+            return value_str[1:-1]
+
+        # Handle booleans
+        if value_str.lower() in ('true', 'yes', 'on'):
+            return True
+        if value_str.lower() in ('false', 'no', 'off'):
+            return False
+
+        # Handle null
+        if value_str.lower() in ('null', '~'):
+            return None
+
+        # Handle integers
+        try:
+            return int(value_str)
+        except ValueError:
+            pass
+
+        # Handle floats
+        try:
+            return float(value_str)
+        except ValueError:
+            pass
+
+        # Return as string, expand tilde for paths
+        if value_str.startswith('~'):
+            return os.path.expanduser(value_str)
+
+        return value_str
+
+    def _parse_dict(self, min_indent: int) -> dict:
+        """
+        Parse a dictionary at the given indentation level.
+
+        Recursively handles nested structures.
+        """
+        result: dict = {}
+
+        while self._index < len(self._lines):
+            line: str = self._lines[self._index]
+
+            # Skip empty lines and pure comments
+            stripped: str = line.strip()
+            if not stripped or stripped.startswith('#'):
+                self._index += 1
+                continue
+
+            current_indent: int = self._current_indent(line)
+
+            # If we've dedented past our level, we're done
+            if current_indent < min_indent:
+                break
+
+            # Skip lines at wrong indent level
+            if current_indent > min_indent and not stripped.startswith('-'):
+                self._index += 1
+                continue
+
+            clean_line: str = self._strip_comment(line).strip()
+
+            # Handle list items at this level
+            if clean_line.startswith('- '):
+                # This is a list, but we're parsing a dict - caller handles this
+                break
+
+            # Parse key-value pair
+            if ':' in clean_line:
+                colon_pos: int = clean_line.index(':')
+                key: str = clean_line[:colon_pos].strip()
+                value_part: str = clean_line[colon_pos + 1:].strip()
+
+                if value_part:
+                    # Simple key: value
+                    result[key] = self._parse_value(value_part)
+                    self._index += 1
+                else:
+                    # Key with nested content
+                    self._index += 1
+                    if self._index < len(self._lines):
+                        next_line: str = self._lines[self._index]
+                        next_stripped: str = next_line.strip()
+                        next_indent: int = self._current_indent(next_line)
+
+                        if next_stripped.startswith('-'):
+                            # It's a list
+                            result[key] = self._parse_list(next_indent)
+                        elif next_indent > current_indent:
+                            # It's a nested dict
+                            result[key] = self._parse_dict(next_indent)
+                        else:
+                            result[key] = None
+                    else:
+                        result[key] = None
+            else:
+                self._index += 1
+
+        return result
+
+    def _parse_list(self, min_indent: int) -> list:
+        """
+        Parse a list at the given indentation level.
+
+        Handles list items that are simple values or nested dicts.
+        """
+        result: list = []
+
+        while self._index < len(self._lines):
+            line: str = self._lines[self._index]
+
+            # Skip empty lines and comments
+            stripped: str = line.strip()
+            if not stripped or stripped.startswith('#'):
+                self._index += 1
+                continue
+
+            current_indent: int = self._current_indent(line)
+
+            # If we've dedented, we're done
+            if current_indent < min_indent:
+                break
+
+            clean_line: str = self._strip_comment(line).strip()
+
+            if clean_line.startswith('- '):
+                item_content: str = clean_line[2:].strip()
+
+                if ':' in item_content:
+                    # List item is a dict starting with key: value
+                    item_dict: dict = {}
+                    colon_pos: int = item_content.index(':')
+                    key: str = item_content[:colon_pos].strip()
+                    value_part: str = item_content[colon_pos + 1:].strip()
+
+                    if value_part:
+                        item_dict[key] = self._parse_value(value_part)
+                    else:
+                        item_dict[key] = None
+
+                    self._index += 1
+
+                    # Check for additional keys at increased indent
+                    while self._index < len(self._lines):
+                        next_line: str = self._lines[self._index]
+                        next_stripped: str = next_line.strip()
+
+                        if not next_stripped or next_stripped.startswith('#'):
+                            self._index += 1
+                            continue
+
+                        next_indent: int = self._current_indent(next_line)
+
+                        # Additional keys should be indented more than the dash
+                        if next_indent <= current_indent:
+                            break
+
+                        if next_stripped.startswith('-'):
+                            break
+
+                        next_clean: str = self._strip_comment(next_line).strip()
+                        if ':' in next_clean:
+                            c_pos: int = next_clean.index(':')
+                            k: str = next_clean[:c_pos].strip()
+                            v: str = next_clean[c_pos + 1:].strip()
+                            item_dict[k] = self._parse_value(v) if v else None
+                            self._index += 1
+                        else:
+                            self._index += 1
+
+                    result.append(item_dict)
+                else:
+                    # Simple list item
+                    result.append(self._parse_value(item_content))
+                    self._index += 1
+            else:
+                # Not a list item, we're done
+                break
+
+        return result
+
+
+# --- Data Classes ---
+@dataclass
+class RepoConfig:
+    """Configuration for a single git repository."""
+    url: str
+    path: Path
+    submodule: bool = False
+
+
+@dataclass
+class Config:
+    """Complete git_mgr configuration."""
+    base_dir: Path
+    repos: list[RepoConfig] = field(default_factory=list)
+
+
+@dataclass
+class GitResult:
+    """Result of a git operation on a single repository."""
+    repo_path: Path
+    success: bool
+    output: str
+    error: str
+
+
+# --- Configuration Loading ---
+def load_config(config_path: Path) -> Config:
+    """
+    Load and parse the git_mgr configuration file.
+
+    Args:
+        config_path: Path to the YAML configuration file
+
+    Returns:
+        Parsed Config object
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist
+        ValueError: If config is malformed
+    """
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    content: str = config_path.read_text()
+    parser: SimpleYamlParser = SimpleYamlParser()
+    data: dict = parser.parse(content)
+
+    # Parse base_dir with tilde expansion
+    base_dir_str: str = data.get('base_dir', '~/source/projects')
+    base_dir: Path = Path(os.path.expanduser(base_dir_str))
+
+    repos: list[RepoConfig] = []
+    repos_data: list = data.get('repos', [])
+
+    for repo_entry in repos_data:
+        if isinstance(repo_entry, dict):
+            url: str = repo_entry.get('url', '')
+            if not url:
+                continue
+
+            path_str: Optional[str] = repo_entry.get('path')
+
+            if path_str:
+                # Expand tilde and handle relative paths
+                path_str = os.path.expanduser(str(path_str))
+                if path_str.startswith('/') or path_str.startswith('~'):
+                    repo_path: Path = Path(path_str)
+                else:
+                    repo_path = base_dir / path_str
+            else:
+                # Derive path from URL
+                repo_name: str = url.rstrip('/').split('/')[-1]
+                if repo_name.endswith('.git'):
+                    repo_name = repo_name[:-4]
+                repo_path = base_dir / repo_name
+
+            is_submodule: bool = repo_entry.get('submodule', False)
+            repos.append(RepoConfig(url=url, path=repo_path.resolve(), submodule=is_submodule))
+
+    return Config(base_dir=base_dir, repos=repos)
+
+
+def extract_repo_name(url: str) -> str:
+    """
+    Extract repository name from a git URL.
+
+    Args:
+        url: Git repository URL
+
+    Returns:
+        Repository name without .git extension
+    """
+    name: str = url.rstrip('/').split('/')[-1]
+    if name.endswith('.git'):
+        name = name[:-4]
+    return name
+
+
+# --- Main Manager Class ---
+class GitManager:
+    """
+    Manages multiple git repositories with parallel execution support.
+
+    Provides operations like clone, pull, fetch, and arbitrary command
+    execution across all configured repositories.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        parallel: int,
+        include_submodules: bool,
+        verbose: bool,
+        dry_run: bool = False
+    ):
+        """
+        Initialize the GitManager.
+
+        Args:
+            config: Parsed configuration object
+            parallel: Number of parallel workers
+            include_submodules: Whether to include submodule directories
+            verbose: Enable verbose output
+            dry_run: Show what would be done without executing
+        """
+        self.config: Config = config
+        self.parallel: int = parallel
+        self.include_submodules: bool = include_submodules
+        self.verbose: bool = verbose
+        self.dry_run: bool = dry_run
+
+    def _is_submodule(self, path: Path) -> bool:
+        """
+        Check if a path is a git submodule rather than a regular repo.
+
+        Submodules have a .git file (containing "gitdir: ...") rather than
+        a .git directory.
+
+        Args:
+            path: Path to check
+
+        Returns:
+            True if path is a submodule, False otherwise
+        """
+        git_path: Path = path / ".git"
+        if not git_path.exists():
+            return False
+        return git_path.is_file()
+
+    def _find_git_repos(self, base_path: Path) -> list[Path]:
+        """
+        Recursively find directories containing .git.
+
+        Skips submodules unless include_submodules is True.
+
+        Args:
+            base_path: Directory to search
+
+        Returns:
+            List of paths to git repositories
+        """
+        repos: list[Path] = []
+
+        if not base_path.exists() or not base_path.is_dir():
+            return repos
+
+        for root, dirs, files in os.walk(base_path):
+            root_path: Path = Path(root)
+
+            if '.git' in dirs or '.git' in files:
+                # Check if it's a submodule
+                if self._is_submodule(root_path):
+                    if self.include_submodules:
+                        repos.append(root_path)
+                else:
+                    repos.append(root_path)
+
+                # Don't descend into .git directories, but do check for nested repos
+                if '.git' in dirs:
+                    dirs.remove('.git')
+
+        return repos
+
+    def _get_configured_repos(self) -> list[Path]:
+        """
+        Get list of repository paths from configuration that exist.
+
+        Skips repos marked as submodules (either via config flag or .git file
+        detection) unless include_submodules is True.
+
+        Returns:
+            List of existing repository paths
+        """
+        repos: list[Path] = []
+        for repo_config in self.config.repos:
+            if repo_config.path.exists():
+                # Skip if marked as submodule in config
+                if repo_config.submodule and not self.include_submodules:
+                    continue
+                # Skip if detected as submodule (.git is a file)
+                if self._is_submodule(repo_config.path) and not self.include_submodules:
+                    continue
+                repos.append(repo_config.path)
+        return repos
+
+    def _run_git(self, repo_path: Path, args: list[str]) -> GitResult:
+        """
+        Execute a git command in the specified repository directory.
+
+        Args:
+            repo_path: Path to the repository
+            args: Git command arguments
+
+        Returns:
+            GitResult with command output and status
+        """
+        try:
+            result: subprocess.CompletedProcess = subprocess.run(
+                ["git"] + args,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            return GitResult(
+                repo_path=repo_path,
+                success=result.returncode == 0,
+                output=result.stdout.strip(),
+                error=result.stderr.strip()
+            )
+        except subprocess.TimeoutExpired:
+            return GitResult(
+                repo_path=repo_path,
+                success=False,
+                output="",
+                error="Command timed out after 5 minutes"
+            )
+        except Exception as e:
+            return GitResult(
+                repo_path=repo_path,
+                success=False,
+                output="",
+                error=str(e)
+            )
+
+    def _run_command(self, repo_path: Path, cmd: str) -> GitResult:
+        """
+        Execute an arbitrary shell command in the specified repository.
+
+        Args:
+            repo_path: Path to the repository
+            cmd: Shell command to execute
+
+        Returns:
+            GitResult with command output and status
+        """
+        try:
+            result: subprocess.CompletedProcess = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            return GitResult(
+                repo_path=repo_path,
+                success=result.returncode == 0,
+                output=result.stdout.strip(),
+                error=result.stderr.strip()
+            )
+        except subprocess.TimeoutExpired:
+            return GitResult(
+                repo_path=repo_path,
+                success=False,
+                output="",
+                error="Command timed out after 5 minutes"
+            )
+        except Exception as e:
+            return GitResult(
+                repo_path=repo_path,
+                success=False,
+                output="",
+                error=str(e)
+            )
+
+    def _print_dry_run(self, repo_path: Path, action: str, details: str = "") -> None:
+        """
+        Print a dry-run message showing what would be done.
+
+        Args:
+            repo_path: Path to the repository
+            action: Action that would be performed
+            details: Additional details about the action
+        """
+        with print_lock:
+            print(f"\033[36m[dry-run]\033[0m {repo_path.name}: {action}")
+            if details and self.verbose:
+                for line in details.split('\n'):
+                    print(f"    {line}")
+
+    def _print_result(self, result: GitResult) -> None:
+        """
+        Print a git operation result in a thread-safe manner.
+
+        Args:
+            result: GitResult to print
+        """
+        with print_lock:
+            status: str = "\033[32m✓\033[0m" if result.success else "\033[31m✗\033[0m"
+            print(f"{status} {result.repo_path.name}")
+
+            if self.verbose or not result.success:
+                if result.output:
+                    for line in result.output.split('\n'):
+                        print(f"    {line}")
+                if result.error and not result.success:
+                    for line in result.error.split('\n'):
+                        print(f"    \033[31m{line}\033[0m")
+
+    def _execute_parallel(
+        self,
+        repos: list[Path],
+        operation: Callable[[Path], GitResult]
+    ) -> list[GitResult]:
+        """
+        Run an operation on multiple repos using ThreadPoolExecutor.
+
+        Args:
+            repos: List of repository paths
+            operation: Function to execute on each repo
+
+        Returns:
+            List of GitResults from all operations
+        """
+        results: list[GitResult] = []
+
+        if not repos:
+            print("No repositories to process.")
+            return results
+
+        with ThreadPoolExecutor(max_workers=self.parallel) as executor:
+            futures = {executor.submit(operation, r): r for r in repos}
+            for future in as_completed(futures):
+                result: GitResult = future.result()
+                results.append(result)
+                self._print_result(result)
+
+        return results
+
+    def clone(self) -> list[GitResult]:
+        """
+        Clone missing repositories from configuration.
+
+        Clones with --recursive flag to include submodules.
+
+        Returns:
+            List of GitResults for clone operations
+        """
+        results: list[GitResult] = []
+
+        for repo_config in self.config.repos:
+            if repo_config.path.exists():
+                with print_lock:
+                    print(f"\033[33m-\033[0m {repo_config.path.name} (already exists)")
+                continue
+
+            if self.dry_run:
+                self._print_dry_run(
+                    repo_config.path,
+                    "would clone",
+                    f"git clone --recursive {repo_config.url} {repo_config.path}"
+                )
+                continue
+
+            # Create parent directory
+            repo_config.path.parent.mkdir(parents=True, exist_ok=True)
+
+            with print_lock:
+                print(f"\033[34m→\033[0m Cloning {repo_config.url}...")
+
+            try:
+                result: subprocess.CompletedProcess = subprocess.run(
+                    ["git", "clone", "--recursive", repo_config.url, str(repo_config.path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=600  # 10 minute timeout for clones
+                )
+                git_result: GitResult = GitResult(
+                    repo_path=repo_config.path,
+                    success=result.returncode == 0,
+                    output=result.stdout.strip(),
+                    error=result.stderr.strip()
+                )
+            except subprocess.TimeoutExpired:
+                git_result = GitResult(
+                    repo_path=repo_config.path,
+                    success=False,
+                    output="",
+                    error="Clone timed out after 10 minutes"
+                )
+            except Exception as e:
+                git_result = GitResult(
+                    repo_path=repo_config.path,
+                    success=False,
+                    output="",
+                    error=str(e)
+                )
+
+            results.append(git_result)
+            self._print_result(git_result)
+
+        return results
+
+    def pull(self, rebase: bool = False) -> list[GitResult]:
+        """
+        Pull all configured repositories.
+
+        Args:
+            rebase: Use --rebase flag
+
+        Returns:
+            List of GitResults
+        """
+        repos: list[Path] = self._get_configured_repos()
+        args: list[str] = ["pull"]
+        if rebase:
+            args.append("--rebase")
+
+        if self.dry_run:
+            cmd_str: str = "git " + " ".join(args)
+            for repo_path in repos:
+                self._print_dry_run(repo_path, "would pull", cmd_str)
+            return []
+
+        def do_pull(repo_path: Path) -> GitResult:
+            return self._run_git(repo_path, args)
+
+        return self._execute_parallel(repos, do_pull)
+
+    def fetch(self, fetch_all: bool = False) -> list[GitResult]:
+        """
+        Fetch all configured repositories.
+
+        Args:
+            fetch_all: Use --all flag to fetch all remotes
+
+        Returns:
+            List of GitResults
+        """
+        repos: list[Path] = self._get_configured_repos()
+        args: list[str] = ["fetch"]
+        if fetch_all:
+            args.append("--all")
+
+        if self.dry_run:
+            cmd_str: str = "git " + " ".join(args)
+            for repo_path in repos:
+                self._print_dry_run(repo_path, "would fetch", cmd_str)
+            return []
+
+        def do_fetch(repo_path: Path) -> GitResult:
+            return self._run_git(repo_path, args)
+
+        return self._execute_parallel(repos, do_fetch)
+
+    def run_command(self, cmd_template: str) -> list[GitResult]:
+        """
+        Run an arbitrary command on all repositories.
+
+        The placeholder {} in the command is replaced with the repo name.
+
+        Args:
+            cmd_template: Command template string
+
+        Returns:
+            List of GitResults
+        """
+        repos: list[Path] = self._get_configured_repos()
+
+        if self.dry_run:
+            for repo_path in repos:
+                cmd: str = cmd_template.replace('{}', repo_path.name)
+                self._print_dry_run(repo_path, "would run", cmd)
+            return []
+
+        def do_command(repo_path: Path) -> GitResult:
+            cmd: str = cmd_template.replace('{}', repo_path.name)
+            return self._run_command(repo_path, cmd)
+
+        return self._execute_parallel(repos, do_command)
+
+    def _get_remote_url(self, repo_path: Path) -> str:
+        """
+        Get the origin remote URL for a repository.
+
+        Args:
+            repo_path: Path to repository
+
+        Returns:
+            Remote URL or empty string if not found
+        """
+        try:
+            result: subprocess.CompletedProcess = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return ""
+
+    def _is_nested_repo(self, repo_path: Path, all_repos: list[Path]) -> bool:
+        """
+        Check if a repo is nested inside another repo.
+
+        Args:
+            repo_path: Path to check
+            all_repos: List of all repository paths
+
+        Returns:
+            True if repo_path is inside another repo's directory tree
+        """
+        for other_repo in all_repos:
+            if other_repo == repo_path:
+                continue
+            try:
+                repo_path.relative_to(other_repo)
+                # If we get here, repo_path is under other_repo
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def dump(self, base_path: Path, sort_by: str = "path") -> str:
+        """
+        Generate YAML configuration from existing directory structure.
+
+        Detects nested repos (repos inside other repos) and marks them with
+        submodule: true flag.
+
+        Args:
+            base_path: Directory to scan for git repositories
+            sort_by: Sort repos by 'path' or 'url'
+
+        Returns:
+            YAML configuration string
+        """
+        repos: list[Path] = self._find_git_repos(base_path)
+        lines: list[str] = [
+            "# git_mgr configuration",
+            "# Generated from existing directory structure",
+            "",
+            f"base_dir: {base_path}",
+            "",
+            "repos:"
+        ]
+
+        # Build list of repo data for sorting
+        repo_data: list[tuple[Path, str, bool]] = []
+        for repo_path in repos:
+            url: str = self._get_remote_url(repo_path)
+            is_nested: bool = self._is_nested_repo(repo_path, repos)
+            is_submod: bool = self._is_submodule(repo_path) or is_nested
+            repo_data.append((repo_path, url, is_submod))
+
+        # Sort by specified field
+        if sort_by == "url":
+            repo_data.sort(key=lambda x: x[1].lower() if x[1] else "")
+        else:  # default: path
+            repo_data.sort(key=lambda x: x[0])
+
+        for repo_path, url, is_submod in repo_data:
+            if url:
+                lines.append(f"  - url: {url}")
+                # Use relative path if under base_path
+                try:
+                    rel_path: Path = repo_path.relative_to(base_path)
+                    lines.append(f"    path: {rel_path}")
+                except ValueError:
+                    lines.append(f"    path: {repo_path}")
+                if is_submod:
+                    lines.append(f"    submodule: true")
+            else:
+                lines.append(f"  # No remote URL found: {repo_path}")
+
+        return '\n'.join(lines)
+
+    def missing(self, scan_path: Path, yaml_output: bool = False) -> str:
+        """
+        Find git repositories not in the configuration.
+
+        Detects nested repos and marks them with submodule: true in YAML output.
+
+        Args:
+            scan_path: Directory to scan
+            yaml_output: Output as YAML snippet
+
+        Returns:
+            List of missing repos or YAML snippet
+        """
+        config_paths: set[Path] = {r.path.resolve() for r in self.config.repos}
+        found_repos: list[Path] = self._find_git_repos(scan_path)
+
+        # Also include configured repos for nested detection
+        all_repos: list[Path] = found_repos + [r.path for r in self.config.repos]
+
+        missing_repos: list[Path] = [
+            r for r in found_repos
+            if r.resolve() not in config_paths
+        ]
+
+        if not missing_repos:
+            return "All repositories in directory are tracked in config."
+
+        if yaml_output:
+            lines: list[str] = ["# Add to repos section:"]
+            for repo_path in sorted(missing_repos):
+                url: str = self._get_remote_url(repo_path)
+                is_nested: bool = self._is_nested_repo(repo_path, all_repos)
+                is_submod: bool = self._is_submodule(repo_path) or is_nested
+
+                if url:
+                    lines.append(f"  - url: {url}")
+                    lines.append(f"    path: {repo_path}")
+                    if is_submod:
+                        lines.append(f"    submodule: true")
+                else:
+                    lines.append(f"  # No remote URL: {repo_path}")
+            return '\n'.join(lines)
+        else:
+            return '\n'.join(str(p) for p in sorted(missing_repos))
+
+
+# --- Command Handlers ---
+def cmd_clone(args: argparse.Namespace) -> int:
+    """Handle the clone subcommand."""
+    try:
+        config: Config = load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    manager: GitManager = GitManager(
+        config=config,
+        parallel=args.parallel,
+        include_submodules=args.submodules,
+        verbose=args.verbose,
+        dry_run=args.dry_run
+    )
+
+    results: list[GitResult] = manager.clone()
+    failed: int = sum(1 for r in results if not r.success)
+
+    if failed > 0:
+        print(f"\n{failed} clone(s) failed.")
+        return 2
+    return 0
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    """Handle the pull subcommand."""
+    try:
+        config: Config = load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    manager: GitManager = GitManager(
+        config=config,
+        parallel=args.parallel,
+        include_submodules=args.submodules,
+        verbose=args.verbose,
+        dry_run=args.dry_run
+    )
+
+    results: list[GitResult] = manager.pull(rebase=args.rebase)
+    failed: int = sum(1 for r in results if not r.success)
+
+    if failed > 0:
+        print(f"\n{failed} pull(s) failed.")
+        return 2
+    return 0
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    """Handle the fetch subcommand."""
+    try:
+        config: Config = load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    manager: GitManager = GitManager(
+        config=config,
+        parallel=args.parallel,
+        include_submodules=args.submodules,
+        verbose=args.verbose,
+        dry_run=args.dry_run
+    )
+
+    results: list[GitResult] = manager.fetch(fetch_all=args.all)
+    failed: int = sum(1 for r in results if not r.success)
+
+    if failed > 0:
+        print(f"\n{failed} fetch(es) failed.")
+        return 2
+    return 0
+
+
+def cmd_command(args: argparse.Namespace) -> int:
+    """Handle the command subcommand."""
+    try:
+        config: Config = load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    cmd: str = ' '.join(args.cmd)
+    if not cmd:
+        print("Error: No command specified.", file=sys.stderr)
+        return 1
+
+    manager: GitManager = GitManager(
+        config=config,
+        parallel=args.parallel,
+        include_submodules=args.submodules,
+        verbose=args.verbose,
+        dry_run=args.dry_run
+    )
+
+    results: list[GitResult] = manager.run_command(cmd)
+    failed: int = sum(1 for r in results if not r.success)
+
+    if failed > 0:
+        print(f"\n{failed} command(s) failed.")
+        return 2
+    return 0
+
+
+def cmd_dump(args: argparse.Namespace) -> int:
+    """Handle the dump subcommand."""
+    scan_path: Path = Path(args.path).expanduser().resolve() if args.path else Path.cwd()
+
+    if not scan_path.exists():
+        print(f"Error: Path does not exist: {scan_path}", file=sys.stderr)
+        return 1
+
+    # Create a minimal manager for scanning
+    manager: GitManager = GitManager(
+        config=Config(base_dir=scan_path, repos=[]),
+        parallel=1,
+        include_submodules=args.submodules,
+        verbose=args.verbose
+    )
+
+    yaml_output: str = manager.dump(scan_path, sort_by=args.sort_by)
+    print(yaml_output)
+    return 0
+
+
+def cmd_missing(args: argparse.Namespace) -> int:
+    """Handle the missing subcommand."""
+    try:
+        config: Config = load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    scan_path: Path = Path(args.path).expanduser().resolve() if args.path else config.base_dir
+
+    if not scan_path.exists():
+        print(f"Error: Path does not exist: {scan_path}", file=sys.stderr)
+        return 1
+
+    manager: GitManager = GitManager(
+        config=config,
+        parallel=1,
+        include_submodules=args.submodules,
+        verbose=args.verbose
+    )
+
+    output: str = manager.missing(scan_path, yaml_output=args.yaml)
+    print(output)
+    return 0
+
+
+# --- Argument Parser ---
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Build and return the argument parser for git_mgr.
+
+    Returns:
+        Configured ArgumentParser instance
+    """
+    # Determine default parallel workers (nproc / 4, minimum 1)
+    try:
+        nproc: int = os.cpu_count() or 4
+        default_parallel: int = max(1, nproc // 4)
+    except Exception:
+        default_parallel = 2
+
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        prog='git_mgr',
+        description='Multi-repository git management tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Clone all repos from config
+  git_mgr clone
+
+  # Pull all repos with 8 workers
+  git_mgr -p 8 pull
+
+  # Pull with rebase
+  git_mgr pull --rebase
+
+  # Fetch all remotes
+  git_mgr fetch --all
+
+  # Dry-run: see what would be fetched
+  git_mgr --dry-run fetch --all
+
+  # Run custom command (-- required before command)
+  git_mgr command -- git status -s
+
+  # Echo repo names
+  git_mgr command -- echo Processing: {}
+
+  # Generate config from existing structure
+  git_mgr dump ~/source/projects > ~/.config/git_mgr/config.yaml
+
+  # Find repos not in config
+  git_mgr missing ~/source/projects
+
+  # Output YAML for missing repos
+  git_mgr missing --yaml ~/source/projects
+"""
+    )
+
+    # Global options
+    parser.add_argument(
+        '-V', '--version',
+        action='version',
+        version=f'git_mgr {VERSION}'
+    )
+    parser.add_argument(
+        '--license',
+        action='store_true',
+        help='Show license information'
+    )
+    parser.add_argument(
+        '-c', '--config',
+        type=Path,
+        default=DEFAULT_CONFIG,
+        metavar='PATH',
+        help=f'Config file (default: {DEFAULT_CONFIG})'
+    )
+    parser.add_argument(
+        '-p', '--parallel',
+        type=int,
+        default=default_parallel,
+        metavar='N',
+        help=f'Number of parallel workers (default: {default_parallel})'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Verbose output'
+    )
+    parser.add_argument(
+        '--submodules',
+        action='store_true',
+        help='Include submodule directories'
+    )
+    parser.add_argument(
+        '-n', '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Show what would be done without executing'
+    )
+
+    subparsers = parser.add_subparsers(dest='command', title='commands')
+
+    # clone
+    clone_parser = subparsers.add_parser(
+        'clone',
+        help='Clone missing repos from config'
+    )
+    clone_parser.set_defaults(func=cmd_clone)
+
+    # pull
+    pull_parser = subparsers.add_parser(
+        'pull',
+        help='Pull all repos'
+    )
+    pull_parser.add_argument(
+        '--rebase',
+        action='store_true',
+        help='Use --rebase when pulling'
+    )
+    pull_parser.set_defaults(func=cmd_pull)
+
+    # fetch
+    fetch_parser = subparsers.add_parser(
+        'fetch',
+        help='Fetch all repos'
+    )
+    fetch_parser.add_argument(
+        '--all', '-a',
+        action='store_true',
+        help='Fetch all remotes'
+    )
+    fetch_parser.set_defaults(func=cmd_fetch)
+
+    # command
+    command_parser = subparsers.add_parser(
+        'command',
+        help='Run command on all repos ({} = repo name)'
+    )
+    command_parser.add_argument(
+        'cmd',
+        nargs=argparse.REMAINDER,
+        help='Command to run (use -- before command with flags)'
+    )
+    command_parser.set_defaults(func=cmd_command)
+
+    # dump
+    dump_parser = subparsers.add_parser(
+        'dump',
+        help='Generate config from existing directory structure'
+    )
+    dump_parser.add_argument(
+        'path',
+        nargs='?',
+        help='Directory to scan (default: current directory)'
+    )
+    dump_parser.add_argument(
+        '--sort-by', '-s',
+        choices=['path', 'url'],
+        default='path',
+        dest='sort_by',
+        help='Sort repos by path or url (default: path)'
+    )
+    dump_parser.set_defaults(func=cmd_dump)
+
+    # missing
+    missing_parser = subparsers.add_parser(
+        'missing',
+        help='Show repos not in config'
+    )
+    missing_parser.add_argument(
+        '--yaml', '-y',
+        action='store_true',
+        help='Output as YAML snippet for config'
+    )
+    missing_parser.add_argument(
+        'path',
+        nargs='?',
+        help='Directory to scan (default: base_dir from config)'
+    )
+    missing_parser.set_defaults(func=cmd_missing)
+
+    return parser
+
+
+def main() -> int:
+    """
+    Main entry point for git_mgr.
+
+    Returns:
+        Exit code (0 success, 1 fatal error, 2 partial failure)
+    """
+    parser: argparse.ArgumentParser = build_parser()
+    args: argparse.Namespace = parser.parse_args()
+
+    if args.license:
+        print(LICENSE_TEXT)
+        return 0
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    # Strip leading '--' from command args if present
+    if args.command == 'command' and args.cmd and args.cmd[0] == '--':
+        args.cmd = args.cmd[1:]
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
