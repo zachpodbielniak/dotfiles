@@ -91,7 +91,7 @@ _source "/usr/libexec/immutablue/immutablue-header.sh"
 
 
 # cd configuration / lookup for fast dir changes
-export CDPATH=".:${HOME}/Documents:${HOME}:${HOME}/Documents/notes:${HOME}/Source/Projects:${HOME}/Source/Public"
+export CDPATH=".:${HOME}/Documents:${HOME}:${HOME}/Documents/notes:${HOME}/source/projects:${HOME}/source/public"
 
 
 # bash options
@@ -150,10 +150,10 @@ alias summarize="ai_summary_as_markdown"
 alias claude="claude_wrapper"
 
 alias cdd="cd ${HOME}/.dotfiles"
-alias cdp="cd ${HOME}/Source/Projects"
-alias cdi="cd ${HOME}/Source/Projects/immutablue"
-alias cdh="cd ${HOME}/Source/Projects/hyacinth-macaw"
-alias cdk="cd ${HOME}/Source/Projects/kuberblue"
+alias cdp="cd ${HOME}/source/projects"
+alias cdi="cd ${HOME}/source/projects/immutablue"
+alias cdh="cd ${HOME}/source/projects/hyacinth-macaw"
+alias cdk="cd ${HOME}/source/projects/kuberblue"
 
 alias cdnas="cd /var/mnt/NAS"
 alias cdnasme="cd /var/mnt/NAS/Media"
