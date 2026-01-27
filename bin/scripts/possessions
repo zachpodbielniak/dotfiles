@@ -44,6 +44,7 @@ try:
     import tempfile
     import uuid
     import re
+    import shutil
 except ImportError as e:
     print(f"Error: Missing required Python module: {e}", file=sys.stderr)
     print("Please install the required dependencies:", file=sys.stderr)
@@ -240,6 +241,94 @@ class PossessionsManager:
         
         where = " AND ".join(clauses) if clauses else "TRUE"
         return where, params
+
+    def _fzf_select_item(self, header: str = "Select an item", include_disposed: bool = False) -> Optional[str]:
+        """
+        Display fzf picker for item selection.
+        Returns full UUID of selected item, or None if cancelled.
+        """
+        fzf_path = shutil.which('fzf')
+        if not fzf_path:
+            self._error("fzf command not found. Please install fzf.")
+            return None
+
+        # Query items for picker
+        where_clause = "TRUE" if include_disposed else "NOT is_disposed"
+        self.cursor.execute(f"""
+            SELECT id, name, category, location, necessity, current_value
+            FROM items WHERE {where_clause} ORDER BY name
+        """)
+        rows = self.cursor.fetchall()
+
+        if not rows:
+            self._info("No items found.")
+            return None
+
+        # Create temp file for picker data
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            for row in rows:
+                line = f"{str(row['id'])[:8]} | {(row['name'] or '')[:30]:<30} | " \
+                       f"{(row['category'] or '')[:15]:<15} | {(row['location'] or '')[:15]:<15} | " \
+                       f"{(row['necessity'] or 'unknown'):<7} | {self._format_money(row['current_value'])}"
+                f.write(line + '\n')
+            temp_file = f.name
+
+        # Create preview script
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(f'''#!/bin/bash
+export PGPASSWORD='{DB_CONFIG["password"]}'
+uuid="${{1%% *}}"
+full_uuid=$(psql -h {DB_CONFIG["host"]} -p {DB_CONFIG["port"]} -d {DB_CONFIG["database"]} -U {DB_CONFIG["user"]} -t -c "SELECT id FROM items WHERE id::text LIKE '$uuid%' LIMIT 1" 2>/dev/null | tr -d ' ')
+[ -z "$full_uuid" ] && echo "Item not found" && exit 1
+psql -h {DB_CONFIG["host"]} -p {DB_CONFIG["port"]} -d {DB_CONFIG["database"]} -U {DB_CONFIG["user"]} -t -c "
+SELECT
+    '━━━ ITEM: ' || name || ' ━━━' || E'\\n' ||
+    'ID: ' || id || E'\\n' ||
+    'Category: ' || COALESCE(category, '-') || E'\\n' ||
+    'Location: ' || COALESCE(location, '-') || E'\\n' ||
+    E'\\n━━━ ACQUISITION ━━━\\n' ||
+    'Date: ' || COALESCE(acquired_date::text, '-') || E'\\n' ||
+    'From: ' || COALESCE(acquired_from, '-') || E'\\n' ||
+    'Cost: ' || COALESCE('\\$' || acquisition_cost::text, '-') || E'\\n' ||
+    'Value: ' || COALESCE('\\$' || current_value::text, '-') || E'\\n' ||
+    E'\\n━━━ STATUS ━━━\\n' ||
+    'Core: ' || CASE WHEN is_core THEN 'Yes' ELSE 'No' END || E'\\n' ||
+    'Necessity: ' || COALESCE(necessity, 'unknown') || E'\\n' ||
+    'Last Used: ' || COALESCE(last_used_date::text, '-') || E'\\n' ||
+    'Usage: ' || COALESCE(usage_frequency, '-') || E'\\n' ||
+    'Condition: ' || COALESCE(condition, '-') || E'\\n' ||
+    CASE WHEN notes IS NOT NULL THEN E'\\n━━━ NOTES ━━━\\n' || notes ELSE '' END ||
+    CASE WHEN array_length(tags, 1) > 0 THEN E'\\nTags: ' || array_to_string(tags, ', ') ELSE '' END
+FROM items WHERE id = '$full_uuid'::uuid
+" 2>/dev/null
+''')
+            preview_file = f.name
+        os.chmod(preview_file, 0o755)
+
+        try:
+            fzf_cmd = [
+                fzf_path,
+                '--preview', f'{preview_file} {{}}',
+                '--preview-window', 'down:60%:wrap',
+                '--header', f'{header} (Ctrl-C to cancel)',
+                '--bind', 'ctrl-/:toggle-preview'
+            ]
+
+            result = subprocess.run(fzf_cmd, stdin=open(temp_file), capture_output=True, text=True)
+
+            if result.returncode == 0 and result.stdout.strip():
+                selected = result.stdout.strip()
+                short_uuid = selected.split(' | ')[0].strip()
+
+                # Resolve to full UUID
+                self.cursor.execute("SELECT id FROM items WHERE id::text LIKE %s LIMIT 1", (f"{short_uuid}%",))
+                row = self.cursor.fetchone()
+                if row:
+                    return str(row['id'])
+            return None
+        finally:
+            os.unlink(temp_file)
+            os.unlink(preview_file)
 
     def _get_columns(self, args) -> List[str]:
         """Get columns to display from args"""
@@ -547,6 +636,17 @@ class PossessionsManager:
 
     def cmd_show(self, args):
         """Show details for an item"""
+        # Handle fzf selection
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select item to view")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
         item_id = self._parse_uuid(args.id)
         if not item_id:
             return
@@ -627,6 +727,17 @@ class PossessionsManager:
 
     def cmd_edit(self, args):
         """Edit item in $EDITOR"""
+        # Handle fzf selection
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select item to edit")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
         item_id = self._parse_uuid(args.id)
         if not item_id:
             return
@@ -717,6 +828,17 @@ class PossessionsManager:
 
     def cmd_use(self, args):
         """Mark item as used today"""
+        # Handle fzf selection
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select item to mark as used")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
         item_id = self._parse_uuid(args.id)
         if not item_id:
             return
@@ -738,6 +860,17 @@ class PossessionsManager:
 
     def cmd_dispose(self, args):
         """Mark item as disposed"""
+        # Handle fzf selection
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select item to dispose")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
         item_id = self._parse_uuid(args.id)
         if not item_id:
             return
@@ -773,6 +906,42 @@ class PossessionsManager:
         self.conn.commit()
         self._success(f"Disposed '{row['name']}' via {method or 'unspecified method'}")
 
+    def cmd_rm(self, args):
+        """Permanently remove an item from the database"""
+        # Handle fzf selection
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select item to delete")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
+        item_id = self._parse_uuid(args.id)
+        if not item_id:
+            return
+
+        # Get item info first
+        self.cursor.execute("SELECT name, is_disposed FROM items WHERE id = %s", (item_id,))
+        row = self.cursor.fetchone()
+
+        if not row:
+            self._error(f"Item not found: {args.id}")
+            return
+
+        # Confirmation unless --force
+        if not args.force:
+            confirm = input(f"Permanently delete '{row['name']}'? This cannot be undone. [y/N]: ").strip().lower()
+            if confirm not in ('y', 'yes'):
+                self._info("Cancelled.")
+                return
+
+        self.cursor.execute("DELETE FROM items WHERE id = %s", (item_id,))
+        self.conn.commit()
+        self._success(f"Permanently deleted '{row['name']}'")
+
     def cmd_search(self, args):
         """Full-text search items"""
         query = args.query
@@ -800,9 +969,32 @@ class PossessionsManager:
 
     def cmd_relate(self, args):
         """Link two items together"""
+        # Handle fzf selection for first item
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select source item to link")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
+        # Handle fzf selection for related item
+        fzf_related = getattr(args, 'fzf_related', False)
+        if fzf_related or not args.related_id:
+            if fzf_related or (not args.related_id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select target item to link to")
+                if not selected:
+                    return
+                args.related_id = selected
+            elif not args.related_id:
+                self._error("Related item ID required (use --fzf-related for interactive selection)")
+                return
+
         item_id = self._parse_uuid(args.id)
         related_id = self._parse_uuid(args.related_id)
-        
+
         if not item_id or not related_id:
             return
         
@@ -829,6 +1021,17 @@ class PossessionsManager:
 
     def cmd_evaluate(self, args):
         """Update necessity status for an item"""
+        # Handle fzf selection
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select item to evaluate")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
         item_id = self._parse_uuid(args.id)
         if not item_id:
             return
@@ -858,6 +1061,17 @@ class PossessionsManager:
 
     def cmd_core(self, args):
         """Mark item as core (non-optional)"""
+        # Handle fzf selection
+        if args.fzf or not args.id:
+            if args.fzf or (not args.id and sys.stdin.isatty()):
+                selected = self._fzf_select_item("Select item to mark as core")
+                if not selected:
+                    return
+                args.id = selected
+            elif not args.id:
+                self._error("Item ID required (use --fzf for interactive selection)")
+                return
+
         item_id = self._parse_uuid(args.id)
         if not item_id:
             return
@@ -1322,25 +1536,35 @@ def main():
     
     # Show command
     show_parser = subparsers.add_parser('show', help='Show item details')
-    show_parser.add_argument('id', help='Item ID (full or prefix)')
+    show_parser.add_argument('id', nargs='?', help='Item ID (full or prefix)')
+    show_parser.add_argument('--fzf', action='store_true', help='Select item using fzf')
     show_parser.add_argument('--format', choices=['yaml', 'json', 'markdown', 'md'], default='yaml')
     
     # Edit command
     edit_parser = subparsers.add_parser('edit', help='Edit item in $EDITOR')
-    edit_parser.add_argument('id', help='Item ID')
+    edit_parser.add_argument('id', nargs='?', help='Item ID')
+    edit_parser.add_argument('--fzf', action='store_true', help='Select item using fzf')
     
     # Use command
     use_parser = subparsers.add_parser('use', help='Mark item as used')
-    use_parser.add_argument('id', help='Item ID')
+    use_parser.add_argument('id', nargs='?', help='Item ID')
+    use_parser.add_argument('--fzf', action='store_true', help='Select item using fzf')
     use_parser.add_argument('--date', help='Use date (YYYY-MM-DD, default today)')
     
     # Dispose command
     dispose_parser = subparsers.add_parser('dispose', help='Mark item as disposed')
-    dispose_parser.add_argument('id', help='Item ID')
+    dispose_parser.add_argument('id', nargs='?', help='Item ID')
+    dispose_parser.add_argument('--fzf', action='store_true', help='Select item using fzf')
     dispose_parser.add_argument('-m', '--method', choices=DISPOSAL_METHODS, help='Disposal method')
     dispose_parser.add_argument('--amount', type=Decimal, help='Amount received (if sold)')
     dispose_parser.add_argument('--date', help='Disposal date (default today)')
-    
+
+    # Remove command
+    rm_parser = subparsers.add_parser('rm', help='Permanently remove an item')
+    rm_parser.add_argument('id', nargs='?', help='Item ID')
+    rm_parser.add_argument('--fzf', action='store_true', help='Select item using fzf')
+    rm_parser.add_argument('-f', '--force', action='store_true', help='Skip confirmation')
+
     # Search command
     search_parser = subparsers.add_parser('search', help='Search items')
     search_parser.add_argument('query', help='Search query')
@@ -1349,18 +1573,22 @@ def main():
     
     # Relate command
     relate_parser = subparsers.add_parser('relate', help='Link two items')
-    relate_parser.add_argument('id', help='Item ID')
-    relate_parser.add_argument('related_id', help='Related item ID')
+    relate_parser.add_argument('id', nargs='?', help='Item ID')
+    relate_parser.add_argument('related_id', nargs='?', help='Related item ID')
+    relate_parser.add_argument('--fzf', action='store_true', help='Select first item using fzf')
+    relate_parser.add_argument('--fzf-related', action='store_true', help='Select related item using fzf')
     
     # Evaluate command
     eval_parser = subparsers.add_parser('evaluate', help='Update necessity status')
-    eval_parser.add_argument('id', help='Item ID')
+    eval_parser.add_argument('id', nargs='?', help='Item ID')
     eval_parser.add_argument('necessity', choices=NECESSITIES, help='Necessity rating')
+    eval_parser.add_argument('--fzf', action='store_true', help='Select item using fzf')
     eval_parser.add_argument('-r', '--reason', help='Reason for rating')
     
     # Core command
     core_parser = subparsers.add_parser('core', help='Mark item as core')
-    core_parser.add_argument('id', help='Item ID')
+    core_parser.add_argument('id', nargs='?', help='Item ID')
+    core_parser.add_argument('--fzf', action='store_true', help='Select item using fzf')
     core_parser.add_argument('--unset', action='store_true', help='Remove core status')
     
     # Report command
@@ -1414,6 +1642,7 @@ def main():
         'edit': mgr.cmd_edit,
         'use': mgr.cmd_use,
         'dispose': mgr.cmd_dispose,
+        'rm': mgr.cmd_rm,
         'search': mgr.cmd_search,
         'relate': mgr.cmd_relate,
         'evaluate': mgr.cmd_evaluate,
