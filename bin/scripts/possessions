@@ -1,0 +1,1434 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+import os
+import sys
+import subprocess
+
+# Container check for distrobox - do this BEFORE any other imports
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Now import everything else inside the dev container
+try:
+    import argparse
+    import json
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    from datetime import datetime, date
+    from typing import Optional, List, Dict, Any
+    from tabulate import tabulate
+    from colorama import init, Fore, Style
+    from decimal import Decimal
+    import yaml
+    import tempfile
+    import uuid
+    import re
+except ImportError as e:
+    print(f"Error: Missing required Python module: {e}", file=sys.stderr)
+    print("Please install the required dependencies:", file=sys.stderr)
+    print("  pip install psycopg2-binary tabulate colorama pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+# Initialize colorama
+init(autoreset=True)
+
+# Database configuration
+DB_CONFIG = {
+    'host': os.environ.get('POSSESSIONS_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('POSSESSIONS_DB_PORT', '5432')),
+    'database': os.environ.get('POSSESSIONS_DB_NAME', 'possessions'),
+    'user': os.environ.get('POSSESSIONS_DB_USER', 'postgres'),
+    'password': os.environ.get('POSSESSIONS_DB_PASSWORD', '')
+}
+
+# Available columns for display
+ALL_COLUMNS = [
+    'id', 'name', 'description', 'category', 'location',
+    'acquired_date', 'acquired_from', 'acquisition_cost', 'current_value', 'url',
+    'count', 'last_used_date', 'usage_frequency', 'condition',
+    'is_core', 'necessity', 'necessity_reason', 'necessity_updated_at',
+    'notes', 'tags', 'related_to',
+    'is_disposed', 'disposed_date', 'disposed_method', 'disposed_amount',
+    'created_at', 'updated_at'
+]
+
+DEFAULT_COLUMNS = ['id', 'name', 'category', 'location', 'is_core', 'necessity', 'last_used_date', 'count', 'current_value']
+
+USAGE_FREQUENCIES = ['daily', 'weekly', 'monthly', 'rarely', 'never']
+CONDITIONS = ['new', 'excellent', 'good', 'fair', 'poor']
+NECESSITIES = ['need', 'want', 'unknown']
+DISPOSAL_METHODS = ['sold', 'donated', 'trashed', 'gifted', 'recycled', 'returned']
+
+
+class PossessionsManager:
+    def __init__(self, no_color: bool = False):
+        self.no_color = no_color
+        self.conn = None
+        self.cursor = None
+        self._connect()
+
+    def _connect(self):
+        """Establish database connection"""
+        try:
+            self.conn = psycopg2.connect(**DB_CONFIG)
+            self.cursor = self.conn.cursor(cursor_factory=RealDictCursor)
+        except psycopg2.Error as e:
+            self._error(f"Database connection failed: {e}")
+            self._error("Run 'local_postgres init-possessions' to initialize the database.")
+            sys.exit(1)
+
+    def __del__(self):
+        """Clean up database connection"""
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+
+    def _color(self, text: str, color: str) -> str:
+        """Apply color to text unless no_color is set"""
+        if self.no_color:
+            return text
+        return f"{color}{text}{Style.RESET_ALL}"
+
+    def _error(self, message: str):
+        """Print error message"""
+        print(self._color(f"Error: {message}", Fore.RED), file=sys.stderr)
+
+    def _success(self, message: str):
+        """Print success message"""
+        print(self._color(message, Fore.GREEN))
+
+    def _info(self, message: str):
+        """Print info message"""
+        print(self._color(message, Fore.CYAN))
+
+    def _warn(self, message: str):
+        """Print warning message"""
+        print(self._color(f"Warning: {message}", Fore.YELLOW))
+
+    def _format_date(self, dt) -> str:
+        """Format datetime for display"""
+        if dt is None:
+            return ""
+        if isinstance(dt, datetime):
+            return dt.strftime("%Y-%m-%d %H:%M")
+        if isinstance(dt, date):
+            return dt.strftime("%Y-%m-%d")
+        return str(dt)
+
+    def _format_money(self, amount) -> str:
+        """Format money for display"""
+        if amount is None:
+            return ""
+        return f"${amount:,.2f}"
+
+    def _format_value(self, value, col: str) -> str:
+        """Format a value based on column type"""
+        if value is None:
+            return ""
+        if col in ['acquisition_cost', 'current_value', 'disposed_amount']:
+            return self._format_money(value)
+        if col in ['acquired_date', 'last_used_date', 'disposed_date']:
+            return self._format_date(value)
+        if col in ['created_at', 'updated_at', 'necessity_updated_at']:
+            return self._format_date(value)
+        if col == 'tags' and isinstance(value, list):
+            return ', '.join(value)
+        if col == 'is_core' or col == 'is_disposed':
+            return '✓' if value else ''
+        if col == 'id':
+            return str(value)[:8]  # Short UUID
+        return str(value)
+
+    def _parse_uuid(self, id_str: str) -> Optional[str]:
+        """Parse a full or partial UUID, returning the full UUID if found"""
+        id_str = id_str.strip().lower()
+        
+        # Try exact match first
+        try:
+            uuid.UUID(id_str)
+            return id_str
+        except ValueError:
+            pass
+        
+        # Try prefix match
+        self.cursor.execute(
+            "SELECT id FROM items WHERE id::text LIKE %s AND NOT is_disposed LIMIT 2",
+            (f"{id_str}%",)
+        )
+        results = self.cursor.fetchall()
+        
+        if len(results) == 0:
+            # Also check disposed items
+            self.cursor.execute(
+                "SELECT id FROM items WHERE id::text LIKE %s LIMIT 2",
+                (f"{id_str}%",)
+            )
+            results = self.cursor.fetchall()
+        
+        if len(results) == 0:
+            self._error(f"No item found matching ID: {id_str}")
+            return None
+        if len(results) > 1:
+            self._error(f"Ambiguous ID prefix '{id_str}', matches multiple items")
+            return None
+        
+        return str(results[0]['id'])
+
+    def _build_where_clause(self, args, include_disposed: bool = False) -> tuple:
+        """Build WHERE clause and params from filter args"""
+        clauses = []
+        params = []
+        
+        if not include_disposed and not getattr(args, 'only_disposed', False):
+            clauses.append("NOT is_disposed")
+        
+        if getattr(args, 'only_disposed', False):
+            clauses.append("is_disposed")
+        
+        if getattr(args, 'category', None):
+            clauses.append("category ILIKE %s")
+            params.append(f"%{args.category}%")
+        
+        if getattr(args, 'location', None):
+            clauses.append("location ILIKE %s")
+            params.append(f"%{args.location}%")
+        
+        if getattr(args, 'necessity', None):
+            clauses.append("necessity = %s")
+            params.append(args.necessity)
+        
+        if getattr(args, 'tag', None):
+            for tag in args.tag:
+                clauses.append("%s = ANY(tags)")
+                params.append(tag)
+        
+        if getattr(args, 'min_value', None) is not None:
+            clauses.append("current_value >= %s")
+            params.append(args.min_value)
+        
+        if getattr(args, 'max_value', None) is not None:
+            clauses.append("current_value <= %s")
+            params.append(args.max_value)
+        
+        # Core filters
+        if getattr(args, 'core', False):
+            clauses.append("is_core = TRUE")
+        elif getattr(args, 'no_core', False):
+            clauses.append("is_core = FALSE")
+        
+        where = " AND ".join(clauses) if clauses else "TRUE"
+        return where, params
+
+    def _get_columns(self, args) -> List[str]:
+        """Get columns to display from args"""
+        if hasattr(args, 'cols') and args.cols:
+            cols = [c.strip() for c in args.cols.split(',')]
+            invalid = [c for c in cols if c not in ALL_COLUMNS]
+            if invalid:
+                self._warn(f"Unknown columns ignored: {', '.join(invalid)}")
+            return [c for c in cols if c in ALL_COLUMNS]
+        return DEFAULT_COLUMNS
+
+    def _output(self, rows: List[Dict], columns: List[str], args):
+        """Output rows in the specified format"""
+        output_format = getattr(args, 'format', 'table')
+        
+        if output_format == 'json':
+            # Convert to JSON-serializable format
+            output = []
+            for row in rows:
+                item = {}
+                for col in columns:
+                    val = row.get(col)
+                    if isinstance(val, (datetime, date)):
+                        item[col] = val.isoformat() if val else None
+                    elif isinstance(val, Decimal):
+                        item[col] = float(val) if val else None
+                    elif isinstance(val, uuid.UUID):
+                        item[col] = str(val)
+                    else:
+                        item[col] = val
+                output.append(item)
+            print(json.dumps(output, indent=2))
+        
+        elif output_format == 'csv':
+            import csv
+            import io
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(columns)
+            for row in rows:
+                writer.writerow([self._format_value(row.get(col), col) for col in columns])
+            print(output.getvalue())
+        
+        elif output_format == 'yaml':
+            output = []
+            for row in rows:
+                item = {}
+                for col in columns:
+                    val = row.get(col)
+                    if isinstance(val, (datetime, date)):
+                        item[col] = val.isoformat() if val else None
+                    elif isinstance(val, Decimal):
+                        item[col] = float(val) if val else None
+                    elif isinstance(val, uuid.UUID):
+                        item[col] = str(val)
+                    else:
+                        item[col] = val
+                output.append(item)
+            print(yaml.dump(output, default_flow_style=False))
+        
+        elif output_format == 'markdown':
+            if not rows:
+                print("*No items found.*")
+                return
+            
+            headers = columns
+            table_data = []
+            for row in rows:
+                table_data.append([self._format_value(row.get(col), col) for col in columns])
+            
+            print(tabulate(table_data, headers=headers, tablefmt='github'))
+            print(f"\n*{len(rows)} item(s)*")
+        
+        else:  # table format
+            if not rows:
+                self._info("No items found.")
+                return
+            
+            headers = columns
+            table_data = []
+            for row in rows:
+                table_data.append([self._format_value(row.get(col), col) for col in columns])
+            
+            print(tabulate(table_data, headers=headers, tablefmt='simple'))
+            print(f"\n{len(rows)} item(s)")
+
+    # ============== COMMANDS ==============
+
+    def cmd_add(self, args):
+        """Add a new item"""
+        # Interactive mode if no name provided
+        if not args.name:
+            return self._add_interactive()
+        
+        # Build insert from args
+        fields = ['name']
+        values = [args.name]
+        placeholders = ['%s']
+        
+        if args.description:
+            fields.append('description')
+            values.append(args.description)
+            placeholders.append('%s')
+        
+        if args.category:
+            fields.append('category')
+            values.append(args.category)
+            placeholders.append('%s')
+        
+        if args.location:
+            fields.append('location')
+            values.append(args.location)
+            placeholders.append('%s')
+        
+        if args.acquired_date:
+            fields.append('acquired_date')
+            values.append(args.acquired_date)
+            placeholders.append('%s')
+        
+        if args.acquired_from:
+            fields.append('acquired_from')
+            values.append(args.acquired_from)
+            placeholders.append('%s')
+        
+        if args.cost is not None:
+            fields.append('acquisition_cost')
+            values.append(args.cost)
+            placeholders.append('%s')
+        
+        if args.value is not None:
+            fields.append('current_value')
+            values.append(args.value)
+            placeholders.append('%s')
+        
+        if args.url:
+            fields.append('url')
+            values.append(args.url)
+            placeholders.append('%s')
+        
+        if args.count is not None:
+            fields.append('count')
+            values.append(args.count)
+            placeholders.append('%s')
+        
+        if args.usage:
+            if args.usage not in USAGE_FREQUENCIES:
+                self._error(f"Invalid usage frequency. Choose from: {', '.join(USAGE_FREQUENCIES)}")
+                return
+            fields.append('usage_frequency')
+            values.append(args.usage)
+            placeholders.append('%s')
+        
+        if args.condition:
+            if args.condition not in CONDITIONS:
+                self._error(f"Invalid condition. Choose from: {', '.join(CONDITIONS)}")
+                return
+            fields.append('condition')
+            values.append(args.condition)
+            placeholders.append('%s')
+        
+        if args.necessity:
+            if args.necessity not in NECESSITIES:
+                self._error(f"Invalid necessity. Choose from: {', '.join(NECESSITIES)}")
+                return
+            fields.append('necessity')
+            values.append(args.necessity)
+            placeholders.append('%s')
+            fields.append('necessity_updated_at')
+            values.append(datetime.now())
+            placeholders.append('%s')
+        
+        if args.core:
+            fields.append('is_core')
+            values.append(True)
+            placeholders.append('%s')
+        
+        if args.notes:
+            fields.append('notes')
+            values.append(args.notes)
+            placeholders.append('%s')
+        
+        if args.tag:
+            fields.append('tags')
+            values.append(args.tag)
+            placeholders.append('%s')
+        
+        sql = f"""
+            INSERT INTO items ({', '.join(fields)})
+            VALUES ({', '.join(placeholders)})
+            RETURNING id
+        """
+        
+        try:
+            self.cursor.execute(sql, values)
+            item_id = self.cursor.fetchone()['id']
+            self.conn.commit()
+            self._success(f"Added item: {str(item_id)[:8]} - {args.name}")
+        except psycopg2.Error as e:
+            self.conn.rollback()
+            self._error(f"Failed to add item: {e}")
+
+    def _add_interactive(self):
+        """Interactive mode for adding items"""
+        print("Add new item (press Enter to skip optional fields)\n")
+        
+        name = input("Name (required): ").strip()
+        if not name:
+            self._error("Name is required")
+            return
+        
+        description = input("Description: ").strip() or None
+        category = input("Category: ").strip() or None
+        location = input("Location: ").strip() or None
+        
+        acquired_date = input("Acquired date (YYYY-MM-DD): ").strip() or None
+        acquired_from = input("Acquired from: ").strip() or None
+        
+        cost_str = input("Acquisition cost: ").strip()
+        cost = Decimal(cost_str.replace('$', '').replace(',', '')) if cost_str else None
+        
+        value_str = input("Current value: ").strip()
+        value = Decimal(value_str.replace('$', '').replace(',', '')) if value_str else None
+        
+        url = input("URL: ").strip() or None
+        
+        count_str = input("Count (default 1): ").strip()
+        count = int(count_str) if count_str else 1
+        
+        print(f"\nUsage frequency options: {', '.join(USAGE_FREQUENCIES)}")
+        usage = input("Usage frequency: ").strip() or None
+        if usage and usage not in USAGE_FREQUENCIES:
+            self._warn(f"Invalid frequency, using None")
+            usage = None
+        
+        print(f"\nCondition options: {', '.join(CONDITIONS)}")
+        condition = input("Condition: ").strip() or None
+        if condition and condition not in CONDITIONS:
+            self._warn(f"Invalid condition, using None")
+            condition = None
+        
+        is_core_str = input("Is this a core item? (y/N): ").strip().lower()
+        is_core = is_core_str in ('y', 'yes', '1', 'true')
+        
+        print(f"\nNecessity options: {', '.join(NECESSITIES)}")
+        necessity = input("Necessity: ").strip() or 'unknown'
+        if necessity not in NECESSITIES:
+            necessity = 'unknown'
+        
+        necessity_reason = None
+        if necessity != 'unknown':
+            necessity_reason = input("Reason for necessity rating: ").strip() or None
+        
+        notes = input("Notes: ").strip() or None
+        
+        tags_str = input("Tags (comma-separated): ").strip()
+        tags = [t.strip() for t in tags_str.split(',')] if tags_str else None
+        
+        # Build and execute insert
+        sql = """
+            INSERT INTO items (
+                name, description, category, location,
+                acquired_date, acquired_from, acquisition_cost, current_value, url,
+                count, usage_frequency, condition,
+                is_core, necessity, necessity_reason, necessity_updated_at,
+                notes, tags
+            ) VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s
+            )
+            RETURNING id
+        """
+        
+        try:
+            self.cursor.execute(sql, (
+                name, description, category, location,
+                acquired_date, acquired_from, cost, value, url,
+                count, usage, condition,
+                is_core, necessity, necessity_reason, datetime.now() if necessity != 'unknown' else None,
+                notes, tags
+            ))
+            item_id = self.cursor.fetchone()['id']
+            self.conn.commit()
+            self._success(f"\nAdded item: {str(item_id)[:8]} - {name}")
+        except psycopg2.Error as e:
+            self.conn.rollback()
+            self._error(f"Failed to add item: {e}")
+
+    def cmd_list(self, args):
+        """List items with optional filters"""
+        columns = self._get_columns(args)
+        where, params = self._build_where_clause(args, getattr(args, 'include_disposed', False))
+        
+        sql = f"""
+            SELECT * FROM items
+            WHERE {where}
+            ORDER BY name
+        """
+        
+        self.cursor.execute(sql, params)
+        rows = self.cursor.fetchall()
+        self._output(rows, columns, args)
+
+    def cmd_show(self, args):
+        """Show details for an item"""
+        item_id = self._parse_uuid(args.id)
+        if not item_id:
+            return
+        
+        self.cursor.execute("SELECT * FROM items WHERE id = %s", (item_id,))
+        row = self.cursor.fetchone()
+        
+        if not row:
+            self._error(f"Item not found: {args.id}")
+            return
+        
+        output_format = getattr(args, 'format', 'yaml')
+        
+        if output_format == 'json':
+            item = {}
+            for col in ALL_COLUMNS:
+                val = row.get(col)
+                if isinstance(val, (datetime, date)):
+                    item[col] = val.isoformat() if val else None
+                elif isinstance(val, Decimal):
+                    item[col] = float(val) if val else None
+                elif isinstance(val, uuid.UUID):
+                    item[col] = str(val)
+                else:
+                    item[col] = val
+            print(json.dumps(item, indent=2))
+        elif output_format == 'markdown':
+            # Pretty print markdown format
+            print(f"\n## {row['name']}")
+            print(f"**ID:** `{row['id']}`\n")
+            
+            for col in ALL_COLUMNS:
+                if col in ['id', 'name']:
+                    continue
+                val = row.get(col)
+                if val is not None and val != '' and val != []:
+                    formatted = self._format_value(val, col)
+                    if formatted:
+                        label = col.replace('_', ' ').title()
+                        if col == 'is_core':
+                            formatted = 'Yes' if val else 'No'
+                        if col == 'is_disposed':
+                            formatted = 'Yes' if val else 'No'
+                        print(f"- **{label}:** {formatted}")
+            
+            # Show related item if any
+            if row.get('related_to'):
+                self.cursor.execute("SELECT name FROM items WHERE id = %s", (row['related_to'],))
+                related = self.cursor.fetchone()
+                if related:
+                    print(f"- **Related Item:** {related['name']}")
+        else:
+            # Pretty print YAML-style
+            print(f"\n{self._color('Item:', Fore.CYAN)} {row['name']}")
+            print(f"{self._color('ID:', Fore.CYAN)} {row['id']}")
+            print("-" * 40)
+            
+            for col in ALL_COLUMNS:
+                if col in ['id', 'name']:
+                    continue
+                val = row.get(col)
+                if val is not None and val != '' and val != []:
+                    formatted = self._format_value(val, col)
+                    if formatted:
+                        label = col.replace('_', ' ').title()
+                        if col == 'is_core':
+                            formatted = 'Yes' if val else 'No'
+                        if col == 'is_disposed':
+                            formatted = 'Yes' if val else 'No'
+                        print(f"  {self._color(label + ':', Fore.YELLOW)} {formatted}")
+            
+            # Show related item if any
+            if row.get('related_to'):
+                self.cursor.execute("SELECT name FROM items WHERE id = %s", (row['related_to'],))
+                related = self.cursor.fetchone()
+                if related:
+                    print(f"  {self._color('Related Item:', Fore.YELLOW)} {related['name']}")
+
+    def cmd_edit(self, args):
+        """Edit item in $EDITOR"""
+        item_id = self._parse_uuid(args.id)
+        if not item_id:
+            return
+        
+        self.cursor.execute("SELECT * FROM items WHERE id = %s", (item_id,))
+        row = self.cursor.fetchone()
+        
+        if not row:
+            self._error(f"Item not found: {args.id}")
+            return
+        
+        # Convert to YAML-editable format
+        item = {}
+        editable_cols = [
+            'name', 'description', 'category', 'location',
+            'acquired_date', 'acquired_from', 'acquisition_cost', 'current_value', 'url',
+            'count', 'last_used_date', 'usage_frequency', 'condition',
+            'is_core', 'necessity', 'necessity_reason',
+            'notes', 'tags'
+        ]
+        
+        for col in editable_cols:
+            val = row.get(col)
+            if isinstance(val, (datetime, date)):
+                item[col] = val.isoformat() if val else None
+            elif isinstance(val, Decimal):
+                item[col] = float(val) if val else None
+            elif isinstance(val, uuid.UUID):
+                item[col] = str(val)
+            else:
+                item[col] = val
+        
+        # Write to temp file
+        editor = os.environ.get('EDITOR', 'vim')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(f"# Edit item: {row['name']}\n")
+            f.write(f"# ID: {item_id}\n")
+            f.write(f"# Usage frequencies: {', '.join(USAGE_FREQUENCIES)}\n")
+            f.write(f"# Conditions: {', '.join(CONDITIONS)}\n")
+            f.write(f"# Necessities: {', '.join(NECESSITIES)}\n")
+            f.write("# Save and close to update. Delete all content to cancel.\n\n")
+            yaml.dump(item, f, default_flow_style=False, allow_unicode=True)
+            temp_path = f.name
+        
+        try:
+            subprocess.run([editor, temp_path])
+            
+            with open(temp_path) as f:
+                content = f.read().strip()
+            
+            if not content or content.startswith('#'):
+                self._info("Edit cancelled.")
+                return
+            
+            # Parse updated YAML
+            updated = yaml.safe_load(content)
+            if not updated:
+                self._info("Edit cancelled.")
+                return
+            
+            # Build UPDATE statement
+            set_clauses = []
+            values = []
+            
+            for col in editable_cols:
+                if col in updated:
+                    new_val = updated[col]
+                    # Handle necessity update timestamp
+                    if col == 'necessity' and new_val != row.get('necessity'):
+                        set_clauses.append("necessity_updated_at = %s")
+                        values.append(datetime.now())
+                    set_clauses.append(f"{col} = %s")
+                    values.append(new_val)
+            
+            if not set_clauses:
+                self._info("No changes detected.")
+                return
+            
+            values.append(item_id)
+            sql = f"UPDATE items SET {', '.join(set_clauses)} WHERE id = %s"
+            
+            self.cursor.execute(sql, values)
+            self.conn.commit()
+            self._success(f"Updated item: {row['name']}")
+            
+        finally:
+            os.unlink(temp_path)
+
+    def cmd_use(self, args):
+        """Mark item as used today"""
+        item_id = self._parse_uuid(args.id)
+        if not item_id:
+            return
+        
+        use_date = args.date if args.date else date.today()
+        
+        self.cursor.execute(
+            "UPDATE items SET last_used_date = %s WHERE id = %s RETURNING name",
+            (use_date, item_id)
+        )
+        result = self.cursor.fetchone()
+        
+        if not result:
+            self._error(f"Item not found: {args.id}")
+            return
+        
+        self.conn.commit()
+        self._success(f"Marked '{result['name']}' as used on {use_date}")
+
+    def cmd_dispose(self, args):
+        """Mark item as disposed"""
+        item_id = self._parse_uuid(args.id)
+        if not item_id:
+            return
+        
+        # Get item info first
+        self.cursor.execute("SELECT name, is_disposed FROM items WHERE id = %s", (item_id,))
+        row = self.cursor.fetchone()
+        
+        if not row:
+            self._error(f"Item not found: {args.id}")
+            return
+        
+        if row['is_disposed']:
+            self._warn(f"Item '{row['name']}' is already marked as disposed.")
+            return
+        
+        method = args.method
+        if method and method not in DISPOSAL_METHODS:
+            self._error(f"Invalid disposal method. Choose from: {', '.join(DISPOSAL_METHODS)}")
+            return
+        
+        dispose_date = args.date if args.date else date.today()
+        
+        self.cursor.execute("""
+            UPDATE items SET
+                is_disposed = TRUE,
+                disposed_date = %s,
+                disposed_method = %s,
+                disposed_amount = %s
+            WHERE id = %s
+        """, (dispose_date, method, args.amount, item_id))
+        
+        self.conn.commit()
+        self._success(f"Disposed '{row['name']}' via {method or 'unspecified method'}")
+
+    def cmd_search(self, args):
+        """Full-text search items"""
+        query = args.query
+        columns = self._get_columns(args)
+        
+        # Build search across multiple text fields
+        sql = """
+            SELECT * FROM items
+            WHERE NOT is_disposed
+            AND (
+                name ILIKE %s
+                OR description ILIKE %s
+                OR category ILIKE %s
+                OR location ILIKE %s
+                OR notes ILIKE %s
+                OR acquired_from ILIKE %s
+            )
+            ORDER BY name
+        """
+        
+        pattern = f"%{query}%"
+        self.cursor.execute(sql, (pattern, pattern, pattern, pattern, pattern, pattern))
+        rows = self.cursor.fetchall()
+        self._output(rows, columns, args)
+
+    def cmd_relate(self, args):
+        """Link two items together"""
+        item_id = self._parse_uuid(args.id)
+        related_id = self._parse_uuid(args.related_id)
+        
+        if not item_id or not related_id:
+            return
+        
+        if item_id == related_id:
+            self._error("Cannot relate an item to itself")
+            return
+        
+        # Get names
+        self.cursor.execute("SELECT id, name FROM items WHERE id IN (%s, %s)", (item_id, related_id))
+        rows = self.cursor.fetchall()
+        
+        if len(rows) != 2:
+            self._error("One or both items not found")
+            return
+        
+        items = {str(r['id']): r['name'] for r in rows}
+        
+        self.cursor.execute(
+            "UPDATE items SET related_to = %s WHERE id = %s",
+            (related_id, item_id)
+        )
+        self.conn.commit()
+        self._success(f"Linked '{items[item_id]}' to '{items[related_id]}'")
+
+    def cmd_evaluate(self, args):
+        """Update necessity status for an item"""
+        item_id = self._parse_uuid(args.id)
+        if not item_id:
+            return
+        
+        self.cursor.execute("SELECT name, necessity FROM items WHERE id = %s", (item_id,))
+        row = self.cursor.fetchone()
+        
+        if not row:
+            self._error(f"Item not found: {args.id}")
+            return
+        
+        necessity = args.necessity
+        if necessity not in NECESSITIES:
+            self._error(f"Invalid necessity. Choose from: {', '.join(NECESSITIES)}")
+            return
+        
+        self.cursor.execute("""
+            UPDATE items SET
+                necessity = %s,
+                necessity_reason = %s,
+                necessity_updated_at = %s
+            WHERE id = %s
+        """, (necessity, args.reason, datetime.now(), item_id))
+        
+        self.conn.commit()
+        self._success(f"Updated '{row['name']}' necessity: {row['necessity']} → {necessity}")
+
+    def cmd_core(self, args):
+        """Mark item as core (non-optional)"""
+        item_id = self._parse_uuid(args.id)
+        if not item_id:
+            return
+        
+        is_core = not args.unset
+        
+        self.cursor.execute(
+            "UPDATE items SET is_core = %s WHERE id = %s RETURNING name",
+            (is_core, item_id)
+        )
+        result = self.cursor.fetchone()
+        
+        if not result:
+            self._error(f"Item not found: {args.id}")
+            return
+        
+        self.conn.commit()
+        if is_core:
+            self._success(f"Marked '{result['name']}' as core item")
+        else:
+            self._success(f"Removed core status from '{result['name']}'")
+
+    def cmd_report(self, args):
+        """Run various reports"""
+        report_type = args.type
+        columns = self._get_columns(args)
+        
+        if report_type == 'unused':
+            days = args.days or 90
+            # Exclude core items by default from unused report
+            core_filter = "" if args.core else "AND NOT is_core"
+            sql = f"""
+                SELECT * FROM items
+                WHERE NOT is_disposed {core_filter}
+                AND (
+                    last_used_date IS NULL
+                    OR last_used_date < CURRENT_DATE - INTERVAL '%s days'
+                )
+                ORDER BY last_used_date NULLS FIRST
+            """
+            self.cursor.execute(sql, (days,))
+        
+        elif report_type == 'wants':
+            core_filter = "" if args.core else "AND NOT is_core"
+            sql = f"""
+                SELECT * FROM items
+                WHERE NOT is_disposed {core_filter}
+                AND necessity = 'want'
+                ORDER BY current_value DESC NULLS LAST
+            """
+            self.cursor.execute(sql)
+        
+        elif report_type == 'unknown':
+            core_filter = "" if args.core else "AND NOT is_core"
+            sql = f"""
+                SELECT * FROM items
+                WHERE NOT is_disposed {core_filter}
+                AND necessity = 'unknown'
+                ORDER BY created_at
+            """
+            self.cursor.execute(sql)
+        
+        elif report_type == 'stale-eval':
+            days = args.days or 90
+            core_filter = "" if args.core else "AND NOT is_core"
+            sql = f"""
+                SELECT * FROM items
+                WHERE NOT is_disposed {core_filter}
+                AND (
+                    necessity_updated_at IS NULL
+                    OR necessity_updated_at < CURRENT_TIMESTAMP - INTERVAL '%s days'
+                )
+                ORDER BY necessity_updated_at NULLS FIRST
+            """
+            self.cursor.execute(sql, (days,))
+        
+        elif report_type == 'category':
+            sql = """
+                SELECT category, COUNT(*) as count,
+                       SUM(current_value) as total_value,
+                       SUM(count) as total_count
+                FROM items
+                WHERE NOT is_disposed
+                GROUP BY category
+                ORDER BY count DESC
+            """
+            self.cursor.execute(sql)
+            rows = self.cursor.fetchall()
+            output_format = getattr(args, 'format', 'table')
+            tablefmt = 'github' if output_format == 'markdown' else 'simple'
+            print(tabulate(
+                [[r['category'] or '(none)', r['count'], r['total_count'], self._format_money(r['total_value'])]
+                 for r in rows],
+                headers=['Category', 'Items', 'Total Count', 'Total Value'],
+                tablefmt=tablefmt
+            ))
+            return
+        
+        elif report_type == 'location':
+            sql = """
+                SELECT location, COUNT(*) as count,
+                       SUM(current_value) as total_value
+                FROM items
+                WHERE NOT is_disposed
+                GROUP BY location
+                ORDER BY count DESC
+            """
+            self.cursor.execute(sql)
+            rows = self.cursor.fetchall()
+            output_format = getattr(args, 'format', 'table')
+            tablefmt = 'github' if output_format == 'markdown' else 'simple'
+            print(tabulate(
+                [[r['location'] or '(none)', r['count'], self._format_money(r['total_value'])]
+                 for r in rows],
+                headers=['Location', 'Items', 'Total Value'],
+                tablefmt=tablefmt
+            ))
+            return
+        
+        elif report_type == 'value':
+            where, params = self._build_where_clause(args)
+            sql = f"""
+                SELECT * FROM items
+                WHERE {where}
+                ORDER BY current_value DESC NULLS LAST
+            """
+            self.cursor.execute(sql, params)
+        
+        elif report_type == 'cost':
+            where, params = self._build_where_clause(args)
+            sql = f"""
+                SELECT * FROM items
+                WHERE {where}
+                ORDER BY acquisition_cost DESC NULLS LAST
+            """
+            self.cursor.execute(sql, params)
+        
+        elif report_type == 'recent':
+            days = args.days or 30
+            sql = """
+                SELECT * FROM items
+                WHERE NOT is_disposed
+                AND acquired_date >= CURRENT_DATE - INTERVAL '%s days'
+                ORDER BY acquired_date DESC
+            """
+            self.cursor.execute(sql, (days,))
+        
+        elif report_type == 'disposed':
+            sql = """
+                SELECT * FROM items
+                WHERE is_disposed
+                ORDER BY disposed_date DESC NULLS LAST
+            """
+            self.cursor.execute(sql)
+            columns = ['id', 'name', 'disposed_date', 'disposed_method', 'disposed_amount', 'acquisition_cost']
+        
+        elif report_type == 'roi':
+            sql = """
+                SELECT *,
+                    CASE
+                        WHEN acquisition_cost > 0 THEN
+                            ROUND(((current_value - acquisition_cost) / acquisition_cost * 100)::numeric, 1)
+                        ELSE NULL
+                    END as roi_percent
+                FROM items
+                WHERE NOT is_disposed
+                AND acquisition_cost IS NOT NULL
+                AND current_value IS NOT NULL
+                ORDER BY roi_percent DESC NULLS LAST
+            """
+            self.cursor.execute(sql)
+            rows = self.cursor.fetchall()
+            output_format = getattr(args, 'format', 'table')
+            tablefmt = 'github' if output_format == 'markdown' else 'simple'
+            count_fmt = f"*{len(rows)} item(s)*" if output_format == 'markdown' else f"{len(rows)} item(s)"
+            print(tabulate(
+                [[str(r['id'])[:8], r['name'], self._format_money(r['acquisition_cost']),
+                  self._format_money(r['current_value']),
+                  f"{r['roi_percent']}%" if r['roi_percent'] else 'N/A']
+                 for r in rows],
+                headers=['ID', 'Name', 'Cost', 'Value', 'ROI'],
+                tablefmt=tablefmt
+            ))
+            print(f"\n{count_fmt}")
+            return
+        
+        elif report_type == 'duplicates':
+            sql = """
+                SELECT * FROM items
+                WHERE NOT is_disposed
+                AND count > 1
+                ORDER BY count DESC, name
+            """
+            self.cursor.execute(sql)
+        
+        elif report_type == 'core':
+            sql = """
+                SELECT * FROM items
+                WHERE NOT is_disposed
+                AND is_core = TRUE
+                ORDER BY name
+            """
+            self.cursor.execute(sql)
+        
+        else:
+            self._error(f"Unknown report type: {report_type}")
+            return
+        
+        rows = self.cursor.fetchall()
+        self._output(rows, columns, args)
+
+    def cmd_stats(self, args):
+        """Show statistics summary"""
+        # Total items and value
+        self.cursor.execute("""
+            SELECT
+                COUNT(*) as total_items,
+                SUM(count) as total_count,
+                SUM(current_value) as total_value,
+                SUM(acquisition_cost) as total_cost,
+                COUNT(*) FILTER (WHERE is_core) as core_items,
+                COUNT(*) FILTER (WHERE necessity = 'need') as need_items,
+                COUNT(*) FILTER (WHERE necessity = 'want') as want_items,
+                COUNT(*) FILTER (WHERE necessity = 'unknown') as unknown_items
+            FROM items
+            WHERE NOT is_disposed
+        """)
+        stats = self.cursor.fetchone()
+        
+        print(f"\n{self._color('Possessions Summary', Fore.CYAN)}")
+        print("=" * 40)
+        print(f"Total Items:      {stats['total_items']}")
+        print(f"Total Count:      {stats['total_count'] or 0}")
+        print(f"Core Items:       {stats['core_items']}")
+        print(f"Total Value:      {self._format_money(stats['total_value'])}")
+        print(f"Total Cost:       {self._format_money(stats['total_cost'])}")
+        
+        print(f"\n{self._color('Necessity Breakdown', Fore.CYAN)}")
+        print("-" * 40)
+        print(f"Need:    {stats['need_items']}")
+        print(f"Want:    {stats['want_items']}")
+        print(f"Unknown: {stats['unknown_items']}")
+        
+        # By category
+        self.cursor.execute("""
+            SELECT category, COUNT(*) as count, SUM(current_value) as value
+            FROM items
+            WHERE NOT is_disposed
+            GROUP BY category
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        categories = self.cursor.fetchall()
+        
+        if categories:
+            print(f"\n{self._color('Top Categories', Fore.CYAN)}")
+            print("-" * 40)
+            for cat in categories:
+                print(f"  {cat['category'] or '(none)':20} {cat['count']:5} items  {self._format_money(cat['value']):>12}")
+        
+        # Disposed stats
+        self.cursor.execute("""
+            SELECT
+                COUNT(*) as disposed_count,
+                SUM(disposed_amount) as total_recovered
+            FROM items
+            WHERE is_disposed
+        """)
+        disposed = self.cursor.fetchone()
+        
+        if disposed['disposed_count'] > 0:
+            print(f"\n{self._color('Disposed Items', Fore.CYAN)}")
+            print("-" * 40)
+            print(f"Items Disposed:   {disposed['disposed_count']}")
+            print(f"Amount Recovered: {self._format_money(disposed['total_recovered'])}")
+
+    def cmd_export(self, args):
+        """Export items to file"""
+        output_format = args.format or 'json'
+        
+        self.cursor.execute("SELECT * FROM items ORDER BY name")
+        rows = self.cursor.fetchall()
+        
+        output = []
+        for row in rows:
+            item = {}
+            for col in ALL_COLUMNS:
+                val = row.get(col)
+                if isinstance(val, (datetime, date)):
+                    item[col] = val.isoformat() if val else None
+                elif isinstance(val, Decimal):
+                    item[col] = float(val) if val else None
+                elif isinstance(val, uuid.UUID):
+                    item[col] = str(val)
+                else:
+                    item[col] = val
+            output.append(item)
+        
+        def _to_markdown(items):
+            """Convert items to markdown table"""
+            if not items:
+                return "*No items.*"
+            headers = ALL_COLUMNS
+            table_data = []
+            for item in items:
+                row_data = []
+                for col in headers:
+                    val = item.get(col)
+                    if val is None:
+                        row_data.append('')
+                    elif col in ['acquisition_cost', 'current_value', 'disposed_amount']:
+                        row_data.append(f"${val:,.2f}" if val else '')
+                    elif col in ['is_core', 'is_disposed']:
+                        row_data.append('✓' if val else '')
+                    elif col == 'tags' and isinstance(val, list):
+                        row_data.append(', '.join(val))
+                    elif col == 'id':
+                        row_data.append(str(val)[:8])
+                    else:
+                        row_data.append(str(val))
+                table_data.append(row_data)
+            return tabulate(table_data, headers=headers, tablefmt='github') + f"\n\n*{len(items)} item(s)*"
+        
+        if args.output:
+            with open(args.output, 'w') as f:
+                if output_format == 'json':
+                    json.dump(output, f, indent=2)
+                elif output_format == 'yaml':
+                    yaml.dump(output, f, default_flow_style=False)
+                elif output_format == 'csv':
+                    import csv
+                    writer = csv.DictWriter(f, fieldnames=ALL_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(output)
+                elif output_format == 'markdown':
+                    f.write(_to_markdown(output))
+            self._success(f"Exported {len(output)} items to {args.output}")
+        else:
+            if output_format == 'json':
+                print(json.dumps(output, indent=2))
+            elif output_format == 'yaml':
+                print(yaml.dump(output, default_flow_style=False))
+            elif output_format == 'csv':
+                import csv
+                import io
+                out = io.StringIO()
+                writer = csv.DictWriter(out, fieldnames=ALL_COLUMNS)
+                writer.writeheader()
+                writer.writerows(output)
+                print(out.getvalue())
+            elif output_format == 'markdown':
+                print(_to_markdown(output))
+
+    def cmd_import(self, args):
+        """Import items from file"""
+        input_format = args.format
+        if not input_format:
+            if args.file.endswith('.json'):
+                input_format = 'json'
+            elif args.file.endswith('.yaml') or args.file.endswith('.yml'):
+                input_format = 'yaml'
+            elif args.file.endswith('.csv'):
+                input_format = 'csv'
+            else:
+                input_format = 'json'
+        
+        try:
+            with open(args.file) as f:
+                if input_format == 'json':
+                    items = json.load(f)
+                elif input_format == 'yaml':
+                    items = yaml.safe_load(f)
+                elif input_format == 'csv':
+                    import csv
+                    reader = csv.DictReader(f)
+                    items = list(reader)
+        except Exception as e:
+            self._error(f"Failed to read file: {e}")
+            return
+        
+        imported = 0
+        skipped = 0
+        
+        for item in items:
+            # Skip if ID already exists
+            if item.get('id'):
+                self.cursor.execute("SELECT 1 FROM items WHERE id = %s", (item['id'],))
+                if self.cursor.fetchone():
+                    skipped += 1
+                    continue
+            
+            # Build insert
+            cols = []
+            vals = []
+            for col in ALL_COLUMNS:
+                if col in item and item[col] is not None:
+                    cols.append(col)
+                    vals.append(item[col])
+            
+            if 'name' not in cols:
+                self._warn(f"Skipping item without name")
+                skipped += 1
+                continue
+            
+            placeholders = ', '.join(['%s'] * len(cols))
+            sql = f"INSERT INTO items ({', '.join(cols)}) VALUES ({placeholders})"
+            
+            try:
+                self.cursor.execute(sql, vals)
+                imported += 1
+            except psycopg2.Error as e:
+                self._warn(f"Failed to import item: {e}")
+                skipped += 1
+        
+        self.conn.commit()
+        self._success(f"Imported {imported} items ({skipped} skipped)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Possessions tracker for minimalist lifestyle',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    parser.add_argument('--license', action='store_true', help='Show license information')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Add command
+    add_parser = subparsers.add_parser('add', help='Add a new item')
+    add_parser.add_argument('name', nargs='?', help='Item name (interactive mode if omitted)')
+    add_parser.add_argument('-d', '--description', help='Item description')
+    add_parser.add_argument('-c', '--category', help='Category')
+    add_parser.add_argument('-l', '--location', help='Storage location')
+    add_parser.add_argument('--acquired-date', help='Acquisition date (YYYY-MM-DD)')
+    add_parser.add_argument('--acquired-from', help='Where/who acquired from')
+    add_parser.add_argument('--cost', type=Decimal, help='Acquisition cost')
+    add_parser.add_argument('--value', type=Decimal, help='Current value')
+    add_parser.add_argument('--url', help='Product URL')
+    add_parser.add_argument('--count', type=int, default=1, help='Quantity')
+    add_parser.add_argument('--usage', choices=USAGE_FREQUENCIES, help='Usage frequency')
+    add_parser.add_argument('--condition', choices=CONDITIONS, help='Condition')
+    add_parser.add_argument('--necessity', choices=NECESSITIES, help='Necessity rating')
+    add_parser.add_argument('--core', action='store_true', help='Mark as core item')
+    add_parser.add_argument('--notes', help='Additional notes')
+    add_parser.add_argument('-t', '--tag', action='append', help='Tag (can be repeated)')
+    
+    # List command
+    list_parser = subparsers.add_parser('list', help='List items')
+    list_parser.add_argument('--cols', help='Columns to display (comma-separated)')
+    list_parser.add_argument('--format', choices=['table', 'json', 'csv', 'yaml', 'markdown', 'md'], default='table')
+    list_parser.add_argument('--category', help='Filter by category')
+    list_parser.add_argument('--location', help='Filter by location')
+    list_parser.add_argument('--necessity', choices=NECESSITIES, help='Filter by necessity')
+    list_parser.add_argument('-t', '--tag', action='append', help='Filter by tag')
+    list_parser.add_argument('--min-value', type=Decimal, help='Minimum value')
+    list_parser.add_argument('--max-value', type=Decimal, help='Maximum value')
+    list_parser.add_argument('--core', action='store_true', help='Show only core items')
+    list_parser.add_argument('--no-core', action='store_true', help='Exclude core items')
+    list_parser.add_argument('--include-disposed', action='store_true', help='Include disposed items')
+    list_parser.add_argument('--only-disposed', action='store_true', help='Show only disposed items')
+    
+    # Show command
+    show_parser = subparsers.add_parser('show', help='Show item details')
+    show_parser.add_argument('id', help='Item ID (full or prefix)')
+    show_parser.add_argument('--format', choices=['yaml', 'json', 'markdown', 'md'], default='yaml')
+    
+    # Edit command
+    edit_parser = subparsers.add_parser('edit', help='Edit item in $EDITOR')
+    edit_parser.add_argument('id', help='Item ID')
+    
+    # Use command
+    use_parser = subparsers.add_parser('use', help='Mark item as used')
+    use_parser.add_argument('id', help='Item ID')
+    use_parser.add_argument('--date', help='Use date (YYYY-MM-DD, default today)')
+    
+    # Dispose command
+    dispose_parser = subparsers.add_parser('dispose', help='Mark item as disposed')
+    dispose_parser.add_argument('id', help='Item ID')
+    dispose_parser.add_argument('-m', '--method', choices=DISPOSAL_METHODS, help='Disposal method')
+    dispose_parser.add_argument('--amount', type=Decimal, help='Amount received (if sold)')
+    dispose_parser.add_argument('--date', help='Disposal date (default today)')
+    
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search items')
+    search_parser.add_argument('query', help='Search query')
+    search_parser.add_argument('--cols', help='Columns to display')
+    search_parser.add_argument('--format', choices=['table', 'json', 'csv', 'yaml', 'markdown', 'md'], default='table')
+    
+    # Relate command
+    relate_parser = subparsers.add_parser('relate', help='Link two items')
+    relate_parser.add_argument('id', help='Item ID')
+    relate_parser.add_argument('related_id', help='Related item ID')
+    
+    # Evaluate command
+    eval_parser = subparsers.add_parser('evaluate', help='Update necessity status')
+    eval_parser.add_argument('id', help='Item ID')
+    eval_parser.add_argument('necessity', choices=NECESSITIES, help='Necessity rating')
+    eval_parser.add_argument('-r', '--reason', help='Reason for rating')
+    
+    # Core command
+    core_parser = subparsers.add_parser('core', help='Mark item as core')
+    core_parser.add_argument('id', help='Item ID')
+    core_parser.add_argument('--unset', action='store_true', help='Remove core status')
+    
+    # Report command
+    report_parser = subparsers.add_parser('report', help='Run reports')
+    report_parser.add_argument('type', choices=[
+        'unused', 'category', 'location', 'value', 'cost', 'recent',
+        'disposed', 'wants', 'unknown', 'stale-eval', 'roi', 'duplicates', 'core'
+    ], help='Report type')
+    report_parser.add_argument('--days', type=int, help='Days threshold for time-based reports')
+    report_parser.add_argument('--cols', help='Columns to display')
+    report_parser.add_argument('--format', choices=['table', 'json', 'csv', 'yaml', 'markdown', 'md'], default='table')
+    report_parser.add_argument('--category', help='Filter by category')
+    report_parser.add_argument('--location', help='Filter by location')
+    report_parser.add_argument('--core', action='store_true', help='Include core items in reports that exclude them')
+    report_parser.add_argument('--no-core', action='store_true', help='Exclude core items')
+    
+    # Stats command
+    stats_parser = subparsers.add_parser('stats', help='Show statistics')
+    
+    # Export command
+    export_parser = subparsers.add_parser('export', help='Export items')
+    export_parser.add_argument('-o', '--output', help='Output file')
+    export_parser.add_argument('--format', choices=['json', 'csv', 'yaml', 'markdown', 'md'], default='json')
+    
+    # Import command
+    import_parser = subparsers.add_parser('import', help='Import items')
+    import_parser.add_argument('file', help='Input file')
+    import_parser.add_argument('--format', choices=['json', 'csv', 'yaml'], help='File format (auto-detected from extension)')
+    
+    args = parser.parse_args()
+    
+    # Normalize 'md' alias to 'markdown'
+    if hasattr(args, 'format') and args.format == 'md':
+        args.format = 'markdown'
+    
+    if args.license:
+        print("AGPL-3.0-or-later")
+        print("Copyright (C) 2025 Zach Podbielniak")
+        return
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    mgr = PossessionsManager(no_color=args.no_color)
+    
+    cmd_map = {
+        'add': mgr.cmd_add,
+        'list': mgr.cmd_list,
+        'show': mgr.cmd_show,
+        'edit': mgr.cmd_edit,
+        'use': mgr.cmd_use,
+        'dispose': mgr.cmd_dispose,
+        'search': mgr.cmd_search,
+        'relate': mgr.cmd_relate,
+        'evaluate': mgr.cmd_evaluate,
+        'core': mgr.cmd_core,
+        'report': mgr.cmd_report,
+        'stats': mgr.cmd_stats,
+        'export': mgr.cmd_export,
+        'import': mgr.cmd_import,
+    }
+    
+    if args.command in cmd_map:
+        cmd_map[args.command](args)
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()
