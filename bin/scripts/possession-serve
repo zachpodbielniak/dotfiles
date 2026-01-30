@@ -1,0 +1,2051 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+# Container check for distrobox - do this BEFORE any other imports
+import os
+import subprocess
+import sys
+
+ctr_id = os.environ.get("CONTAINER_ID", "")
+no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check and ctr_id != "dev":
+    cmd = ["distrobox", "enter", "dev", "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+# Now import everything else inside the dev container
+import argparse
+import asyncio
+import json
+import uuid
+from datetime import datetime, date
+from decimal import Decimal
+from typing import Optional, List, Dict, Any
+
+# Try to import database dependencies
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extras import RealDictCursor
+    DB_AVAILABLE = True
+except ImportError:
+    print("Error: psycopg2 is required for possession-serve", file=sys.stderr)
+    print("Install with: pip install psycopg2-binary", file=sys.stderr)
+    sys.exit(1)
+
+# Try to import web server dependencies
+try:
+    from quart import Quart, request, jsonify
+    from quart_cors import cors
+except ImportError:
+    print("Error: Quart and quart-cors are required for possession-serve", file=sys.stderr)
+    print("Install with: pip install quart quart-cors", file=sys.stderr)
+    sys.exit(1)
+
+# Database configuration
+DB_CONFIG = {
+    'host': os.environ.get('POSSESSIONS_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('POSSESSIONS_DB_PORT', '5432')),
+    'database': os.environ.get('POSSESSIONS_DB_NAME', 'possessions'),
+    'user': os.environ.get('POSSESSIONS_DB_USER', 'postgres'),
+    'password': os.environ.get('POSSESSIONS_DB_PASSWORD', '')
+}
+
+# Constants
+USAGE_FREQUENCIES = ['daily', 'weekly', 'monthly', 'rarely', 'never']
+CONDITIONS = ['new', 'excellent', 'good', 'fair', 'poor']
+NECESSITIES = ['need', 'want', 'unknown']
+DISPOSAL_METHODS = ['sold', 'donated', 'trashed', 'gifted', 'recycled', 'returned']
+
+ALL_COLUMNS = [
+    'id', 'name', 'description', 'category', 'location',
+    'acquired_date', 'acquired_from', 'acquisition_cost', 'current_value', 'url',
+    'serial_number', 'count', 'last_used_date', 'usage_frequency', 'condition',
+    'is_core', 'necessity', 'necessity_reason', 'necessity_updated_at',
+    'notes', 'tags', 'related_to',
+    'is_disposed', 'disposed_date', 'disposed_method', 'disposed_amount',
+    'created_at', 'updated_at'
+]
+
+# Create Quart app
+app = Quart(__name__)
+app = cors(app, allow_origin="*")
+
+
+def get_db_connection():
+    """Get database connection."""
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def serialize_row(row: Dict) -> Dict:
+    """Convert database row to JSON-serializable dict."""
+    result = {}
+    for key, val in row.items():
+        if isinstance(val, (datetime, date)):
+            result[key] = val.isoformat() if val else None
+        elif isinstance(val, Decimal):
+            result[key] = float(val) if val else None
+        elif isinstance(val, uuid.UUID):
+            result[key] = str(val)
+        else:
+            result[key] = val
+    return result
+
+
+# HTML Template
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Possessions Tracker</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-tertiary: #1a1a25;
+            --bg-hover: #22222f;
+            --border-color: #2a2a3a;
+            --text-primary: #e0e0e8;
+            --text-secondary: #8888a0;
+            --text-muted: #555566;
+            --accent-primary: #00ff88;
+            --accent-secondary: #00ccff;
+            --accent-warning: #ffaa00;
+            --accent-danger: #ff4466;
+            --accent-purple: #aa88ff;
+            --shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            --radius: 8px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'JetBrains Mono', monospace;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
+            border-bottom: 1px solid var(--border-color);
+            padding: 20px 30px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+
+        .header-content {
+            max-width: 1600px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .logo-icon {
+            font-size: 28px;
+        }
+
+        .logo h1 {
+            font-size: 24px;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        /* Stats Bar */
+        .stats-bar {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius);
+            border: 1px solid var(--border-color);
+        }
+
+        .stat-value {
+            font-weight: 700;
+            color: var(--accent-primary);
+            font-size: 18px;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        /* Main Layout */
+        .main-container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px 30px;
+        }
+
+        /* Toolbar */
+        .toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .search-box {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex: 1;
+            max-width: 500px;
+        }
+
+        .search-input {
+            flex: 1;
+            padding: 12px 16px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px rgba(0, 255, 136, 0.1);
+        }
+
+        .filters {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        select, button {
+            font-family: inherit;
+            font-size: 14px;
+        }
+
+        select {
+            padding: 10px 14px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        select:hover {
+            border-color: var(--accent-secondary);
+        }
+
+        select:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: var(--radius);
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-primary), #00cc66);
+            color: #000;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0, 255, 136, 0.3);
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-hover);
+            border-color: var(--accent-secondary);
+        }
+
+        .btn-danger {
+            background: var(--accent-danger);
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background: #ff2244;
+        }
+
+        .btn-small {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .btn-icon {
+            padding: 8px;
+            min-width: 36px;
+            justify-content: center;
+        }
+
+        /* Table */
+        .table-container {
+            background: var(--bg-secondary);
+            border-radius: var(--radius);
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+            box-shadow: var(--shadow);
+        }
+
+        .table-scroll {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 14px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            background: var(--bg-tertiary);
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            position: sticky;
+            top: 0;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        th:hover {
+            color: var(--accent-primary);
+        }
+
+        th.sorted-asc::after {
+            content: ' ▲';
+            color: var(--accent-primary);
+        }
+
+        th.sorted-desc::after {
+            content: ' ▼';
+            color: var(--accent-primary);
+        }
+
+        tr:hover {
+            background: var(--bg-hover);
+        }
+
+        tr.disposed {
+            opacity: 0.5;
+        }
+
+        /* Badges */
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-need {
+            background: rgba(0, 255, 136, 0.15);
+            color: var(--accent-primary);
+        }
+
+        .badge-want {
+            background: rgba(255, 170, 0, 0.15);
+            color: var(--accent-warning);
+        }
+
+        .badge-unknown {
+            background: rgba(136, 136, 160, 0.15);
+            color: var(--text-secondary);
+        }
+
+        .badge-core {
+            background: rgba(170, 136, 255, 0.15);
+            color: var(--accent-purple);
+        }
+
+        .badge-disposed {
+            background: rgba(255, 68, 102, 0.15);
+            color: var(--accent-danger);
+        }
+
+        /* Tags */
+        .tags {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+        }
+
+        .tag {
+            padding: 2px 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        /* Money */
+        .money {
+            color: var(--accent-primary);
+            font-weight: 600;
+        }
+
+        .money-negative {
+            color: var(--accent-danger);
+        }
+
+        /* Actions Column */
+        .actions-cell {
+            display: flex;
+            gap: 4px;
+        }
+
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: flex-start;
+            padding: 40px 20px;
+            overflow-y: auto;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--bg-secondary);
+            border-radius: var(--radius);
+            border: 1px solid var(--border-color);
+            width: 100%;
+            max-width: 700px;
+            box-shadow: var(--shadow);
+            animation: slideIn 0.2s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .modal-header h2 {
+            font-size: 18px;
+            color: var(--accent-primary);
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            line-height: 1;
+        }
+
+        .modal-close:hover {
+            color: var(--accent-danger);
+        }
+
+        .modal-body {
+            padding: 20px;
+            max-height: 70vh;
+            overflow-y: auto;
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            padding: 20px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        /* Form */
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .form-group label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            padding: 10px 14px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 14px;
+        }
+
+        .form-group textarea {
+            min-height: 80px;
+            resize: vertical;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+
+        .form-group input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            accent-color: var(--accent-primary);
+        }
+
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        /* Detail View */
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+
+        .detail-item {
+            padding: 12px;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius);
+        }
+
+        .detail-item.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .detail-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .detail-value {
+            color: var(--text-primary);
+            word-break: break-word;
+        }
+
+        .detail-value a {
+            color: var(--accent-secondary);
+            text-decoration: none;
+        }
+
+        .detail-value a:hover {
+            text-decoration: underline;
+        }
+
+        /* Toast Notifications */
+        .toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .toast {
+            padding: 14px 20px;
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            box-shadow: var(--shadow);
+            animation: slideInRight 0.3s ease;
+            max-width: 400px;
+        }
+
+        @keyframes slideInRight {
+            from {
+                opacity: 0;
+                transform: translateX(100px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .toast-success {
+            border-color: var(--accent-primary);
+        }
+
+        .toast-error {
+            border-color: var(--accent-danger);
+        }
+
+        /* View Tabs */
+        .view-tabs {
+            display: flex;
+            gap: 5px;
+            background: var(--bg-tertiary);
+            padding: 4px;
+            border-radius: var(--radius);
+        }
+
+        .view-tab {
+            padding: 8px 16px;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 13px;
+            transition: all 0.2s ease;
+        }
+
+        .view-tab:hover {
+            color: var(--text-primary);
+        }
+
+        .view-tab.active {
+            background: var(--accent-primary);
+            color: #000;
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+
+        /* Loading */
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 40px;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--border-color);
+            border-top-color: var(--accent-primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Reports Section */
+        .reports-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        .report-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 20px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .report-card:hover {
+            border-color: var(--accent-primary);
+            transform: translateY(-2px);
+        }
+
+        .report-card h3 {
+            color: var(--accent-primary);
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+
+        .report-card p {
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        /* ID display */
+        .item-id {
+            font-family: monospace;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header-content {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .form-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .detail-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .toolbar {
+                flex-direction: column;
+            }
+
+            .search-box {
+                max-width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-content">
+            <div class="logo">
+                <span class="logo-icon">📦</span>
+                <h1>Possessions</h1>
+            </div>
+            <div class="stats-bar" id="statsBar">
+                <div class="stat-item">
+                    <span class="stat-value" id="totalItems">-</span>
+                    <span class="stat-label">Items</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-value" id="totalValue">-</span>
+                    <span class="stat-label">Total Value</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-value" id="coreItems">-</span>
+                    <span class="stat-label">Core</span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-primary" onclick="openAddModal()">
+                    <span>+</span> Add Item
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <div class="toolbar">
+            <div class="search-box">
+                <input type="text" class="search-input" id="searchInput" placeholder="Search items...">
+            </div>
+            <div class="filters">
+                <select id="categoryFilter">
+                    <option value="">All Categories</option>
+                </select>
+                <select id="locationFilter">
+                    <option value="">All Locations</option>
+                </select>
+                <select id="necessityFilter">
+                    <option value="">All Necessity</option>
+                    <option value="need">Need</option>
+                    <option value="want">Want</option>
+                    <option value="unknown">Unknown</option>
+                </select>
+                <select id="statusFilter">
+                    <option value="active">Active</option>
+                    <option value="disposed">Disposed</option>
+                    <option value="all">All</option>
+                </select>
+            </div>
+            <div class="view-tabs">
+                <button class="view-tab active" data-view="items">Items</button>
+                <button class="view-tab" data-view="reports">Reports</button>
+            </div>
+        </div>
+
+        <div id="itemsView">
+            <div class="table-container">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th data-sort="name">Name</th>
+                                <th data-sort="category">Category</th>
+                                <th data-sort="location">Location</th>
+                                <th data-sort="necessity">Necessity</th>
+                                <th data-sort="current_value">Value</th>
+                                <th data-sort="last_used_date">Last Used</th>
+                                <th data-sort="count">Qty</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="itemsTableBody">
+                            <tr>
+                                <td colspan="8" class="loading">
+                                    <div class="spinner"></div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="reportsView" style="display: none;">
+            <div class="reports-grid">
+                <div class="report-card" onclick="runReport('unused')">
+                    <h3>📅 Unused Items</h3>
+                    <p>Items not used in 90+ days</p>
+                </div>
+                <div class="report-card" onclick="runReport('wants')">
+                    <h3>🎯 Wants</h3>
+                    <p>Items marked as "want" (potential to declutter)</p>
+                </div>
+                <div class="report-card" onclick="runReport('unknown')">
+                    <h3>❓ Unknown Necessity</h3>
+                    <p>Items needing evaluation</p>
+                </div>
+                <div class="report-card" onclick="runReport('stale-eval')">
+                    <h3>🔄 Stale Evaluations</h3>
+                    <p>Items not evaluated in 90+ days</p>
+                </div>
+                <div class="report-card" onclick="runReport('category')">
+                    <h3>📊 By Category</h3>
+                    <p>Breakdown by category</p>
+                </div>
+                <div class="report-card" onclick="runReport('location')">
+                    <h3>🗺️ By Location</h3>
+                    <p>Breakdown by storage location</p>
+                </div>
+                <div class="report-card" onclick="runReport('value')">
+                    <h3>💰 By Value</h3>
+                    <p>Most valuable items</p>
+                </div>
+                <div class="report-card" onclick="runReport('recent')">
+                    <h3>🆕 Recent Acquisitions</h3>
+                    <p>Items acquired in last 30 days</p>
+                </div>
+                <div class="report-card" onclick="runReport('disposed')">
+                    <h3>🗑️ Disposed Items</h3>
+                    <p>Items no longer owned</p>
+                </div>
+                <div class="report-card" onclick="runReport('duplicates')">
+                    <h3>📋 Duplicates</h3>
+                    <p>Items with count > 1</p>
+                </div>
+                <div class="report-card" onclick="runReport('core')">
+                    <h3>⭐ Core Items</h3>
+                    <p>Essential possessions</p>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Add/Edit Modal -->
+    <div class="modal-overlay" id="itemModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 id="modalTitle">Add Item</h2>
+                <button class="modal-close" onclick="closeModal('itemModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="itemForm" class="form-grid">
+                    <input type="hidden" id="itemId">
+                    
+                    <div class="form-group full-width">
+                        <label for="itemName">Name *</label>
+                        <input type="text" id="itemName" required>
+                    </div>
+                    
+                    <div class="form-group full-width">
+                        <label for="itemDescription">Description</label>
+                        <textarea id="itemDescription"></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemCategory">Category</label>
+                        <input type="text" id="itemCategory" list="categorySuggestions">
+                        <datalist id="categorySuggestions"></datalist>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemLocation">Location</label>
+                        <input type="text" id="itemLocation" list="locationSuggestions">
+                        <datalist id="locationSuggestions"></datalist>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemAcquiredDate">Acquired Date</label>
+                        <input type="date" id="itemAcquiredDate">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemAcquiredFrom">Acquired From</label>
+                        <input type="text" id="itemAcquiredFrom">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemCost">Acquisition Cost</label>
+                        <input type="number" id="itemCost" step="0.01" min="0">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemValue">Current Value</label>
+                        <input type="number" id="itemValue" step="0.01" min="0">
+                    </div>
+                    
+                    <div class="form-group full-width">
+                        <label for="itemUrl">URL</label>
+                        <input type="url" id="itemUrl">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemSerialNumber">Serial Number</label>
+                        <input type="text" id="itemSerialNumber">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemCount">Quantity</label>
+                        <input type="number" id="itemCount" min="1" value="1">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemUsage">Usage Frequency</label>
+                        <select id="itemUsage">
+                            <option value="">Select...</option>
+                            <option value="daily">Daily</option>
+                            <option value="weekly">Weekly</option>
+                            <option value="monthly">Monthly</option>
+                            <option value="rarely">Rarely</option>
+                            <option value="never">Never</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemCondition">Condition</label>
+                        <select id="itemCondition">
+                            <option value="">Select...</option>
+                            <option value="new">New</option>
+                            <option value="excellent">Excellent</option>
+                            <option value="good">Good</option>
+                            <option value="fair">Fair</option>
+                            <option value="poor">Poor</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemNecessity">Necessity</label>
+                        <select id="itemNecessity">
+                            <option value="unknown">Unknown</option>
+                            <option value="need">Need</option>
+                            <option value="want">Want</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="itemNecessityReason">Necessity Reason</label>
+                        <input type="text" id="itemNecessityReason">
+                    </div>
+                    
+                    <div class="form-group full-width">
+                        <label for="itemNotes">Notes</label>
+                        <textarea id="itemNotes"></textarea>
+                    </div>
+                    
+                    <div class="form-group full-width">
+                        <label for="itemTags">Tags (comma separated)</label>
+                        <input type="text" id="itemTags">
+                    </div>
+                    
+                    <div class="form-group">
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="itemIsCore">
+                            <label for="itemIsCore">Core Item</label>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('itemModal')">Cancel</button>
+                <button class="btn btn-primary" onclick="saveItem()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detail Modal -->
+    <div class="modal-overlay" id="detailModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 id="detailTitle">Item Details</h2>
+                <button class="modal-close" onclick="closeModal('detailModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="detail-grid" id="detailContent"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="markUsed()" id="markUsedBtn">Mark Used</button>
+                <button class="btn btn-secondary" onclick="editCurrentItem()">Edit</button>
+                <button class="btn btn-danger" onclick="disposeCurrentItem()" id="disposeBtn">Dispose</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dispose Modal -->
+    <div class="modal-overlay" id="disposeModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Dispose Item</h2>
+                <button class="modal-close" onclick="closeModal('disposeModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="disposeMethod">Method</label>
+                        <select id="disposeMethod">
+                            <option value="">Select...</option>
+                            <option value="sold">Sold</option>
+                            <option value="donated">Donated</option>
+                            <option value="trashed">Trashed</option>
+                            <option value="gifted">Gifted</option>
+                            <option value="recycled">Recycled</option>
+                            <option value="returned">Returned</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="disposeAmount">Amount Received</label>
+                        <input type="number" id="disposeAmount" step="0.01" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label for="disposeDate">Date</label>
+                        <input type="date" id="disposeDate">
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('disposeModal')">Cancel</button>
+                <button class="btn btn-danger" onclick="confirmDispose()">Dispose</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        // State
+        let items = [];
+        let categories = [];
+        let locations = [];
+        let currentItem = null;
+        let sortColumn = 'name';
+        let sortDirection = 'asc';
+
+        // API helpers
+        async function api(endpoint, options = {}) {
+            const response = await fetch('/api' + endpoint, {
+                headers: { 'Content-Type': 'application/json' },
+                ...options
+            });
+            return response.json();
+        }
+
+        // Toast notifications
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
+        }
+
+        // Format helpers
+        function formatMoney(val) {
+            if (val == null) return '-';
+            return '$' + parseFloat(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function formatDate(val) {
+            if (!val) return '-';
+            return new Date(val).toLocaleDateString();
+        }
+
+        // Load data
+        async function loadItems() {
+            const params = new URLSearchParams();
+            
+            const search = document.getElementById('searchInput').value;
+            if (search) params.set('search', search);
+            
+            const category = document.getElementById('categoryFilter').value;
+            if (category) params.set('category', category);
+            
+            const location = document.getElementById('locationFilter').value;
+            if (location) params.set('location', location);
+            
+            const necessity = document.getElementById('necessityFilter').value;
+            if (necessity) params.set('necessity', necessity);
+            
+            const status = document.getElementById('statusFilter').value;
+            if (status === 'disposed') params.set('only_disposed', 'true');
+            else if (status === 'all') params.set('include_disposed', 'true');
+            
+            params.set('sort', sortColumn);
+            params.set('direction', sortDirection);
+            
+            const data = await api('/items?' + params.toString());
+            items = data.items;
+            renderTable();
+        }
+
+        async function loadStats() {
+            const data = await api('/stats');
+            document.getElementById('totalItems').textContent = data.total_items || 0;
+            document.getElementById('totalValue').textContent = formatMoney(data.total_value);
+            document.getElementById('coreItems').textContent = data.core_items || 0;
+        }
+
+        async function loadFilters() {
+            const data = await api('/filters');
+            categories = data.categories;
+            locations = data.locations;
+            
+            const catSelect = document.getElementById('categoryFilter');
+            const catSuggestions = document.getElementById('categorySuggestions');
+            categories.forEach(c => {
+                catSelect.innerHTML += `<option value="${c}">${c}</option>`;
+                catSuggestions.innerHTML += `<option value="${c}">`;
+            });
+            
+            const locSelect = document.getElementById('locationFilter');
+            const locSuggestions = document.getElementById('locationSuggestions');
+            locations.forEach(l => {
+                locSelect.innerHTML += `<option value="${l}">${l}</option>`;
+                locSuggestions.innerHTML += `<option value="${l}">`;
+            });
+        }
+
+        // Render table
+        function renderTable() {
+            const tbody = document.getElementById('itemsTableBody');
+            
+            if (items.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="8">
+                            <div class="empty-state">
+                                <div class="empty-state-icon">📦</div>
+                                <p>No items found</p>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+            
+            tbody.innerHTML = items.map(item => `
+                <tr class="${item.is_disposed ? 'disposed' : ''}" onclick="showDetail('${item.id}')">
+                    <td>
+                        <div>${item.name}</div>
+                        ${item.is_core ? '<span class="badge badge-core">Core</span>' : ''}
+                        ${item.is_disposed ? '<span class="badge badge-disposed">Disposed</span>' : ''}
+                    </td>
+                    <td>${item.category || '-'}</td>
+                    <td>${item.location || '-'}</td>
+                    <td>
+                        <span class="badge badge-${item.necessity || 'unknown'}">${item.necessity || 'unknown'}</span>
+                    </td>
+                    <td class="money">${formatMoney(item.current_value)}</td>
+                    <td>${formatDate(item.last_used_date)}</td>
+                    <td>${item.count || 1}</td>
+                    <td class="actions-cell" onclick="event.stopPropagation()">
+                        <button class="btn btn-small btn-secondary btn-icon" onclick="editItem('${item.id}')" title="Edit">✏️</button>
+                        ${!item.is_disposed ? `<button class="btn btn-small btn-secondary btn-icon" onclick="quickUse('${item.id}')" title="Mark Used">✓</button>` : ''}
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        // Modal helpers
+        function openModal(id) {
+            document.getElementById(id).classList.add('active');
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('active');
+        }
+
+        // Add item
+        function openAddModal() {
+            document.getElementById('modalTitle').textContent = 'Add Item';
+            document.getElementById('itemForm').reset();
+            document.getElementById('itemId').value = '';
+            document.getElementById('itemCount').value = '1';
+            openModal('itemModal');
+        }
+
+        // Edit item
+        async function editItem(id) {
+            const data = await api(`/items/${id}`);
+            const item = data.item;
+            
+            document.getElementById('modalTitle').textContent = 'Edit Item';
+            document.getElementById('itemId').value = item.id;
+            document.getElementById('itemName').value = item.name || '';
+            document.getElementById('itemDescription').value = item.description || '';
+            document.getElementById('itemCategory').value = item.category || '';
+            document.getElementById('itemLocation').value = item.location || '';
+            document.getElementById('itemAcquiredDate').value = item.acquired_date ? item.acquired_date.split('T')[0] : '';
+            document.getElementById('itemAcquiredFrom').value = item.acquired_from || '';
+            document.getElementById('itemCost').value = item.acquisition_cost || '';
+            document.getElementById('itemValue').value = item.current_value || '';
+            document.getElementById('itemUrl').value = item.url || '';
+            document.getElementById('itemSerialNumber').value = item.serial_number || '';
+            document.getElementById('itemCount').value = item.count || 1;
+            document.getElementById('itemUsage').value = item.usage_frequency || '';
+            document.getElementById('itemCondition').value = item.condition || '';
+            document.getElementById('itemNecessity').value = item.necessity || 'unknown';
+            document.getElementById('itemNecessityReason').value = item.necessity_reason || '';
+            document.getElementById('itemNotes').value = item.notes || '';
+            document.getElementById('itemTags').value = (item.tags || []).join(', ');
+            document.getElementById('itemIsCore').checked = item.is_core || false;
+            
+            openModal('itemModal');
+        }
+
+        // Save item
+        async function saveItem() {
+            const id = document.getElementById('itemId').value;
+            const tags = document.getElementById('itemTags').value
+                .split(',')
+                .map(t => t.trim())
+                .filter(t => t);
+            
+            const data = {
+                name: document.getElementById('itemName').value,
+                description: document.getElementById('itemDescription').value || null,
+                category: document.getElementById('itemCategory').value || null,
+                location: document.getElementById('itemLocation').value || null,
+                acquired_date: document.getElementById('itemAcquiredDate').value || null,
+                acquired_from: document.getElementById('itemAcquiredFrom').value || null,
+                acquisition_cost: document.getElementById('itemCost').value || null,
+                current_value: document.getElementById('itemValue').value || null,
+                url: document.getElementById('itemUrl').value || null,
+                serial_number: document.getElementById('itemSerialNumber').value || null,
+                count: parseInt(document.getElementById('itemCount').value) || 1,
+                usage_frequency: document.getElementById('itemUsage').value || null,
+                condition: document.getElementById('itemCondition').value || null,
+                necessity: document.getElementById('itemNecessity').value || 'unknown',
+                necessity_reason: document.getElementById('itemNecessityReason').value || null,
+                notes: document.getElementById('itemNotes').value || null,
+                tags: tags.length ? tags : null,
+                is_core: document.getElementById('itemIsCore').checked
+            };
+            
+            try {
+                if (id) {
+                    await api(`/items/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+                    showToast('Item updated');
+                } else {
+                    await api('/items', { method: 'POST', body: JSON.stringify(data) });
+                    showToast('Item added');
+                }
+                closeModal('itemModal');
+                loadItems();
+                loadStats();
+                loadFilters();
+            } catch (e) {
+                showToast('Error saving item', 'error');
+            }
+        }
+
+        // Show detail
+        async function showDetail(id) {
+            const data = await api(`/items/${id}`);
+            currentItem = data.item;
+            
+            document.getElementById('detailTitle').textContent = currentItem.name;
+            
+            const content = document.getElementById('detailContent');
+            content.innerHTML = `
+                <div class="detail-item">
+                    <div class="detail-label">ID</div>
+                    <div class="detail-value item-id">${currentItem.id}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Category</div>
+                    <div class="detail-value">${currentItem.category || '-'}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Location</div>
+                    <div class="detail-value">${currentItem.location || '-'}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Necessity</div>
+                    <div class="detail-value"><span class="badge badge-${currentItem.necessity || 'unknown'}">${currentItem.necessity || 'unknown'}</span></div>
+                </div>
+                ${currentItem.necessity_reason ? `
+                <div class="detail-item full-width">
+                    <div class="detail-label">Necessity Reason</div>
+                    <div class="detail-value">${currentItem.necessity_reason}</div>
+                </div>
+                ` : ''}
+                <div class="detail-item">
+                    <div class="detail-label">Core Item</div>
+                    <div class="detail-value">${currentItem.is_core ? '⭐ Yes' : 'No'}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Condition</div>
+                    <div class="detail-value">${currentItem.condition || '-'}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Acquisition Cost</div>
+                    <div class="detail-value money">${formatMoney(currentItem.acquisition_cost)}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Current Value</div>
+                    <div class="detail-value money">${formatMoney(currentItem.current_value)}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Quantity</div>
+                    <div class="detail-value">${currentItem.count || 1}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Usage Frequency</div>
+                    <div class="detail-value">${currentItem.usage_frequency || '-'}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Acquired Date</div>
+                    <div class="detail-value">${formatDate(currentItem.acquired_date)}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Acquired From</div>
+                    <div class="detail-value">${currentItem.acquired_from || '-'}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Last Used</div>
+                    <div class="detail-value">${formatDate(currentItem.last_used_date)}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Serial Number</div>
+                    <div class="detail-value">${currentItem.serial_number || '-'}</div>
+                </div>
+                ${currentItem.url ? `
+                <div class="detail-item full-width">
+                    <div class="detail-label">URL</div>
+                    <div class="detail-value"><a href="${currentItem.url}" target="_blank">${currentItem.url}</a></div>
+                </div>
+                ` : ''}
+                ${currentItem.description ? `
+                <div class="detail-item full-width">
+                    <div class="detail-label">Description</div>
+                    <div class="detail-value">${currentItem.description}</div>
+                </div>
+                ` : ''}
+                ${currentItem.notes ? `
+                <div class="detail-item full-width">
+                    <div class="detail-label">Notes</div>
+                    <div class="detail-value">${currentItem.notes}</div>
+                </div>
+                ` : ''}
+                ${currentItem.tags && currentItem.tags.length ? `
+                <div class="detail-item full-width">
+                    <div class="detail-label">Tags</div>
+                    <div class="detail-value tags">${currentItem.tags.map(t => `<span class="tag">${t}</span>`).join('')}</div>
+                </div>
+                ` : ''}
+                ${currentItem.is_disposed ? `
+                <div class="detail-item">
+                    <div class="detail-label">Disposed Date</div>
+                    <div class="detail-value">${formatDate(currentItem.disposed_date)}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Disposal Method</div>
+                    <div class="detail-value">${currentItem.disposed_method || '-'}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Amount Received</div>
+                    <div class="detail-value money">${formatMoney(currentItem.disposed_amount)}</div>
+                </div>
+                ` : ''}
+            `;
+            
+            // Update buttons based on disposed status
+            document.getElementById('markUsedBtn').style.display = currentItem.is_disposed ? 'none' : 'inline-flex';
+            document.getElementById('disposeBtn').style.display = currentItem.is_disposed ? 'none' : 'inline-flex';
+            
+            openModal('detailModal');
+        }
+
+        // Quick use
+        async function quickUse(id) {
+            try {
+                await api(`/items/${id}/use`, { method: 'POST' });
+                showToast('Marked as used');
+                loadItems();
+            } catch (e) {
+                showToast('Error', 'error');
+            }
+        }
+
+        // Mark used from detail
+        async function markUsed() {
+            if (!currentItem) return;
+            await quickUse(currentItem.id);
+            closeModal('detailModal');
+        }
+
+        // Edit from detail
+        function editCurrentItem() {
+            if (!currentItem) return;
+            closeModal('detailModal');
+            editItem(currentItem.id);
+        }
+
+        // Dispose from detail
+        function disposeCurrentItem() {
+            if (!currentItem) return;
+            document.getElementById('disposeMethod').value = '';
+            document.getElementById('disposeAmount').value = '';
+            document.getElementById('disposeDate').value = new Date().toISOString().split('T')[0];
+            closeModal('detailModal');
+            openModal('disposeModal');
+        }
+
+        // Confirm dispose
+        async function confirmDispose() {
+            if (!currentItem) return;
+            
+            const data = {
+                method: document.getElementById('disposeMethod').value || null,
+                amount: document.getElementById('disposeAmount').value || null,
+                date: document.getElementById('disposeDate').value || null
+            };
+            
+            try {
+                await api(`/items/${currentItem.id}/dispose`, { method: 'POST', body: JSON.stringify(data) });
+                showToast('Item disposed');
+                closeModal('disposeModal');
+                loadItems();
+                loadStats();
+            } catch (e) {
+                showToast('Error disposing item', 'error');
+            }
+        }
+
+        // Sorting
+        document.querySelectorAll('th[data-sort]').forEach(th => {
+            th.addEventListener('click', () => {
+                const col = th.dataset.sort;
+                if (sortColumn === col) {
+                    sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortColumn = col;
+                    sortDirection = 'asc';
+                }
+                
+                document.querySelectorAll('th').forEach(h => {
+                    h.classList.remove('sorted-asc', 'sorted-desc');
+                });
+                th.classList.add(`sorted-${sortDirection}`);
+                
+                loadItems();
+            });
+        });
+
+        // View tabs
+        document.querySelectorAll('.view-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                
+                const view = tab.dataset.view;
+                document.getElementById('itemsView').style.display = view === 'items' ? 'block' : 'none';
+                document.getElementById('reportsView').style.display = view === 'reports' ? 'block' : 'none';
+            });
+        });
+
+        // Reports
+        async function runReport(type) {
+            // For now, just filter items by report type
+            // Reset filters first
+            document.getElementById('searchInput').value = '';
+            document.getElementById('categoryFilter').value = '';
+            document.getElementById('locationFilter').value = '';
+            document.getElementById('necessityFilter').value = '';
+            
+            if (type === 'disposed') {
+                document.getElementById('statusFilter').value = 'disposed';
+            } else if (type === 'wants') {
+                document.getElementById('statusFilter').value = 'active';
+                document.getElementById('necessityFilter').value = 'want';
+            } else if (type === 'unknown') {
+                document.getElementById('statusFilter').value = 'active';
+                document.getElementById('necessityFilter').value = 'unknown';
+            } else {
+                document.getElementById('statusFilter').value = 'active';
+            }
+            
+            // Switch to items view
+            document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('.view-tab[data-view="items"]').classList.add('active');
+            document.getElementById('itemsView').style.display = 'block';
+            document.getElementById('reportsView').style.display = 'none';
+            
+            // For special reports, hit the report endpoint
+            if (['unused', 'stale-eval', 'category', 'location', 'value', 'recent', 'duplicates', 'core'].includes(type)) {
+                const data = await api(`/reports/${type}`);
+                items = data.items || [];
+                renderTable();
+                showToast(`Showing ${type} report`);
+            } else {
+                loadItems();
+            }
+        }
+
+        // Search debounce
+        let searchTimeout;
+        document.getElementById('searchInput').addEventListener('input', () => {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(loadItems, 300);
+        });
+
+        // Filter changes
+        ['categoryFilter', 'locationFilter', 'necessityFilter', 'statusFilter'].forEach(id => {
+            document.getElementById(id).addEventListener('change', loadItems);
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadStats();
+            loadFilters();
+            loadItems();
+        });
+    </script>
+</body>
+</html>
+"""
+
+
+# Routes
+@app.route('/')
+async def index():
+    """Main web interface."""
+    return HTML_TEMPLATE
+
+
+@app.route('/api/items', methods=['GET'])
+async def list_items():
+    """List items with filters."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    clauses = []
+    params = []
+    
+    # Status filter
+    only_disposed = request.args.get('only_disposed') == 'true'
+    include_disposed = request.args.get('include_disposed') == 'true'
+    
+    if only_disposed:
+        clauses.append("is_disposed = TRUE")
+    elif not include_disposed:
+        clauses.append("is_disposed = FALSE")
+    
+    # Search
+    search = request.args.get('search')
+    if search:
+        clauses.append("""(
+            name ILIKE %s OR description ILIKE %s OR category ILIKE %s 
+            OR location ILIKE %s OR notes ILIKE %s
+        )""")
+        pattern = f"%{search}%"
+        params.extend([pattern] * 5)
+    
+    # Category
+    category = request.args.get('category')
+    if category:
+        clauses.append("category = %s")
+        params.append(category)
+    
+    # Location
+    location = request.args.get('location')
+    if location:
+        clauses.append("location = %s")
+        params.append(location)
+    
+    # Necessity
+    necessity = request.args.get('necessity')
+    if necessity:
+        clauses.append("necessity = %s")
+        params.append(necessity)
+    
+    where = " AND ".join(clauses) if clauses else "TRUE"
+    
+    # Sorting
+    sort_col = request.args.get('sort', 'name')
+    if sort_col not in ALL_COLUMNS:
+        sort_col = 'name'
+    sort_dir = 'DESC' if request.args.get('direction') == 'desc' else 'ASC'
+    
+    sql = f"""
+        SELECT * FROM items
+        WHERE {where}
+        ORDER BY {sort_col} {sort_dir} NULLS LAST
+    """
+    
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'items': [serialize_row(r) for r in rows]})
+
+
+@app.route('/api/items', methods=['POST'])
+async def create_item():
+    """Create new item."""
+    data = await request.get_json()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Build insert
+    fields = []
+    values = []
+    placeholders = []
+    
+    field_map = {
+        'name': 'name', 'description': 'description', 'category': 'category',
+        'location': 'location', 'acquired_date': 'acquired_date', 
+        'acquired_from': 'acquired_from', 'acquisition_cost': 'acquisition_cost',
+        'current_value': 'current_value', 'url': 'url', 'serial_number': 'serial_number',
+        'count': 'count', 'usage_frequency': 'usage_frequency', 'condition': 'condition',
+        'necessity': 'necessity', 'necessity_reason': 'necessity_reason',
+        'notes': 'notes', 'tags': 'tags', 'is_core': 'is_core'
+    }
+    
+    for key, col in field_map.items():
+        if key in data and data[key] is not None:
+            fields.append(col)
+            values.append(data[key])
+            placeholders.append('%s')
+    
+    # Add necessity timestamp if necessity set
+    if data.get('necessity') and data['necessity'] != 'unknown':
+        fields.append('necessity_updated_at')
+        values.append(datetime.now())
+        placeholders.append('%s')
+    
+    sql = f"""
+        INSERT INTO items ({', '.join(fields)})
+        VALUES ({', '.join(placeholders)})
+        RETURNING id
+    """
+    
+    cursor.execute(sql, values)
+    item_id = cursor.fetchone()['id']
+    conn.commit()
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'id': str(item_id), 'success': True})
+
+
+@app.route('/api/items/<item_id>', methods=['GET'])
+async def get_item(item_id):
+    """Get single item."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    cursor.execute("SELECT * FROM items WHERE id = %s", (item_id,))
+    row = cursor.fetchone()
+    
+    cursor.close()
+    conn.close()
+    
+    if not row:
+        return jsonify({'error': 'Not found'}), 404
+    
+    return jsonify({'item': serialize_row(row)})
+
+
+@app.route('/api/items/<item_id>', methods=['PUT'])
+async def update_item(item_id):
+    """Update item."""
+    data = await request.get_json()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Get current item for necessity comparison
+    cursor.execute("SELECT necessity FROM items WHERE id = %s", (item_id,))
+    current = cursor.fetchone()
+    
+    # Build update
+    set_parts = []
+    values = []
+    
+    field_map = {
+        'name': 'name', 'description': 'description', 'category': 'category',
+        'location': 'location', 'acquired_date': 'acquired_date',
+        'acquired_from': 'acquired_from', 'acquisition_cost': 'acquisition_cost',
+        'current_value': 'current_value', 'url': 'url', 'serial_number': 'serial_number',
+        'count': 'count', 'usage_frequency': 'usage_frequency', 'condition': 'condition',
+        'necessity': 'necessity', 'necessity_reason': 'necessity_reason',
+        'notes': 'notes', 'tags': 'tags', 'is_core': 'is_core'
+    }
+    
+    for key, col in field_map.items():
+        if key in data:
+            set_parts.append(f"{col} = %s")
+            values.append(data[key])
+    
+    # Update necessity timestamp if changed
+    if current and data.get('necessity') != current.get('necessity'):
+        set_parts.append("necessity_updated_at = %s")
+        values.append(datetime.now())
+    
+    values.append(item_id)
+    
+    sql = f"UPDATE items SET {', '.join(set_parts)} WHERE id = %s"
+    cursor.execute(sql, values)
+    conn.commit()
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+
+@app.route('/api/items/<item_id>', methods=['DELETE'])
+async def delete_item(item_id):
+    """Delete item permanently."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("DELETE FROM items WHERE id = %s", (item_id,))
+    conn.commit()
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+
+@app.route('/api/items/<item_id>/use', methods=['POST'])
+async def mark_used(item_id):
+    """Mark item as used today."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "UPDATE items SET last_used_date = %s WHERE id = %s",
+        (date.today(), item_id)
+    )
+    conn.commit()
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+
+@app.route('/api/items/<item_id>/dispose', methods=['POST'])
+async def dispose_item(item_id):
+    """Mark item as disposed."""
+    data = await request.get_json()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE items SET
+            is_disposed = TRUE,
+            disposed_date = %s,
+            disposed_method = %s,
+            disposed_amount = %s
+        WHERE id = %s
+    """, (
+        data.get('date') or date.today(),
+        data.get('method'),
+        data.get('amount'),
+        item_id
+    ))
+    conn.commit()
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+
+@app.route('/api/stats')
+async def get_stats():
+    """Get summary statistics."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    cursor.execute("""
+        SELECT
+            COUNT(*) as total_items,
+            SUM(count) as total_count,
+            SUM(current_value) as total_value,
+            SUM(acquisition_cost) as total_cost,
+            COUNT(*) FILTER (WHERE is_core) as core_items,
+            COUNT(*) FILTER (WHERE necessity = 'need') as need_items,
+            COUNT(*) FILTER (WHERE necessity = 'want') as want_items,
+            COUNT(*) FILTER (WHERE necessity = 'unknown') as unknown_items
+        FROM items
+        WHERE NOT is_disposed
+    """)
+    stats = cursor.fetchone()
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify(serialize_row(stats))
+
+
+@app.route('/api/filters')
+async def get_filters():
+    """Get filter options."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    cursor.execute("SELECT DISTINCT category FROM items WHERE category IS NOT NULL ORDER BY category")
+    categories = [r['category'] for r in cursor.fetchall()]
+    
+    cursor.execute("SELECT DISTINCT location FROM items WHERE location IS NOT NULL ORDER BY location")
+    locations = [r['location'] for r in cursor.fetchall()]
+    
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'categories': categories, 'locations': locations})
+
+
+@app.route('/api/reports/<report_type>')
+async def run_report(report_type):
+    """Run a report."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    days = int(request.args.get('days', 90))
+    
+    if report_type == 'unused':
+        cursor.execute("""
+            SELECT * FROM items
+            WHERE NOT is_disposed AND NOT is_core
+            AND (last_used_date IS NULL OR last_used_date < CURRENT_DATE - INTERVAL '%s days')
+            ORDER BY last_used_date NULLS FIRST
+        """, (days,))
+    
+    elif report_type == 'stale-eval':
+        cursor.execute("""
+            SELECT * FROM items
+            WHERE NOT is_disposed AND NOT is_core
+            AND (necessity_updated_at IS NULL OR necessity_updated_at < CURRENT_TIMESTAMP - INTERVAL '%s days')
+            ORDER BY necessity_updated_at NULLS FIRST
+        """, (days,))
+    
+    elif report_type == 'category':
+        cursor.execute("""
+            SELECT category, COUNT(*) as count, SUM(current_value) as total_value
+            FROM items WHERE NOT is_disposed
+            GROUP BY category ORDER BY count DESC
+        """)
+    
+    elif report_type == 'location':
+        cursor.execute("""
+            SELECT location, COUNT(*) as count, SUM(current_value) as total_value
+            FROM items WHERE NOT is_disposed
+            GROUP BY location ORDER BY count DESC
+        """)
+    
+    elif report_type == 'value':
+        cursor.execute("""
+            SELECT * FROM items
+            WHERE NOT is_disposed
+            ORDER BY current_value DESC NULLS LAST
+        """)
+    
+    elif report_type == 'recent':
+        cursor.execute("""
+            SELECT * FROM items
+            WHERE NOT is_disposed
+            AND acquired_date >= CURRENT_DATE - INTERVAL '30 days'
+            ORDER BY acquired_date DESC
+        """)
+    
+    elif report_type == 'duplicates':
+        cursor.execute("""
+            SELECT * FROM items
+            WHERE NOT is_disposed AND count > 1
+            ORDER BY count DESC, name
+        """)
+    
+    elif report_type == 'core':
+        cursor.execute("""
+            SELECT * FROM items
+            WHERE NOT is_disposed AND is_core = TRUE
+            ORDER BY name
+        """)
+    
+    else:
+        cursor.close()
+        conn.close()
+        return jsonify({'error': 'Unknown report type'}), 400
+    
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    
+    return jsonify({'items': [serialize_row(r) for r in rows]})
+
+
+async def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description='Possessions web server')
+    parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
+    parser.add_argument('--port', type=int, default=5004, help='Port to bind to')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--license', action='store_true', help='Show license')
+    
+    args = parser.parse_args()
+    
+    if args.license:
+        print("AGPL-3.0-or-later")
+        print("Copyright (C) 2025 Zach Podbielniak")
+        return
+    
+    print(f"Starting Possession Server on http://{args.host}:{args.port}")
+    await app.run_task(host=args.host, port=args.port, debug=args.debug)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
