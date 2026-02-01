@@ -271,6 +271,19 @@ def load_context_from_file(date_str):
         print(f"Warning: Could not load context from {file_path}: {e}", file=sys.stderr)
         return None
 
+def is_native_image_gen_model(model: str) -> bool:
+    """Check if model uses Gemini native image generation (Nano Banana) API."""
+    native_image_patterns = [
+        "flash-image",        # gemini-2.5-flash-image
+        "pro-image-preview",  # gemini-3-pro-image-preview
+        "image-generation",   # gemini-2.0-flash-preview-image-generation
+    ]
+    return any(pattern in model.lower() for pattern in native_image_patterns)
+
+def is_imagen_model(model: str) -> bool:
+    """Check if model is an Imagen model (uses predict endpoint)."""
+    return "imagen" in model.lower()
+
 def get_model_limits(model):
     """Get input and output token limits for different Gemini models."""
     # Model limits based on official documentation (as of December 2025)
@@ -280,6 +293,7 @@ def get_model_limits(model):
         "gemini-3-pro-image-preview": {"input": 1_048_576, "output": 65_536},
 
         # Gemini 2.5 models
+        "gemini-2.5-flash-image": {"input": 1_048_576, "output": 8_192},
         "gemini-2.5-pro": {"input": 1_048_576, "output": 65_536},
         "gemini-2.5-flash": {"input": 1_048_576, "output": 65_536},
         "gemini-2.5-flash-preview": {"input": 1_048_576, "output": 65_536},
@@ -935,24 +949,64 @@ try:
             }
         }
     elif args.image_gen:
-        # Use the image generation API for Gemini (Imagen)
-        image_model = args.model if "imagen" in args.model else "imagen-3.0-generate-002"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:generateImage"
-        
-        # Validate aspect ratio (common ratios that Imagen typically supports)
-        valid_aspect_ratios = ["1:1", "16:9", "9:16", "4:3", "3:4"]
-        if args.size not in valid_aspect_ratios:
-            print(f"Warning: Aspect ratio '{args.size}' may not be supported. Common ratios: {', '.join(valid_aspect_ratios)}", file=sys.stderr)
-        
-        data = {
-            "prompt": {
-                "text": query
-            },
-            "config": {
-                "aspectRatio": args.size,
-                "sampleCount": 1
+        # Determine which image generation API to use based on the model
+        if is_native_image_gen_model(args.model):
+            # Nano Banana API: Uses generateContent with responseModalities
+            # Models: gemini-2.5-flash-image, gemini-3-pro-image-preview,
+            #         gemini-2.0-flash-preview-image-generation
+            image_model = args.model
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:generateContent"
+
+            data = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{
+                        "text": query
+                    }]
+                }],
+                "generationConfig": {
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "maxOutputTokens": 8192
+                }
             }
-        }
+        elif is_imagen_model(args.model):
+            # Imagen API: Uses predict endpoint
+            image_model = args.model
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:predict"
+
+            # Validate aspect ratio (common ratios that Imagen typically supports)
+            valid_aspect_ratios = ["1:1", "16:9", "9:16", "4:3", "3:4"]
+            if args.size not in valid_aspect_ratios:
+                print(f"Warning: Aspect ratio '{args.size}' may not be supported. Common ratios: {', '.join(valid_aspect_ratios)}", file=sys.stderr)
+
+            data = {
+                "instances": [{
+                    "prompt": query
+                }],
+                "parameters": {
+                    "aspectRatio": args.size,
+                    "sampleCount": 1
+                }
+            }
+        else:
+            # Default to Imagen for unrecognized models
+            image_model = "imagen-3.0-generate-002"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:predict"
+
+            # Validate aspect ratio (common ratios that Imagen typically supports)
+            valid_aspect_ratios = ["1:1", "16:9", "9:16", "4:3", "3:4"]
+            if args.size not in valid_aspect_ratios:
+                print(f"Warning: Aspect ratio '{args.size}' may not be supported. Common ratios: {', '.join(valid_aspect_ratios)}", file=sys.stderr)
+
+            data = {
+                "instances": [{
+                    "prompt": query
+                }],
+                "parameters": {
+                    "aspectRatio": args.size,
+                    "sampleCount": 1
+                }
+            }
     else:
         # Use standard generation endpoint
         endpoint = "generateContent"
@@ -1145,13 +1199,16 @@ try:
         elif args.image_gen or args.regen:
             response_data = response.json()
             image_data = None
-            
+
             # Handle different response formats
-            if "generatedImages" in response_data and len(response_data["generatedImages"]) > 0:
-                # Standard image generation format
+            if "predictions" in response_data and len(response_data["predictions"]) > 0:
+                # Imagen API format (uses :predict endpoint)
+                image_data = response_data["predictions"][0].get("bytesBase64Encoded")
+            elif "generatedImages" in response_data and len(response_data["generatedImages"]) > 0:
+                # Legacy image generation format
                 image_data = response_data["generatedImages"][0]["bytesBase64Encoded"]
             elif "candidates" in response_data and len(response_data["candidates"]) > 0:
-                # GenerateContent format (used for regeneration)
+                # GenerateContent format (used for Nano Banana and regeneration)
                 for candidate in response_data["candidates"]:
                     if "content" in candidate and "parts" in candidate["content"]:
                         for part in candidate["content"]["parts"]:
