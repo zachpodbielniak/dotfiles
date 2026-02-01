@@ -78,6 +78,13 @@ PROCESS_MISSING=false
 PROCESS_EXISTING=false
 NO_CONFIRM=false
 
+# Color metadata overrides (bypass ffprobe detection)
+OVERRIDE_COLOR_PRIMARIES=""
+OVERRIDE_COLOR_TRC=""
+OVERRIDE_COLORSPACE=""
+OVERRIDE_COLOR_RANGE=""
+GET_COLOR_METADATA_ONLY=false
+
 # Media library directories (easy to change for different mount points)
 # Check hostname to determine movie path
 if [[ "$(hostname)" =~ ^nas- ]]; then
@@ -276,6 +283,13 @@ OPTIONS:
     --process-missing          Only process files not already in output directory
     --process-existing         Only process files that already exist in output directory
     -y, --no-confirm           Automatically overwrite existing output files (ffmpeg -y)
+
+COLOR METADATA (to fix green/magenta tint issues):
+    --get-color-metadata       Show color metadata for input file(s) and exit
+    --color-primaries VALUE    Override color primaries (e.g., bt709, bt601, bt2020)
+    --color-trc VALUE          Override transfer characteristics (e.g., bt709, smpte2084)
+    --colorspace VALUE         Override color matrix (e.g., bt709, bt601, bt2020nc)
+    --color-range VALUE        Override color range (tv, pc)
 
 QUEUE MANAGEMENT (Redis-based async processing):
     --enqueue                   Add jobs to Redis queue instead of processing
@@ -809,6 +823,86 @@ get_auto_quality() {
     echo "$quality"
 }
 
+# Get video color metadata using ffprobe in container
+# Returns: color_primaries:color_trc:colorspace:color_range (e.g., "bt709:bt709:bt709:tv")
+# Returns empty fields for unset/unknown values
+get_color_metadata() {
+    local input_file="$1"
+    local input_dir
+    input_dir="$(dirname "$(realpath "$input_file")")"
+    local input_basename
+    input_basename="$(basename "$input_file")"
+
+    # Run ffprobe in container to get color metadata
+    local ffprobe_output
+    ffprobe_output=$(podman run --rm \
+        --security-opt label=disable \
+        --entrypoint ffprobe \
+        -v "${input_dir}:/input:z" \
+        "$CONTAINER_IMAGE" \
+        -v quiet \
+        -select_streams v:0 \
+        -show_entries "stream=color_primaries,color_transfer,color_space,color_range,width,height" \
+        -of "default=noprint_wrappers=1" \
+        "/input/${input_basename}" 2>/dev/null)
+
+    if [[ -z "$ffprobe_output" ]]; then
+        debug "Could not get color metadata from ffprobe"
+        echo ""
+        return 1
+    fi
+
+    # Parse the output
+    local color_primaries=""
+    local color_trc=""
+    local colorspace=""
+    local color_range=""
+    local width=""
+    local height=""
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            color_primaries) color_primaries="$value" ;;
+            color_transfer) color_trc="$value" ;;
+            color_space) colorspace="$value" ;;
+            color_range) color_range="$value" ;;
+            width) width="$value" ;;
+            height) height="$value" ;;
+        esac
+    done <<< "$ffprobe_output"
+
+    # If color metadata is missing or "unknown", try to infer from resolution
+    # HD content (720p+) is typically BT.709, SD is BT.601
+    if [[ "$color_primaries" == "unknown" ]] || [[ -z "$color_primaries" ]]; then
+        if [[ -n "$width" ]] && [[ "$width" =~ ^[0-9]+$ ]] && [[ $width -ge 1280 ]]; then
+            color_primaries="bt709"
+            debug "Inferred color_primaries=bt709 from HD resolution (${width}x${height})"
+        fi
+    fi
+
+    if [[ "$color_trc" == "unknown" ]] || [[ -z "$color_trc" ]]; then
+        if [[ -n "$width" ]] && [[ "$width" =~ ^[0-9]+$ ]] && [[ $width -ge 1280 ]]; then
+            color_trc="bt709"
+            debug "Inferred color_trc=bt709 from HD resolution (${width}x${height})"
+        fi
+    fi
+
+    if [[ "$colorspace" == "unknown" ]] || [[ -z "$colorspace" ]]; then
+        if [[ -n "$width" ]] && [[ "$width" =~ ^[0-9]+$ ]] && [[ $width -ge 1280 ]]; then
+            colorspace="bt709"
+            debug "Inferred colorspace=bt709 from HD resolution (${width}x${height})"
+        fi
+    fi
+
+    # Default color_range to tv (limited) if not set, as this is most common
+    if [[ "$color_range" == "unknown" ]] || [[ -z "$color_range" ]]; then
+        color_range="tv"
+    fi
+
+    debug "Color metadata: primaries=$color_primaries, trc=$color_trc, space=$colorspace, range=$color_range"
+    echo "${color_primaries}:${color_trc}:${colorspace}:${color_range}"
+}
+
 # Check if hardware acceleration is available
 check_hwaccel() {
     if [[ -c "$HWACCEL_DEVICE" ]]; then
@@ -1097,6 +1191,30 @@ parse_args() {
                 NO_CONFIRM=true
                 shift
                 ;;
+            --get-color-metadata)
+                GET_COLOR_METADATA_ONLY=true
+                shift
+                ;;
+            --color-primaries)
+                OVERRIDE_COLOR_PRIMARIES="$2"
+                shift 2
+                ;;
+            --color-trc)
+                OVERRIDE_COLOR_TRC="$2"
+                shift 2
+                ;;
+            --colorspace)
+                OVERRIDE_COLORSPACE="$2"
+                shift 2
+                ;;
+            --color-range)
+                if [[ "$2" != "tv" ]] && [[ "$2" != "pc" ]]; then
+                    error "Invalid color range: $2 (must be 'tv' or 'pc')"
+                    exit 1
+                fi
+                OVERRIDE_COLOR_RANGE="$2"
+                shift 2
+                ;;
             -*)
                 error "Unknown option: $1"
                 show_help
@@ -1302,7 +1420,75 @@ build_ffmpeg_args() {
     if [[ -n "${FFMPEG_PRESET:-}" ]]; then
         args+=("-preset" "$FFMPEG_PRESET")
     fi
-    
+
+    # Color metadata preservation to prevent green/magenta tint issues
+    # This is critical when converting between codecs (especially H.264 -> H.265)
+    # Command line overrides take precedence over ffprobe detection
+    local color_primaries=""
+    local color_trc=""
+    local colorspace=""
+    local color_range=""
+
+    # Check if any overrides are set - if so, use them and skip ffprobe
+    if [[ -n "$OVERRIDE_COLOR_PRIMARIES" ]] || [[ -n "$OVERRIDE_COLOR_TRC" ]] || \
+       [[ -n "$OVERRIDE_COLORSPACE" ]] || [[ -n "$OVERRIDE_COLOR_RANGE" ]]; then
+        color_primaries="$OVERRIDE_COLOR_PRIMARIES"
+        color_trc="$OVERRIDE_COLOR_TRC"
+        colorspace="$OVERRIDE_COLORSPACE"
+        color_range="$OVERRIDE_COLOR_RANGE"
+        debug "Using command line color metadata overrides"
+    else
+        # No overrides, detect from input file via ffprobe
+        local color_metadata
+        color_metadata=$(get_color_metadata "$input_file")
+        if [[ -n "$color_metadata" ]]; then
+            IFS=':' read -r color_primaries color_trc colorspace color_range <<< "$color_metadata"
+        fi
+    fi
+
+    # Set output color metadata if we have valid values
+    if [[ -n "$color_primaries" ]] && [[ "$color_primaries" != "unknown" ]]; then
+        args+=("-color_primaries" "$color_primaries")
+        debug "Setting output color_primaries=$color_primaries"
+    fi
+
+    if [[ -n "$color_trc" ]] && [[ "$color_trc" != "unknown" ]]; then
+        args+=("-color_trc" "$color_trc")
+        debug "Setting output color_trc=$color_trc"
+    fi
+
+    if [[ -n "$colorspace" ]] && [[ "$colorspace" != "unknown" ]]; then
+        args+=("-colorspace" "$colorspace")
+        debug "Setting output colorspace=$colorspace"
+    fi
+
+    if [[ -n "$color_range" ]] && [[ "$color_range" != "unknown" ]]; then
+        args+=("-color_range" "$color_range")
+        debug "Setting output color_range=$color_range"
+    fi
+
+    # For H.265/HEVC software encoding, also pass color info via x265-params
+    # This ensures the metadata is properly embedded in the HEVC stream
+    if [[ "$VIDEO_CODEC" == "h265" ]] && [[ "$hw_type" == "none" ]]; then
+        local x265_color_params=""
+        if [[ -n "$color_primaries" ]] && [[ "$color_primaries" != "unknown" ]]; then
+            x265_color_params+="colorprim=${color_primaries}:"
+        fi
+        if [[ -n "$color_trc" ]] && [[ "$color_trc" != "unknown" ]]; then
+            x265_color_params+="transfer=${color_trc}:"
+        fi
+        if [[ -n "$colorspace" ]] && [[ "$colorspace" != "unknown" ]]; then
+            x265_color_params+="colormatrix=${colorspace}:"
+        fi
+        # Remove trailing colon
+        x265_color_params="${x265_color_params%:}"
+
+        if [[ -n "$x265_color_params" ]]; then
+            args+=("-x265-params" "$x265_color_params")
+            debug "Setting x265-params: $x265_color_params"
+        fi
+    fi
+
     # Audio codec settings
     if [[ "$AUDIO_CODEC" == "copy" ]]; then
         args+=("-c:a" "copy")
@@ -2044,7 +2230,7 @@ show_queue_status() {
 }
 
 # Export function for parallel to use
-export -f process_video log error warn debug write_log is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library add_to_media_db get_video_resolution get_auto_quality
+export -f process_video log error warn debug write_log is_converted add_to_journal check_hwaccel check_vulkan build_ffmpeg_args copy_to_movie_library copy_to_tv_series_library add_to_media_db get_video_resolution get_auto_quality get_color_metadata
 
 # Wrapper function that parallel can call
 process_video_wrapper() {
@@ -2067,6 +2253,32 @@ main() {
 
     # Initialize logging
     init_logging "$@"
+
+    # Handle --get-color-metadata mode
+    # Show color metadata for each input file and exit
+    if [[ "$GET_COLOR_METADATA_ONLY" == "true" ]]; then
+        for input_file in "${INPUT_FILES[@]}"; do
+            if [[ ! -f "$input_file" ]]; then
+                error "Input file not found: $input_file"
+                continue
+            fi
+
+            echo "File: $input_file"
+            local metadata
+            metadata=$(get_color_metadata "$input_file")
+            if [[ -n "$metadata" ]]; then
+                IFS=':' read -r primaries trc space range <<< "$metadata"
+                echo "  color_primaries:  ${primaries:-unknown}"
+                echo "  color_trc:        ${trc:-unknown}"
+                echo "  colorspace:       ${space:-unknown}"
+                echo "  color_range:      ${range:-unknown}"
+            else
+                echo "  (could not detect color metadata)"
+            fi
+            echo ""
+        done
+        exit 0
+    fi
 
     # Handle queue modes
     if [[ "$MODE" == "enqueue" ]]; then
@@ -2160,6 +2372,7 @@ main() {
             export IS_MOVIE IS_TV_SERIES IS_VIDEO MOVIES_DIR TV_SERIES_DIR NO_SUBTITLES
             export CONTAINER_CPUS CONTAINER_MEMORY AUTO_QUALITY CUSTOM_QP MEDIA_TAGS NO_DB
             export PROCESS_MISSING PROCESS_EXISTING NO_CONFIRM
+            export OVERRIDE_COLOR_PRIMARIES OVERRIDE_COLOR_TRC OVERRIDE_COLORSPACE OVERRIDE_COLOR_RANGE
             
             # Process jobs in parallel
             local parallel_failed=0
