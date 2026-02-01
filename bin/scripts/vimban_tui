@@ -625,6 +625,8 @@ class AppState:
     selected_col: int = 0
     scroll_offset: int = 0
     detail_scroll: int = 0
+    kanban_scroll_offsets: dict[int, int] = field(default_factory=dict)  # per-column scroll offsets
+    kanban_cards_per_col: int = 0  # visible cards per column, set during render
 
     # Data cache
     tickets: list[Ticket] = field(default_factory=list)
@@ -926,11 +928,38 @@ class StateManager:
                 items: list[Ticket] = self.state.kanban_board.get(current_status, [])
                 max_row = max(0, len(items) - 1)
                 self.state.selected_row = max(0, min(self.state.selected_row, max_row))
+
+            # Adjust scroll offset to keep selected row visible
+            self._adjust_kanban_scroll()
         else:
             # List or Split layout
             max_row = max(0, len(self.state.tickets) - 1)
             self.state.selected_row = max(0, min(self.state.selected_row, max_row))
             self.state.selected_col = 0
+
+    def _adjust_kanban_scroll(self) -> None:
+        """
+        Adjust the kanban scroll offset for the current column to keep
+        the selected row visible within the viewport.
+        """
+        col_idx: int = self.state.selected_col
+        selected_row: int = self.state.selected_row
+        cards_per_col: int = self.state.kanban_cards_per_col
+
+        # If cards_per_col is 0, rendering hasn't happened yet - skip adjustment
+        if cards_per_col <= 0:
+            return
+
+        # Get current scroll offset for this column
+        current_scroll: int = self.state.kanban_scroll_offsets.get(col_idx, 0)
+
+        # Check if selected row is above visible area
+        if selected_row < current_scroll:
+            self.state.kanban_scroll_offsets[col_idx] = selected_row
+
+        # Check if selected row is below visible area
+        elif selected_row >= current_scroll + cards_per_col:
+            self.state.kanban_scroll_offsets[col_idx] = selected_row - cards_per_col + 1
 
     def get_selected_item(self) -> Optional[Ticket | Person]:
         """Get the currently selected item (ticket or person)."""
@@ -1705,6 +1734,9 @@ class KanbanRenderer:
         card_height: int = 3 if self.config.kanban_compact else 4
         cards_per_col: int = (height - 2) // card_height
 
+        # Store cards_per_col on state for scroll adjustment calculations
+        self.state.kanban_cards_per_col = cards_per_col
+
         for col_idx, status in enumerate(columns):
             col_x: int = start_x + (col_idx * col_width)
             tickets: list[Ticket] = self.state.kanban_board.get(status, [])
@@ -1718,12 +1750,16 @@ class KanbanRenderer:
             except curses.error:
                 pass
 
-            # Draw cards
-            for card_idx, ticket in enumerate(tickets[:cards_per_col]):
-                card_y: int = start_y + 1 + (card_idx * card_height)
+            # Draw cards with scroll offset
+            col_scroll: int = self.state.kanban_scroll_offsets.get(col_idx, 0)
+            visible_tickets: list[Ticket] = tickets[col_scroll:col_scroll + cards_per_col]
+
+            for display_idx, ticket in enumerate(visible_tickets):
+                card_y: int = start_y + 1 + (display_idx * card_height)
+                actual_idx: int = col_scroll + display_idx
                 is_selected: bool = (
                     col_idx == self.state.selected_col and
-                    card_idx == self.state.selected_row
+                    actual_idx == self.state.selected_row
                 )
 
                 self._draw_card(
@@ -1731,6 +1767,18 @@ class KanbanRenderer:
                     col_width - 2, card_height,
                     is_selected
                 )
+
+            # Draw scroll indicator if there are more tickets above or below
+            total_tickets: int = len(tickets)
+            if total_tickets > cards_per_col:
+                indicator: str = f"[{col_scroll + 1}-{min(col_scroll + cards_per_col, total_tickets)}/{total_tickets}]"
+                indicator_y: int = start_y + height - 1
+                try:
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_HELP))
+                    self.stdscr.addstr(indicator_y, col_x, indicator[:col_width - 2])
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_HELP))
+                except curses.error:
+                    pass
 
     def _draw_card(
         self,
@@ -2546,6 +2594,9 @@ class VimbanTUI:
         """Go to the first item."""
         self.state_manager.move_selection(absolute_row=0)
         self.state.scroll_offset = 0
+        # Reset kanban scroll for current column
+        if self.state.current_layout == LayoutType.KANBAN:
+            self.state.kanban_scroll_offsets[self.state.selected_col] = 0
 
     def _goto_bottom(self) -> None:
         """Go to the last item."""
