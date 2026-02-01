@@ -1,4 +1,4 @@
-#!/bin/bash 
+#!/bin/bash
 
 # dotfiles - Personal configuration files and scripts
 # Copyright (C) 2025  Zach Podbielniak
@@ -16,16 +16,318 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+# emoji - Comprehensive emoji picker and filter utility
+#
+# Supports:
+#   - Direct shortcode lookup
+#   - Interactive fzf picker
+#   - TSV list output for external tools
+#   - Filter stdin/file to replace :shortcode: with emojis
+#   - Search by name or shortcode
+#   - Category filtering
+#   - Clipboard copy
 
-emoji() {
-    if [ $# -ne 1 ]
+set -euo pipefail
+
+# Path to emoji data file
+EMOJI_DATA="${HOME}/.dotfiles/share/emoji/emojis.yaml"
+
+show_help () {
+    cat << 'EOF'
+emoji - Emoji picker and filter utility
+
+USAGE:
+    emoji [OPTIONS] [SHORTCODE]
+
+OPTIONS:
+    -h, --help        Show this help message
+    --license         Show AGPLv3 license information
+    -l, --list        Print all emojis (TSV: shortcode TAB emoji TAB name TAB category)
+    -c, --copy        Copy selected emoji to clipboard (use with picker)
+    -f, --filter      Filter stdin/file, replace :shortcode: with emojis
+    -s, --search TERM Search emojis by name or shortcode
+    --category CAT    Filter by category (partial match)
+    --categories      List all unique categories
+
+ARGUMENTS:
+    SHORTCODE         Direct lookup (e.g., `emoji rocket` outputs 🚀)
+    (no args)         Interactive fzf picker
+
+EXAMPLES:
+    emoji rocket                        # Direct lookup: outputs 🚀
+    emoji                               # Opens fzf picker
+    emoji -c                            # Picker, copy result to clipboard
+    emoji -l                            # List all emojis as TSV
+    emoji -l | grep smile               # Search via grep
+    emoji -s fire                       # Search for emojis matching "fire"
+    emoji --category Food               # List food-related emojis
+    emoji --categories                  # Show all categories
+    echo ":rocket: launch" | emoji -f   # Filter: outputs "🚀 launch"
+    emoji -f < notes.txt                # Filter file content
+
+TSV OUTPUT FORMAT (for -l/--list):
+    shortcode<TAB>emoji<TAB>name<TAB>category
+
+EOF
+}
+
+show_license () {
+    cat << 'EOF'
+emoji - Emoji picker and filter utility
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+# Load all emojis as TSV (shortcode\temoji\tname\tcategory)
+load_emojis_tsv () {
+    yq -r '.emojis[] | [.shortcode, .emoji, .name, .category] | @tsv' "${EMOJI_DATA}"
+}
+
+# List all emojis as TSV
+list_emojis () {
+    load_emojis_tsv
+}
+
+# List unique categories
+list_categories () {
+    yq -r '.emojis[].category' "${EMOJI_DATA}" | sort -u
+}
+
+# Search emojis by term (matches shortcode or name)
+search_emojis () {
+    local term="${1}"
+    load_emojis_tsv | grep -i "${term}" || true
+}
+
+# Filter by category
+filter_category () {
+    local cat="${1}"
+    load_emojis_tsv | awk -F'\t' -v cat="${cat}" 'tolower($4) ~ tolower(cat) {print}'
+}
+
+# Direct shortcode lookup - outputs emoji character or empty
+lookup_shortcode () {
+    local shortcode="${1}"
+    # Use yq v4 syntax with environment variable for the shortcode
+    SC="${shortcode}" yq -r '.emojis[] | select(.shortcode == strenv(SC)) | .emoji' "${EMOJI_DATA}" | head -1
+}
+
+# Interactive fzf picker
+fzf_picker () {
+    local copy_mode="${1:-false}"
+    local selected
+
+    # Format for fzf display: emoji  shortcode - name (category)
+    selected=$(load_emojis_tsv | awk -F'\t' '{printf "%s  %s - %s (%s)\n", $2, $1, $3, $4}' | fzf --prompt="Emoji> " --preview-window=hidden)
+
+    if [[ -z "${selected}" ]]
     then
-        echo "Use this correctly!"
-        echo "emoji <name>"
         return 1
     fi
 
-    filter_emoji <<< ":$1:"
+    # Extract just the emoji (first field before double space)
+    local emoji
+    emoji=$(echo "${selected}" | awk '{print $1}')
+
+    if [[ "${copy_mode}" == "true" ]]
+    then
+        copy_to_clipboard "${emoji}"
+        echo "Copied: ${emoji}" >&2
+    else
+        printf '%s' "${emoji}"
+    fi
 }
 
-emoji $@
+# Copy to clipboard (Wayland or X11)
+copy_to_clipboard () {
+    local content="${1}"
+
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]
+    then
+        printf '%s' "${content}" | wl-copy
+    elif [[ -n "${DISPLAY:-}" ]]
+    then
+        printf '%s' "${content}" | xclip -selection clipboard
+    else
+        echo "Error: No display server detected (Wayland or X11)" >&2
+        return 1
+    fi
+}
+
+# Filter mode: replace :shortcode: patterns with emojis
+filter_text () {
+    local input_file="${1:-/dev/stdin}"
+
+    # Build associative array of shortcode -> emoji
+    declare -A emoji_map
+    while IFS=$'\t' read -r shortcode emoji _name _category
+    do
+        emoji_map["${shortcode}"]="${emoji}"
+    done < <(load_emojis_tsv)
+
+    # Read input and replace :shortcode: patterns
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        # Find all :shortcode: patterns and replace them
+        while [[ "${line}" =~ :([a-zA-Z0-9_+-]+): ]]
+        do
+            local match="${BASH_REMATCH[0]}"
+            local shortcode="${BASH_REMATCH[1]}"
+
+            if [[ -v emoji_map["${shortcode}"] ]]
+            then
+                line="${line//${match}/${emoji_map["${shortcode}"]}}"
+            else
+                # No match found, break to avoid infinite loop
+                break
+            fi
+        done
+        echo "${line}"
+    done < "${input_file}"
+}
+
+main () {
+    local mode="picker"
+    local copy_mode="false"
+    local search_term=""
+    local category_filter=""
+    local shortcode_arg=""
+    local filter_file=""
+
+    # Check for data file
+    if [[ ! -f "${EMOJI_DATA}" ]]
+    then
+        echo "Error: Emoji data file not found: ${EMOJI_DATA}" >&2
+        echo "Please ensure the emoji data file is installed." >&2
+        exit 1
+    fi
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --license)
+                show_license
+                exit 0
+                ;;
+            -l|--list)
+                mode="list"
+                shift
+                ;;
+            -c|--copy)
+                copy_mode="true"
+                shift
+                ;;
+            -f|--filter)
+                mode="filter"
+                shift
+                # Check if next arg is a file (not another option)
+                if [[ $# -gt 0 && "${1}" != -* && -f "${1}" ]]
+                then
+                    filter_file="${1}"
+                    shift
+                fi
+                ;;
+            -s|--search)
+                mode="search"
+                shift
+                if [[ $# -eq 0 ]]
+                then
+                    echo "Error: --search requires a search term" >&2
+                    exit 1
+                fi
+                search_term="${1}"
+                shift
+                ;;
+            --category)
+                mode="category"
+                shift
+                if [[ $# -eq 0 ]]
+                then
+                    echo "Error: --category requires a category name" >&2
+                    exit 1
+                fi
+                category_filter="${1}"
+                shift
+                ;;
+            --categories)
+                mode="categories"
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: ${1}" >&2
+                show_help >&2
+                exit 1
+                ;;
+            *)
+                # Positional argument: shortcode lookup
+                shortcode_arg="${1}"
+                mode="lookup"
+                shift
+                ;;
+        esac
+    done
+
+    # Execute based on mode
+    case "${mode}" in
+        list)
+            list_emojis
+            ;;
+        categories)
+            list_categories
+            ;;
+        search)
+            search_emojis "${search_term}"
+            ;;
+        category)
+            filter_category "${category_filter}"
+            ;;
+        lookup)
+            local result
+            result=$(lookup_shortcode "${shortcode_arg}")
+            if [[ -n "${result}" ]]
+            then
+                if [[ "${copy_mode}" == "true" ]]
+                then
+                    copy_to_clipboard "${result}"
+                    echo "Copied: ${result}" >&2
+                else
+                    printf '%s' "${result}"
+                fi
+            else
+                echo "Error: Unknown shortcode: ${shortcode_arg}" >&2
+                exit 1
+            fi
+            ;;
+        filter)
+            if [[ -n "${filter_file}" ]]
+            then
+                filter_text "${filter_file}"
+            else
+                filter_text
+            fi
+            ;;
+        picker)
+            fzf_picker "${copy_mode}"
+            ;;
+    esac
+}
+
+main "$@"
