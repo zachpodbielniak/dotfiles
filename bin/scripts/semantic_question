@@ -1,4 +1,4 @@
-#!/bin/bash 
+#!/usr/bin/python3
 
 # dotfiles - Personal configuration files and scripts
 # Copyright (C) 2025  Zach Podbielniak
@@ -16,90 +16,491 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-set -euo pipefail
 
+"""
+semantic_question - Ask questions about your second brain using semantic search and LLMs.
 
-input=""
-limit=5
-provider="grokpy"
-sanitize="false"
-dry_run="false"
-child_args=()
+This script:
+1. Uses semantic_search to find relevant chunks from your notes
+2. Assembles context from matched chunks (respecting token limits)
+3. Queries an LLM with the context and your question
+4. Streams the response to stdout
+"""
 
+import os
+import sys
+import argparse
+import json
+import subprocess
+from pathlib import Path
+from typing import Optional
 
+# ----- Constants -----
+DEFAULT_PROVIDER: str = "ollampy"
+DEFAULT_LIMIT: int = 10
+DEFAULT_MAX_CONTEXT: int = 8000  # tokens
 
-print_help() {
-    echo -e "Usage: $(basename) <args>"
-    echo -e "  -h,--help\tshow this message"
-    echo -e "  -p,--prompt\tset the prompt (in addition to stdin if passed)"
-    echo -e "  --provider\twhich ai provider to use (claudpy, grokpy, perpy, ollampy, geminpy, openpy)"
-    echo -e "  --limit\tset the limit for search with semantic_search (default: 5)"
-    echo -e "  --sanitize\tpass data through the data sanitizer before passing off to the provider"
+# Token estimation
+CHARS_PER_TOKEN: float = 4.0
+
+# Provider configurations with approximate context windows
+PROVIDER_CONFIGS: dict = {
+    "ollampy": {"max_tokens": 8192, "default_model": None},
+    "claudpy": {"max_tokens": 100000, "default_model": None},
+    "grokpy": {"max_tokens": 131072, "default_model": None},
+    "geminpy": {"max_tokens": 1000000, "default_model": None},
+    "openpy": {"max_tokens": 128000, "default_model": None},
+    "perpy": {"max_tokens": 127000, "default_model": None},
 }
 
 
-while [[ $# -gt 0 ]]
-do 
-    case "${1}" in 
-    -h|--help)
-        print_help
-        exit 0
-        ;;
-    -p|--prompt)
-        input="${2}"
-        shift
-        ;;
-    --provider)
-        provider="${2}"
-        shift
-        ;;
-    --limit)
-        limit="${1}"
-        ;;
-    --sanitize)
-        sanitize="true"
-        ;;
-    --dry-run)
-        dry_run="true"
-        ;;
-    *)
-        child_args+=("${1}")
-        ;;
-    esac
-    shift
-done
+# ----- Argument Parsing -----
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Ask questions about your second brain using semantic search and LLMs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  semantic_question "what are my health goals?"
+  semantic_question --provider claudpy "explain my bash configuration"
+  semantic_question --limit 20 --dry-run "how do I use fzf?"
+  echo "summarize my notes on python" | semantic_question
+"""
+    )
 
-# process stdin and append to input
-while read -r line 
-do 
-    printf -v input "%s%s\n" "${input}" "${line}"
-done
+    # Main question argument
+    parser.add_argument(
+        "question",
+        nargs="?",
+        help="The question to ask about your notes"
+    )
 
-# get the stuff that maps
-files=$(semantic_search --limit "${limit}" --simple --full-path "${input}")
+    # Provider options
+    parser.add_argument(
+        "--provider",
+        choices=list(PROVIDER_CONFIGS.keys()),
+        default=DEFAULT_PROVIDER,
+        help=f"LLM provider (default: {DEFAULT_PROVIDER})"
+    )
+    parser.add_argument(
+        "--model",
+        help="Specific model to use (provider-specific default if not specified)"
+    )
 
-# separate content and modify input after we did our initial search
-printf -v input "%s\n-------------------------------\n" "${input}"
-printf -v input "%sanswer the question above, given only the information below.\n" "${input}" 
-printf -v input "%ssome of the content may be relevant, and some not.\n" "${input}"
-printf -v input "%srespond only in markdown format.\n" "${input}"
-printf -v input "%s\n-------------------------------\n" "${input}"
+    # Search options
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        metavar="N",
+        help=f"Number of chunks to retrieve (default: {DEFAULT_LIMIT})"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.3,
+        metavar="FLOAT",
+        help="Minimum similarity threshold (default: 0.3)"
+    )
 
-# iterate all files and cat them 
-for f in ${files}
-do 
-    input=$(cat <(cat <<< "${input}") "${f}")
-done
+    # Context options
+    parser.add_argument(
+        "--max-context",
+        type=int,
+        default=DEFAULT_MAX_CONTEXT,
+        metavar="N",
+        help=f"Max context tokens (default: {DEFAULT_MAX_CONTEXT})"
+    )
 
-if [[ "true" == "${sanitize}" ]]
-then 
-    input=$(sanitize_data <<< "${input}")
-fi
+    # Output options
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show context without querying LLM"
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming output"
+    )
+    parser.add_argument(
+        "--sanitize",
+        action="store_true",
+        help="Sanitize data before sending to provider"
+    )
+    parser.add_argument(
+        "--show-sources",
+        action="store_true",
+        help="Show source files at the end of the response"
+    )
 
-if [[ "true" == "${dry_run}" ]]
-then 
-    cat <<< "${input}"
-else
-    ${provider} ${child_args[@]} <<< "${input}"
-fi
+    # Path options
+    parser.add_argument(
+        "--path",
+        default=os.path.expanduser("~/Documents/notes"),
+        help="Notes directory path"
+    )
 
+    # License
+    parser.add_argument(
+        "--license",
+        action="store_true",
+        help="Show license information"
+    )
+
+    return parser.parse_args()
+
+
+# ----- Utility Functions -----
+def estimate_tokens(text: str) -> int:
+    """Estimate token count from text."""
+    return int(len(text) / CHARS_PER_TOKEN)
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to approximately max_tokens."""
+    max_chars: int = int(max_tokens * CHARS_PER_TOKEN)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[... content truncated to fit context window ...]"
+
+
+def read_file_safely(file_path: str) -> Optional[str]:
+    """Read file content handling different encodings and errors."""
+    encodings: list[str] = ['utf-8', 'latin-1', 'cp1252']
+
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                return f.read()
+        except (UnicodeDecodeError, OSError):
+            continue
+
+    return None
+
+
+# ----- Search Functions -----
+def search_notes(
+    question: str,
+    limit: int,
+    threshold: float,
+    notes_path: str
+) -> list[dict]:
+    """
+    Use semantic_search to find relevant chunks.
+
+    Returns list of dicts with file_path, content, and similarity.
+    """
+    cmd: list[str] = [
+        "semantic_search",
+        "--json",
+        "--show-chunks",
+        "--limit", str(limit),
+        "--threshold", str(threshold),
+        "--path", notes_path,
+        question
+    ]
+
+    try:
+        # Set NO_DBOX_CHECK to avoid nested distrobox calls
+        env = os.environ.copy()
+        env["NO_DBOX_CHECK"] = "1"
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env
+        )
+
+        if result.returncode != 0:
+            print(f"Warning: semantic_search returned non-zero: {result.stderr}", file=sys.stderr)
+            return []
+
+        if not result.stdout.strip():
+            return []
+
+        data: dict = json.loads(result.stdout)
+        return data.get("results", [])
+
+    except subprocess.TimeoutExpired:
+        print("Warning: semantic_search timed out", file=sys.stderr)
+        return []
+    except json.JSONDecodeError as e:
+        print(f"Warning: Failed to parse semantic_search output: {e}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"Warning: Error running semantic_search: {e}", file=sys.stderr)
+        return []
+
+
+# ----- Context Assembly -----
+def assemble_context(
+    question: str,
+    search_results: list[dict],
+    max_context_tokens: int,
+    notes_path: str
+) -> tuple[str, list[str]]:
+    """
+    Assemble context from search results, respecting token limits.
+
+    Returns:
+        Tuple of (assembled context string, list of source file paths)
+    """
+    if not search_results:
+        return "", []
+
+    context_parts: list[str] = []
+    sources: list[str] = []
+    current_tokens: int = 0
+
+    # Reserve tokens for the question and system prompt
+    reserved_tokens: int = estimate_tokens(question) + 500  # 500 for system prompt
+    available_tokens: int = max_context_tokens - reserved_tokens
+
+    for result in search_results:
+        file_path: str = result.get("file_path", "")
+        full_path: str = result.get("full_path", os.path.join(notes_path, file_path))
+
+        # Try to get chunk content from search results first
+        chunk_content: Optional[str] = result.get("chunk_content")
+
+        # If no chunk content, read the full file
+        if not chunk_content:
+            file_content: Optional[str] = read_file_safely(full_path)
+            if file_content:
+                # Limit file content to reasonable size
+                chunk_content = file_content[:8000]  # ~2000 tokens max per file
+            else:
+                continue
+
+        # Estimate tokens for this chunk
+        chunk_tokens: int = estimate_tokens(chunk_content)
+
+        # Check if we can fit this chunk
+        if current_tokens + chunk_tokens > available_tokens:
+            # Try to fit a truncated version
+            remaining_tokens: int = available_tokens - current_tokens
+            if remaining_tokens > 200:  # Only add if we can fit meaningful content
+                truncated: str = truncate_to_tokens(chunk_content, remaining_tokens)
+                context_parts.append(f"=== From: {file_path} ===\n{truncated}\n")
+                sources.append(file_path)
+            break
+
+        # Add the chunk
+        context_parts.append(f"=== From: {file_path} ===\n{chunk_content}\n")
+        sources.append(file_path)
+        current_tokens += chunk_tokens
+
+    return "\n".join(context_parts), sources
+
+
+def build_prompt(question: str, context: str) -> str:
+    """Build the full prompt with context and question."""
+    prompt: str = f"""{question}
+
+-------------------------------
+Answer the question above using ONLY the information provided below.
+Some of the content may be relevant, and some may not.
+Respond in markdown format.
+If the information below does not contain enough details to answer the question,
+say so clearly.
+-------------------------------
+
+{context}
+"""
+    return prompt
+
+
+# ----- LLM Query -----
+def query_llm(
+    prompt: str,
+    provider: str,
+    model: Optional[str],
+    no_stream: bool,
+    sanitize: bool
+) -> Optional[str]:
+    """
+    Query the LLM with the assembled prompt.
+
+    Returns the response text, or None on error.
+    """
+    cmd: list[str] = [provider]
+
+    if model:
+        cmd.extend(["--model", model])
+
+    if no_stream:
+        cmd.append("--no-streaming")
+
+    # Set NO_DBOX_CHECK to avoid nested distrobox calls
+    env = os.environ.copy()
+    env["NO_DBOX_CHECK"] = "1"
+
+    # Handle sanitization
+    input_text: str = prompt
+    if sanitize:
+        try:
+            sanitize_result = subprocess.run(
+                ["sanitize_data"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env
+            )
+            if sanitize_result.returncode == 0:
+                input_text = sanitize_result.stdout
+        except Exception as e:
+            print(f"Warning: Sanitization failed: {e}", file=sys.stderr)
+
+    try:
+        if no_stream:
+            # Non-streaming: capture output and return
+            result = subprocess.run(
+                cmd,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+                env=env
+            )
+
+            if result.returncode != 0:
+                print(f"Error from {provider}: {result.stderr}", file=sys.stderr)
+                return None
+
+            return result.stdout
+
+        else:
+            # Streaming: pipe output directly to stdout
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env
+            )
+
+            # Write input and close stdin
+            stdout, stderr = process.communicate(input=input_text, timeout=300)
+
+            if process.returncode != 0:
+                print(f"Error from {provider}: {stderr}", file=sys.stderr)
+                return None
+
+            # Print the output (already streamed by the provider)
+            print(stdout, end="")
+            return stdout
+
+    except subprocess.TimeoutExpired:
+        print(f"Error: {provider} timed out", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Error querying {provider}: {e}", file=sys.stderr)
+        return None
+
+
+# ----- Main -----
+def main() -> None:
+    """Main entry point."""
+    args: argparse.Namespace = parse_args()
+
+    # Handle license flag
+    if args.license:
+        print("GNU Affero General Public License v3.0")
+        print("https://www.gnu.org/licenses/agpl-3.0.html")
+        sys.exit(0)
+
+    # Get question from argument or stdin
+    question: str = ""
+
+    if args.question:
+        question = args.question
+
+    # Also read from stdin if available
+    if not sys.stdin.isatty():
+        stdin_content: str = sys.stdin.read().strip()
+        if stdin_content:
+            if question:
+                question = f"{question}\n{stdin_content}"
+            else:
+                question = stdin_content
+
+    if not question:
+        print("Error: No question provided. Use positional argument or pipe via stdin.", file=sys.stderr)
+        print("Example: semantic_question 'what are my health goals?'", file=sys.stderr)
+        sys.exit(1)
+
+    # Search for relevant content
+    print("Searching for relevant content...", file=sys.stderr)
+    search_results: list[dict] = search_notes(
+        question,
+        args.limit,
+        args.threshold,
+        args.path
+    )
+
+    if not search_results:
+        print("No relevant content found in your notes.", file=sys.stderr)
+        print("Try adjusting --threshold or running 'semantic_search --index'", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(search_results)} relevant chunks", file=sys.stderr)
+
+    # Assemble context
+    context, sources = assemble_context(
+        question,
+        search_results,
+        args.max_context,
+        args.path
+    )
+
+    if not context:
+        print("No readable content found in matched files.", file=sys.stderr)
+        sys.exit(1)
+
+    # Build the prompt
+    prompt: str = build_prompt(question, context)
+    prompt_tokens: int = estimate_tokens(prompt)
+
+    print(f"Context assembled: ~{prompt_tokens} tokens", file=sys.stderr)
+
+    # Handle dry-run mode
+    if args.dry_run:
+        print("\n=== DRY RUN - PROMPT PREVIEW ===", file=sys.stderr)
+        print(prompt)
+        print("\n=== END DRY RUN ===", file=sys.stderr)
+        print(f"\nSources ({len(sources)} files):", file=sys.stderr)
+        for source in sources:
+            print(f"  - {source}", file=sys.stderr)
+        sys.exit(0)
+
+    # Query the LLM
+    print(f"Querying {args.provider}...", file=sys.stderr)
+    print("", file=sys.stderr)  # Blank line before response
+
+    response: Optional[str] = query_llm(
+        prompt,
+        args.provider,
+        args.model,
+        args.no_stream,
+        args.sanitize
+    )
+
+    if response is None:
+        sys.exit(1)
+
+    # Show sources if requested
+    if args.show_sources:
+        print("\n\n---")
+        print(f"Sources ({len(sources)} files):")
+        for source in sources:
+            print(f"  - {source}")
+
+
+if __name__ == "__main__":
+    main()
