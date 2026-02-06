@@ -1,6 +1,6 @@
 # normal stow operation
 stow: dep_dirs
-    #!/usr/bin/env bash 
+    #!/usr/bin/env bash
     set -euxo pipefail
 
     stow \
@@ -13,12 +13,24 @@ stow: dep_dirs
         --ignore=trees \
         --ignore=share \
         --ignore=.gitconfig \
+        --ignore=vimban \
         .
+
+    # stow vimban submodule as its own package
+    stow \
+        --ignore=LICENSE \
+        --ignore=README.md \
+        --ignore=Makefile \
+        --ignore=requirements.txt \
+        --ignore=docs \
+        --ignore=examples \
+        --ignore=.gitignore \
+        vimban
 
 
 # modified stow operation for other devices
 stow_alt: dep_dirs
-    #!/usr/bin/env bash 
+    #!/usr/bin/env bash
     set -euxo pipefail
 
     stow \
@@ -31,14 +43,27 @@ stow_alt: dep_dirs
         --ignore=trees \
         --ignore=share \
         --ignore=.gitconfig \
+        --ignore=vimban \
         .
+
+    # stow vimban submodule as its own package
+    stow \
+        --ignore=LICENSE \
+        --ignore=README.md \
+        --ignore=Makefile \
+        --ignore=requirements.txt \
+        --ignore=docs \
+        --ignore=examples \
+        --ignore=.gitignore \
+        vimban
 
 
 # unstow
 unstow:
-    #!/usr/bin/env bash 
+    #!/usr/bin/env bash
     set -euxo pipefail
 
+    stow -D vimban
     stow -D .
 
 
@@ -80,6 +105,8 @@ dep_dirs:
     mkdir -p $HOME/.config/neomutt
     mkdir -p $HOME/.config/mpd
     mkdir -p $HOME/.config/tmux/plugins
+    mkdir -p $HOME/.config/vimban
+    mkdir -p $HOME/share/vimban/templates
 
 
 # install deps
