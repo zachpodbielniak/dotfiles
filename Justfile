@@ -13,17 +13,20 @@ stow: dep_dirs
         --ignore=trees \
         --ignore=share \
         --ignore=.gitconfig \
-        --ignore=vimban \
+        --ignore=deps \
         .
 
     # stow vimban submodule as its own package
     stow \
+        -d deps \
+        -t $HOME \
         --ignore=LICENSE \
         --ignore=README.md \
         --ignore=Makefile \
         --ignore=requirements.txt \
         --ignore=docs \
         --ignore=examples \
+        --ignore=share \
         --ignore=.gitignore \
         vimban
 
@@ -43,17 +46,20 @@ stow_alt: dep_dirs
         --ignore=trees \
         --ignore=share \
         --ignore=.gitconfig \
-        --ignore=vimban \
+        --ignore=deps \
         .
 
     # stow vimban submodule as its own package
     stow \
+        -d deps \
+        -t $HOME \
         --ignore=LICENSE \
         --ignore=README.md \
         --ignore=Makefile \
         --ignore=requirements.txt \
         --ignore=docs \
         --ignore=examples \
+        --ignore=share \
         --ignore=.gitignore \
         vimban
 
@@ -63,7 +69,7 @@ unstow:
     #!/usr/bin/env bash
     set -euxo pipefail
 
-    stow -D vimban
+    stow -D -d deps -t $HOME vimban
     stow -D .
 
 
@@ -106,7 +112,6 @@ dep_dirs:
     mkdir -p $HOME/.config/mpd
     mkdir -p $HOME/.config/tmux/plugins
     mkdir -p $HOME/.config/vimban
-    mkdir -p $HOME/share/vimban/templates
 
 
 # install deps
