@@ -118,7 +118,7 @@ set -o vi
 # Aliases
 
 # distrobox
-if [[ -d "${HOME}../linuxbrew/.linuxbrew" ]] && [[ "$(uname -m)" == "x86_64" ]]
+if [[ -d "${HOME}/../linuxbrew/.linuxbrew" ]]
 then 
     alias dc="distrobox create --additional-flags '-v /var/home/linuxbrew:/var/home/linuxbrew -v /home/linuxbrew:/home/linuxbrew'"
 else 
