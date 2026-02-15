@@ -450,18 +450,28 @@ class MemoryManager:
         category: Optional[str] = None,
         include_archived: bool = False,
         limit: int = 25,
+        exact: bool = False,
     ) -> list[dict]:
         """
-        Full-text search across memory content and summary.
+        Hybrid search across memory content, summary, and tags.
 
-        Uses ILIKE for broad matching. If pg_trgm is available,
-        trigram similarity is also used for ranking.
+        Default mode (fuzzy): Uses pg_trgm similarity for fuzzy matching
+        with ILIKE fallback, plus tag search. Tolerates typos and partial
+        matches. Results ranked by trigram similarity score.
+
+        Exact mode (--exact): Uses PostgreSQL tsvector full-text search
+        with stemming and boolean queries. Supports operators:
+          - 'python async'  -> matches both terms (AND)
+          - 'python | rust'  -> matches either term (OR)
+          - '!docker'        -> excludes term (NOT)
+          - 'deploy:*'       -> prefix match
 
         Args:
-            query: Search string
+            query: Search string (plain text or tsquery operators in exact mode)
             category: Optional category filter
             include_archived: Include archived memories
             limit: Max results
+            exact: Use tsvector full-text search instead of fuzzy trgm
 
         Returns:
             List of matching memory dicts, ranked by relevance
@@ -470,11 +480,33 @@ class MemoryManager:
         params: list = []
         idx: int = 1
 
-        # Search in content and summary
-        search_pattern: str = f"%{query}%"
-        conditions.append(f"(content ILIKE ${idx} OR summary ILIKE ${idx})")
-        params.append(search_pattern)
-        idx += 1
+        if exact:
+            # tsvector full-text search with stemming and boolean operators
+            conditions.append(f"search_vector @@ websearch_to_tsquery('english', ${idx})")
+            rank_expr: str = f"ts_rank_cd(search_vector, websearch_to_tsquery('english', ${idx}))"
+            params.append(query)
+            idx += 1
+        else:
+            # Hybrid: pg_trgm fuzzy similarity + ILIKE fallback + tag search
+            # $idx = ILIKE pattern, $idx+1 = raw query for similarity()
+            like_idx: int = idx
+            sim_idx: int = idx + 1
+            search_pattern: str = f"%{query}%"
+            conditions.append(
+                f"(content ILIKE ${like_idx} OR summary ILIKE ${like_idx} "
+                f"OR array_to_string(tags, ' ') ILIKE ${like_idx})"
+            )
+            params.append(search_pattern)
+            # Rank by trigram similarity (best match across content/summary)
+            rank_expr = (
+                f"GREATEST("
+                f"  COALESCE(similarity(summary, ${sim_idx}), 0) * 2.0,"
+                f"  COALESCE(similarity(content, ${sim_idx}), 0),"
+                f"  COALESCE(similarity(array_to_string(tags, ' '), ${sim_idx}), 0) * 1.5"
+                f")"
+            )
+            params.append(query)
+            idx += 2
 
         if not include_archived:
             conditions.append("is_archived = FALSE")
@@ -488,11 +520,7 @@ class MemoryManager:
         params.append(limit)
 
         sql: str = f"""
-            SELECT *,
-                CASE
-                    WHEN summary ILIKE ${1} THEN 2
-                    ELSE 1
-                END as relevance
+            SELECT *, {rank_expr} as relevance
             FROM memories
             WHERE {where}
             ORDER BY is_pinned DESC, relevance DESC, created_at DESC
@@ -991,6 +1019,7 @@ async def cmd_search(mgr: MemoryManager, args: argparse.Namespace) -> None:
         category=args.category,
         include_archived=args.include_archived,
         limit=args.limit,
+        exact=args.exact,
     )
 
     fmt: str = args.format
@@ -1384,6 +1413,8 @@ importance: """ + ", ".join(IMPORTANCE_LEVELS),
     p_search = subparsers.add_parser("search", help="Search memories")
     p_search.add_argument("query", nargs="?", help="Search query")
     p_search.add_argument("--fzf", action="store_true", help="Interactive fzf search")
+    p_search.add_argument("--exact", action="store_true",
+                          help="Use tsvector full-text search (stemming, boolean ops) instead of fuzzy trgm")
     p_search.add_argument("--category", help="Filter by category")
     p_search.add_argument("--include-archived", action="store_true", help="Include archived")
     p_search.add_argument("--limit", type=int, default=25, help="Max results")

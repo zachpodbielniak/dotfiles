@@ -485,6 +485,58 @@ init_agent_memories_schema() {
     execute_sql "CREATE INDEX IF NOT EXISTS idx_memories_content_trgm ON memories USING GIN(content gin_trgm_ops);" "agent_memories" 2>/dev/null || true
     execute_sql "CREATE INDEX IF NOT EXISTS idx_memories_summary_trgm ON memories USING GIN(summary gin_trgm_ops);" "agent_memories" 2>/dev/null || true
 
+    # Add tsvector column for full-text search, maintained by trigger
+    echo "Setting up tsvector full-text search..."
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'memories' AND column_name = 'search_vector'
+        ) THEN
+            ALTER TABLE memories ADD COLUMN search_vector tsvector;
+        END IF;
+    END
+    \$\$;" "agent_memories" 2>/dev/null || true
+
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_memories_search_vector ON memories USING GIN(search_vector);" "agent_memories" 2>/dev/null || true
+
+    # Create trigger function to maintain the search_vector column
+    execute_sql "
+    CREATE OR REPLACE FUNCTION update_memories_search_vector()
+    RETURNS TRIGGER AS \$\$
+    BEGIN
+        NEW.search_vector :=
+            setweight(to_tsvector('english', COALESCE(NEW.summary, '')), 'A') ||
+            setweight(to_tsvector('english', COALESCE(NEW.content, '')), 'B') ||
+            setweight(to_tsvector('english', COALESCE(NEW.category, '')), 'C') ||
+            setweight(to_tsvector('english', COALESCE(NEW.subcategory, '')), 'C') ||
+            setweight(to_tsvector('english', COALESCE(array_to_string(NEW.tags, ' '), '')), 'C');
+        RETURN NEW;
+    END;
+    \$\$ LANGUAGE plpgsql;" "agent_memories" 2>/dev/null || true
+
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_memories_search_vector') THEN
+            CREATE TRIGGER trg_memories_search_vector
+            BEFORE INSERT OR UPDATE ON memories
+            FOR EACH ROW EXECUTE FUNCTION update_memories_search_vector();
+        END IF;
+    END
+    \$\$;" "agent_memories" 2>/dev/null || true
+
+    # Backfill search_vector for existing rows
+    execute_sql "
+    UPDATE memories SET search_vector =
+        setweight(to_tsvector('english', COALESCE(summary, '')), 'A') ||
+        setweight(to_tsvector('english', COALESCE(content, '')), 'B') ||
+        setweight(to_tsvector('english', COALESCE(category, '')), 'C') ||
+        setweight(to_tsvector('english', COALESCE(subcategory, '')), 'C') ||
+        setweight(to_tsvector('english', COALESCE(array_to_string(tags, ' '), '')), 'C')
+    WHERE search_vector IS NULL;" "agent_memories" 2>/dev/null || true
+
     # Create trigger
     execute_sql "
     DO \$\$
