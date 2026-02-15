@@ -1,0 +1,1821 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+from os import environ
+from subprocess import run
+from sys import argv, exit, stdin, stderr
+import argparse
+import json
+import requests
+import sys
+import os
+import time
+import select
+from datetime import datetime
+from pathlib import Path
+
+
+ctr_id: str|None = ""
+api_key: str|None = ""
+
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the 'dev' distrobox re-exec the script
+# inside of the 'dev' distrobox
+if not no_dbox_check and ("dev" != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        "dev",
+        "--",
+        *argv
+    ]
+
+    run(cmd)
+    exit(0)
+
+if ("SUNO_API_KEY" in environ):
+    api_key = environ.get("SUNO_API_KEY")
+    if ("" == api_key):
+        print("SUNO_API_KEY is empty")
+        exit(1)
+else:
+    print("SUNO_API_KEY is not set")
+    exit(1)
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+BASE_URL: str = "https://api.sunoapi.org"
+DEFAULT_MODEL: str = "V4_5"
+DEFAULT_POLL_INTERVAL: int = 30
+MAX_POLL_ATTEMPTS: int = 60
+
+AGPLV3_NOTICE: str = """sunopy - Suno AI CLI wrapper
+Copyright (C) 2026  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>."""
+
+SUNO_MODELS: dict[str, dict] = {
+    "V4": {
+        "max_duration": 240,
+        "max_prompt": 3000,
+        "max_style": 200,
+        "max_title": 80,
+        "description": "Suno V4 - highest quality, up to 4 minutes",
+    },
+    "V4_5": {
+        "max_duration": 480,
+        "max_prompt": 5000,
+        "max_style": 1000,
+        "max_title": 100,
+        "description": "Suno V4.5 - advanced features, up to 8 minutes",
+    },
+    "V4_5PLUS": {
+        "max_duration": 480,
+        "max_prompt": 5000,
+        "max_style": 1000,
+        "max_title": 100,
+        "description": "Suno V4.5 Plus - enhanced musicality, up to 8 minutes",
+    },
+    "V4_5ALL": {
+        "max_duration": 480,
+        "max_prompt": 5000,
+        "max_style": 1000,
+        "max_title": 80,
+        "description": "Suno V4.5 All - optimized song structure, up to 8 minutes",
+    },
+    "V5": {
+        "max_duration": 480,
+        "max_prompt": 5000,
+        "max_style": 1000,
+        "max_title": 100,
+        "description": "Suno V5 - latest model, superior musicality, up to 8 minutes",
+    },
+}
+
+TASK_STATUSES: dict[str, str] = {
+    "PENDING": "Task queued, waiting to start",
+    "GENERATING": "Music is being generated",
+    "SUCCESS": "Generation complete",
+    "FAILED": "Generation failed",
+}
+
+ERROR_CODES: dict[int, str] = {
+    400: "Bad request - check parameters",
+    401: "Unauthorized - check SUNO_API_KEY",
+    404: "Resource not found",
+    405: "Rate limit exceeded",
+    413: "Payload too large - content exceeds length limits",
+    429: "Insufficient credits",
+    430: "Request frequency too high",
+    455: "System maintenance",
+    500: "Server error",
+}
+
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+parser = argparse.ArgumentParser(
+    description="Generate music with Suno AI API",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog="""Examples:
+  # Generate music from a text description (non-custom mode)
+  sunopy --prompt "A melancholic acoustic guitar ballad about rain"
+
+  # Generate with custom mode (lyrics + style + title)
+  sunopy --prompt "Verse 1: Walking in the rain..." --style "acoustic folk" --title "Rainy Day"
+
+  # Generate instrumental only
+  sunopy --style "energetic EDM" --title "Drop Zone" --instrumental
+
+  # Generate lyrics only
+  sunopy --lyrics --prompt "A song about summer adventures"
+
+  # Pipe lyrics from stdin
+  echo "Verse 1: The sun goes down..." | sunopy --style "indie rock" --title "Sunset"
+
+  # Check your credits
+  sunopy --credits
+
+  # Check status of a generation task
+  sunopy --status suno_task_abc123
+
+  # Extend an existing track from 120 seconds
+  sunopy --extend --audio-id AUDIO_ID --continue-at 120 --style "rock" --title "Extended Jam"
+
+  # Download generated files
+  sunopy --prompt "Jazz piano solo" --download --output ./music/
+
+  # Boost a style description (V4.5+ only)
+  sunopy --boost-style "dreamy lo-fi beats"
+
+  # Separate vocals from a track
+  sunopy --separate --task-id TASK_ID --audio-id AUDIO_ID
+
+  # Full stem separation (12 stems)
+  sunopy --separate --task-id TASK_ID --audio-id AUDIO_ID --separate-type split_stem
+
+  # Get task result without waiting
+  sunopy --prompt "A happy folk song" --no-wait
+
+  # Create a music video from generated audio
+  sunopy --video --task-id TASK_ID --audio-id AUDIO_ID --video-author "Zach"
+""",
+)
+
+# Common flags (matching grokpy interface)
+parser.add_argument("--prompt",
+    help="Text description or lyrics for generation")
+parser.add_argument("--model", default=DEFAULT_MODEL,
+    choices=list(SUNO_MODELS.keys()),
+    help=f"Suno model to use (default: {DEFAULT_MODEL}). "
+         "V4=4min max, V4_5/V4_5PLUS/V4_5ALL/V5=8min max")
+parser.add_argument("--debug", action="store_true",
+    help="Enable debug mode (shows request/response details)")
+parser.add_argument("--json", action="store_true",
+    help="Return raw JSON response")
+parser.add_argument("--summary", action="store_true",
+    help="Show usage summary with timing in a formatted table")
+parser.add_argument("--dry-run", action="store_true",
+    help="Show what would be sent to the API without making the request")
+parser.add_argument("--no-preserve", action="store_true",
+    help="Don't save the transaction to the second-brain markdown file")
+parser.add_argument("--no-color", action="store_true",
+    help="Disable colored output")
+parser.add_argument("--license", action="store_true",
+    help="Show the AGPLv3 license notice and exit")
+parser.add_argument("--show-models", action="store_true",
+    help="Display available models with details and exit")
+
+# Operation modes
+mode_group = parser.add_argument_group("Operation Modes")
+mode_group.add_argument("--generate", action="store_true",
+    help="Generate music (default mode)")
+mode_group.add_argument("--lyrics", action="store_true",
+    help="Generate lyrics only")
+mode_group.add_argument("--extend", action="store_true",
+    help="Extend an existing track")
+mode_group.add_argument("--cover", action="store_true",
+    help="Create a cover from uploaded audio")
+mode_group.add_argument("--add-vocals", action="store_true",
+    help="Add vocals to an instrumental track")
+mode_group.add_argument("--add-instrumental", action="store_true",
+    help="Add instrumental to a vocal track")
+mode_group.add_argument("--separate", action="store_true",
+    help="Separate vocals from music")
+mode_group.add_argument("--to-wav", action="store_true",
+    help="Convert a track to WAV format")
+mode_group.add_argument("--video", action="store_true",
+    help="Create a music video from a generated track")
+mode_group.add_argument("--boost-style", action="store_true",
+    help="Boost/enhance a style description (V4.5+ only, synchronous)")
+mode_group.add_argument("--timestamped-lyrics", action="store_true",
+    help="Get timestamped lyrics for a generated track")
+mode_group.add_argument("--credits", action="store_true",
+    help="Check remaining credit balance")
+mode_group.add_argument("--status", metavar="TASK_ID",
+    help="Check status of a generation task")
+
+# Music generation options
+gen_group = parser.add_argument_group("Music Generation Options")
+gen_group.add_argument("--style",
+    help="Music style/genre tags (e.g. 'acoustic folk', 'jazz piano')")
+gen_group.add_argument("--title",
+    help="Song title")
+gen_group.add_argument("--instrumental", action="store_true",
+    help="Generate instrumental only (no vocals)")
+gen_group.add_argument("--custom-mode", action="store_true",
+    help="Enable custom mode (auto-detected when --style or --title provided)")
+gen_group.add_argument("--negative-tags",
+    help="Styles or traits to exclude from generation")
+gen_group.add_argument("--vocal-gender", choices=["m", "f"],
+    help="Vocal gender preference (m=male, f=female)")
+gen_group.add_argument("--style-weight", type=float, metavar="0.0-1.0",
+    help="Style guidance influence (0.0 to 1.0)")
+gen_group.add_argument("--weirdness", type=float, metavar="0.0-1.0",
+    help="Creative deviation constraint (0.0 to 1.0)")
+gen_group.add_argument("--audio-weight", type=float, metavar="0.0-1.0",
+    help="Input audio influence weight (0.0 to 1.0)")
+gen_group.add_argument("--persona-id",
+    help="Suno persona ID for styled generation")
+gen_group.add_argument("--persona-model",
+    choices=["style_persona", "voice_persona"],
+    default="style_persona",
+    help="Persona application type (default: style_persona)")
+
+# Task/track reference
+ref_group = parser.add_argument_group("Task/Track Reference")
+ref_group.add_argument("--audio-id",
+    help="Audio ID for operations on existing tracks")
+ref_group.add_argument("--task-id",
+    help="Task ID for operations on existing tasks")
+ref_group.add_argument("--upload-url",
+    help="URL of audio file to process (for cover, add-vocals, add-instrumental)")
+ref_group.add_argument("--continue-at", type=float, metavar="SECONDS",
+    help="Timestamp in seconds from which to start extending")
+
+# Output & polling
+out_group = parser.add_argument_group("Output & Polling Options")
+out_group.add_argument("--poll-interval", type=int, default=DEFAULT_POLL_INTERVAL,
+    help=f"Polling interval in seconds (default: {DEFAULT_POLL_INTERVAL})")
+out_group.add_argument("--no-wait", action="store_true",
+    help="Return task ID immediately without waiting for completion")
+out_group.add_argument("--download", action="store_true",
+    help="Download generated audio files to disk")
+out_group.add_argument("--output",
+    help="Output directory or filename for downloads (default: current directory)")
+out_group.add_argument("--video-author", metavar="NAME",
+    help="Author name displayed on music video (max 50 chars)")
+out_group.add_argument("--video-domain", metavar="DOMAIN",
+    help="Domain name watermark on music video (max 50 chars)")
+out_group.add_argument("--separate-type",
+    choices=["separate_vocal", "split_stem"],
+    default="separate_vocal",
+    help="Vocal separation mode: separate_vocal (2 stems, 1 credit) "
+         "or split_stem (12 stems, 5 credits)")
+
+args = parser.parse_args()
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def auto_detect_custom_mode(parsed_args: argparse.Namespace) -> bool:
+    """Auto-detect whether custom mode should be enabled.
+    Returns True if --style or --title is provided."""
+    return bool(parsed_args.style or parsed_args.title)
+
+
+def validate_float_range(value: float|None, name: str) -> None:
+    """Validate that a float parameter is in the 0.0-1.0 range."""
+    if value is not None and (value < 0.0 or value > 1.0):
+        print(f"Error: --{name} must be between 0.0 and 1.0, got {value}",
+              file=stderr)
+        exit(1)
+
+
+def get_auto_numbered_filename(
+    base_name: str = "suno-output",
+    extension: str = ".mp3"
+) -> str:
+    """Generate an auto-numbered filename that doesn't exist yet."""
+    counter: int = 0
+    while True:
+        filename: str = f"{base_name}-{counter:04d}{extension}"
+        if not os.path.exists(filename):
+            return filename
+        counter += 1
+
+
+# ============================================================================
+# API Communication
+# ============================================================================
+
+def make_api_request(
+    method: str,
+    endpoint: str,
+    data: dict|None = None,
+    params: dict|None = None,
+    debug: bool = False,
+    max_retries: int = 3
+) -> dict:
+    """
+    Send a request to the Suno API.
+
+    Handles auth headers, error codes, rate limit retries (430),
+    debug output, and JSON parsing.
+    Returns the 'data' field from the parsed JSON response.
+    Exits on fatal errors.
+    """
+    url: str = f"{BASE_URL}{endpoint}"
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    if debug:
+        print(f"Debug: {method} {url}", file=stderr)
+        if data:
+            print(f"Debug: Payload: {json.dumps(data, indent=2)}", file=stderr)
+        if params:
+            print(f"Debug: Params: {params}", file=stderr)
+
+    retry_delay: float = 2.0
+    for attempt in range(max_retries + 1):
+        try:
+            if method.upper() == "GET":
+                response = requests.get(
+                    url, headers=headers, params=params, timeout=30)
+            else:
+                response = requests.post(
+                    url, headers=headers, json=data, timeout=30)
+
+            if debug:
+                print(f"Debug: Response status: {response.status_code}",
+                      file=stderr)
+                try:
+                    print(f"Debug: Response body: "
+                          f"{json.dumps(response.json(), indent=2)}",
+                          file=stderr)
+                except (json.JSONDecodeError, ValueError):
+                    print(f"Debug: Response text: {response.text[:500]}",
+                          file=stderr)
+
+            if response.status_code == 200:
+                response_data: dict = response.json()
+                code: int = response_data.get("code", 200)
+                if code != 200:
+                    error_msg: str = response_data.get("msg", "Unknown error")
+                    print(f"Error: API returned code {code}: {error_msg}",
+                          file=stderr)
+                    exit(1)
+                return response_data.get("data", response_data)
+
+            # Handle rate limiting with retry
+            if response.status_code == 430 and attempt < max_retries:
+                print(f"Warning: Rate limited, retrying in {retry_delay}s "
+                      f"(attempt {attempt + 1}/{max_retries})", file=stderr)
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+
+            # Fatal error
+            error_desc: str = ERROR_CODES.get(
+                response.status_code,
+                f"Unknown error (HTTP {response.status_code})")
+            print(f"Error: {response.status_code} - {error_desc}", file=stderr)
+            try:
+                error_body: dict = response.json()
+                error_msg = error_body.get("msg", "")
+                if error_msg:
+                    print(f"Detail: {error_msg}", file=stderr)
+            except (json.JSONDecodeError, ValueError):
+                if response.text:
+                    print(f"Detail: {response.text[:200]}", file=stderr)
+            exit(1)
+
+        except requests.exceptions.Timeout:
+            if attempt < max_retries:
+                print(f"Warning: Request timed out, retrying in {retry_delay}s",
+                      file=stderr)
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            print("Error: Request timed out after all retries", file=stderr)
+            exit(1)
+
+        except requests.exceptions.ConnectionError as e:
+            print(f"Error: Connection failed: {e}", file=stderr)
+            exit(1)
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error: Request failed: {e}", file=stderr)
+            exit(1)
+
+    # Should not reach here, but just in case
+    print("Error: All retries exhausted", file=stderr)
+    exit(1)
+
+
+# ============================================================================
+# Polling Mechanism
+# ============================================================================
+
+def poll_for_result(
+    task_id: str,
+    poll_interval: int = DEFAULT_POLL_INTERVAL,
+    max_attempts: int = MAX_POLL_ATTEMPTS,
+    debug: bool = False,
+    no_color: bool = False
+) -> dict:
+    """
+    Poll GET /api/v1/generate/record-info until status is SUCCESS or FAILED.
+
+    Shows a spinner on stderr to indicate activity.
+    Returns the response dict containing audio data on success.
+    Exits on timeout or FAILED status.
+    """
+    spinner_chars: list[str] = ["|", "/", "-", "\\"]
+    spinner_idx: int = 0
+    last_status: str = ""
+
+    for attempt in range(max_attempts):
+        result: dict = make_api_request(
+            "GET",
+            "/api/v1/generate/record-info",
+            params={"taskId": task_id},
+            debug=debug,
+        )
+
+        status: str = result.get("status", "UNKNOWN")
+
+        # Print status transitions
+        if status != last_status:
+            if last_status:
+                print("", file=stderr)
+            status_desc: str = TASK_STATUSES.get(status, "Unknown status")
+            print(f"Status: {status} - {status_desc}", file=stderr)
+            last_status = status
+
+        if status == "SUCCESS":
+            print("", file=stderr)
+            return result
+
+        if status == "FAILED":
+            print("", file=stderr)
+            error_msg: str = result.get("failReason", "Unknown error")
+            print(f"Error: Generation failed - {error_msg}", file=stderr)
+            exit(1)
+
+        # Show spinner
+        spinner: str = spinner_chars[spinner_idx % len(spinner_chars)]
+        elapsed: int = (attempt + 1) * poll_interval
+        print(f"\r  {spinner} Waiting... ({elapsed}s elapsed, "
+              f"attempt {attempt + 1}/{max_attempts})",
+              end="", file=stderr, flush=True)
+        spinner_idx += 1
+
+        time.sleep(poll_interval)
+
+    print("", file=stderr)
+    timeout_secs: int = max_attempts * poll_interval
+    print(f"Error: Timed out after {timeout_secs}s waiting for task {task_id}",
+          file=stderr)
+    print(f"Check status manually: sunopy --status {task_id}", file=stderr)
+    exit(1)
+
+
+# ============================================================================
+# Operation Functions
+# ============================================================================
+
+def generate_music(parsed_args: argparse.Namespace, query: str) -> str:
+    """
+    POST /api/v1/generate
+
+    Generate music from a text description or lyrics.
+    Auto-detects custom mode when --style or --title is provided.
+    Returns the taskId for polling.
+    """
+    custom_mode: bool = (parsed_args.custom_mode
+                         or auto_detect_custom_mode(parsed_args))
+    model_spec: dict = SUNO_MODELS[parsed_args.model]
+
+    payload: dict = {
+        "model": parsed_args.model,
+        "customMode": custom_mode,
+        "instrumental": parsed_args.instrumental,
+        "callBackUrl": "",
+    }
+
+    if custom_mode:
+        if parsed_args.instrumental:
+            # Custom + instrumental: style and title required, no prompt
+            if not parsed_args.style or not parsed_args.title:
+                print("Error: --style and --title are required for "
+                      "custom instrumental mode", file=stderr)
+                exit(1)
+            payload["style"] = parsed_args.style[:model_spec["max_style"]]
+            payload["title"] = parsed_args.title[:model_spec["max_title"]]
+        else:
+            # Custom + vocals: prompt, style, and title all required
+            if not query:
+                print("Error: --prompt or stdin input required for "
+                      "custom vocal mode", file=stderr)
+                exit(1)
+            if not parsed_args.style or not parsed_args.title:
+                print("Error: --style and --title are required for "
+                      "custom mode", file=stderr)
+                exit(1)
+            payload["prompt"] = query[:model_spec["max_prompt"]]
+            payload["style"] = parsed_args.style[:model_spec["max_style"]]
+            payload["title"] = parsed_args.title[:model_spec["max_title"]]
+    else:
+        # Non-custom mode: only prompt required (max 500 chars)
+        if not query:
+            print("Error: --prompt or stdin input required", file=stderr)
+            exit(1)
+        if len(query) > 500:
+            print(f"Warning: Prompt truncated from {len(query)} to 500 chars "
+                  "for non-custom mode (use --style and --title for "
+                  "custom mode with longer prompts)", file=stderr)
+        payload["prompt"] = query[:500]
+
+    # Optional parameters
+    if parsed_args.persona_id:
+        payload["personaId"] = parsed_args.persona_id
+        payload["personaModel"] = parsed_args.persona_model
+    if parsed_args.negative_tags:
+        payload["negativeTags"] = parsed_args.negative_tags
+    if parsed_args.vocal_gender:
+        payload["vocalGender"] = parsed_args.vocal_gender
+    if parsed_args.style_weight is not None:
+        payload["styleWeight"] = parsed_args.style_weight
+    if parsed_args.weirdness is not None:
+        payload["weirdnessConstraint"] = parsed_args.weirdness
+    if parsed_args.audio_weight is not None:
+        payload["audioWeight"] = parsed_args.audio_weight
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/generate",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def generate_lyrics(parsed_args: argparse.Namespace, query: str) -> str:
+    """
+    POST /api/v1/lyrics
+
+    Generate lyrics from a text description.
+    Returns the taskId for polling.
+    """
+    if not query:
+        print("Error: --prompt or stdin input required for lyrics generation",
+              file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "prompt": query,
+        "callBackUrl": "",
+    }
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/lyrics",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def extend_music(parsed_args: argparse.Namespace, query: str) -> str:
+    """
+    POST /api/v1/generate/extend
+
+    Extend an existing track from a given timestamp.
+    Returns the taskId for polling.
+    """
+    if not parsed_args.audio_id:
+        print("Error: --audio-id is required for extending a track",
+              file=stderr)
+        exit(1)
+
+    model_spec: dict = SUNO_MODELS[parsed_args.model]
+
+    # defaultParamFlag=true means user provides custom params
+    has_custom_params: bool = bool(
+        parsed_args.style or parsed_args.title or query)
+
+    payload: dict = {
+        "audioId": parsed_args.audio_id,
+        "defaultParamFlag": has_custom_params,
+        "callBackUrl": "",
+        "model": parsed_args.model,
+    }
+
+    if has_custom_params:
+        if query:
+            payload["prompt"] = query[:model_spec["max_prompt"]]
+        if parsed_args.style:
+            payload["style"] = parsed_args.style[:model_spec["max_style"]]
+        if parsed_args.title:
+            payload["title"] = parsed_args.title[:model_spec["max_title"]]
+        if parsed_args.continue_at is not None:
+            payload["continueAt"] = parsed_args.continue_at
+
+    # Optional parameters
+    if parsed_args.persona_id:
+        payload["personaId"] = parsed_args.persona_id
+        payload["personaModel"] = parsed_args.persona_model
+    if parsed_args.negative_tags:
+        payload["negativeTags"] = parsed_args.negative_tags
+    if parsed_args.vocal_gender:
+        payload["vocalGender"] = parsed_args.vocal_gender
+    if parsed_args.style_weight is not None:
+        payload["styleWeight"] = parsed_args.style_weight
+    if parsed_args.weirdness is not None:
+        payload["weirdnessConstraint"] = parsed_args.weirdness
+    if parsed_args.audio_weight is not None:
+        payload["audioWeight"] = parsed_args.audio_weight
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/generate/extend",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def upload_and_cover(parsed_args: argparse.Namespace, query: str) -> str:
+    """
+    POST /api/v1/generate/upload-cover
+
+    Create a cover from uploaded audio, transforming it into a new style.
+    Returns the taskId for polling.
+    """
+    if not parsed_args.upload_url:
+        print("Error: --upload-url is required for cover generation",
+              file=stderr)
+        exit(1)
+
+    custom_mode: bool = (parsed_args.custom_mode
+                         or auto_detect_custom_mode(parsed_args))
+    model_spec: dict = SUNO_MODELS[parsed_args.model]
+
+    payload: dict = {
+        "uploadUrl": parsed_args.upload_url,
+        "customMode": custom_mode,
+        "instrumental": parsed_args.instrumental,
+        "callBackUrl": "",
+        "model": parsed_args.model,
+    }
+
+    if custom_mode:
+        if parsed_args.instrumental:
+            if not parsed_args.style or not parsed_args.title:
+                print("Error: --style and --title required for custom "
+                      "instrumental cover", file=stderr)
+                exit(1)
+            payload["style"] = parsed_args.style[:model_spec["max_style"]]
+            payload["title"] = parsed_args.title[:model_spec["max_title"]]
+        else:
+            if not parsed_args.style or not parsed_args.title:
+                print("Error: --style and --title required for custom cover",
+                      file=stderr)
+                exit(1)
+            payload["style"] = parsed_args.style[:model_spec["max_style"]]
+            payload["title"] = parsed_args.title[:model_spec["max_title"]]
+            if query:
+                payload["prompt"] = query[:model_spec["max_prompt"]]
+    else:
+        if query:
+            payload["prompt"] = query[:500]
+
+    # Optional parameters
+    if parsed_args.persona_id:
+        payload["personaId"] = parsed_args.persona_id
+        payload["personaModel"] = parsed_args.persona_model
+    if parsed_args.negative_tags:
+        payload["negativeTags"] = parsed_args.negative_tags
+    if parsed_args.vocal_gender:
+        payload["vocalGender"] = parsed_args.vocal_gender
+    if parsed_args.style_weight is not None:
+        payload["styleWeight"] = parsed_args.style_weight
+    if parsed_args.weirdness is not None:
+        payload["weirdnessConstraint"] = parsed_args.weirdness
+    if parsed_args.audio_weight is not None:
+        payload["audioWeight"] = parsed_args.audio_weight
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/generate/upload-cover",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def add_vocals(parsed_args: argparse.Namespace, query: str) -> str:
+    """
+    POST /api/v1/generate/add-vocals
+
+    Layer AI-generated vocals on top of an existing instrumental.
+    Returns the taskId for polling.
+    """
+    if not parsed_args.upload_url:
+        print("Error: --upload-url is required for adding vocals",
+              file=stderr)
+        exit(1)
+    if not query:
+        print("Error: --prompt or stdin input required for vocal description",
+              file=stderr)
+        exit(1)
+    if not parsed_args.title:
+        print("Error: --title is required for adding vocals", file=stderr)
+        exit(1)
+    if not parsed_args.style:
+        print("Error: --style is required for adding vocals", file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "uploadUrl": parsed_args.upload_url,
+        "prompt": query,
+        "title": parsed_args.title[:100],
+        "style": parsed_args.style,
+        "negativeTags": parsed_args.negative_tags or "",
+        "callBackUrl": "",
+    }
+
+    # Optional parameters
+    if parsed_args.vocal_gender:
+        payload["vocalGender"] = parsed_args.vocal_gender
+    if parsed_args.style_weight is not None:
+        payload["styleWeight"] = parsed_args.style_weight
+    if parsed_args.weirdness is not None:
+        payload["weirdnessConstraint"] = parsed_args.weirdness
+    if parsed_args.audio_weight is not None:
+        payload["audioWeight"] = parsed_args.audio_weight
+    if parsed_args.model in ("V4_5PLUS", "V5"):
+        payload["model"] = parsed_args.model
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/generate/add-vocals",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def add_instrumental(parsed_args: argparse.Namespace) -> str:
+    """
+    POST /api/v1/generate/add-instrumental
+
+    Add instrumental accompaniment to a vocal track.
+    Returns the taskId for polling.
+    """
+    if not parsed_args.upload_url:
+        print("Error: --upload-url is required for adding instrumental",
+              file=stderr)
+        exit(1)
+    if not parsed_args.title:
+        print("Error: --title is required for adding instrumental",
+              file=stderr)
+        exit(1)
+    if not parsed_args.style:
+        print("Error: --style is required for adding instrumental "
+              "(used as tags)", file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "uploadUrl": parsed_args.upload_url,
+        "title": parsed_args.title[:100],
+        "tags": parsed_args.style,
+        "negativeTags": parsed_args.negative_tags or "",
+        "callBackUrl": "",
+    }
+
+    # Optional parameters
+    if parsed_args.vocal_gender:
+        payload["vocalGender"] = parsed_args.vocal_gender
+    if parsed_args.style_weight is not None:
+        payload["styleWeight"] = parsed_args.style_weight
+    if parsed_args.audio_weight is not None:
+        payload["audioWeight"] = parsed_args.audio_weight
+    if parsed_args.weirdness is not None:
+        payload["weirdnessConstraint"] = parsed_args.weirdness
+    if parsed_args.model in ("V4_5PLUS", "V5"):
+        payload["model"] = parsed_args.model
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/generate/add-instrumental",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def separate_vocals(parsed_args: argparse.Namespace) -> str:
+    """
+    POST /api/v1/vocal-removal/generate
+
+    Separate vocals from an instrumental in a generated track.
+    Returns the taskId for polling.
+    """
+    if not parsed_args.task_id:
+        print("Error: --task-id is required for vocal separation",
+              file=stderr)
+        exit(1)
+    if not parsed_args.audio_id:
+        print("Error: --audio-id is required for vocal separation",
+              file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "taskId": parsed_args.task_id,
+        "audioId": parsed_args.audio_id,
+        "callBackUrl": "",
+        "type": parsed_args.separate_type,
+    }
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/vocal-removal/generate",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def convert_to_wav(parsed_args: argparse.Namespace) -> str:
+    """
+    POST /api/v1/wav/generate
+
+    Convert a generated track to WAV format.
+    Returns the taskId for polling.
+    """
+    if not parsed_args.task_id:
+        print("Error: --task-id is required for WAV conversion", file=stderr)
+        exit(1)
+    if not parsed_args.audio_id:
+        print("Error: --audio-id is required for WAV conversion", file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "taskId": parsed_args.task_id,
+        "audioId": parsed_args.audio_id,
+        "callBackUrl": "",
+    }
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/wav/generate",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def create_music_video(parsed_args: argparse.Namespace) -> str:
+    """
+    POST /api/v1/mp4/generate
+
+    Create a music video with synchronized visuals.
+    Returns the taskId for polling.
+    """
+    if not parsed_args.task_id:
+        print("Error: --task-id is required for video creation", file=stderr)
+        exit(1)
+    if not parsed_args.audio_id:
+        print("Error: --audio-id is required for video creation", file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "taskId": parsed_args.task_id,
+        "audioId": parsed_args.audio_id,
+        "callBackUrl": "",
+    }
+
+    if parsed_args.video_author:
+        payload["author"] = parsed_args.video_author[:50]
+    if parsed_args.video_domain:
+        payload["domainName"] = parsed_args.video_domain[:50]
+
+    result: dict = make_api_request(
+        "POST", "/api/v1/mp4/generate",
+        data=payload, debug=parsed_args.debug)
+    return result.get("taskId", "")
+
+
+def boost_style_request(parsed_args: argparse.Namespace, query: str) -> dict:
+    """
+    POST /api/v1/style/generate
+
+    Boost/enhance a style description using AI. V4.5+ only.
+    This is synchronous -- returns the result immediately, no polling needed.
+    """
+    if not query:
+        print("Error: --prompt or stdin input required for style boost",
+              file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "content": query,
+    }
+
+    return make_api_request(
+        "POST", "/api/v1/style/generate",
+        data=payload, debug=parsed_args.debug)
+
+
+def get_timestamped_lyrics_request(parsed_args: argparse.Namespace) -> dict:
+    """
+    POST /api/v1/generate/get-timestamped-lyrics
+
+    Get word-level timestamped lyrics for a generated track.
+    Returns the lyrics data immediately.
+    """
+    if not parsed_args.task_id:
+        print("Error: --task-id is required for timestamped lyrics",
+              file=stderr)
+        exit(1)
+    if not parsed_args.audio_id:
+        print("Error: --audio-id is required for timestamped lyrics",
+              file=stderr)
+        exit(1)
+
+    payload: dict = {
+        "taskId": parsed_args.task_id,
+        "audioId": parsed_args.audio_id,
+    }
+
+    return make_api_request(
+        "POST", "/api/v1/generate/get-timestamped-lyrics",
+        data=payload, debug=parsed_args.debug)
+
+
+def get_credits_request() -> dict:
+    """
+    GET /api/v1/get-credits
+
+    Get remaining credit balance.
+    """
+    return make_api_request(
+        "GET", "/api/v1/get-credits",
+        debug=args.debug)
+
+
+def get_task_status(task_id: str) -> dict:
+    """
+    GET /api/v1/generate/record-info
+
+    Get the current status and data for a generation task.
+    """
+    return make_api_request(
+        "GET", "/api/v1/generate/record-info",
+        params={"taskId": task_id},
+        debug=args.debug)
+
+
+# ============================================================================
+# Output Formatting
+# ============================================================================
+
+def print_generation_result(result: dict, use_color: bool = True) -> None:
+    """Print a formatted display of generated music results."""
+    if use_color:
+        BOLD: str = '\033[1m'
+        CYAN: str = '\033[96m'
+        GREEN: str = '\033[92m'
+        YELLOW: str = '\033[93m'
+        BLUE: str = '\033[94m'
+        MAGENTA: str = '\033[95m'
+        END: str = '\033[0m'
+    else:
+        BOLD = CYAN = GREEN = YELLOW = BLUE = MAGENTA = END = ''
+
+    status: str = result.get("status", "UNKNOWN")
+    task_id: str = result.get("taskId", "N/A")
+
+    print(f"\n{BOLD}{CYAN}Task:{END} {task_id}", file=stderr)
+    print(f"{BOLD}{CYAN}Status:{END} {status}", file=stderr)
+
+    # Get the audio data from the response
+    response_data: dict = result.get("response", result)
+    tracks: list = []
+    if isinstance(response_data, dict):
+        tracks = response_data.get("data", [])
+    elif isinstance(response_data, list):
+        tracks = response_data
+
+    if not tracks:
+        # Check for lyrics result
+        if "text" in result:
+            print(f"\n{BOLD}{GREEN}Generated Lyrics:{END}\n", file=stderr)
+            print(result["text"])
+            if "title" in result:
+                print(f"\n{BOLD}Suggested Title:{END} {result['title']}",
+                      file=stderr)
+        return
+
+    print(f"\n{BOLD}{GREEN}Generated {len(tracks)} track(s):{END}\n",
+          file=stderr)
+
+    for i, track in enumerate(tracks):
+        title: str = track.get("title", "Untitled")
+        duration: float = track.get("duration", 0)
+        tags: str = track.get("tags", "N/A")
+        audio_url: str = track.get("audio_url", "")
+        stream_url: str = track.get("stream_audio_url", "")
+        image_url: str = track.get("image_url", "")
+        audio_id: str = track.get("id", "N/A")
+        model_name: str = track.get("model_name", "N/A")
+        create_time: str = track.get("createTime", "")
+
+        print(f"  {BOLD}{YELLOW}Track {i + 1}:{END} {title}", file=stderr)
+        print(f"    {BOLD}Audio ID:{END}  {BLUE}{audio_id}{END}", file=stderr)
+        print(f"    {BOLD}Duration:{END}  {duration:.1f}s", file=stderr)
+        print(f"    {BOLD}Style:{END}     {tags}", file=stderr)
+        print(f"    {BOLD}Model:{END}     {model_name}", file=stderr)
+        if audio_url:
+            print(f"    {BOLD}Audio:{END}     {MAGENTA}{audio_url}{END}",
+                  file=stderr)
+        if stream_url:
+            print(f"    {BOLD}Stream:{END}    {stream_url}", file=stderr)
+        if image_url:
+            print(f"    {BOLD}Cover:{END}    {image_url}", file=stderr)
+        if create_time:
+            print(f"    {BOLD}Created:{END}   {create_time}", file=stderr)
+        print("", file=stderr)
+
+
+def print_credits_display(credits_data: dict, use_color: bool = True) -> None:
+    """Print credit balance in a formatted display."""
+    if use_color:
+        BOLD: str = '\033[1m'
+        CYAN: str = '\033[96m'
+        GREEN: str = '\033[92m'
+        END: str = '\033[0m'
+    else:
+        BOLD = CYAN = GREEN = END = ''
+
+    width: int = 40
+    print(f"\n{BOLD}{CYAN}{'=' * width}{END}", file=stderr)
+    print(f"{BOLD}{CYAN}  Suno AI Credits{END}", file=stderr)
+    print(f"{BOLD}{CYAN}{'=' * width}{END}", file=stderr)
+
+    if isinstance(credits_data, dict):
+        for key, value in credits_data.items():
+            print(f"  {BOLD}{key}:{END} {GREEN}{value}{END}", file=stderr)
+    else:
+        print(f"  {BOLD}Balance:{END} {GREEN}{credits_data}{END}", file=stderr)
+
+    print(f"{BOLD}{CYAN}{'=' * width}{END}\n", file=stderr)
+
+
+def print_summary_table(
+    model: str,
+    operation: str,
+    total_time: float,
+    task_id: str|None = None,
+    audio_count: int = 0,
+    use_color: bool = True,
+    downloaded_files: list|None = None,
+) -> None:
+    """Print a formatted usage summary table adapted for Suno."""
+    if use_color:
+        CYAN: str = '\033[96m'
+        GREEN: str = '\033[92m'
+        YELLOW: str = '\033[93m'
+        BLUE: str = '\033[94m'
+        MAGENTA: str = '\033[95m'
+        BOLD: str = '\033[1m'
+        END: str = '\033[0m'
+    else:
+        CYAN = GREEN = YELLOW = BLUE = MAGENTA = BOLD = END = ''
+
+    import re
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+    def strip_ansi(text: str) -> str:
+        return ansi_escape.sub('', text)
+
+    width: int = 50
+
+    def make_line(left: str, right: str, left_width: int = 22) -> str:
+        """Create a line with left and right parts, properly padded."""
+        left_plain: str = strip_ansi(left)
+        right_plain: str = strip_ansi(right)
+        left_part: str = left + ' ' * (left_width - len(left_plain))
+        remaining_width: int = 48 - left_width - 1
+        right_part: str = right + ' ' * max(
+            0, remaining_width - len(right_plain))
+        content: str = f"{left_part} {right_part}"
+        return f"{CYAN}|{END} {content} {CYAN}|{END}"
+
+    print(f"\n{BOLD}{CYAN}+{'=' * width}+{END}", file=stderr)
+
+    title: str = "Suno API Usage Summary"
+    title_pad_left: int = (width - len(title)) // 2
+    title_pad_right: int = width - len(title) - title_pad_left
+    print(f"{BOLD}{CYAN}|{' ' * title_pad_left}{title}"
+          f"{' ' * title_pad_right}|{END}", file=stderr)
+
+    print(f"{BOLD}{CYAN}+{'=' * width}+{END}", file=stderr)
+
+    # Model
+    print(make_line(f"{BOLD}Model:{END}",
+                    f"{GREEN}{model}{END}"), file=stderr)
+    print(make_line(f"{BOLD}Operation:{END}",
+                    f"{GREEN}{operation}{END}"), file=stderr)
+    print(f"{CYAN}+{'-' * width}+{END}", file=stderr)
+
+    # Task info
+    if task_id:
+        task_display: str = task_id
+        if len(task_display) > 25:
+            task_display = task_display[:22] + "..."
+        print(make_line(f"{BOLD}Task ID:{END}",
+                        f"{YELLOW}{task_display}{END}"), file=stderr)
+
+    if audio_count > 0:
+        print(make_line(f"{BOLD}Tracks generated:{END}",
+                        f"{YELLOW}{audio_count}{END}"), file=stderr)
+
+    print(f"{CYAN}+{'-' * width}+{END}", file=stderr)
+
+    # Timing
+    print(make_line(f"{BOLD}Total time:{END}",
+                    f"{BLUE}{total_time:.1f}s{END}"), file=stderr)
+
+    # Downloaded files
+    if downloaded_files:
+        print(f"{CYAN}+{'-' * width}+{END}", file=stderr)
+        print(make_line(f"{BOLD}Downloaded:{END}", ""), file=stderr)
+        for filepath in downloaded_files:
+            fname: str = os.path.basename(filepath)
+            if len(fname) > 35:
+                fname = fname[:32] + "..."
+            print(make_line("", f"{MAGENTA}{fname}{END}"), file=stderr)
+
+    print(f"{BOLD}{CYAN}+{'=' * width}+{END}", file=stderr)
+
+
+def print_timestamped_lyrics(
+    lyrics_data: dict,
+    use_color: bool = True
+) -> None:
+    """Print timestamped lyrics in a readable format."""
+    if use_color:
+        BOLD: str = '\033[1m'
+        CYAN: str = '\033[96m'
+        YELLOW: str = '\033[93m'
+        END: str = '\033[0m'
+    else:
+        BOLD = CYAN = YELLOW = END = ''
+
+    aligned_words: list = lyrics_data.get("alignedWords", [])
+    if not aligned_words:
+        print("No timestamped lyrics available", file=stderr)
+        return
+
+    print(f"\n{BOLD}{CYAN}Timestamped Lyrics:{END}\n", file=stderr)
+
+    current_line: str = ""
+    line_start: float = -1.0
+
+    for word_data in aligned_words:
+        word: str = word_data.get("word", "")
+        start_s: float = word_data.get("startS", 0.0)
+        end_s: float = word_data.get("endS", 0.0)
+
+        if line_start < 0:
+            line_start = start_s
+
+        # Detect line breaks (newlines in the word text)
+        if "\n" in word:
+            parts: list = word.split("\n")
+            current_line += parts[0]
+            if current_line.strip():
+                mins: int = int(line_start // 60)
+                secs: float = line_start % 60
+                print(f"  {YELLOW}[{mins:02d}:{secs:05.2f}]{END} "
+                      f"{current_line.strip()}")
+            current_line = parts[-1] if len(parts) > 1 else ""
+            line_start = end_s
+        else:
+            current_line += word
+
+    # Print any remaining text
+    if current_line.strip():
+        mins = int(line_start // 60)
+        secs = line_start % 60
+        print(f"  {YELLOW}[{mins:02d}:{secs:05.2f}]{END} "
+              f"{current_line.strip()}")
+
+    print("", file=stderr)
+
+
+# ============================================================================
+# Download Functions
+# ============================================================================
+
+def download_audio_files(
+    result: dict,
+    output_path: str|None = None,
+    debug: bool = False
+) -> list[str]:
+    """
+    Download audio files from URLs in the generation result.
+
+    Returns a list of downloaded file paths.
+    """
+    response_data: dict = result.get("response", result)
+    tracks: list = []
+    if isinstance(response_data, dict):
+        tracks = response_data.get("data", [])
+    elif isinstance(response_data, list):
+        tracks = response_data
+
+    if not tracks:
+        print("Warning: No audio tracks found to download", file=stderr)
+        return []
+
+    downloaded: list[str] = []
+
+    # Determine output directory
+    output_dir: str = "."
+    if output_path:
+        if os.path.isdir(output_path):
+            output_dir = output_path
+        else:
+            # Treat as directory if it looks like one (ends with /)
+            if output_path.endswith("/") or output_path.endswith(os.sep):
+                os.makedirs(output_path, exist_ok=True)
+                output_dir = output_path
+            else:
+                # Treat as a base filename
+                output_dir = os.path.dirname(output_path) or "."
+                os.makedirs(output_dir, exist_ok=True)
+
+    for track in tracks:
+        audio_url: str = track.get("audio_url", "")
+        if not audio_url:
+            continue
+
+        title: str = track.get("title", "suno-output")
+        # Sanitize title for filename
+        safe_title: str = "".join(
+            c if c.isalnum() or c in ("-", "_", " ") else "_"
+            for c in title
+        ).strip().replace(" ", "-")
+        if not safe_title:
+            safe_title = "suno-output"
+
+        filename: str = get_auto_numbered_filename(
+            base_name=os.path.join(output_dir, safe_title),
+            extension=".mp3")
+
+        if debug:
+            print(f"Debug: Downloading {audio_url} -> {filename}",
+                  file=stderr)
+
+        try:
+            print(f"Downloading: {title} -> {filename}", file=stderr)
+            response = requests.get(audio_url, timeout=120, stream=True)
+            response.raise_for_status()
+
+            with open(filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            file_size: int = os.path.getsize(filename)
+            size_mb: float = file_size / (1024 * 1024)
+            print(f"  Saved: {filename} ({size_mb:.1f} MB)", file=stderr)
+            downloaded.append(filename)
+
+        except requests.exceptions.RequestException as e:
+            print(f"Warning: Failed to download {title}: {e}", file=stderr)
+        except IOError as e:
+            print(f"Warning: Failed to write {filename}: {e}", file=stderr)
+
+    return downloaded
+
+
+# ============================================================================
+# Transaction Saving
+# ============================================================================
+
+def save_suno_transaction(
+    operation: str,
+    model: str,
+    prompt: str,
+    result: dict,
+    metadata: dict|None = None
+) -> None:
+    """Save Suno transaction to second-brain markdown file."""
+    base_path: Path = Path(
+        "/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    today: datetime = datetime.now()
+    filename: str = today.strftime("%Y-%m-%d.md")
+    file_path: Path = base_path / filename
+    timestamp: str = today.strftime("%Y-%m-%d %H:%M:%S")
+
+    content: str = f"\n# {timestamp}\n\n"
+    content += f"## Prompt\n\n```\n{prompt}\n```\n\n"
+
+    # Build response text
+    content += f"## Response\n\n"
+
+    response_data: dict = result.get("response", result)
+    tracks: list = []
+    if isinstance(response_data, dict):
+        tracks = response_data.get("data", [])
+    elif isinstance(response_data, list):
+        tracks = response_data
+
+    if tracks:
+        content += f"Generated {len(tracks)} track(s):\n\n"
+        for track in tracks:
+            title: str = track.get("title", "Untitled")
+            duration: float = track.get("duration", 0)
+            tags: str = track.get("tags", "N/A")
+            audio_url: str = track.get("audio_url", "")
+            image_url: str = track.get("image_url", "")
+            content += f"- **{title}** ({duration:.1f}s) - [{tags}]\n"
+            if audio_url:
+                content += f"  - Audio: {audio_url}\n"
+            if image_url:
+                content += f"  - Cover: {image_url}\n"
+    elif "text" in result:
+        content += f"{result['text']}\n"
+    elif "result" in result:
+        content += f"{result['result']}\n"
+    else:
+        content += f"Task submitted successfully.\n"
+
+    content += f"\n## Metadata\n\n"
+    content += f"- **Provider**: Suno\n"
+    content += f"- **Model**: {model}\n"
+    content += f"- **Operation**: {operation}\n"
+
+    if metadata:
+        if "task_id" in metadata:
+            content += f"- **Task ID**: {metadata['task_id']}\n"
+        if "total_time" in metadata:
+            content += f"- **Total Time**: {metadata['total_time']:.2f}s\n"
+        if "downloaded_files" in metadata:
+            content += (f"- **Downloaded**: "
+                        f"{len(metadata['downloaded_files'])} file(s)\n")
+            for fp in metadata["downloaded_files"]:
+                content += f"  - {fp}\n"
+
+    content += "\n---\n"
+
+    try:
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        print(f"Warning: Could not save transaction: {e}", file=stderr)
+
+
+# ============================================================================
+# Dry Run
+# ============================================================================
+
+def print_dry_run(
+    operation: str,
+    endpoint: str,
+    method: str,
+    payload: dict|None = None,
+    params: dict|None = None,
+    query: str = "",
+) -> None:
+    """Show what would be sent to the API without making the request."""
+    print("=== DRY RUN MODE ===", file=stderr)
+    print(f"\nOperation: {operation}", file=stderr)
+    print(f"API Endpoint: {BASE_URL}{endpoint}", file=stderr)
+    print(f"HTTP Method: {method}", file=stderr)
+    print(f"\nHeaders:", file=stderr)
+    print(f"  Authorization: Bearer {api_key[:5]}..."
+          f"{api_key[-4:] if len(api_key) > 9 else '***'}", file=stderr)
+    print(f"  Content-Type: application/json", file=stderr)
+
+    if payload:
+        print(f"\nRequest Payload:", file=stderr)
+        display_payload: dict = payload.copy()
+        # Truncate long fields for readability
+        for key in ("prompt", "content"):
+            if key in display_payload and len(str(display_payload[key])) > 500:
+                display_payload[key] = (
+                    str(display_payload[key])[:500] + "... [truncated]")
+        print(json.dumps(display_payload, indent=2), file=stderr)
+
+    if params:
+        print(f"\nQuery Parameters:", file=stderr)
+        print(json.dumps(params, indent=2), file=stderr)
+
+    if query and len(query) > 0:
+        print(f"\nFull Prompt ({len(query)} characters):", file=stderr)
+        if len(query) > 1000:
+            print(query[:1000] + "... [truncated]", file=stderr)
+        else:
+            print(query, file=stderr)
+
+    print("\n=== END DRY RUN ===", file=stderr)
+
+
+# ============================================================================
+# Main Execution
+# ============================================================================
+
+try:
+    # Handle --license
+    if args.license:
+        print(AGPLV3_NOTICE)
+        exit(0)
+
+    # Handle --show-models
+    if args.show_models:
+        use_colors: bool = (not args.no_color
+                            and environ.get("NO_COLOR", "").lower()
+                            not in ("1", "true"))
+        if use_colors:
+            BOLD: str = '\033[1m'
+            CYAN: str = '\033[96m'
+            GREEN: str = '\033[92m'
+            YELLOW: str = '\033[93m'
+            BLUE: str = '\033[94m'
+            HEADER: str = '\033[95m'
+            END: str = '\033[0m'
+        else:
+            BOLD = CYAN = GREEN = YELLOW = BLUE = HEADER = END = ''
+
+        print(f"\n{BOLD}{CYAN}Available Suno Models:{END}")
+        print(f"{BOLD}{'─' * 75}{END}")
+        print(f"{BOLD}{HEADER}{'Model':<12} {'Max Duration':<14} "
+              f"{'Max Prompt':<12} {'Description':<35}{END}")
+        print(f"{'─' * 12} {'─' * 14} {'─' * 12} {'─' * 35}")
+
+        for i, (model_id, specs) in enumerate(SUNO_MODELS.items()):
+            color: str = CYAN if i % 2 == 0 else BLUE
+            duration_str: str = f"{specs['max_duration'] // 60} min"
+            prompt_str: str = f"{specs['max_prompt']} chars"
+            desc: str = specs['description']
+            if len(desc) > 35:
+                desc = desc[:32] + "..."
+
+            default_marker: str = " *" if model_id == DEFAULT_MODEL else ""
+            print(f"{color}{model_id:<12}{END} "
+                  f"{YELLOW}{duration_str:<14}{END} "
+                  f"{YELLOW}{prompt_str:<12}{END} "
+                  f"{GREEN}{desc}{default_marker}{END}")
+
+        print(f"{'─' * 75}")
+        print(f"  * = default model")
+        print(f"  Generated files are retained for 15 days\n")
+        exit(0)
+
+    # Handle --credits (no input needed)
+    if args.credits:
+        result: dict = get_credits_request()
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print_credits_display(result, use_color=not args.no_color)
+        exit(0)
+
+    # Handle --status TASK_ID
+    if args.status:
+        result = get_task_status(args.status)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print_generation_result(result, use_color=not args.no_color)
+        exit(0)
+
+    # Handle --timestamped-lyrics (synchronous, no polling needed)
+    if args.timestamped_lyrics:
+        if args.dry_run:
+            print_dry_run("timestamped_lyrics",
+                          "/api/v1/generate/get-timestamped-lyrics", "POST",
+                          payload={"taskId": args.task_id or "REQUIRED",
+                                   "audioId": args.audio_id or "REQUIRED"})
+            exit(0)
+        result = get_timestamped_lyrics_request(args)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print_timestamped_lyrics(result, use_color=not args.no_color)
+        exit(0)
+
+    # Read from stdin if available (same pattern as grokpy)
+    query: str = ""
+    if not stdin.isatty() or stdin in select.select([stdin], [], [], 0)[0]:
+        query = stdin.read()
+
+    # Combine with --prompt
+    if args.prompt:
+        if query:
+            query = args.prompt + "\n" + query
+        else:
+            query = args.prompt
+
+    # Handle --boost-style (synchronous, no polling)
+    if args.boost_style:
+        if not query:
+            print("Error: --prompt or stdin input required for style boost",
+                  file=stderr)
+            exit(1)
+        if args.dry_run:
+            print_dry_run("boost_style", "/api/v1/style/generate", "POST",
+                          payload={"content": query}, query=query)
+            exit(0)
+
+        start_time: float = time.time()
+        result = boost_style_request(args, query)
+        end_time: float = time.time()
+        total_time: float = end_time - start_time
+
+        if args.json:
+            print(json.dumps(result))
+        else:
+            boosted_style: str = result.get("result", "")
+            if boosted_style:
+                print(boosted_style)
+            else:
+                print(json.dumps(result))
+
+        if args.summary:
+            print_summary_table(
+                model=args.model, operation="boost_style",
+                total_time=total_time, use_color=not args.no_color)
+
+        if not args.no_preserve:
+            save_suno_transaction(
+                "boost_style", args.model, query, result,
+                metadata={"total_time": total_time})
+        exit(0)
+
+    # Validate float range parameters
+    validate_float_range(args.style_weight, "style-weight")
+    validate_float_range(args.weirdness, "weirdness")
+    validate_float_range(args.audio_weight, "audio-weight")
+
+    # Determine operation and build dry-run info
+    operation: str = "generate"
+    dry_run_endpoint: str = "/api/v1/generate"
+    dry_run_method: str = "POST"
+    dry_run_payload: dict = {}
+
+    if args.lyrics:
+        operation = "lyrics"
+        dry_run_endpoint = "/api/v1/lyrics"
+        if not query:
+            print("Error: --prompt or stdin input required", file=stderr)
+            exit(1)
+        dry_run_payload = {"prompt": query, "callBackUrl": ""}
+    elif args.extend:
+        operation = "extend"
+        dry_run_endpoint = "/api/v1/generate/extend"
+        dry_run_payload = {
+            "audioId": args.audio_id or "REQUIRED",
+            "defaultParamFlag": bool(args.style or args.title or query),
+            "callBackUrl": "", "model": args.model,
+        }
+        if query:
+            dry_run_payload["prompt"] = query
+        if args.style:
+            dry_run_payload["style"] = args.style
+        if args.title:
+            dry_run_payload["title"] = args.title
+        if args.continue_at is not None:
+            dry_run_payload["continueAt"] = args.continue_at
+    elif args.cover:
+        operation = "cover"
+        dry_run_endpoint = "/api/v1/generate/upload-cover"
+        custom: bool = args.custom_mode or auto_detect_custom_mode(args)
+        dry_run_payload = {
+            "uploadUrl": args.upload_url or "REQUIRED",
+            "customMode": custom,
+            "instrumental": args.instrumental,
+            "callBackUrl": "", "model": args.model,
+        }
+        if query:
+            dry_run_payload["prompt"] = query
+        if args.style:
+            dry_run_payload["style"] = args.style
+        if args.title:
+            dry_run_payload["title"] = args.title
+    elif args.add_vocals:
+        operation = "add_vocals"
+        dry_run_endpoint = "/api/v1/generate/add-vocals"
+        dry_run_payload = {
+            "uploadUrl": args.upload_url or "REQUIRED",
+            "prompt": query or "REQUIRED",
+            "title": args.title or "REQUIRED",
+            "style": args.style or "REQUIRED",
+            "negativeTags": args.negative_tags or "",
+            "callBackUrl": "",
+        }
+    elif args.add_instrumental:
+        operation = "add_instrumental"
+        dry_run_endpoint = "/api/v1/generate/add-instrumental"
+        dry_run_payload = {
+            "uploadUrl": args.upload_url or "REQUIRED",
+            "title": args.title or "REQUIRED",
+            "tags": args.style or "REQUIRED",
+            "negativeTags": args.negative_tags or "",
+            "callBackUrl": "",
+        }
+    elif args.separate:
+        operation = "separate"
+        dry_run_endpoint = "/api/v1/vocal-removal/generate"
+        dry_run_payload = {
+            "taskId": args.task_id or "REQUIRED",
+            "audioId": args.audio_id or "REQUIRED",
+            "callBackUrl": "",
+            "type": args.separate_type,
+        }
+    elif args.to_wav:
+        operation = "to_wav"
+        dry_run_endpoint = "/api/v1/wav/generate"
+        dry_run_payload = {
+            "taskId": args.task_id or "REQUIRED",
+            "audioId": args.audio_id or "REQUIRED",
+            "callBackUrl": "",
+        }
+    elif args.video:
+        operation = "video"
+        dry_run_endpoint = "/api/v1/mp4/generate"
+        dry_run_payload = {
+            "taskId": args.task_id or "REQUIRED",
+            "audioId": args.audio_id or "REQUIRED",
+            "callBackUrl": "",
+        }
+        if args.video_author:
+            dry_run_payload["author"] = args.video_author
+        if args.video_domain:
+            dry_run_payload["domainName"] = args.video_domain
+    else:
+        # Default: generate music
+        operation = "generate"
+        custom = args.custom_mode or auto_detect_custom_mode(args)
+        dry_run_payload = {
+            "model": args.model,
+            "customMode": custom,
+            "instrumental": args.instrumental,
+            "callBackUrl": "",
+        }
+        if custom:
+            if not args.instrumental and query:
+                dry_run_payload["prompt"] = query
+            if args.style:
+                dry_run_payload["style"] = args.style
+            if args.title:
+                dry_run_payload["title"] = args.title
+        else:
+            if query:
+                dry_run_payload["prompt"] = query[:500]
+
+    # Handle --dry-run
+    if args.dry_run:
+        print_dry_run(operation, dry_run_endpoint, dry_run_method,
+                      payload=dry_run_payload, query=query)
+        exit(0)
+
+    # Validate we have input for operations that need it
+    if (operation in ("generate", "lyrics", "add_vocals")
+            and not query
+            and not args.instrumental
+            and not (operation == "generate"
+                     and auto_detect_custom_mode(args)
+                     and args.instrumental)):
+        print("Error: No input provided. Use --prompt or pipe input via stdin",
+              file=stderr)
+        exit(1)
+
+    # Start timing
+    start_time = time.time()
+
+    # Dispatch to operation function
+    task_id: str = ""
+    result = {}
+
+    if args.lyrics:
+        task_id = generate_lyrics(args, query)
+    elif args.extend:
+        task_id = extend_music(args, query)
+    elif args.cover:
+        task_id = upload_and_cover(args, query)
+    elif args.add_vocals:
+        task_id = add_vocals(args, query)
+    elif args.add_instrumental:
+        task_id = add_instrumental(args)
+    elif args.separate:
+        task_id = separate_vocals(args)
+    elif args.to_wav:
+        task_id = convert_to_wav(args)
+    elif args.video:
+        task_id = create_music_video(args)
+    else:
+        task_id = generate_music(args, query)
+
+    # Handle --no-wait
+    if args.no_wait and task_id:
+        print(task_id)
+        if not args.no_preserve:
+            save_suno_transaction(
+                operation, args.model, query,
+                {"taskId": task_id, "status": "PENDING"},
+                metadata={"task_id": task_id})
+        exit(0)
+
+    # Poll for result
+    if task_id:
+        print(f"Task submitted: {task_id}", file=stderr)
+        result = poll_for_result(
+            task_id,
+            poll_interval=args.poll_interval,
+            max_attempts=MAX_POLL_ATTEMPTS,
+            debug=args.debug,
+            no_color=args.no_color,
+        )
+
+    # Calculate total time
+    end_time = time.time()
+    total_time = end_time - start_time
+
+    # Output result
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print_generation_result(result, use_color=not args.no_color)
+
+    # Download if requested
+    downloaded_files: list[str] = []
+    if args.download and result:
+        downloaded_files = download_audio_files(
+            result,
+            output_path=args.output,
+            debug=args.debug,
+        )
+
+    # Summary table
+    if args.summary:
+        response_data: dict = result.get("response", result)
+        track_list: list = []
+        if isinstance(response_data, dict):
+            track_list = response_data.get("data", [])
+        elif isinstance(response_data, list):
+            track_list = response_data
+
+        print_summary_table(
+            model=args.model,
+            operation=operation,
+            total_time=total_time,
+            task_id=task_id,
+            audio_count=len(track_list),
+            use_color=not args.no_color,
+            downloaded_files=downloaded_files,
+        )
+
+    # Save transaction
+    if not args.no_preserve and result:
+        metadata: dict = {
+            "operation": operation,
+            "task_id": task_id,
+            "total_time": total_time,
+        }
+        if downloaded_files:
+            metadata["downloaded_files"] = downloaded_files
+
+        save_suno_transaction(
+            operation, args.model, query, result, metadata)
+
+except (ImportError, Exception) as e:
+    print(f"Error: {e}")
+    if args.debug:
+        import traceback
+        traceback.print_exc()
+    exit(1)
