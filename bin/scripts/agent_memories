@@ -33,8 +33,11 @@ if not no_dbox_check and ctr_id != "dev":
 import argparse
 import asyncio
 import json
+import re
 import tempfile
 import shutil
+import urllib.request
+import urllib.error
 from datetime import datetime, date, timezone
 from typing import Optional
 
@@ -81,6 +84,7 @@ ALL_COLUMNS: list[str] = [
     "id", "content", "summary", "category", "subcategory", "importance",
     "source", "source_context", "conversation_id", "tags", "related_to",
     "is_archived", "is_pinned", "last_accessed_at", "access_count",
+    "confidence", "expires_at",
     "metadata", "created_at", "updated_at",
 ]
 
@@ -117,6 +121,68 @@ def _bold(text: str) -> str:
 
 def _dim(text: str) -> str:
     return _c("2", text)
+
+
+# =============================================================================
+# Embedding generation via Ollama
+# =============================================================================
+
+OLLAMA_URL: str = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+EMBED_MODEL: str = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+
+
+def _ollama_embed_sync(text: str) -> Optional[list[float]]:
+    """
+    Generate an embedding vector via Ollama HTTP API (synchronous).
+
+    Uses stdlib urllib so no extra deps required. Returns None on any
+    failure (ollama down, timeout, model not loaded, etc.).
+
+    Args:
+        text: The text to embed
+
+    Returns:
+        768-dimension float vector, or None on failure
+    """
+    url: str = f"{OLLAMA_URL}/api/embed"
+    payload: bytes = json.dumps({
+        "model": EMBED_MODEL,
+        "input": text,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data: dict = json.loads(resp.read().decode("utf-8"))
+            embeddings: list = data.get("embeddings", [])
+            if embeddings and len(embeddings) > 0:
+                return embeddings[0]
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+async def generate_embedding(text: str) -> Optional[list[float]]:
+    """
+    Generate embedding via Ollama, non-blocking.
+
+    Runs the synchronous HTTP call in a thread executor so it doesn't
+    block the asyncio event loop.
+
+    Args:
+        text: The text to embed
+
+    Returns:
+        768-dimension float vector, or None on failure
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _ollama_embed_sync, text)
 
 
 # =============================================================================
@@ -197,6 +263,8 @@ class MemoryManager:
         related_to: Optional[str] = None,
         pinned: bool = False,
         metadata: Optional[dict] = None,
+        confidence: float = 1.0,
+        expires_at: Optional[datetime] = None,
     ) -> str:
         """
         Store a new memory in the database.
@@ -232,8 +300,9 @@ class MemoryManager:
             INSERT INTO memories (
                 content, summary, category, subcategory, importance,
                 source, source_context, conversation_id,
-                tags, related_to, is_pinned, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                tags, related_to, is_pinned, metadata,
+                confidence, expires_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id
             """,
             content,
@@ -248,8 +317,22 @@ class MemoryManager:
             related_uuid,
             pinned,
             json.dumps(metadata or {}),
+            confidence,
+            expires_at,
         )
-        return str(row["id"])
+        memory_id: str = str(row["id"])
+
+        # Generate embedding async (non-fatal if ollama is unavailable)
+        embed_text: str = f"{summary or ''} {content}"
+        embedding: Optional[list[float]] = await generate_embedding(embed_text)
+        if embedding:
+            await self.pool.execute(
+                "UPDATE memories SET embedding = $1 WHERE id = $2",
+                str(embedding),
+                memory_id,
+            )
+
+        return memory_id
 
     async def get_memory(self, memory_id: str) -> Optional[dict]:
         """
@@ -302,6 +385,7 @@ class MemoryManager:
             "content", "summary", "category", "subcategory", "importance",
             "source", "source_context", "conversation_id", "tags",
             "is_archived", "is_pinned", "metadata",
+            "confidence", "expires_at",
         }
 
         sets: list[str] = []
@@ -322,6 +406,22 @@ class MemoryManager:
 
         query: str = f"UPDATE memories SET {', '.join(sets)} WHERE id = $1"
         await self.pool.execute(query, full_id, *vals)
+
+        # Regenerate embedding if content or summary changed
+        if "content" in kwargs or "summary" in kwargs:
+            row = await self.pool.fetchrow(
+                "SELECT content, summary FROM memories WHERE id = $1", full_id
+            )
+            if row:
+                embed_text: str = f"{row['summary'] or ''} {row['content']}"
+                embedding: Optional[list[float]] = await generate_embedding(embed_text)
+                if embedding:
+                    await self.pool.execute(
+                        "UPDATE memories SET embedding = $1 WHERE id = $2",
+                        str(embedding),
+                        full_id,
+                    )
+
         return True
 
     async def delete_memory(self, memory_id: str) -> bool:
@@ -426,6 +526,9 @@ class MemoryManager:
             params.append(pinned)
             idx += 1
 
+        # Exclude expired memories by default
+        conditions.append("(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)")
+
         where: str = " AND ".join(conditions) if conditions else "TRUE"
         direction: str = "DESC" if descending else "ASC"
 
@@ -516,19 +619,90 @@ class MemoryManager:
             params.append(category)
             idx += 1
 
+        # Exclude expired memories
+        conditions.append("(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)")
+
         where: str = " AND ".join(conditions)
         params.append(limit)
+
+        # Weight confidence into ranking
+        confidence_rank: str = f"({rank_expr}) * COALESCE(confidence, 1.0)"
 
         sql: str = f"""
             SELECT *, {rank_expr} as relevance
             FROM memories
             WHERE {where}
-            ORDER BY is_pinned DESC, relevance DESC, created_at DESC
+            ORDER BY is_pinned DESC, ({confidence_rank}) DESC, created_at DESC
             LIMIT ${idx}
         """
 
         rows = await self.pool.fetch(sql, *params)
         return [dict(r) for r in rows]
+
+    async def semantic_search(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        include_archived: bool = False,
+        limit: int = 25,
+    ) -> list[dict]:
+        """
+        Semantic similarity search using pgvector cosine distance.
+
+        Generates an embedding for the query text via Ollama, then finds
+        the most similar memories using the HNSW index. Falls back to
+        fuzzy search if ollama is unavailable or no embeddings exist.
+
+        Args:
+            query: Natural language search query
+            category: Optional category filter
+            include_archived: Include archived memories
+            limit: Max results
+
+        Returns:
+            List of matching memory dicts, ranked by cosine similarity
+        """
+        query_embedding: Optional[list[float]] = await generate_embedding(query)
+        if query_embedding is None:
+            print(
+                _yellow("Warning: ollama unavailable, falling back to fuzzy search"),
+                file=sys.stderr,
+            )
+            return await self.search_memories(
+                query=query, category=category,
+                include_archived=include_archived, limit=limit,
+            )
+
+        conditions: list[str] = ["embedding IS NOT NULL"]
+        params: list = [str(query_embedding)]
+        idx: int = 2
+
+        if not include_archived:
+            conditions.append("is_archived = FALSE")
+
+        if category:
+            conditions.append(f"category = ${idx}")
+            params.append(category)
+            idx += 1
+
+        # Exclude expired memories
+        conditions.append("(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)")
+
+        where: str = " AND ".join(conditions)
+        params.append(limit)
+
+        sql: str = f"""
+            SELECT *, (1 - (embedding <=> $1::vector)) * COALESCE(confidence, 1.0)
+                AS similarity
+            FROM memories
+            WHERE {where}
+            ORDER BY similarity DESC
+            LIMIT ${idx}
+        """
+
+        rows = await self.pool.fetch(sql, *params)
+        # Filter out low-similarity noise
+        return [dict(r) for r in rows if r["similarity"] >= 0.5]
 
     async def get_stats(self) -> dict:
         """
@@ -784,6 +958,17 @@ def format_memory_detail(mem: dict) -> str:
 
     lines.append(f"  {_cyan('Pinned:')}      {'yes' if mem.get('is_pinned') else 'no'}")
     lines.append(f"  {_cyan('Archived:')}    {'yes' if mem.get('is_archived') else 'no'}")
+    lines.append(f"  {_cyan('Confidence:')}  {mem.get('confidence', 1.0):.2f}")
+
+    expires: str = "-"
+    if mem.get("expires_at"):
+        exp_dt: datetime = mem["expires_at"]
+        expires = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
+        if exp_dt < datetime.now(timezone.utc):
+            expires += _red(" (EXPIRED)")
+    lines.append(f"  {_cyan('Expires:')}     {expires}")
+    has_embed: str = "yes" if mem.get("embedding") else "no"
+    lines.append(f"  {_cyan('Embedding:')}   {has_embed}")
     lines.append(f"  {_cyan('Accessed:')}    {mem.get('access_count', 0)} times")
 
     tags: list[str] = mem.get("tags", [])
@@ -835,9 +1020,9 @@ def format_memory_table(memories: list[dict], columns: Optional[list[str]] = Non
 
     cols: list[str] = columns or DEFAULT_COLUMNS
     col_widths: dict[str, int] = {
-        "id": 8, "category": 12, "subcategory": 12, "importance": 8,
-        "summary": 50, "source": 15, "tags": 25, "created_at": 10,
-        "updated_at": 10, "access_count": 6, "is_pinned": 3,
+        "id": 8, "similarity": 6, "category": 12, "subcategory": 12,
+        "importance": 8, "summary": 50, "source": 15, "tags": 25,
+        "created_at": 10, "updated_at": 10, "access_count": 6, "is_pinned": 3,
     }
 
     # Header
@@ -858,6 +1043,8 @@ def format_memory_table(memories: list[dict], columns: Optional[list[str]] = Non
 
             if col == "id":
                 val = str(val)[:8]
+            elif col == "similarity":
+                val = f"{float(val):.2f}" if val is not None else ""
             elif col == "tags":
                 val = ",".join(val[:3]) if val else ""
             elif col in ("created_at", "updated_at"):
@@ -916,6 +1103,45 @@ def format_as_yaml(data: list[dict] | dict) -> str:
 
 
 # =============================================================================
+# Helpers
+# =============================================================================
+
+def _parse_expiry(value: str) -> datetime:
+    """
+    Parse a relative or absolute expiry string into a datetime.
+
+    Relative formats: 7d (days), 2w (weeks), 3m (months), 1y (years)
+    Absolute: ISO 8601 date or datetime string
+    """
+    from datetime import timedelta
+
+    match: Optional[re.Match] = re.match(r"^(\d+)([dwmy])$", value.strip())
+    if match:
+        amount: int = int(match.group(1))
+        unit: str = match.group(2)
+        now: datetime = datetime.now(timezone.utc)
+        if unit == "d":
+            return now + timedelta(days=amount)
+        elif unit == "w":
+            return now + timedelta(weeks=amount)
+        elif unit == "m":
+            return now + timedelta(days=amount * 30)
+        elif unit == "y":
+            return now + timedelta(days=amount * 365)
+
+    # Try ISO format
+    try:
+        dt: datetime = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        print(_red(f"Invalid expiry format: '{value}'"), file=sys.stderr)
+        print("Use relative (7d, 2w, 3m, 1y) or ISO date (2026-03-01)", file=sys.stderr)
+        sys.exit(1)
+
+
+# =============================================================================
 # Command handlers
 # =============================================================================
 
@@ -930,6 +1156,11 @@ async def cmd_add(mgr: MemoryManager, args: argparse.Namespace) -> None:
             print(_red("No content provided via stdin"), file=sys.stderr)
             sys.exit(1)
 
+    # Parse expiry if provided
+    expires_at: Optional[datetime] = None
+    if args.expires:
+        expires_at = _parse_expiry(args.expires)
+
     memory_id: str = await mgr.add_memory(
         content=content,
         summary=args.summary,
@@ -943,6 +1174,8 @@ async def cmd_add(mgr: MemoryManager, args: argparse.Namespace) -> None:
         related_to=args.related_to,
         pinned=args.pin,
         metadata=json.loads(args.metadata) if args.metadata else None,
+        confidence=args.confidence,
+        expires_at=expires_at,
     )
     print(_green(f"Memory created: {memory_id[:8]}"))
 
@@ -1022,21 +1255,35 @@ async def cmd_search(mgr: MemoryManager, args: argparse.Namespace) -> None:
         print(_red("Search query required"), file=sys.stderr)
         return
 
-    results: list[dict] = await mgr.search_memories(
-        query=args.query,
-        category=args.category,
-        include_archived=args.include_archived,
-        limit=args.limit,
-        exact=args.exact,
-    )
+    semantic: bool = getattr(args, "semantic", False)
+    if semantic:
+        results: list[dict] = await mgr.semantic_search(
+            query=args.query,
+            category=args.category,
+            include_archived=args.include_archived,
+            limit=args.limit,
+        )
+    else:
+        results: list[dict] = await mgr.search_memories(
+            query=args.query,
+            category=args.category,
+            include_archived=args.include_archived,
+            limit=args.limit,
+            exact=args.exact,
+        )
 
     fmt: str = args.format
+    # Show similarity score column for semantic searches
+    sem_cols: Optional[list[str]] = None
+    if semantic and results:
+        sem_cols = ["id", "similarity", "category", "importance", "summary", "tags"]
+
     if fmt == "json":
         print(format_as_json(results))
     elif fmt in ("yaml", "yml"):
         print(format_as_yaml(results))
     else:
-        print(format_memory_table(results))
+        print(format_memory_table(results, columns=sem_cols))
 
 
 async def cmd_edit(mgr: MemoryManager, args: argparse.Namespace) -> None:
@@ -1349,6 +1596,229 @@ async def cmd_import(mgr: MemoryManager, args: argparse.Namespace) -> None:
     print(_green(f"Imported {count} memories"))
 
 
+async def cmd_prune(mgr: MemoryManager, args: argparse.Namespace) -> None:
+    """Handle the 'prune' subcommand — archive or delete expired memories."""
+    # Count expired memories
+    expired_count: int = await mgr.pool.fetchval(
+        "SELECT COUNT(*) FROM memories "
+        "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP "
+        "AND is_archived = FALSE"
+    )
+
+    if expired_count == 0:
+        print("No expired memories to prune.")
+        return
+
+    if args.dry_run:
+        print(f"Would prune {expired_count} expired memories:")
+        rows = await mgr.pool.fetch(
+            "SELECT id, summary, expires_at FROM memories "
+            "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP "
+            "AND is_archived = FALSE "
+            "ORDER BY expires_at ASC"
+        )
+        for row in rows:
+            exp: str = row["expires_at"].strftime("%Y-%m-%d %H:%M")
+            print(f"  [{str(row['id'])[:8]}] expired {exp}: {row['summary'] or '(no summary)'}")
+        return
+
+    if args.delete:
+        # Permanently delete expired memories
+        result: str = await mgr.pool.execute(
+            "DELETE FROM memories "
+            "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP"
+        )
+        count: int = int(result.split(" ")[-1])
+        print(_green(f"Deleted {count} expired memories"))
+    else:
+        # Archive expired memories
+        result = await mgr.pool.execute(
+            "UPDATE memories SET is_archived = TRUE "
+            "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP "
+            "AND is_archived = FALSE"
+        )
+        count = int(result.split(" ")[-1])
+        print(_green(f"Archived {count} expired memories"))
+
+
+# =============================================================================
+# Backfill — generate embeddings for memories missing them
+# =============================================================================
+
+async def cmd_backfill(mgr: MemoryManager, args: argparse.Namespace) -> None:
+    """
+    Generate embeddings for all memories that don't have one yet.
+
+    Iterates through memories with NULL embedding, calls ollama for each,
+    and updates the row. Prints progress as it goes. Skips archived by
+    default unless --include-archived is set.
+    """
+    conditions: list[str] = ["embedding IS NULL"]
+    if not getattr(args, "include_archived", False):
+        conditions.append("is_archived = FALSE")
+
+    where: str = " AND ".join(conditions)
+    rows = await mgr.pool.fetch(
+        f"SELECT id, content, summary FROM memories WHERE {where} ORDER BY created_at ASC"
+    )
+
+    total: int = len(rows)
+    if total == 0:
+        print("All memories already have embeddings.")
+        return
+
+    print(f"Backfilling embeddings for {total} memories...")
+    success: int = 0
+    failed: int = 0
+
+    for i, row in enumerate(rows, 1):
+        embed_text: str = f"{row['summary'] or ''} {row['content']}"
+        embedding: Optional[list[float]] = await generate_embedding(embed_text)
+        if embedding:
+            await mgr.pool.execute(
+                "UPDATE memories SET embedding = $1 WHERE id = $2",
+                str(embedding),
+                row["id"],
+            )
+            success += 1
+        else:
+            failed += 1
+            if failed == 1:
+                print(_yellow("Warning: ollama may be unavailable"), file=sys.stderr)
+
+        # Progress every 10 or on last
+        if i % 10 == 0 or i == total:
+            print(f"  [{i}/{total}] {success} embedded, {failed} failed", end="\r")
+
+    print(f"\n{_green(f'Done: {success} embedded')}, {_yellow(f'{failed} failed') if failed else '0 failed'}")
+
+
+
+
+
+# =============================================================================
+# Bootstrap — structured context injection for session start hooks
+# =============================================================================
+
+async def cmd_bootstrap(mgr: MemoryManager, args: argparse.Namespace) -> None:
+    """
+    Output structured memory context for AI session bootstrap.
+
+    Pulls pinned, decisions, preferences, critical, and recent memories
+    into a compact format (~500-800 tokens) suitable for injection via
+    a SessionStart hook. Deduplicates by UUID across sections.
+    """
+    seen_ids: set[str] = set()
+    sections: list[tuple[str, list[dict]]] = []
+    recent_limit: int = args.limit if hasattr(args, "limit") else 5
+    fmt: str = args.format if hasattr(args, "format") else "text"
+
+    # 1. Pinned memories (all, non-archived)
+    pinned: list[dict] = await mgr.list_memories(pinned=True, limit=100)
+    sections.append(("PINNED", pinned))
+
+    # 2. All decisions (non-archived)
+    decisions: list[dict] = await mgr.list_memories(category="decision", limit=100)
+    sections.append(("DECISIONS", decisions))
+
+    # 3. All preferences (non-archived)
+    preferences: list[dict] = await mgr.list_memories(category="preference", limit=100)
+    sections.append(("PREFERENCES", preferences))
+
+    # 4. All critical importance (non-archived)
+    critical: list[dict] = await mgr.list_memories(importance="critical", limit=100)
+    sections.append(("CRITICAL", critical))
+
+    # 5. Recent from key categories
+    for cat in ("project", "technical", "learning", "workflow"):
+        recent: list[dict] = await mgr.list_memories(
+            category=cat, limit=recent_limit
+        )
+        sections.append((f"RECENT ({cat})", recent))
+
+    if fmt == "json":
+        _bootstrap_json(sections, seen_ids)
+    else:
+        _bootstrap_text(sections, seen_ids)
+
+
+def _bootstrap_format_line(mem: dict) -> str:
+    """Format a single memory as a compact one-liner for bootstrap output."""
+    mid: str = str(mem["id"])[:8]
+    summary: str = mem.get("summary") or ""
+    if not summary:
+        content: str = mem.get("content", "")
+        summary = content[:120].split("\n")[0]
+    tags: list[str] = mem.get("tags") or []
+    tag_str: str = f" {{tags: {','.join(tags)}}}" if tags else ""
+    return f"- [{mid}] {summary}{tag_str}"
+
+
+def _bootstrap_text(
+    sections: list[tuple[str, list[dict]]],
+    seen_ids: set[str],
+) -> None:
+    """Output bootstrap context as compact structured text."""
+    total: int = 0
+    output_lines: list[str] = []
+
+    for section_name, memories in sections:
+        lines: list[str] = []
+        for mem in memories:
+            mid: str = str(mem["id"])
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            lines.append(_bootstrap_format_line(mem))
+            total += 1
+
+        if lines:
+            output_lines.append(f"\n## {section_name}")
+            output_lines.extend(lines)
+
+    if total == 0:
+        print("=== AGENT MEMORIES BOOTSTRAP ===")
+        print("No memories stored yet. Use 'agent_memories add' to create memories.")
+        print("=== END BOOTSTRAP ===")
+        return
+
+    print("=== AGENT MEMORIES BOOTSTRAP ===")
+    print(f"[{total} memories injected]")
+    for line in output_lines:
+        print(line)
+    print("\n=== END BOOTSTRAP ===")
+
+
+def _bootstrap_json(
+    sections: list[tuple[str, list[dict]]],
+    seen_ids: set[str],
+) -> None:
+    """Output bootstrap context as JSON."""
+    result: dict = {"sections": {}, "total": 0}
+    total: int = 0
+
+    for section_name, memories in sections:
+        entries: list[dict] = []
+        for mem in memories:
+            mid: str = str(mem["id"])
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            entries.append({
+                "id": mid[:8],
+                "summary": (mem.get("summary") or mem.get("content", "")[:120]),
+                "category": mem.get("category", "general"),
+                "tags": mem.get("tags") or [],
+            })
+            total += 1
+
+        if entries:
+            result["sections"][section_name] = entries
+
+    result["total"] = total
+    print(json.dumps(result, indent=2))
+
+
 # =============================================================================
 # Argument parsing and main
 # =============================================================================
@@ -1371,6 +1841,8 @@ examples:
   agent_memories pin --fzf
   agent_memories stats
   agent_memories export -o backup.json
+  agent_memories bootstrap
+  agent_memories bootstrap --format json --limit 10
 
 categories: """ + ", ".join(CATEGORIES) + """
 importance: """ + ", ".join(IMPORTANCE_LEVELS),
@@ -1393,6 +1865,10 @@ importance: """ + ", ".join(IMPORTANCE_LEVELS),
     p_add.add_argument("--related-to", help="UUID of related memory")
     p_add.add_argument("--pin", action="store_true", help="Pin this memory")
     p_add.add_argument("--metadata", help="JSON metadata string")
+    p_add.add_argument("--confidence", type=float, default=1.0,
+                        help="Confidence score 0.0-1.0 (default: 1.0)")
+    p_add.add_argument("--expires", type=str, default=None,
+                        help="Expiry: relative (7d, 2w, 3m, 1y) or ISO date")
 
     # --- show ---
     p_show = subparsers.add_parser("show", help="Show memory details")
@@ -1423,6 +1899,8 @@ importance: """ + ", ".join(IMPORTANCE_LEVELS),
     p_search.add_argument("--fzf", action="store_true", help="Interactive fzf search")
     p_search.add_argument("--exact", action="store_true",
                           help="Use tsvector full-text search (stemming, boolean ops) instead of fuzzy trgm")
+    p_search.add_argument("--semantic", action="store_true",
+                          help="Use semantic similarity search via pgvector + ollama embeddings")
     p_search.add_argument("--category", help="Filter by category")
     p_search.add_argument("--include-archived", action="store_true", help="Include archived")
     p_search.add_argument("--limit", type=int, default=25, help="Max results")
@@ -1472,6 +1950,38 @@ importance: """ + ", ".join(IMPORTANCE_LEVELS),
     p_import.add_argument("file", help="Input file (json or yaml)")
     p_import.add_argument("--format", choices=["json", "yaml"], help="File format (auto-detected)")
 
+    # --- prune ---
+    p_prune = subparsers.add_parser(
+        "prune",
+        help="Archive or delete expired memories",
+    )
+    p_prune.add_argument("--delete", action="store_true",
+                          help="Permanently delete expired memories instead of archiving")
+    p_prune.add_argument("--dry-run", action="store_true",
+                          help="Show what would be pruned without doing it")
+
+    # --- backfill ---
+    p_backfill = subparsers.add_parser(
+        "backfill",
+        help="Generate embeddings for memories missing them (requires ollama)",
+    )
+    p_backfill.add_argument("--include-archived", action="store_true",
+                             help="Include archived memories in backfill")
+
+    # --- bootstrap ---
+    p_bootstrap = subparsers.add_parser(
+        "bootstrap",
+        help="Output structured context for AI session bootstrap hooks",
+    )
+    p_bootstrap.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default: text)",
+    )
+    p_bootstrap.add_argument(
+        "--limit", type=int, default=5,
+        help="Number of recent memories per category (default: 5)",
+    )
+
     args: argparse.Namespace = parser.parse_args()
 
     if args.license:
@@ -1501,6 +2011,9 @@ importance: """ + ", ".join(IMPORTANCE_LEVELS),
             "stats": cmd_stats,
             "export": cmd_export,
             "import": cmd_import,
+            "bootstrap": cmd_bootstrap,
+            "prune": cmd_prune,
+            "backfill": cmd_backfill,
         }
 
         handler = dispatch.get(args.command)
