@@ -101,6 +101,8 @@ dep_dirs:
     mkdir -p $HOME/.config
     mkdir -p $HOME/.config/autostart
     mkdir -p $HOME/.config/btop
+    mkdir -p $HOME/.config/gst
+    mkdir -p $HOME/.config/gowl
     mkdir -p $HOME/.config/mpd
     mkdir -p $HOME/.config/rofi
     mkdir -p $HOME/.config/qtile
