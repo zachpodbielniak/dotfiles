@@ -161,7 +161,7 @@ gst_config_init(void)
 	gst_config_set_module_config_int(config, "keyboard_select", "search_alpha", 150);
 
 	/* kittygfx */
-	gst_config_set_module_config_bool(config, "kittygfx", "enabled", FALSE);
+	gst_config_set_module_config_bool(config, "kittygfx", "enabled", TRUE);
 	gst_config_set_module_config_int(config, "kittygfx", "max_total_ram_mb", 256);
 	gst_config_set_module_config_int(config, "kittygfx", "max_single_image_mb", 64);
 	gst_config_set_module_config_int(config, "kittygfx", "max_placements", 4096);
