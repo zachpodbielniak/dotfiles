@@ -108,90 +108,118 @@ gst_config_init(void)
 	/* --- Modules --- */
 
 	/* scrollback */
-	gst_config_set_module_config_bool(config, "scrollback", "enabled", TRUE);
-	gst_config_set_module_config_int(config, "scrollback", "lines", 10000);
-	gst_config_set_module_config_int(config, "scrollback", "mouse_scroll_lines", 3);
+	config->modules.scrollback.enabled = TRUE;
+	config->modules.scrollback.lines = 10000;
+	config->modules.scrollback.mouse_scroll_lines = 3;
 
 	/* transparency */
-	gst_config_set_module_config_bool(config, "transparency", "enabled", TRUE);
-	gst_config_set_module_config_double(config, "transparency", "opacity", 0.9);
+	config->modules.transparency.enabled = TRUE;
+	config->modules.transparency.opacity = 0.9;
+    config->modules.transparency.focus_opacity = 0.9;
+    config->modules.transparency.unfocus_opacity = 0.9;
 
 	/* urlclick */
-	gst_config_set_module_config_bool(config, "urlclick", "enabled", TRUE);
-	gst_config_set_module_config_string(config, "urlclick", "opener", "xdg-open");
-	gst_config_set_module_config_string(config, "urlclick", "regex", "(https?|ftp|file)://[\\w\\-_.~:/?#\\[\\]@!$&'()*+,;=%]+");
-	gst_config_set_module_config_string(config, "urlclick", "modifiers", "Ctrl");
+	config->modules.urlclick.enabled = TRUE;
+	GST_CONFIG_SET_STRING(config->modules.urlclick.opener, "xdg-open");
+	GST_CONFIG_SET_STRING(config->modules.urlclick.regex,
+		"(https?|ftp|file)://[\\w\\-_.~:/?#\\[\\]@!$&'()*+,;=%]+");
+	GST_CONFIG_SET_STRING(config->modules.urlclick.modifiers, "Ctrl");
 
 	/* externalpipe */
-	gst_config_set_module_config_bool(config, "externalpipe", "enabled", FALSE);
-	gst_config_set_module_config_string(config, "externalpipe", "command", "");
-	gst_config_set_module_config_string(config, "externalpipe", "key", "Ctrl+Shift+e");
+	config->modules.externalpipe.enabled = FALSE;
+	GST_CONFIG_SET_STRING(config->modules.externalpipe.command, "");
+	GST_CONFIG_SET_STRING(config->modules.externalpipe.key, "Ctrl+Shift+e");
 
 	/* boxdraw */
-	gst_config_set_module_config_bool(config, "boxdraw", "enabled", TRUE);
-	gst_config_set_module_config_int(config, "boxdraw", "bold_offset", 1);
+	config->modules.boxdraw.enabled = TRUE;
+	config->modules.boxdraw.bold_offset = 1;
 
 	/* visualbell */
-	gst_config_set_module_config_bool(config, "visualbell", "enabled", FALSE);
-	gst_config_set_module_config_int(config, "visualbell", "duration", 100);
+	config->modules.visualbell.enabled = FALSE;
+	config->modules.visualbell.duration = 100;
 
 	/* undercurl */
-	gst_config_set_module_config_bool(config, "undercurl", "enabled", TRUE);
+	config->modules.undercurl.enabled = TRUE;
 
 	/* clipboard */
-	gst_config_set_module_config_bool(config, "clipboard", "enabled", TRUE);
+	config->modules.clipboard.enabled = TRUE;
 
 	/* font2 */
-	gst_config_set_module_config_bool(config, "font2", "enabled", TRUE);
+	config->modules.font2.enabled = TRUE;
 	{
 		static const gchar *font2_fonts[] = {
 			"NotoColorEmoji:pixelsize=20:antialias=true:autohint=true",
 			NULL
 		};
-		gst_config_set_module_config_strv(config, "font2", "fonts", font2_fonts);
+		g_strfreev(config->modules.font2.fonts);
+		config->modules.font2.fonts = g_strdupv((gchar **)font2_fonts);
 	}
 
 	/* keyboard_select */
-	gst_config_set_module_config_bool(config, "keyboard_select", "enabled", FALSE);
-	gst_config_set_module_config_string(config, "keyboard_select", "key", "Ctrl+Shift+Escape");
-	gst_config_set_module_config_bool(config, "keyboard_select", "show_crosshair", TRUE);
-	gst_config_set_module_config_string(config, "keyboard_select", "highlight_color", "#ff8800");
-	gst_config_set_module_config_int(config, "keyboard_select", "highlight_alpha", 100);
-	gst_config_set_module_config_string(config, "keyboard_select", "search_color", "#ffff00");
-	gst_config_set_module_config_int(config, "keyboard_select", "search_alpha", 150);
+	config->modules.keyboard_select.enabled = FALSE;
+	GST_CONFIG_SET_STRING(config->modules.keyboard_select.key,
+		"Ctrl+Shift+Escape");
+	config->modules.keyboard_select.show_crosshair = TRUE;
+	GST_CONFIG_SET_STRING(config->modules.keyboard_select.highlight_color,
+		"#ff8800");
+	config->modules.keyboard_select.highlight_alpha = 100;
+	GST_CONFIG_SET_STRING(config->modules.keyboard_select.search_color,
+		"#ffff00");
+	config->modules.keyboard_select.search_alpha = 150;
 
 	/* kittygfx */
-	gst_config_set_module_config_bool(config, "kittygfx", "enabled", TRUE);
-	gst_config_set_module_config_int(config, "kittygfx", "max_total_ram_mb", 256);
-	gst_config_set_module_config_int(config, "kittygfx", "max_single_image_mb", 64);
-	gst_config_set_module_config_int(config, "kittygfx", "max_placements", 4096);
-	gst_config_set_module_config_bool(config, "kittygfx", "allow_file_transfer", FALSE);
-	gst_config_set_module_config_bool(config, "kittygfx", "allow_shm_transfer", FALSE);
+	config->modules.kittygfx.enabled = TRUE;
+	config->modules.kittygfx.max_total_ram_mb = 256;
+	config->modules.kittygfx.max_single_image_mb = 64;
+	config->modules.kittygfx.max_placements = 4096;
+	config->modules.kittygfx.allow_file_transfer = FALSE;
+	config->modules.kittygfx.allow_shm_transfer = FALSE;
 
 	/* mcp */
-	gst_config_set_module_config_bool(config, "mcp", "enabled", TRUE);
-	gst_config_set_module_config_string(config, "mcp", "transport", "unix-socket");
+	config->modules.mcp.enabled = TRUE;
+	GST_CONFIG_SET_STRING(config->modules.mcp.transport, "unix-socket");
 
 	/* mcp tools */
-	gst_config_set_module_config_sub_bool(config, "mcp","tools", "read_screen", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "read_scrollback", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "search_scrollback", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "get_cursor_position", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "get_cell_attributes", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "get_foreground_process", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "get_working_directory", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "is_shell_idle", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "get_pty_info", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "list_detected_urls", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "get_config", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "list_modules", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "set_config", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "toggle_module", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "get_window_info", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "set_window_title", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "send_text", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "send_keys", TRUE);
-	gst_config_set_module_config_sub_bool(config, "mcp", "tools", "screenshot", TRUE);
+	config->modules.mcp.tools.read_screen = TRUE;
+	config->modules.mcp.tools.read_scrollback = TRUE;
+	config->modules.mcp.tools.search_scrollback = TRUE;
+	config->modules.mcp.tools.get_cursor_position = TRUE;
+	config->modules.mcp.tools.get_cell_attributes = TRUE;
+	config->modules.mcp.tools.get_foreground_process = TRUE;
+	config->modules.mcp.tools.get_working_directory = TRUE;
+	config->modules.mcp.tools.is_shell_idle = TRUE;
+	config->modules.mcp.tools.get_pty_info = TRUE;
+	config->modules.mcp.tools.list_detected_urls = TRUE;
+	config->modules.mcp.tools.get_config = TRUE;
+	config->modules.mcp.tools.list_modules = TRUE;
+	config->modules.mcp.tools.set_config = TRUE;
+	config->modules.mcp.tools.toggle_module = TRUE;
+	config->modules.mcp.tools.get_window_info = TRUE;
+	config->modules.mcp.tools.set_window_title = TRUE;
+	config->modules.mcp.tools.send_text = TRUE;
+	config->modules.mcp.tools.send_keys = TRUE;
+	config->modules.mcp.tools.screenshot = TRUE;
+	config->modules.mcp.tools.save_screenshot = TRUE;
+
+	/* osc52 */
+	config->modules.osc52.enabled = TRUE;
+	config->modules.osc52.allow_read = TRUE;
+	config->modules.osc52.allow_write = TRUE;
+	config->modules.osc52.max_bytes = 100000;
+
+	/* hyperlinks */
+	config->modules.hyperlinks.enabled = TRUE;
+	GST_CONFIG_SET_STRING(config->modules.hyperlinks.opener, "xdg-open");
+	GST_CONFIG_SET_STRING(config->modules.hyperlinks.modifier, "Ctrl");
+	config->modules.hyperlinks.underline_hover = TRUE;
+
+	/* sixel */
+	config->modules.sixel.enabled = TRUE;
+	config->modules.sixel.max_width = 4096;
+	config->modules.sixel.max_height = 4096;
+	config->modules.sixel.max_colors = 1024;
+	config->modules.sixel.max_total_ram_mb = 128;
+	config->modules.sixel.max_placements = 1024;
 
 	return TRUE;
 }
