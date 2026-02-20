@@ -157,14 +157,11 @@ gst_config_init(void)
 
 	/* keyboard_select */
 	config->modules.keyboard_select.enabled = FALSE;
-	GST_CONFIG_SET_STRING(config->modules.keyboard_select.key,
-		"Ctrl+Shift+Escape");
+	GST_CONFIG_SET_STRING(config->modules.keyboard_select.key, "Ctrl+Shift+Escape");
 	config->modules.keyboard_select.show_crosshair = TRUE;
-	GST_CONFIG_SET_STRING(config->modules.keyboard_select.highlight_color,
-		"#ff8800");
+	GST_CONFIG_SET_STRING(config->modules.keyboard_select.highlight_color, "#ff8800");
 	config->modules.keyboard_select.highlight_alpha = 100;
-	GST_CONFIG_SET_STRING(config->modules.keyboard_select.search_color,
-		"#ffff00");
+	GST_CONFIG_SET_STRING(config->modules.keyboard_select.search_color, "#ffff00");
 	config->modules.keyboard_select.search_alpha = 150;
 
 	/* kittygfx */
