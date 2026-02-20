@@ -321,10 +321,81 @@ class TranscriptionProcessor:
             print(f"Error updating transcription: {e}", file=sys.stderr)
             return None
     
+    def convert_to_whisper_wav(self, input_file: str) -> Optional[str]:
+        """Convert any audio file to 16kHz 16-bit mono WAV for whisper.cpp
+
+        whisper.cpp expects 16kHz 16-bit mono PCM WAV input. This method
+        converts any audio format (ogg, opus, mp3, flac, etc.) or
+        non-conforming WAV files to the correct format using ffmpeg.
+
+        Uses $HOME/.tmp/ for the converted file so it is accessible across
+        distrobox containers (system /tmp/ is not shared).
+
+        Args:
+            input_file: path to the source audio file
+
+        Returns:
+            path to the converted WAV file in a temp directory, or None on failure
+        """
+        # Use $HOME/.tmp/ so the file is accessible across distrobox containers
+        home_tmp: str = os.path.join(Path.home(), ".tmp")
+        os.makedirs(home_tmp, exist_ok=True)
+        converted_wav: str = os.path.join(
+            home_tmp,
+            f"whisper_{os.path.basename(input_file)}.wav"
+        )
+
+        cmd: list = [
+            'ffmpeg', '-y', '-i', input_file,
+            '-ar', '16000', '-ac', '1', '-sample_fmt', 's16',
+            converted_wav
+        ]
+
+        try:
+            result: subprocess.CompletedProcess = subprocess.run(
+                cmd, capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                print(f"Error: ffmpeg conversion failed: {result.stderr}", file=sys.stderr)
+                return None
+            return converted_wav
+        except FileNotFoundError:
+            print("Error: ffmpeg not found. Cannot convert audio for whisper.", file=sys.stderr)
+            return None
+
     def transcribe_file(self, input_file: str, output_dir: Optional[str] = None) -> Optional[str]:
         """Transcribe audio file using whisper, capturing both timestamped and plain text"""
         # Whisper creates output file as input_file + .txt in the same directory
         expected_output = f"{input_file}.txt"
+
+        # Convert input to 16kHz 16-bit mono WAV that whisper.cpp requires
+        whisper_input: str = input_file
+        converted_file: Optional[str] = None
+        needs_conversion: bool = not input_file.lower().endswith('.wav')
+
+        # Also convert WAV files that aren't 16kHz mono (e.g. 48kHz stereo from yt-dlp)
+        if input_file.lower().endswith('.wav'):
+            try:
+                probe_result: subprocess.CompletedProcess = subprocess.run(
+                    ['ffprobe', '-v', 'error', '-show_entries',
+                     'stream=sample_rate,channels',
+                     '-of', 'default=noprint_wrappers=1', input_file],
+                    capture_output=True, text=True
+                )
+                output: str = probe_result.stdout
+                if 'sample_rate=16000' not in output or 'channels=1' not in output:
+                    needs_conversion = True
+            except FileNotFoundError:
+                pass
+
+        if needs_conversion:
+            if args.verbose:
+                print(f"Converting audio to 16kHz mono WAV for whisper: {input_file}")
+            converted_file = self.convert_to_whisper_wav(input_file)
+            if converted_file:
+                whisper_input = converted_file
+            else:
+                print("Warning: Audio conversion failed, trying original file", file=sys.stderr)
 
         # Build whisper command - check if we need distrobox wrapper
         no_dbox_check = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
@@ -332,32 +403,38 @@ class TranscriptionProcessor:
 
         if no_dbox_check or container_id == "whisper":
             # Run whisper directly
-            # Set LD_LIBRARY_PATH for ggml shared libraries
-            ggml_lib_path = str(Path(WHISPER_BIN).parent.parent / "ggml" / "src")
+            # Set LD_LIBRARY_PATH for ggml and whisper shared libraries
+            whisper_build_dir = Path(WHISPER_BIN).parent.parent
+            ggml_lib_path = f"{whisper_build_dir / 'src'}:{whisper_build_dir / 'ggml' / 'src'}"
             cmd = [
                 'env', f'LD_LIBRARY_PATH={ggml_lib_path}',
                 WHISPER_BIN,
                 '-m', f"{WHISPER_MODEL_PATH}/{args.model}",
-                '-f', input_file,
+                '-f', whisper_input,
                 '-otxt'
             ]
         else:
             # Run whisper via distrobox
-            # Set LD_LIBRARY_PATH for ggml shared libraries
-            ggml_lib_path = str(Path(WHISPER_BIN).parent.parent / "ggml" / "src")
+            # Set LD_LIBRARY_PATH for ggml and whisper shared libraries
+            whisper_build_dir = Path(WHISPER_BIN).parent.parent
+            ggml_lib_path = f"{whisper_build_dir / 'src'}:{whisper_build_dir / 'ggml' / 'src'}"
             cmd = [
                 'distrobox', 'enter', 'whisper', '--',
                 'env', f'LD_LIBRARY_PATH={ggml_lib_path}',
                 WHISPER_BIN,
                 '-m', f"{WHISPER_MODEL_PATH}/{args.model}",
-                '-f', input_file,
+                '-f', whisper_input,
                 '-otxt'
             ]
         
+        # Whisper writes .txt next to the input it receives, which may be
+        # the converted temp file rather than the original input_file
+        whisper_output: str = f"{whisper_input}.txt"
+
         try:
             if args.verbose:
                 print(f"Running command: {' '.join(cmd)}")
-            
+
             # Capture stdout for timestamped content
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
@@ -366,7 +443,7 @@ class TranscriptionProcessor:
                     print(f"Command stderr: {result.stderr}", file=sys.stderr)
                     print(f"Command stdout: {result.stdout}", file=sys.stderr)
                 return None
-            
+
             # Extract timestamped content from stdout
             timestamped_content = ""
             for line in result.stdout.split('\n'):
@@ -374,33 +451,39 @@ class TranscriptionProcessor:
                 # Note: Do NOT check endswith(']') - that would only capture [silence] lines
                 if line.strip().startswith('[') and '-->' in line:
                     timestamped_content += line + '\n'
-            
+
             # Wait for output file to be written with content (retry up to 30 times)
             import time
             max_retries: int = 30
             for attempt in range(max_retries):
-                if os.path.exists(expected_output) and os.path.getsize(expected_output) > 0:
+                if os.path.exists(whisper_output) and os.path.getsize(whisper_output) > 0:
                     break
                 time.sleep(1)
             else:
-                print(f"Warning: Timeout waiting for {expected_output} to be written", file=sys.stderr)
+                print(f"Warning: Timeout waiting for {whisper_output} to be written", file=sys.stderr)
 
             # Read the plain text transcription result from where whisper puts it
             plain_content: str = ""
-            if os.path.exists(expected_output):
-                with open(expected_output, 'r', encoding='utf-8') as f:
+            if os.path.exists(whisper_output):
+                with open(whisper_output, 'r', encoding='utf-8') as f:
                     plain_content = f.read()
-                    
+
                 if args.verbose:
-                    print(f"Read {len(plain_content)} characters from {expected_output}")
+                    print(f"Read {len(plain_content)} characters from {whisper_output}")
                     print(f"Captured {len(timestamped_content)} characters of timestamped content")
-                
+
+                # If we used a converted file, copy the transcript to the
+                # expected location next to the original input file
+                if converted_file and whisper_output != expected_output:
+                    with open(expected_output, 'w', encoding='utf-8') as f:
+                        f.write(plain_content)
+
                 # If output_dir specified, copy to that location
                 if output_dir and plain_content:
                     final_output = os.path.join(output_dir, f"{os.path.basename(input_file)}.txt")
                     with open(final_output, 'w', encoding='utf-8') as f:
                         f.write(plain_content)
-                
+
                 # Combine both formats: timestamped followed by plain text
                 combined_content = ""
                 if timestamped_content:
@@ -410,21 +493,29 @@ class TranscriptionProcessor:
                 else:
                     # No timestamps captured, just use plain content
                     combined_content = plain_content
-                
+
                 return combined_content
             else:
-                print(f"Error: Transcription output file not found: {expected_output}", file=sys.stderr)
+                print(f"Error: Transcription output file not found: {whisper_output}", file=sys.stderr)
                 # List files in directory for debugging
                 if args.verbose:
-                    dir_path = os.path.dirname(input_file)
+                    dir_path = os.path.dirname(whisper_input)
                     print(f"Files in {dir_path}:", file=sys.stderr)
                     for f in os.listdir(dir_path):
                         print(f"  {f}", file=sys.stderr)
                 return None
-                
+
         except Exception as e:
             print(f"Error running transcription: {e}", file=sys.stderr)
             return None
+        finally:
+            # Clean up converted temp file and its whisper output
+            if converted_file:
+                if os.path.exists(converted_file):
+                    os.remove(converted_file)
+                whisper_tmp_txt: str = f"{converted_file}.txt"
+                if os.path.exists(whisper_tmp_txt):
+                    os.remove(whisper_tmp_txt)
 
 
 def main():
