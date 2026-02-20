@@ -3602,24 +3602,38 @@ download_youtube_audio() {
     
     echo "yt-dlp completed. Checking for downloaded file..."
     # First check for the expected WAV file
+    local wav_file=""
     if [[ -f "${dl_dir}/${base_name}.wav" ]]; then
         echo "Found WAV file: ${dl_dir}/${base_name}.wav"
-        cp "${dl_dir}/${base_name}.wav" "${output_file}"
-        echo "Copied WAV file to: ${output_file}"
+        wav_file="${dl_dir}/${base_name}.wav"
     else
         # Fallback: find any file that might have been created
         echo "WAV file not found at expected location. Searching for alternatives..."
         local found_file=$(find "$dl_dir" -name "${base_name}.*" -type f | head -1)
-        
+
         # If we found something, use it
         if [[ -n "$found_file" && -f "$found_file" ]]; then
             echo "Found alternative file: ${found_file}"
-            cp "$found_file" "${output_file}"
-            echo "Copied alternative file to: ${output_file}"
+            wav_file="$found_file"
         else
             echo "Error: Downloaded file not found."
             return 1
         fi
+    fi
+
+    # Convert WAV to OGG (opus) to reduce file size before transcription
+    local ogg_file="${dl_dir}/${base_name}.ogg"
+    echo "Converting WAV to OGG for transcription: ${wav_file} -> ${ogg_file}"
+    if ffmpeg -y -i "$wav_file" -vn -codec:a libopus -b:a 128k "$ogg_file" 2>&1; then
+        echo "Conversion to OGG successful."
+        cp "$ogg_file" "${output_file}"
+        echo "Copied OGG file to: ${output_file}"
+        # Clean up the large WAV file
+        rm -f "$wav_file"
+    else
+        echo "Warning: FFmpeg conversion to OGG failed. Falling back to WAV."
+        cp "$wav_file" "${output_file}"
+        echo "Copied WAV file to: ${output_file}"
     fi
     
     # Final verification
@@ -6374,7 +6388,7 @@ if [[ ${#URLS[@]} -gt 0 ]]; then
         
         # Generate a unique filename for this URL
         url_hash=$(echo "$url" | md5sum | cut -d' ' -f1)
-        audio_file="${YT_TEMP_DIR}/${url_hash}"  # Extension will be added by yt-dlp
+        audio_file="${YT_TEMP_DIR}/${url_hash}.ogg"
         debug_log "DEBUG" "Generated hash for URL: $url_hash"
         debug_log "DEBUG" "Target audio file path: $audio_file"
         
@@ -6592,8 +6606,12 @@ for file in "${FILES[@]}"; do
         debug_log "DEBUG" "Using original filename: $filename (base: $filename_no_ext)"
     fi
     
-    # Convert filename to under_score_case
-    filename_underscored=$(echo "$filename_no_ext" | tr ' -' '_' | tr '[:upper:]' '[:lower:]')
+    # Convert filename to under_score_case and sanitize unsafe characters
+    # Strip characters that are unsafe in filenames ($ / & ! etc.), then convert spaces/hyphens to underscores
+    filename_underscored=$(echo "$filename_no_ext" | sed 's/[^a-zA-Z0-9 _-]//g' | tr ' -' '_' | tr -s '_' | tr '[:upper:]' '[:lower:]')
+    # Remove leading/trailing underscores
+    filename_underscored="${filename_underscored#_}"
+    filename_underscored="${filename_underscored%_}"
     debug_log "DEBUG" "Converted filename to underscore case: $filename_underscored"
     
     # Determine PARA category folder
@@ -6830,17 +6848,17 @@ for file in "${FILES[@]}"; do
             # Clean up
             rm -f "$TEMP_OUTPUT"
             
-        elif is_audio_file "$file"; then
-            # Process audio file - transcribe and summarize
+        elif is_audio_file "$file" && [[ ! -f "${file}.direct_audio" ]]; then
+            # Process generic audio file (non-YouTube) - transcribe and summarize
             echo "Detected audio file. Processing..."
             TEMP_OUTPUT=$(mktemp $HOME/.tmp/sbi-audio-XXXXXX)
-            
+
             if process_audio_file "$file" "$TEMP_OUTPUT" "$filename_no_ext"; then
                 # If processing succeeded, copy to target
                 cp "$TEMP_OUTPUT" "$TARGET_FILE"
                 echo -e "\n" >> "$TARGET_FILE"
                 echo "Audio processed and ingested to: $TARGET_FILE"
-                
+
                 # Edit if requested
                 if [[ "$EDIT_FLAG" == true && "$STDIN_MODE" == false ]]; then
                     ${EDITOR:-vi} "$TARGET_FILE"
@@ -6871,13 +6889,10 @@ for file in "${FILES[@]}"; do
                 } > "$TARGET_FILE"
                 echo "Error placeholder created at: $TARGET_FILE"
             fi
-            
+
             # Clean up
             rm -f "$TEMP_OUTPUT"
-            
-            # Skip to next file to prevent double processing
-            continue
-            
+
         elif is_excel_file "$file"; then
             # Process Excel spreadsheet
             show_progress "Detected Excel spreadsheet ($(basename "$file")). Processing..."
