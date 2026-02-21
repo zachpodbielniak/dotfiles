@@ -1,7 +1,6 @@
 #!/bin/bash
-
 # dotfiles - Personal configuration files and scripts
-# Copyright (C) 2025  Zach Podbielniak
+# Copyright (C) 2026  Zach Podbielniak
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -16,271 +15,1499 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#
-# A tool to perform a native thread dump for a native process.
-# Usecases include but not limited to:
-# - Validate a perceived stuck process (alternative option/complement to strace)
-# - Check for suspicious items in a thread's stack.
-# - Get detailed thread names
-#
-#
-# Examples:
-# 
-# - General thread dump:
-#	- ./thread_dump -p 867803 -s 
-#
-# - Thread dump of all threads:
-#	- ./thread_dump -p 867803 -s -a
-#
-# - Validate a process is stuck or not. The below command will recursiving run the
-#   thread_dump utility, pipe the output to grep, which will look for the 'rip' register 
-#   line. From here, at some point the 'rip' (instruction pointer) register value should
-#   change. If it never does it means it is likely a stuck thread. *Please note* that this 
-#   is essentially a race condition. thread_dump relies on the ability for gdb to attach
-#   to the process to perform this there is an operation. It is entirely possible that
-#   the process is not stuck, but the 'rip' register's value never changes because during
-#   execution of thread_dump it never captures it.
-#	- while true; do sh -c './thread_dump -p 867803 -i -s 2>/dev/null | grep rip'; done
-#
-# - Get detailed thread names. The below can help to show thread info and the thread names
-#   and other misc. thread details.
-# 	- ./thread_dump -p 867803 -t -s
-#
+set -euo pipefail
 
 
+# ============================================================================
+# Usage and help
+# ============================================================================
+
+usage () {
+	cat << 'EOF'
+thread_dump - Native thread dump and process inspection via GDB
+
+USAGE:
+	thread_dump [OPTIONS] -p <pid>
+	thread_dump [OPTIONS] -P <process_name>
+
+OPTIONS:
+	-h, --help              Show this help message
+	--license               Show license information
+
+  Target:
+	-p, --pid <pid>         PID to attach GDB to
+	-P, --process <name>    Process name (resolved via pgrep)
+
+  Backtrace:
+	-a, --all-threads       Backtrace all threads (thread apply all bt)
+	-f, --full              Full backtrace with locals and arguments
+	--locals                Alias for --full
+	--frame-walk            Exhaustive per-frame variable dump (full struct/array expansion)
+	--thread <N>            Dump only GDB thread N
+
+  Registers:
+	-r, --registers         Dump all registers
+	-R, --register-type <t> Dump specific register type (all, general, vector, mmx)
+	-i, --instruction       Dump instruction pointer register (rip/pc)
+
+  Thread Info:
+	-t, --thread-info       Show thread details only (no backtrace)
+
+  Process Inspection:
+	--info                  Print process info header (name, memory, threads, FDs)
+	-m, --maps              Show memory mappings (info proc mappings)
+	-l, --libraries         Show loaded shared libraries (info sharedlibrary)
+	--signals               Show pending/blocked signals from /proc
+	--io                    Show IO stats from /proc (read/write bytes, syscalls)
+	--limits                Show resource limits (ulimits)
+	--sched                 Show scheduling stats and CPU affinity
+	--ns                    Show namespace and cgroup info with resource limits
+	--core [prefix]         Generate core dump via gcore (default prefix: "core")
+
+  Analysis:
+	--group                 Group threads with identical stacks (implies -a)
+	--folded                Output in folded stack format for flamegraph.pl (implies -a)
+	--stuck <count>         Detect stuck threads over N IP samples
+
+  Presets:
+	--preset <name>         Use a preset profile:
+	                          full  = --info -a -f -m -l --signals --timestamp
+	                          stuck = -i -a -w 5 --interval 0.5 --diff
+	                          quick = --info -a --timestamp
+
+  Custom:
+	--gdb-cmd "cmd"         Arbitrary GDB -ex command (repeatable)
+
+  Watch Mode:
+	-w, --watch <count>     Take N consecutive dumps
+	--interval <seconds>    Interval between dumps (default: 1)
+	--diff                  With --watch, show only changed lines between dumps
+
+  Output:
+	-o, --output <dir>      Save each dump to a timestamped file in <dir>
+	--timestamp             Prefix output with ISO-8601 timestamp
+	--snapshot <dir>        Collect full forensic bundle into a directory
+
+  Execution:
+	-s, --sudo              Run GDB with sudo
+	-v, --verbose           Show command and ask for confirmation
+	-d, --dry-run           Print the command without executing
+
+EXAMPLES:
+	# Basic thread dump
+	thread_dump -p 12345 -s
+
+	# Full inspection preset (3am escalation call mode)
+	thread_dump --preset full -p 12345 -s
+
+	# Detect stuck threads (automates the while-true-grep-rip pattern)
+	thread_dump -p 12345 -s --stuck 5 --interval 0.5
+
+	# Group identical stacks (noise reduction for thread pools)
+	thread_dump -p 12345 -s -a --group
+
+	# Generate flamegraph-compatible folded stacks
+	thread_dump -p 12345 -s -a --folded | flamegraph.pl > dump.svg
+
+	# Exhaustive per-frame variable inspection
+	thread_dump -p 12345 -s --frame-walk
+
+	# Dump only a specific thread
+	thread_dump -p 12345 -s --thread 3 -f
+
+	# Full forensic snapshot bundle
+	thread_dump -p 12345 -s --snapshot /tmp/forensic
+
+	# Custom GDB commands alongside normal dump
+	thread_dump -p 12345 -s --gdb-cmd 'print some_global' --gdb-cmd 'info mutex'
+
+	# Namespace and cgroup investigation
+	thread_dump -p 12345 --ns --limits --io --sched
+
+	# Save 10 consecutive dumps to files
+	thread_dump -p 12345 -s -a -w 10 -o /tmp/dumps
+
+	# Watch with diff to spot stuck vs progressing threads
+	thread_dump -p 12345 -i -s -w 10 --diff
+
+EOF
+}
 
 
-TD_ARGS=("$@")		# Arguments
-TD_VERBOSE=0		# Verbose mode. 0 is false, 1 is true.
-TD_DRY_RUN=0		# Dry run mode. 0 is false, 1 is true.
-TD_GDB_PARAMS=""	# GDB Parameters
-TD_PID=-1		# PID to perform thread dump on
-TD_ITERATOR=0		# Iterator for iterating through arguments
-TD_ALL_THREADS=0	# Multi-thread dump. 0 is false, 1 is true.
-TD_THREAD_DETAILS=0	# Thread detailed mode. No thread dump, just thread info.
-TD_SUDO=0		# Auto prepend 'sudo'. 0 is false, 1 is true.
-TD_FULL=0		# Full backtrace setting
+# ============================================================================
+# Utility functions
+# ============================================================================
+
+die () {
+	printf 'Error: %s\n' "${1}" >&2
+	exit "${2:-1}"
+}
+
+warn () {
+	printf 'Warning: %s\n' "${1}" >&2
+}
+
+timestamp_now () {
+	date +%Y-%m-%dT%H:%M:%S
+}
+
+require_command () {
+	local cmd="${1}"
+	local msg="${2}"
+	if ! command -v "${cmd}" &>/dev/null; then
+		die "${msg}"
+	fi
+}
 
 
+# ============================================================================
+# Validation functions
+# ============================================================================
+
+validate_pid () {
+	local target_pid="${1}"
+
+	# Must be a positive integer
+	if [[ ! "${target_pid}" =~ ^[0-9]+$ ]]; then
+		die "PID must be a positive integer, got: ${target_pid}"
+	fi
+
+	# Check if process exists
+	if ! kill -0 "${target_pid}" 2>/dev/null; then
+		if [[ ! -d "/proc/${target_pid}" ]]; then
+			die "Process ${target_pid} does not exist"
+		else
+			warn "Cannot signal process ${target_pid} (permission denied). GDB may need --sudo."
+		fi
+	fi
+}
+
+resolve_process_name () {
+	local name="${1}"
+	local pids
+
+	# Try exact match first, then partial
+	pids=$(pgrep -x "${name}" 2>/dev/null || true)
+	if [[ -z "${pids}" ]]; then
+		pids=$(pgrep "${name}" 2>/dev/null || true)
+	fi
+
+	if [[ -z "${pids}" ]]; then
+		die "No process found matching '${name}'"
+	fi
+
+	local count
+	count=$(printf '%s\n' "${pids}" | wc -l)
+
+	if [[ "${count}" -gt 1 ]]; then
+		printf 'Multiple processes match "%s":\n' "${name}" >&2
+		while IFS= read -r p; do
+			local cmdline
+			cmdline=$(tr '\0' ' ' < "/proc/${p}/cmdline" 2>/dev/null || echo "N/A")
+			printf '  PID %-8s %s\n' "${p}" "${cmdline}" >&2
+		done <<< "${pids}"
+		die "Use -p <pid> to specify the exact process"
+	fi
+
+	printf '%s' "${pids}"
+}
+
+# Return the architecture-appropriate instruction pointer register name
+get_ip_register () {
+	local arch
+	arch=$(uname -m)
+	case "${arch}" in
+		x86_64)  printf 'rip' ;;
+		aarch64) printf 'pc' ;;
+		*)       printf 'pc' ;;
+	esac
+}
 
 
-if [ $# -lt 1 ]
-then
-	echo -e "Use this tool correctly"
-	echo -e "See --help how to use it.\n"
+# ============================================================================
+# Process inspection functions (read from /proc)
+# ============================================================================
+
+print_process_info () {
+	local target_pid="${1}"
+	local proc_dir="/proc/${target_pid}"
+
+	if [[ ! -d "${proc_dir}" ]]; then
+		warn "Cannot read /proc/${target_pid} -- process info unavailable (try --sudo)"
+		return 0
+	fi
+
+	printf '=== Process Information ===\n'
+
+	# Process name
+	local name
+	name=$(cat "${proc_dir}/comm" 2>/dev/null || echo "N/A")
+	printf 'Name:       %s\n' "${name}"
+
+	printf 'PID:        %s\n' "${target_pid}"
+
+	# Full command line (null-delimited in /proc)
+	local cmdline
+	cmdline=$(tr '\0' ' ' < "${proc_dir}/cmdline" 2>/dev/null || echo "N/A")
+	printf 'Cmdline:    %s\n' "${cmdline}"
+
+	# Executable path
+	local exe_path
+	exe_path=$(readlink "${proc_dir}/exe" 2>/dev/null || echo "N/A")
+	printf 'Executable: %s\n' "${exe_path}"
+
+	# Process state from /proc/<pid>/status
+	local state
+	state=$(awk '/^State:/ {$1=""; print substr($0,2)}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	printf 'State:      %s\n' "${state}"
+
+	# Thread count
+	local threads
+	threads=$(awk '/^Threads:/ {print $2}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	printf 'Threads:    %s\n' "${threads}"
+
+	# Memory usage
+	local vm_rss vm_size
+	vm_rss=$(awk '/^VmRSS:/ {print $2, $3}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	vm_size=$(awk '/^VmSize:/ {print $2, $3}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	printf 'VmRSS:      %s\n' "${vm_rss}"
+	printf 'VmSize:     %s\n' "${vm_size}"
+
+	# Process uptime calculated from start time in clock ticks
+	local start_ticks hz sys_uptime proc_start proc_age
+	start_ticks=$(awk '{print $22}' "${proc_dir}/stat" 2>/dev/null || echo "0")
+	hz=$(getconf CLK_TCK)
+	sys_uptime=$(awk '{printf "%.0f", $1}' /proc/uptime)
+	proc_start=$(( start_ticks / hz ))
+	proc_age=$(( sys_uptime - proc_start ))
+	if [[ "${proc_age}" -ge 0 ]]; then
+		local days hours minutes seconds
+		days=$(( proc_age / 86400 ))
+		hours=$(( (proc_age % 86400) / 3600 ))
+		minutes=$(( (proc_age % 3600) / 60 ))
+		seconds=$(( proc_age % 60 ))
+		printf 'Uptime:     %dd %dh %dm %ds\n' "${days}" "${hours}" "${minutes}" "${seconds}"
+	else
+		printf 'Uptime:     N/A\n'
+	fi
+
+	# Open file descriptor count
+	local fd_count
+	fd_count=$(find "${proc_dir}/fd/" -maxdepth 1 -type l 2>/dev/null | wc -l || echo "N/A")
+	printf 'Open FDs:   %s\n' "${fd_count}"
+
+	printf '===========================\n\n'
+}
+
+print_signal_info () {
+	local target_pid="${1}"
+	local proc_dir="/proc/${target_pid}"
+
+	if [[ ! -r "${proc_dir}/status" ]]; then
+		warn "Cannot read /proc/${target_pid}/status -- signal info unavailable"
+		return 0
+	fi
+
+	printf '=== Signal Information ===\n'
+
+	local sig_pnd sig_blk sig_ign sig_cgt
+	sig_pnd=$(awk '/^SigPnd:/ {print $2}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	sig_blk=$(awk '/^SigBlk:/ {print $2}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	sig_ign=$(awk '/^SigIgn:/ {print $2}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	sig_cgt=$(awk '/^SigCgt:/ {print $2}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+
+	printf 'Pending:    0x%s\n' "${sig_pnd}"
+	printf 'Blocked:    0x%s\n' "${sig_blk}"
+	printf 'Ignored:    0x%s\n' "${sig_ign}"
+	printf 'Caught:     0x%s\n' "${sig_cgt}"
+
+	printf '==========================\n\n'
+}
+
+# Show IO statistics from /proc/<pid>/io
+print_io_stats () {
+	local target_pid="${1}"
+	local io_file="/proc/${target_pid}/io"
+
+	if [[ ! -r "${io_file}" ]]; then
+		warn "Cannot read /proc/${target_pid}/io -- IO stats unavailable"
+		return 0
+	fi
+
+	printf '=== IO Statistics ===\n'
+	# /proc/<pid>/io has key: value format, one per line
+	while IFS=': ' read -r key value; do
+		case "${key}" in
+			rchar)                    printf 'Chars Read:         %s\n' "${value}" ;;
+			wchar)                    printf 'Chars Written:      %s\n' "${value}" ;;
+			syscr)                    printf 'Read Syscalls:      %s\n' "${value}" ;;
+			syscw)                    printf 'Write Syscalls:     %s\n' "${value}" ;;
+			read_bytes)               printf 'Bytes Read (disk):  %s\n' "${value}" ;;
+			write_bytes)              printf 'Bytes Written (disk): %s\n' "${value}" ;;
+			cancelled_write_bytes)    printf 'Cancelled Writes:   %s\n' "${value}" ;;
+		esac
+	done < "${io_file}" 2>/dev/null
+	printf '=====================\n\n'
+}
+
+# Show resource limits from /proc/<pid>/limits
+print_resource_limits () {
+	local target_pid="${1}"
+	local limits_file="/proc/${target_pid}/limits"
+
+	if [[ ! -r "${limits_file}" ]]; then
+		warn "Cannot read /proc/${target_pid}/limits -- resource limits unavailable"
+		return 0
+	fi
+
+	printf '=== Resource Limits ===\n'
+	cat "${limits_file}" 2>/dev/null
+	printf '=======================\n\n'
+}
+
+# Show scheduling stats from /proc/<pid>/sched and CPU affinity
+print_sched_stats () {
+	local target_pid="${1}"
+	local proc_dir="/proc/${target_pid}"
+
+	printf '=== Scheduling Statistics ===\n'
+
+	# CPU affinity from /proc/<pid>/status
+	local cpus_allowed
+	cpus_allowed=$(awk '/^Cpus_allowed_list:/ {$1=""; print substr($0,2)}' "${proc_dir}/status" 2>/dev/null || echo "N/A")
+	printf 'CPU Affinity:       %s\n' "${cpus_allowed}"
+
+	# Scheduling stats from /proc/<pid>/sched (if readable)
+	if [[ -r "${proc_dir}/sched" ]]; then
+		local vol_switches invol_switches nr_migrations sum_exec
+		vol_switches=$(awk '/nr_voluntary_switches/ {print $NF}' "${proc_dir}/sched" 2>/dev/null || echo "N/A")
+		invol_switches=$(awk '/nr_involuntary_switches/ {print $NF}' "${proc_dir}/sched" 2>/dev/null || echo "N/A")
+		nr_migrations=$(awk '/^nr_migrations/ {print $NF}' "${proc_dir}/sched" 2>/dev/null || echo "N/A")
+		sum_exec=$(awk '/sum_exec_runtime/ {print $NF}' "${proc_dir}/sched" 2>/dev/null || echo "N/A")
+		printf 'Voluntary Switches: %s\n' "${vol_switches}"
+		printf 'Involuntary Switches: %s\n' "${invol_switches}"
+		printf 'CPU Migrations:     %s\n' "${nr_migrations}"
+		printf 'Total Exec Runtime: %s ms\n' "${sum_exec}"
+	else
+		warn "Cannot read /proc/${target_pid}/sched"
+	fi
+
+	# schedstat: cpu_time_ns, io_wait_ns, timeslices
+	if [[ -r "${proc_dir}/schedstat" ]]; then
+		local sched_fields
+		read -r -a sched_fields < "${proc_dir}/schedstat" 2>/dev/null || true
+		if [[ "${#sched_fields[@]}" -ge 3 ]]; then
+			printf 'CPU Time (ns):      %s\n' "${sched_fields[0]}"
+			printf 'IO Wait (ns):       %s\n' "${sched_fields[1]}"
+			printf 'Timeslices:         %s\n' "${sched_fields[2]}"
+		fi
+	fi
+
+	printf '=============================\n\n'
+}
+
+# Show namespace and cgroup info with resource limits
+print_namespace_info () {
+	local target_pid="${1}"
+	local proc_dir="/proc/${target_pid}"
+
+	printf '=== Namespace Information ===\n'
+
+	# Namespace inodes from /proc/<pid>/ns/
+	if [[ -d "${proc_dir}/ns" ]]; then
+		local ns_name ns_link
+		for ns_path in "${proc_dir}/ns/"*; do
+			ns_name=$(basename "${ns_path}")
+			ns_link=$(readlink "${ns_path}" 2>/dev/null || echo "N/A")
+			printf '  %-20s %s\n' "${ns_name}" "${ns_link}"
+		done
+	else
+		printf '  Namespace info not available\n'
+	fi
+
+	printf '\n=== Cgroup Information ===\n'
+
+	# Cgroup path from /proc/<pid>/cgroup
+	local cgroup_path=""
+	if [[ -r "${proc_dir}/cgroup" ]]; then
+		local cgroup_line
+		cgroup_line=$(cat "${proc_dir}/cgroup" 2>/dev/null || echo "")
+		printf 'Cgroup:     %s\n' "${cgroup_line}"
+
+		# Extract the path portion (after the last ::)
+		cgroup_path="${cgroup_line##*::}"
+	else
+		printf 'Cgroup:     N/A\n'
+	fi
+
+	# Read cgroup resource limits from /sys/fs/cgroup/<path>/
+	if [[ -n "${cgroup_path}" ]]; then
+		local cg_dir="/sys/fs/cgroup${cgroup_path}"
+		if [[ -d "${cg_dir}" ]]; then
+			printf '\nCgroup Limits (%s):\n' "${cg_dir}"
+
+			local val
+			# Memory limits
+			val=$(cat "${cg_dir}/memory.max" 2>/dev/null || echo "N/A")
+			printf '  memory.max:         %s\n' "${val}"
+			val=$(cat "${cg_dir}/memory.current" 2>/dev/null || echo "N/A")
+			printf '  memory.current:     %s\n' "${val}"
+			val=$(cat "${cg_dir}/memory.swap.max" 2>/dev/null || echo "N/A")
+			printf '  memory.swap.max:    %s\n' "${val}"
+
+			# CPU limits
+			val=$(cat "${cg_dir}/cpu.max" 2>/dev/null || echo "N/A")
+			printf '  cpu.max:            %s\n' "${val}"
+			val=$(cat "${cg_dir}/cpu.weight" 2>/dev/null || echo "N/A")
+			printf '  cpu.weight:         %s\n' "${val}"
+
+			# PID limits
+			val=$(cat "${cg_dir}/pids.max" 2>/dev/null || echo "N/A")
+			printf '  pids.max:           %s\n' "${val}"
+			val=$(cat "${cg_dir}/pids.current" 2>/dev/null || echo "N/A")
+			printf '  pids.current:       %s\n' "${val}"
+		else
+			# Try walking up the hierarchy to find the closest cgroup with limits
+			local parent_dir
+			parent_dir=$(dirname "${cg_dir}")
+			if [[ -d "${parent_dir}" ]]; then
+				printf '\nCgroup Limits (parent: %s):\n' "${parent_dir}"
+				val=$(cat "${parent_dir}/memory.max" 2>/dev/null || echo "N/A")
+				printf '  memory.max:         %s\n' "${val}"
+				val=$(cat "${parent_dir}/memory.current" 2>/dev/null || echo "N/A")
+				printf '  memory.current:     %s\n' "${val}"
+				val=$(cat "${parent_dir}/cpu.max" 2>/dev/null || echo "N/A")
+				printf '  cpu.max:            %s\n' "${val}"
+				val=$(cat "${parent_dir}/pids.max" 2>/dev/null || echo "N/A")
+				printf '  pids.max:           %s\n' "${val}"
+			fi
+		fi
+	fi
+
+	printf '\n=============================\n\n'
+}
+
+
+# ============================================================================
+# Post-processing filters (awk-based, piped after GDB output)
+# ============================================================================
+
+# Group threads with identical stacks and show count + thread IDs per group.
+# Normalizes hex addresses so threads at different addresses in the same
+# function group together. Sorts groups by size descending.
+filter_group_stacks () {
+	awk '
+	BEGIN {
+		current_tid = ""
+		current_raw = ""
+		current_norm = ""
+		group_count_total = 0
+	}
+
+	# Finalize the previous thread stack and record its group
+	function finalize_thread() {
+		if (current_tid == "") return
+		sub(/\n$/, "", current_raw)
+		sub(/\n$/, "", current_norm)
+
+		if (current_norm in group_threads) {
+			group_threads[current_norm] = group_threads[current_norm] ", " current_tid
+			group_size[current_norm]++
+		} else {
+			group_count_total++
+			group_order[group_count_total] = current_norm
+			group_threads[current_norm] = current_tid
+			group_size[current_norm] = 1
+			group_raw[current_norm] = current_raw
+		}
+
+		current_tid = ""
+		current_raw = ""
+		current_norm = ""
+	}
+
+	# Thread header: "Thread N (Thread 0x... (LWP ...))"
+	/^Thread [0-9]+/ {
+		finalize_thread()
+		current_tid = $2
+		next
+	}
+
+	# Stack frame: "#N  0x... in func (...)"
+	/^#[0-9]+/ {
+		current_raw = current_raw $0 "\n"
+		line = $0
+		gsub(/0x[0-9a-fA-F]+/, "0xNNN", line)
+		current_norm = current_norm line "\n"
+		next
+	}
+
+	# Skip GDB noise lines
+	{ next }
+
+	END {
+		finalize_thread()
+
+		# Bubble sort groups by size descending
+		for (i = 1; i <= group_count_total; i++) {
+			for (j = i + 1; j <= group_count_total; j++) {
+				ki = group_order[i]
+				kj = group_order[j]
+				if (group_size[ki] < group_size[kj]) {
+					group_order[i] = kj
+					group_order[j] = ki
+				}
+			}
+		}
+
+		for (i = 1; i <= group_count_total; i++) {
+			k = group_order[i]
+			n = group_size[k]
+			word = (n == 1) ? "thread" : "threads"
+			printf "=== %d %s with this stack (Threads: %s) ===\n", n, word, group_threads[k]
+			print group_raw[k]
+			print ""
+		}
+	}
+	'
+}
+
+# Output stacks in Brendan Gregg folded format for FlameGraph compatibility.
+# Format: func_bottom;func_mid;func_top count
+# Extracts function names, reverses frame order, counts identical stacks.
+filter_folded_stacks () {
+	awk '
+	BEGIN {
+		current_tid = ""
+		frame_count = 0
+		stack_count_total = 0
+	}
+
+	function finalize_thread() {
+		if (current_tid == "" || frame_count == 0) return
+
+		# Build folded string in reverse order (bottom of stack first)
+		folded = ""
+		for (i = frame_count; i >= 1; i--) {
+			if (folded != "") folded = folded ";"
+			folded = folded frames[i]
+		}
+
+		if (folded in stack_count) {
+			stack_count[folded]++
+		} else {
+			stack_count_total++
+			stack_order[stack_count_total] = folded
+			stack_count[folded] = 1
+		}
+
+		current_tid = ""
+		frame_count = 0
+	}
+
+	# Thread header
+	/^Thread [0-9]+/ {
+		finalize_thread()
+		current_tid = $2
+		next
+	}
+
+	# Frame line: extract function name
+	/^#[0-9]+/ {
+		func_name = ""
+
+		# Try "in <function>" pattern first
+		idx = index($0, " in ")
+		if (idx > 0) {
+			rest = substr($0, idx + 4)
+			match(rest, /^[^ (]+/)
+			if (RSTART > 0) {
+				func_name = substr(rest, RSTART, RLENGTH)
+			}
+		} else {
+			# No "in" -- function name is field after frame number
+			func_name = $2
+			if (func_name ~ /^0x/) func_name = "[unknown]"
+		}
+
+		# Strip GLIBC version suffixes (e.g. @@GLIBC_2.3.2)
+		sub(/@@.*$/, "", func_name)
+
+		if (func_name == "??" || func_name == "") func_name = "[unknown]"
+
+		frame_count++
+		frames[frame_count] = func_name
+		next
+	}
+
+	{ next }
+
+	END {
+		finalize_thread()
+		for (i = 1; i <= stack_count_total; i++) {
+			k = stack_order[i]
+			printf "%s %d\n", k, stack_count[k]
+		}
+	}
+	'
+}
+
+# Route output through the appropriate filter, or pass through unchanged
+apply_output_filter () {
+	if [[ "${opt_group}" == true ]]; then
+		filter_group_stacks
+	elif [[ "${opt_folded}" == true ]]; then
+		filter_folded_stacks
+	else
+		cat
+	fi
+}
+
+
+# ============================================================================
+# GDB command building and execution
+# ============================================================================
+
+# Build the gdb_ex_cmds array from the current option state.
+# Uses global option variables and writes to global gdb_ex_cmds array.
+build_gdb_cmd () {
+	gdb_ex_cmds=()
+
+	# Frame-walk mode: enable full struct/array expansion in args
+	if [[ "${opt_frame_walk}" == true ]]; then
+		gdb_ex_cmds+=(-ex 'set print frame-arguments all')
+	fi
+
+	# Thread selection (must come before backtrace commands)
+	if [[ -n "${opt_thread_id}" ]]; then
+		gdb_ex_cmds+=(-ex "thread ${opt_thread_id}")
+	fi
+
+	# Registers
+	if [[ "${opt_registers}" == true ]]; then
+		gdb_ex_cmds+=(-ex 'info registers')
+	fi
+
+	if [[ -n "${opt_register_type}" ]]; then
+		gdb_ex_cmds+=(-ex "info registers ${opt_register_type}")
+	fi
+
+	if [[ "${opt_instruction}" == true ]]; then
+		local ip_reg
+		ip_reg=$(get_ip_register)
+		gdb_ex_cmds+=(-ex "info registers ${ip_reg}")
+	fi
+
+	# Memory maps
+	if [[ "${opt_maps}" == true ]]; then
+		gdb_ex_cmds+=(-ex 'info proc mappings')
+	fi
+
+	# Shared libraries
+	if [[ "${opt_libraries}" == true ]]; then
+		gdb_ex_cmds+=(-ex 'info sharedlibrary')
+	fi
+
+	# Thread info mode overrides backtrace
+	if [[ "${opt_thread_info}" == true ]]; then
+		gdb_ex_cmds+=(-ex 'info threads')
+	else
+		# Build backtrace command based on options
+		local bt_cmd="bt"
+		if [[ "${opt_full}" == true ]]; then
+			bt_cmd="bt full"
+		fi
+		if [[ "${opt_all_threads}" == true ]]; then
+			bt_cmd="thread apply all ${bt_cmd}"
+		fi
+		gdb_ex_cmds+=(-ex "${bt_cmd}")
+	fi
+
+	# Custom GDB commands (appended after built-in commands)
+	local custom_cmd
+	for custom_cmd in "${opt_gdb_cmds[@]}"; do
+		gdb_ex_cmds+=(-ex "${custom_cmd}")
+	done
+}
+
+# Build the full GDB command array and print it (for dry-run and verbose).
+print_command () {
+	local cmd=()
+	if [[ "${opt_sudo}" == true ]]; then
+		cmd+=(sudo)
+	fi
+	cmd+=(gdb --batch -q -p "${pid}" "${gdb_ex_cmds[@]}")
+	printf '%s\n' "${cmd[*]}"
+}
+
+# Execute GDB and return its output. Exit code is propagated.
+run_gdb () {
+	local cmd=()
+	if [[ "${opt_sudo}" == true ]]; then
+		cmd+=(sudo)
+	fi
+	cmd+=(gdb --batch -q -p "${pid}" "${gdb_ex_cmds[@]}")
+
+	local rc=0
+	"${cmd[@]}" || rc=$?
+
+	if [[ "${rc}" -ne 0 ]]; then
+		# Check if ptrace is the issue and suggest --sudo
+		if [[ "${opt_sudo}" == false ]]; then
+			local ptrace_scope
+			ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo "unknown")
+			if [[ "${ptrace_scope}" != "0" ]]; then
+				warn "GDB failed (exit ${rc}). ptrace_scope=${ptrace_scope} -- try --sudo"
+			fi
+		fi
+		return "${rc}"
+	fi
+}
+
+# Execute GDB with custom ex_cmds (for stuck detection which needs different commands)
+run_gdb_with_cmds () {
+	local custom_ex_cmds=("$@")
+	local cmd=()
+	if [[ "${opt_sudo}" == true ]]; then
+		cmd+=(sudo)
+	fi
+	cmd+=(gdb --batch -q -p "${pid}" "${custom_ex_cmds[@]}")
+
+	local rc=0
+	"${cmd[@]}" || rc=$?
+	return "${rc}"
+}
+
+# Generate a core dump via gcore without killing the process
+run_gcore () {
+	local core_prefix="${1:-${opt_core_prefix}}"
+	local cmd=()
+	if [[ "${opt_sudo}" == true ]]; then
+		cmd+=(sudo)
+	fi
+	cmd+=(gcore -o "${core_prefix}" "${pid}")
+
+	printf '=== Generating Core Dump ===\n'
+	printf 'Command: %s\n' "${cmd[*]}"
+
+	local rc=0
+	"${cmd[@]}" || rc=$?
+
+	if [[ "${rc}" -ne 0 ]]; then
+		warn "gcore failed with exit code ${rc}"
+	else
+		printf 'Core dump saved with prefix: %s\n' "${core_prefix}"
+	fi
+	printf '============================\n\n'
+
+	return "${rc}"
+}
+
+
+# ============================================================================
+# Dump execution
+# ============================================================================
+
+# Run one complete dump cycle: optional info headers + GDB
+run_single_dump () {
+	local output=""
+
+	# Timestamp prefix
+	if [[ "${opt_timestamp}" == true ]]; then
+		output+="[$(timestamp_now)] "
+		output+=$'\n'
+	fi
+
+	# Process info header
+	if [[ "${opt_info}" == true ]]; then
+		output+=$(print_process_info "${pid}")
+		output+=$'\n'
+	fi
+
+	# Signal info
+	if [[ "${opt_signals}" == true ]]; then
+		output+=$(print_signal_info "${pid}")
+		output+=$'\n'
+	fi
+
+	# IO stats
+	if [[ "${opt_io}" == true ]]; then
+		output+=$(print_io_stats "${pid}")
+		output+=$'\n'
+	fi
+
+	# Resource limits
+	if [[ "${opt_limits}" == true ]]; then
+		output+=$(print_resource_limits "${pid}")
+		output+=$'\n'
+	fi
+
+	# Scheduling stats
+	if [[ "${opt_sched}" == true ]]; then
+		output+=$(print_sched_stats "${pid}")
+		output+=$'\n'
+	fi
+
+	# Namespace and cgroup info
+	if [[ "${opt_ns}" == true ]]; then
+		output+=$(print_namespace_info "${pid}")
+		output+=$'\n'
+	fi
+
+	# GDB dump
+	local gdb_output=""
+	local rc=0
+	gdb_output=$(run_gdb 2>&1) || rc=$?
+	output+="${gdb_output}"
+
+	printf '%s\n' "${output}"
+	return "${rc}"
+}
+
+# Run multiple dumps at an interval, optionally showing diffs
+run_watch_mode () {
+	local count="${1}"
+	local interval="${2}"
+	local do_diff="${3}"
+	local prev_output=""
+	local iteration=0
+
+	# Temp files for diff mode
+	local tmp_prev="" tmp_curr=""
+	if [[ "${do_diff}" == true ]]; then
+		tmp_prev=$(mktemp)
+		tmp_curr=$(mktemp)
+	fi
+
+	while [[ "${iteration}" -lt "${count}" ]]; do
+		iteration=$(( iteration + 1 ))
+
+		# Verify process still exists
+		if ! kill -0 "${pid}" 2>/dev/null && [[ ! -d "/proc/${pid}" ]]; then
+			warn "Process ${pid} no longer exists after ${iteration} iterations"
+			return 1
+		fi
+
+		local current_output=""
+		local rc=0
+		current_output=$(run_single_dump | apply_output_filter) || rc=$?
+
+		if [[ "${do_diff}" == true ]] && [[ -n "${prev_output}" ]]; then
+			# Show header and diff between previous and current
+			printf '=== Iteration %d/%d (diff) ===\n' "${iteration}" "${count}"
+			printf '%s\n' "${prev_output}" > "${tmp_prev}"
+			printf '%s\n' "${current_output}" > "${tmp_curr}"
+			diff --suppress-common-lines "${tmp_prev}" "${tmp_curr}" || true
+			printf '\n'
+		else
+			if [[ "${count}" -gt 1 ]]; then
+				printf '=== Iteration %d/%d ===\n' "${iteration}" "${count}"
+			fi
+			# Handle output to file if requested
+			if [[ -n "${opt_output}" ]]; then
+				local out_file
+				out_file=$(generate_output_path "${opt_output}" "${pid}")
+				printf '%s\n' "${current_output}" | tee "${out_file}"
+				printf 'Saved: %s\n' "${out_file}" >&2
+			else
+				printf '%s\n' "${current_output}"
+			fi
+		fi
+
+		prev_output="${current_output}"
+
+		# Don't sleep after the last iteration
+		if [[ "${iteration}" -lt "${count}" ]]; then
+			sleep "${interval}"
+		fi
+	done
+
+	# Cleanup temp files
+	if [[ -n "${tmp_prev}" ]] && [[ -f "${tmp_prev}" ]]; then
+		rm -f "${tmp_prev}"
+	fi
+	if [[ -n "${tmp_curr}" ]] && [[ -f "${tmp_curr}" ]]; then
+		rm -f "${tmp_curr}"
+	fi
+}
+
+# Generate a timestamped output file path
+generate_output_path () {
+	local output_dir="${1}"
+	local target_pid="${2}"
+	local proc_name
+	proc_name=$(cat "/proc/${target_pid}/comm" 2>/dev/null || echo "unknown")
+	local ts
+	ts=$(date +%Y-%m-%dT%H:%M:%S)
+	printf '%s/%s_%s_%s.txt' "${output_dir}" "${proc_name}" "${target_pid}" "${ts}"
+}
+
+
+# ============================================================================
+# Stuck thread detection
+# ============================================================================
+
+# Take N instruction pointer samples at an interval and report which threads
+# are stuck (IP unchanged) vs progressing (IP changed). Replaces the manual
+# "while true; do thread_dump -i | grep rip; done" workflow.
+run_stuck_detection () {
+	local sample_count="${1}"
+	local interval="${2}"
+	local ip_reg
+	ip_reg=$(get_ip_register)
+
+	printf '=== Stuck Thread Analysis (%d samples, %ss interval) ===\n\n' "${sample_count}" "${interval}"
+	printf 'Sampling instruction pointers...\n' >&2
+
+	# Collect samples: each sample is a set of "thread_id ip_value" pairs
+	# stored as lines in sample_data[N]
+	local -a all_samples=()
+	local iteration=0
+
+	while [[ "${iteration}" -lt "${sample_count}" ]]; do
+		iteration=$(( iteration + 1 ))
+
+		# Verify process still exists
+		if ! kill -0 "${pid}" 2>/dev/null && [[ ! -d "/proc/${pid}" ]]; then
+			warn "Process ${pid} no longer exists after ${iteration} samples"
+			break
+		fi
+
+		# Get IP for all threads using GDB
+		local gdb_output=""
+		local rc=0
+		gdb_output=$(run_gdb_with_cmds -ex "thread apply all info registers ${ip_reg}" 2>&1) || rc=$?
+
+		# Parse thread IDs and IP values from GDB output
+		# GDB output looks like:
+		#   Thread 3 (Thread 0x... (LWP ...)):
+		#   rip            0x7f...    0x7f... <func+offset>
+		local parsed
+		parsed=$(printf '%s\n' "${gdb_output}" | awk '
+			/^Thread [0-9]+/ { tid = $2 }
+			/^'"${ip_reg}"'/ { print tid, $2 }
+		')
+
+		all_samples+=("${parsed}")
+
+		printf '  Sample %d/%d collected\n' "${iteration}" "${sample_count}" >&2
+
+		# Don't sleep after the last sample
+		if [[ "${iteration}" -lt "${sample_count}" ]]; then
+			sleep "${interval}"
+		fi
+	done
+
+	printf '\n'
+
+	# Analyze: for each thread, check if IP changed across samples
+	# Build a list of all thread IDs seen
+	local all_threads
+	all_threads=$(for s in "${all_samples[@]}"; do
+		printf '%s\n' "${s}"
+	done | awk '{print $1}' | sort -un)
+
+	# For each thread, collect all observed IPs
+	while IFS= read -r tid; do
+		[[ -z "${tid}" ]] && continue
+
+		local unique_ips=0
+		local total_seen=0
+		local ip_list=""
+
+		for s in "${all_samples[@]}"; do
+			local ip_val
+			ip_val=$(printf '%s\n' "${s}" | awk -v t="${tid}" '$1 == t {print $2}')
+			if [[ -n "${ip_val}" ]]; then
+				total_seen=$(( total_seen + 1 ))
+				ip_list+="${ip_val}"$'\n'
+			fi
+		done
+
+		if [[ "${total_seen}" -eq 0 ]]; then
+			continue
+		fi
+
+		unique_ips=$(printf '%s' "${ip_list}" | sort -u | grep -c . || true)
+		local changes=$(( unique_ips - 1 ))
+
+		if [[ "${unique_ips}" -le 1 ]]; then
+			local stuck_ip
+			stuck_ip=$(printf '%s' "${ip_list}" | head -1)
+			printf 'Thread %-4s  STUCK        (IP unchanged across %d samples: %s)\n' "${tid}" "${total_seen}" "${stuck_ip}"
+		else
+			printf 'Thread %-4s  PROGRESSING  (IP changed %d/%d samples)\n' "${tid}" "${changes}" "${total_seen}"
+		fi
+	done <<< "${all_threads}"
+
+	printf '\n===================================================\n'
+}
+
+
+# ============================================================================
+# Snapshot bundle
+# ============================================================================
+
+# Collect everything into a single timestamped directory for forensic handoff.
+# Each piece of data goes into a separate file for easy sharing and review.
+run_snapshot () {
+	local base_dir="${1}"
+	local proc_name
+	proc_name=$(cat "/proc/${pid}/comm" 2>/dev/null || echo "unknown")
+	local ts
+	ts=$(date +%Y-%m-%dT%H:%M:%S)
+	local snap_dir="${base_dir}/${proc_name}_${pid}_${ts}"
+
+	mkdir -p "${snap_dir}" || die "Cannot create snapshot directory: ${snap_dir}"
+
+	printf 'Creating forensic snapshot in %s\n' "${snap_dir}" >&2
+
+	# Process info
+	printf '  Collecting process info...\n' >&2
+	print_process_info "${pid}" > "${snap_dir}/process_info.txt" 2>&1
+
+	# Thread dump (all threads, full backtrace)
+	printf '  Collecting thread dump...\n' >&2
+	local saved_all="${opt_all_threads}"
+	local saved_full="${opt_full}"
+	opt_all_threads=true
+	opt_full=true
+	build_gdb_cmd
+	run_gdb > "${snap_dir}/thread_dump.txt" 2>&1 || true
+	opt_all_threads="${saved_all}"
+	opt_full="${saved_full}"
+
+	# Memory maps
+	printf '  Collecting memory maps...\n' >&2
+	local map_cmds=(-ex 'info proc mappings')
+	run_gdb_with_cmds "${map_cmds[@]}" > "${snap_dir}/maps.txt" 2>&1 || true
+
+	# Shared libraries
+	printf '  Collecting shared libraries...\n' >&2
+	local lib_cmds=(-ex 'info sharedlibrary')
+	run_gdb_with_cmds "${lib_cmds[@]}" > "${snap_dir}/libraries.txt" 2>&1 || true
+
+	# Signals
+	printf '  Collecting signal info...\n' >&2
+	print_signal_info "${pid}" > "${snap_dir}/signals.txt" 2>&1
+
+	# IO stats
+	printf '  Collecting IO stats...\n' >&2
+	print_io_stats "${pid}" > "${snap_dir}/io.txt" 2>&1
+
+	# Resource limits
+	printf '  Collecting resource limits...\n' >&2
+	print_resource_limits "${pid}" > "${snap_dir}/limits.txt" 2>&1
+
+	# Scheduling stats
+	printf '  Collecting scheduling stats...\n' >&2
+	print_sched_stats "${pid}" > "${snap_dir}/sched.txt" 2>&1
+
+	# Namespace and cgroup info
+	printf '  Collecting namespace/cgroup info...\n' >&2
+	print_namespace_info "${pid}" > "${snap_dir}/namespace.txt" 2>&1
+
+	# Core dump (only if --core was also specified)
+	if [[ "${opt_core}" == true ]]; then
+		printf '  Generating core dump...\n' >&2
+		run_gcore "${snap_dir}/core" > "${snap_dir}/core_dump_log.txt" 2>&1 || true
+	fi
+
+	# Rebuild GDB command for any subsequent operations
+	build_gdb_cmd
+
+	printf '\nSnapshot complete: %s\n' "${snap_dir}"
+	printf 'Files:\n'
+	find "${snap_dir}" -type f -printf '  %f (%s bytes)\n' 2>/dev/null | sort
+}
+
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+pid=""
+opt_sudo=false
+opt_verbose=false
+opt_dry_run=false
+opt_all_threads=false
+opt_full=false
+opt_thread_info=false
+opt_registers=false
+opt_register_type=""
+opt_instruction=false
+opt_maps=false
+opt_libraries=false
+opt_signals=false
+opt_core=false
+opt_core_prefix="core"
+opt_output=""
+opt_watch=""
+opt_interval="1"
+opt_timestamp=false
+opt_diff=false
+opt_info=false
+opt_io=false
+opt_limits=false
+opt_sched=false
+opt_ns=false
+opt_group=false
+opt_folded=false
+opt_frame_walk=false
+opt_stuck=""
+opt_thread_id=""
+opt_snapshot=""
+opt_gdb_cmds=()
+
+if [[ $# -lt 1 ]]; then
+	printf 'No arguments provided. See --help for usage.\n' >&2
 	exit 1
 fi
 
-
-
-
-# Iterate over the args
-while [ $TD_ITERATOR -lt $# ]
-do
-	# Get the current key
-	TD_KEY=${TD_ARGS[$TD_ITERATOR]}
-	
-	if [ $TD_ITERATOR -lt $(( $#-1 )) ]
-	then
-		# Value for the "key" is the next arg
-		TD_VALUE=${TD_ARGS[$(( TD_ITERATOR+1 ))]}
-	else
-		# At the end of the args
-		TD_VALUE=""
-	fi
-
-
-	# Help
-	if [ "--help" = "$TD_KEY" ] || [ "-h" = "$TD_KEY" ]
-	then
-		echo -e "thread_dump script"
-		echo -e "------------------"
-		echo -e "A script to aid in performing a thread dump of a native process at runtime"
-		echo -e ""
-		echo -e "Usage:"
-		echo -e "\t-h, --help\t\t| Print this message"
-		echo -e "\t-v, --verbose\t\t| Verbose mode. Print command executed before executing"
-		echo -e "\t-d, --dry-run\t\t| Don't actually run the command, but print the command"
-		echo -e "\t-s, --sudo\t\t| Auto sudo the gdb call. If not, then you need ptrace cap."
-		echo -e "\t-p, --pid\t\t| PID to perform the thread dump on"
-		echo -e "\t-P, --process\t\t| Process to perform it on (rather than PID). Uses \$(pgrep)"
-		echo -e "\t-r, --registers\t\t| Print registers"
-		echo -e "\t-R, --register-type\t| Prints the types of registers, ex: all, vector, mmx, general"
-		echo -e "\t-i, --instruction\t| Print instruction pointer register"
-		echo -e "\t-f, --full\t\t| Print a full backtrace"
-		echo -e "\t-a, --all-threads\t| Perform thread dump of all threads"
-		echo -e "\t-t, --thread-info\t| Get thread info. Does not perform a thread dump"
-		echo ""
-		exit 0
-	fi
-	
-
-	# Verbose
-	if [ "--verbose" = "$TD_KEY" ] || [ "-v" = "$TD_KEY" ]
-	then
-		TD_VERBOSE=1
-	fi
-	
-
-	# Dry Run
-	if [ "--dry-run" = "$TD_KEY" ] || [ "-d" = "$TD_KEY" ]
-	then
-		TD_DRY_RUN=1
-	fi
-	
-
-	# Sudo
-	if [ "--sudo" = "$TD_KEY" ] || [ "-s" = "$TD_KEY" ]
-	then
-		TD_SUDO=1
-	fi
-
-	
-	# PID
-	if [ "--pid" = "$TD_KEY" ] || [ "-p" = "$TD_KEY" ]
-	then
-		TD_PID="$TD_VALUE"
-	fi
-	
-
-	# Process
-	if [ "--process" = "$TD_KEY" ] || [ "-P" = "$TD_KEY" ]
-	then
-		TD_PID=$(pgrep "$TD_VALUE")
-	fi
-	
-
-	# Registers
-	if [ "--registers" = "$TD_KEY" ] || [ "-r" = "$TD_KEY" ]
-	then
-		TD_GDB_PARAMS="${TD_GDB_PARAMS}-ex 'i r' "
-	fi
-	
-
-	# Register Type
-	if [ "--register-type" = "$TD_KEY" ] || [ "-R" = "$TD_KEY" ]
-	then
-		TD_GDB_PARAMS="${TD_GDB_PARAMS}-ex 'i r $TD_VALUE' "
-	fi
-	
-
-	# Instruction Pointer
-	if [ "--instruction" = "$TD_KEY" ] || [ "-i" = "$TD_KEY" ]
-	then
-		TD_GDB_PARAMS="${TD_GDB_PARAMS}-ex 'i r rip' "
-	fi
-	
-
-	# Full backtrace
-	if [ "--full" = "$TD_KEY" ] || [ "-f" = "$TD_KEY" ]
-	then
-		TD_FULL=1
-	fi
-	
-
-	# All Threads
-	if [ "--all-threads" = "$TD_KEY" ] || [ "-a" = "$TD_KEY" ]
-	then
-		TD_ALL_THREADS=1
-	fi
-	
-
-	# Thread Info
-	if [ "--thread-info" = "$TD_KEY" ] || [ "-t" = "$TD_KEY" ]
-	then
-		TD_THREAD_DETAILS=1
-	fi
-	
-
-	#Increment the iterator
-	TD_ITERATOR=$(( TD_ITERATOR+1 ))
+while [[ $# -gt 0 ]]; do
+	case "${1}" in
+		-h|--help)
+			usage
+			exit 0
+			;;
+		--license)
+			echo "AGPLv3"
+			exit 0
+			;;
+		-p|--pid)
+			pid="${2}"
+			shift 2
+			;;
+		-P|--process)
+			pid=$(resolve_process_name "${2}")
+			shift 2
+			;;
+		-s|--sudo)
+			opt_sudo=true
+			shift
+			;;
+		-v|--verbose)
+			opt_verbose=true
+			shift
+			;;
+		-d|--dry-run)
+			opt_dry_run=true
+			shift
+			;;
+		-a|--all-threads)
+			opt_all_threads=true
+			shift
+			;;
+		-f|--full)
+			opt_full=true
+			shift
+			;;
+		--locals)
+			opt_full=true
+			shift
+			;;
+		--frame-walk)
+			opt_frame_walk=true
+			shift
+			;;
+		--thread)
+			opt_thread_id="${2}"
+			shift 2
+			;;
+		-t|--thread-info)
+			opt_thread_info=true
+			shift
+			;;
+		-r|--registers)
+			opt_registers=true
+			shift
+			;;
+		-R|--register-type)
+			opt_register_type="${2}"
+			shift 2
+			;;
+		-i|--instruction)
+			opt_instruction=true
+			shift
+			;;
+		-m|--maps)
+			opt_maps=true
+			shift
+			;;
+		-l|--libraries)
+			opt_libraries=true
+			shift
+			;;
+		--signals)
+			opt_signals=true
+			shift
+			;;
+		--io)
+			opt_io=true
+			shift
+			;;
+		--limits)
+			opt_limits=true
+			shift
+			;;
+		--sched)
+			opt_sched=true
+			shift
+			;;
+		--ns)
+			opt_ns=true
+			shift
+			;;
+		--core)
+			opt_core=true
+			# Optional path prefix: consume next arg if it doesn't look like a flag
+			if [[ $# -gt 1 ]] && [[ "${2}" != -* ]]; then
+				opt_core_prefix="${2}"
+				shift 2
+			else
+				shift
+			fi
+			;;
+		--group)
+			opt_group=true
+			shift
+			;;
+		--folded)
+			opt_folded=true
+			shift
+			;;
+		--stuck)
+			opt_stuck="${2}"
+			shift 2
+			;;
+		--preset)
+			case "${2}" in
+				full)
+					opt_info=true
+					opt_all_threads=true
+					opt_full=true
+					opt_maps=true
+					opt_libraries=true
+					opt_signals=true
+					opt_timestamp=true
+					;;
+				stuck)
+					opt_instruction=true
+					opt_all_threads=true
+					opt_watch="5"
+					opt_interval="0.5"
+					opt_diff=true
+					;;
+				quick)
+					opt_info=true
+					opt_all_threads=true
+					opt_timestamp=true
+					;;
+				*)
+					die "Unknown preset: ${2}. Available: full, stuck, quick"
+					;;
+			esac
+			shift 2
+			;;
+		--gdb-cmd)
+			opt_gdb_cmds+=("${2}")
+			shift 2
+			;;
+		-o|--output)
+			opt_output="${2}"
+			shift 2
+			;;
+		-w|--watch)
+			opt_watch="${2}"
+			shift 2
+			;;
+		--interval)
+			opt_interval="${2}"
+			shift 2
+			;;
+		--timestamp)
+			opt_timestamp=true
+			shift
+			;;
+		--diff)
+			opt_diff=true
+			shift
+			;;
+		--info)
+			opt_info=true
+			shift
+			;;
+		--snapshot)
+			opt_snapshot="${2}"
+			shift 2
+			;;
+		*)
+			die "Unknown option: ${1}. Use --help for usage."
+			;;
+	esac
 done
 
 
+# ============================================================================
+# Validation
+# ============================================================================
 
+# GDB is required for most operations (not for /proc-only modes)
+require_command "gdb" "GDB is required. Install with: sudo dnf install gdb"
 
-# Append correct thread backtrace info
-if [ "1" = "$TD_ALL_THREADS" ]
-then 
-	if [ "1" = "$TD_FULL" ]
-	then
-		TD_GDB_PARAMS="${TD_GDB_PARAMS}-ex 'thread apply all bt full' "
-	else
-		TD_GDB_PARAMS="${TD_GDB_PARAMS}-ex 'thread apply all bt' "
+# gcore needed for --core
+if [[ "${opt_core}" == true ]]; then
+	require_command "gcore" "gcore is required for core dumps. Install with: sudo dnf install gdb"
+fi
+
+# PID must be provided
+if [[ -z "${pid}" ]]; then
+	die "No PID specified. Use -p <pid> or -P <process_name>"
+fi
+
+# Validate PID
+validate_pid "${pid}"
+
+# Validate --watch is a positive integer
+if [[ -n "${opt_watch}" ]] && [[ ! "${opt_watch}" =~ ^[0-9]+$ ]]; then
+	die "--watch must be a positive integer, got: ${opt_watch}"
+fi
+
+# Validate --stuck is a positive integer
+if [[ -n "${opt_stuck}" ]] && [[ ! "${opt_stuck}" =~ ^[0-9]+$ ]]; then
+	die "--stuck must be a positive integer, got: ${opt_stuck}"
+fi
+
+# Validate --interval is a positive number (integer or decimal)
+if [[ ! "${opt_interval}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+	die "--interval must be a positive number, got: ${opt_interval}"
+fi
+
+# Validate --thread is a positive integer
+if [[ -n "${opt_thread_id}" ]] && [[ ! "${opt_thread_id}" =~ ^[0-9]+$ ]]; then
+	die "--thread must be a positive integer, got: ${opt_thread_id}"
+fi
+
+# Warn about --diff without --watch
+if [[ "${opt_diff}" == true ]] && [[ -z "${opt_watch}" ]]; then
+	warn "--diff has no effect without --watch"
+fi
+
+# --group and --folded are mutually exclusive
+if [[ "${opt_group}" == true ]] && [[ "${opt_folded}" == true ]]; then
+	die "--group and --folded are mutually exclusive"
+fi
+
+# --group and --folded imply --all-threads
+if [[ "${opt_group}" == true ]] && [[ "${opt_all_threads}" == false ]]; then
+	warn "--group implies --all-threads, enabling it"
+	opt_all_threads=true
+fi
+if [[ "${opt_folded}" == true ]] && [[ "${opt_all_threads}" == false ]]; then
+	warn "--folded implies --all-threads, enabling it"
+	opt_all_threads=true
+fi
+
+# --frame-walk implies --all-threads and --full
+if [[ "${opt_frame_walk}" == true ]]; then
+	opt_all_threads=true
+	opt_full=true
+fi
+
+# --thread conflicts with --all-threads
+if [[ -n "${opt_thread_id}" ]] && [[ "${opt_all_threads}" == true ]]; then
+	warn "--thread ignored when --all-threads is active"
+	opt_thread_id=""
+fi
+
+# Validate and create output directory
+if [[ -n "${opt_output}" ]]; then
+	if [[ ! -d "${opt_output}" ]]; then
+		mkdir -p "${opt_output}" || die "Cannot create output directory: ${opt_output}"
 	fi
-else
-	if [ "1" = "$TD_FULL" ]
-	then
-		TD_GDB_PARAMS="${TD_GDB_PARAMS}-ex 'bt full' "
-	else
-		TD_GDB_PARAMS="${TD_GDB_PARAMS}-ex 'bt' "
+	if [[ ! -w "${opt_output}" ]]; then
+		die "Output directory is not writable: ${opt_output}"
+	fi
+fi
+
+# Validate and create snapshot directory
+if [[ -n "${opt_snapshot}" ]]; then
+	if [[ ! -d "${opt_snapshot}" ]]; then
+		mkdir -p "${opt_snapshot}" || die "Cannot create snapshot directory: ${opt_snapshot}"
+	fi
+	if [[ ! -w "${opt_snapshot}" ]]; then
+		die "Snapshot directory is not writable: ${opt_snapshot}"
+	fi
+fi
+
+# Check ptrace_scope and warn proactively
+if [[ "${opt_sudo}" == false ]] && [[ "${opt_dry_run}" == false ]]; then
+	local_ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo "unknown")
+	if [[ "${local_ptrace_scope}" != "0" ]] && [[ "${local_ptrace_scope}" != "unknown" ]]; then
+		warn "ptrace_scope=${local_ptrace_scope} -- GDB may fail without --sudo"
 	fi
 fi
 
 
+# ============================================================================
+# Trap for cleanup on unexpected exit
+# ============================================================================
+
+cleanup () {
+	:
+}
+trap cleanup EXIT
 
 
-# If we are in thread detail mode, set GDB params accordingly
-if [ "1" = "$TD_THREAD_DETAILS" ]
-then
-	TD_GDB_PARAMS="-ex 'info threads' "
-fi
+# ============================================================================
+# Main execution
+# ============================================================================
 
+# Build the GDB command array
+build_gdb_cmd
 
-
-
-# If dry run, just do the dry run
-if [ "1" == "$TD_DRY_RUN" ]
-then
-	if [ "1" = "$TD_SUDO" ]
-	then 
-		echo -e "sudo gdb --batch -q -p $TD_PID $TD_GDB_PARAMS"
-	else
-		echo -e "gdb --batch -q -p $TD_PID $TD_GDB_PARAMS"
-	fi 
-
+# Dry-run: print and exit
+if [[ "${opt_dry_run}" == true ]]; then
+	print_command
 	exit 0
 fi
 
-
-
-
-# If verbose, lets ask if they want to continue
-if [ "1" == "$TD_VERBOSE" ]
-then
-	if [ "1" = "$TD_SUDO" ]
-	then 
-		echo -e "sudo gdb --batch -q -p $TD_PID $TD_GDB_PARAMS"
-	else
-		echo -e "gdb --batch -q -p $TD_PID $TD_GDB_PARAMS"
-	fi 
-
-	echo -e "Do you wish to continue? y/n: "
-	read TD_CONFIRMATION
-
-	if [ "n" = "$TD_CONFIRMATION" ] || [ "N" = "$TD_CONFIRMATION" ]
-	then
+# Verbose: print command and ask for confirmation via the confirm utility
+if [[ "${opt_verbose}" == true ]]; then
+	printf 'Command: '
+	print_command
+	if ! confirm "Execute this command?"; then
 		exit 0
 	fi
 fi
 
+# Snapshot mode: collect everything and exit
+if [[ -n "${opt_snapshot}" ]]; then
+	run_snapshot "${opt_snapshot}"
+	exit 0
+fi
 
+# Core dump (can run alongside other operations)
+if [[ "${opt_core}" == true ]]; then
+	run_gcore || true
+fi
 
+# Stuck detection mode: run dedicated analysis and exit
+if [[ -n "${opt_stuck}" ]]; then
+	run_stuck_detection "${opt_stuck}" "${opt_interval}"
+	exit 0
+fi
 
-# If sudo, run the command with sudo
-if [ "1" = "$TD_SUDO" ]
-then 
-	# The real gdb call
-	sh -c "sudo gdb --batch -q -p $TD_PID $TD_GDB_PARAMS"
-	exit $?
+# Watch mode vs single dump
+if [[ -n "${opt_watch}" ]]; then
+	run_watch_mode "${opt_watch}" "${opt_interval}" "${opt_diff}"
 else
-	# The real gdb call
-	sh -c "gdb --batch -q -p $TD_PID $TD_GDB_PARAMS"
-fi 
-
-
-
-
-# Exit with the status from the 'sh -c' call.
-exit $?
-
+	# Single dump with optional output filter and file output
+	if [[ -n "${opt_output}" ]]; then
+		out_file=$(generate_output_path "${opt_output}" "${pid}")
+		run_single_dump | apply_output_filter | tee "${out_file}"
+		printf 'Saved: %s\n' "${out_file}" >&2
+	else
+		run_single_dump | apply_output_filter
+	fi
+fi
