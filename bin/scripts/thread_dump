@@ -94,6 +94,11 @@ OPTIONS:
 	-v, --verbose           Show command and ask for confirmation
 	-d, --dry-run           Print the command without executing
 
+  Remote:
+	--ssh <user@host>       Run on a remote host via SSH
+	                        Copies the script, executes remotely, then cleans up
+	                        (--output and --snapshot paths are on the remote host)
+
 EXAMPLES:
 	# Basic thread dump
 	thread_dump -p 12345 -s
@@ -131,6 +136,12 @@ EXAMPLES:
 	# Watch with diff to spot stuck vs progressing threads
 	thread_dump -p 12345 -i -s -w 10 --diff
 
+	# Run a thread dump on a remote host
+	thread_dump --ssh user@10.0.0.5 -p 12345 -s -a
+
+	# Full inspection on a remote host
+	thread_dump --ssh root@prod-server --preset full -p 12345
+
 EOF
 }
 
@@ -158,6 +169,38 @@ require_command () {
 	if ! command -v "${cmd}" &>/dev/null; then
 		die "${msg}"
 	fi
+}
+
+# Copy this script to a remote host, execute it with forwarded args, then clean up.
+# Uses an EXIT trap on the remote shell to guarantee cleanup even on signal/failure.
+run_remote () {
+	local ssh_target="${1}"
+	shift
+	local remote_args=("$@")
+
+	local local_script
+	local_script=$(readlink -f "${BASH_SOURCE[0]}")
+	local remote_tmp
+	remote_tmp="/tmp/thread_dump_${$}_$(date +%s)"
+
+	printf 'Copying script to %s:%s ...\n' "${ssh_target}" "${remote_tmp}" >&2
+	scp -q "${local_script}" "${ssh_target}:${remote_tmp}" \
+		|| die "Failed to copy script to ${ssh_target}"
+
+	# Build a properly quoted argument string for the remote shell
+	local quoted_args=""
+	local arg
+	for arg in "${remote_args[@]}"; do
+		quoted_args+="$(printf '%q ' "${arg}")"
+	done
+
+	# Run remotely with an EXIT trap to guarantee cleanup of the tmp file
+	local rc=0
+	ssh "${ssh_target}" \
+		"trap 'rm -f \"${remote_tmp}\"' EXIT; chmod +x '${remote_tmp}' && '${remote_tmp}' ${quoted_args}" \
+		|| rc=$?
+
+	return "${rc}"
 }
 
 
@@ -1144,6 +1187,52 @@ run_snapshot () {
 	printf 'Files:\n'
 	find "${snap_dir}" -type f -printf '  %f (%s bytes)\n' 2>/dev/null | sort
 }
+
+
+# ============================================================================
+# SSH remote execution (pre-scan before local argument parsing)
+# ============================================================================
+
+# Detect --ssh early so we can forward to the remote host without
+# local validation (PID, GDB, /proc checks don't apply locally).
+_ssh_requested=false
+for _arg in "$@"; do
+	[[ "${_arg}" == "--ssh" ]] && _ssh_requested=true && break
+done
+
+if [[ "${_ssh_requested}" == true ]]; then
+	# Handle help/license locally even in SSH mode
+	for _arg in "$@"; do
+		case "${_arg}" in
+			-h|--help) usage; exit 0 ;;
+			--license) echo "AGPLv3"; exit 0 ;;
+		esac
+	done
+
+	# Extract SSH target and build forwarded args (everything except --ssh <host>)
+	_opt_ssh=""
+	_forward_args=()
+	_skip_next=false
+	for _arg in "$@"; do
+		if [[ "${_skip_next}" == true ]]; then
+			_opt_ssh="${_arg}"
+			_skip_next=false
+			continue
+		fi
+		if [[ "${_arg}" == "--ssh" ]]; then
+			_skip_next=true
+			continue
+		fi
+		_forward_args+=("${_arg}")
+	done
+
+	if [[ -z "${_opt_ssh}" ]]; then
+		die "--ssh requires a target (e.g., user@host)"
+	fi
+
+	run_remote "${_opt_ssh}" "${_forward_args[@]}"
+	exit $?
+fi
 
 
 # ============================================================================
