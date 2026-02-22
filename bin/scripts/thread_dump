@@ -64,6 +64,8 @@ OPTIONS:
 	--sched                 Show scheduling stats and CPU affinity
 	--ns                    Show namespace and cgroup info with resource limits
 	--core [prefix]         Generate core dump via gcore (default prefix: "core")
+	--mem                   Memory profiling: pmap regions, smaps_rollup summary,
+	                        and glibc heap stats via malloc_info (intrusive GDB call)
 
   Analysis:
 	--group                 Group threads with identical stacks (implies -a)
@@ -126,6 +128,9 @@ EXAMPLES:
 
 	# Custom GDB commands alongside normal dump
 	thread_dump -p 12345 -s --gdb-cmd 'print some_global' --gdb-cmd 'info mutex'
+
+	# Memory profiling (pmap, smaps_rollup, glibc malloc_info)
+	thread_dump -p 12345 -s --mem
 
 	# Namespace and cgroup investigation
 	thread_dump -p 12345 --ns --limits --io --sched
@@ -531,6 +536,97 @@ print_namespace_info () {
 	printf '\n=============================\n\n'
 }
 
+# Show memory region overview via pmap -x
+print_pmap_info () {
+	local target_pid="${1}"
+
+	if ! command -v pmap &>/dev/null; then
+		warn "pmap not found -- install procps-ng for memory region overview"
+		return 0
+	fi
+
+	printf '=== Memory Regions (pmap) ===\n'
+
+	local cmd=()
+	if [[ "${opt_sudo}" == true ]]; then
+		cmd+=(sudo)
+	fi
+	cmd+=(pmap -x "${target_pid}")
+
+	"${cmd[@]}" 2>/dev/null || warn "pmap failed for PID ${target_pid} (try --sudo)"
+
+	printf '=============================\n\n'
+}
+
+# Show summarized memory stats from /proc/<pid>/smaps_rollup (kernel 4.14+)
+print_smaps_rollup () {
+	local target_pid="${1}"
+	local rollup_file="/proc/${target_pid}/smaps_rollup"
+
+	if [[ ! -e "${rollup_file}" ]]; then
+		warn "/proc/${target_pid}/smaps_rollup does not exist (kernel 4.14+ required)"
+		return 0
+	fi
+
+	if [[ ! -r "${rollup_file}" ]]; then
+		warn "Cannot read /proc/${target_pid}/smaps_rollup (try --sudo or run as process owner)"
+		return 0
+	fi
+
+	printf '=== Memory Summary (smaps_rollup) ===\n'
+	cat "${rollup_file}" 2>/dev/null
+	printf '=====================================\n\n'
+}
+
+# Dump glibc internal heap statistics by calling malloc_info(0, FILE*)
+# inside the target process via GDB. Writes XML output to a temp file
+# that is then read back and displayed.
+# NOTE: This is intrusive -- it executes code in the target process.
+# Only works with glibc-linked processes (not musl, Go, static builds, etc.).
+print_malloc_info () {
+	local target_pid="${1}"
+	local tmp_file="/tmp/thread_dump_malloc_info_${target_pid}_$$"
+
+	printf '=== Glibc Heap Stats (malloc_info) ===\n'
+
+	# Call malloc_info in the target process via GDB.
+	# fopen/malloc_info/fclose all execute inside the inferior's address space.
+	local malloc_cmds=(
+		-ex "set \$_mi_f = (void*)fopen(\"${tmp_file}\", \"w\")"
+		-ex 'call (int)malloc_info(0, $_mi_f)'
+		-ex 'call (int)fclose($_mi_f)'
+	)
+
+	local rc=0
+	run_gdb_with_cmds "${malloc_cmds[@]}" >/dev/null 2>&1 || rc=$?
+
+	if [[ "${rc}" -ne 0 ]]; then
+		warn "malloc_info failed (exit ${rc}) -- process may not use glibc"
+		rm -f "${tmp_file}" 2>/dev/null || true
+		printf '======================================\n\n'
+		return 0
+	fi
+
+	# Read the XML output. The file is owned by the target process user,
+	# so we may need sudo to read it.
+	if [[ -r "${tmp_file}" ]]; then
+		cat "${tmp_file}" 2>/dev/null
+	elif [[ "${opt_sudo}" == true ]]; then
+		sudo cat "${tmp_file}" 2>/dev/null || warn "Cannot read malloc_info output at ${tmp_file}"
+	else
+		warn "Cannot read ${tmp_file} (try --sudo)"
+	fi
+
+	# Cleanup the temp file
+	if [[ "${opt_sudo}" == true ]]; then
+		sudo rm -f "${tmp_file}" 2>/dev/null || true
+	else
+		rm -f "${tmp_file}" 2>/dev/null || true
+	fi
+
+	printf '======================================\n\n'
+}
+
 
 # ============================================================================
 # Post-processing filters (awk-based, piped after GDB output)
@@ -921,6 +1017,17 @@ run_single_dump () {
 		output+=$'\n'
 	fi
 
+	# Memory profiling (pmap + smaps_rollup are non-intrusive,
+	# malloc_info requires GDB attach and is intrusive)
+	if [[ "${opt_mem}" == true ]]; then
+		output+=$(print_pmap_info "${pid}")
+		output+=$'\n'
+		output+=$(print_smaps_rollup "${pid}")
+		output+=$'\n'
+		output+=$(print_malloc_info "${pid}")
+		output+=$'\n'
+	fi
+
 	# GDB dump
 	local gdb_output=""
 	local rc=0
@@ -1174,6 +1281,14 @@ run_snapshot () {
 	printf '  Collecting namespace/cgroup info...\n' >&2
 	print_namespace_info "${pid}" > "${snap_dir}/namespace.txt" 2>&1
 
+	# Memory profiling
+	printf '  Collecting memory profile...\n' >&2
+	{
+		print_pmap_info "${pid}"
+		print_smaps_rollup "${pid}"
+		print_malloc_info "${pid}"
+	} > "${snap_dir}/memory.txt" 2>&1
+
 	# Core dump (only if --core was also specified)
 	if [[ "${opt_core}" == true ]]; then
 		printf '  Generating core dump...\n' >&2
@@ -1264,6 +1379,7 @@ opt_io=false
 opt_limits=false
 opt_sched=false
 opt_ns=false
+opt_mem=false
 opt_group=false
 opt_folded=false
 opt_frame_walk=false
@@ -1369,6 +1485,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--ns)
 			opt_ns=true
+			shift
+			;;
+		--mem)
+			opt_mem=true
 			shift
 			;;
 		--core)
