@@ -1820,6 +1820,720 @@ def _bootstrap_json(
 
 
 # =============================================================================
+# MCP stdio server — Model Context Protocol over JSON-RPC 2.0
+# =============================================================================
+
+MCP_PROTOCOL_VERSION: str = "2024-11-05"
+MCP_SERVER_NAME: str = "agent-memories"
+MCP_SERVER_VERSION: str = "1.0.0"
+
+
+def _mcp_serialize(obj) -> object:
+    """JSON serializer for MCP responses — handles datetime, UUID, bytes."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if hasattr(obj, "hex"):  # UUID
+        return str(obj)
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _mcp_tool_definitions() -> list[dict]:
+    """Return the list of MCP tool definitions with JSON schemas."""
+    category_enum: list[str] = CATEGORIES
+    importance_enum: list[str] = IMPORTANCE_LEVELS
+
+    return [
+        {
+            "name": "memory_add",
+            "description": "Store a new memory in the persistent agent memory database.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The full memory content text"},
+                    "summary": {"type": "string", "description": "Short one-line summary (auto-generated from content if omitted)"},
+                    "category": {"type": "string", "enum": category_enum, "description": "Memory category (default: general)"},
+                    "subcategory": {"type": "string", "description": "Subcategory for finer classification"},
+                    "importance": {"type": "string", "enum": importance_enum, "description": "Importance level (default: normal)"},
+                    "source": {"type": "string", "description": "Source of the memory (e.g., conversation, heartbeat)"},
+                    "source_context": {"type": "string", "description": "Additional source context"},
+                    "conversation_id": {"type": "string", "description": "Link to a specific conversation"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
+                    "related_to": {"type": "string", "description": "UUID (or prefix) of a related memory"},
+                    "pin": {"type": "boolean", "description": "Pin this memory (default: false)"},
+                    "metadata": {"type": "object", "description": "Arbitrary JSON metadata"},
+                    "confidence": {"type": "number", "description": "Confidence score 0.0-1.0 (default: 1.0)"},
+                    "expires": {"type": "string", "description": "Expiry: relative (7d, 2w, 3m, 1y) or ISO date"},
+                },
+                "required": ["content"],
+            },
+        },
+        {
+            "name": "memory_show",
+            "description": "Fetch and display a single memory by ID (full UUID or prefix).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID (full UUID or prefix)"},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "memory_list",
+            "description": "List memories with optional filtering, sorting, and pagination.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": category_enum, "description": "Filter by category"},
+                    "subcategory": {"type": "string", "description": "Filter by subcategory"},
+                    "importance": {"type": "string", "enum": importance_enum, "description": "Filter by importance"},
+                    "source": {"type": "string", "description": "Filter by source"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags (all must match)"},
+                    "pinned": {"type": "boolean", "description": "Show only pinned memories"},
+                    "include_archived": {"type": "boolean", "description": "Include archived memories"},
+                    "only_archived": {"type": "boolean", "description": "Show only archived memories"},
+                    "limit": {"type": "integer", "description": "Max results (default: 50)"},
+                    "offset": {"type": "integer", "description": "Pagination offset"},
+                    "sort": {"type": "string", "description": "Sort column (default: created_at)"},
+                    "ascending": {"type": "boolean", "description": "Sort ascending instead of descending"},
+                },
+            },
+        },
+        {
+            "name": "memory_search",
+            "description": (
+                "Search memories using fuzzy (default), exact (tsvector), or semantic (pgvector+ollama) modes. "
+                "Fuzzy: tolerates typos, partial matches. "
+                "Exact: boolean operators (AND, |, -, :*). "
+                "Semantic: conceptual similarity via embeddings."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query text"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["fuzzy", "exact", "semantic"],
+                        "description": "Search mode: fuzzy (default), exact (tsvector boolean), or semantic (embedding similarity)",
+                    },
+                    "category": {"type": "string", "enum": category_enum, "description": "Filter by category"},
+                    "include_archived": {"type": "boolean", "description": "Include archived memories"},
+                    "limit": {"type": "integer", "description": "Max results (default: 25)"},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "memory_update",
+            "description": "Update fields on an existing memory. Only provided fields are changed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID (full UUID or prefix)"},
+                    "content": {"type": "string", "description": "New content text"},
+                    "summary": {"type": "string", "description": "New summary"},
+                    "category": {"type": "string", "enum": category_enum, "description": "New category"},
+                    "subcategory": {"type": "string", "description": "New subcategory"},
+                    "importance": {"type": "string", "enum": importance_enum, "description": "New importance level"},
+                    "source": {"type": "string", "description": "New source"},
+                    "source_context": {"type": "string", "description": "New source context"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Replace tags array"},
+                    "is_pinned": {"type": "boolean", "description": "Set pinned status"},
+                    "is_archived": {"type": "boolean", "description": "Set archived status"},
+                    "metadata": {"type": "object", "description": "Replace metadata object"},
+                    "confidence": {"type": "number", "description": "New confidence score 0.0-1.0"},
+                    "expires_at": {"type": "string", "description": "New expiry: relative (7d, 2w, 3m, 1y) or ISO date"},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "memory_archive",
+            "description": "Archive or unarchive a memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID (full UUID or prefix)"},
+                    "unarchive": {"type": "boolean", "description": "Unarchive instead of archive (default: false)"},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "memory_pin",
+            "description": "Pin or unpin a memory. Pinned memories rank first in search results and appear in bootstrap.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID (full UUID or prefix)"},
+                    "unpin": {"type": "boolean", "description": "Unpin instead of pin (default: false)"},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "memory_delete",
+            "description": "Permanently delete a memory. This cannot be undone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID (full UUID or prefix)"},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "memory_tag",
+            "description": "Add or remove tags on a memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID (full UUID or prefix)"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags to add or remove"},
+                    "remove": {"type": "boolean", "description": "Remove the specified tags instead of adding (default: false)"},
+                },
+                "required": ["id", "tags"],
+            },
+        },
+        {
+            "name": "memory_stats",
+            "description": "Get aggregate statistics about the memory store (counts by category, importance, top tags, etc).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        {
+            "name": "memory_export",
+            "description": "Export all memories as a JSON array.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_archived": {"type": "boolean", "description": "Include archived memories (default: true)"},
+                },
+            },
+        },
+        {
+            "name": "memory_import",
+            "description": "Import memories from a JSON array of memory objects.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "summary": {"type": "string"},
+                                "category": {"type": "string"},
+                                "subcategory": {"type": "string"},
+                                "importance": {"type": "string"},
+                                "source": {"type": "string"},
+                                "tags": {"type": "array", "items": {"type": "string"}},
+                                "metadata": {"type": "object"},
+                            },
+                            "required": ["content"],
+                        },
+                        "description": "Array of memory objects to import",
+                    },
+                },
+                "required": ["memories"],
+            },
+        },
+        {
+            "name": "memory_prune",
+            "description": "Archive or permanently delete expired memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "delete": {"type": "boolean", "description": "Permanently delete instead of archiving (default: false)"},
+                    "dry_run": {"type": "boolean", "description": "Preview what would be pruned without executing (default: false)"},
+                },
+            },
+        },
+        {
+            "name": "memory_backfill",
+            "description": "Generate embeddings for all memories that are missing them (requires ollama running).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_archived": {"type": "boolean", "description": "Include archived memories (default: false)"},
+                },
+            },
+        },
+        {
+            "name": "memory_bootstrap",
+            "description": "Get structured memory context for AI session bootstrap. Returns pinned, decisions, preferences, critical, and recent memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "format": {"type": "string", "enum": ["text", "json"], "description": "Output format (default: text)"},
+                    "limit": {"type": "integer", "description": "Number of recent memories per category (default: 5)"},
+                },
+            },
+        },
+        {
+            "name": "memory_bootstrap_slim",
+            "description": "Get minimal memory context for AI session bootstrap. Returns only pinned and critical memories. Lighter than memory_bootstrap — use during compaction or when context budget is tight.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "format": {"type": "string", "enum": ["text", "json"], "description": "Output format (default: text)"},
+                },
+            },
+        },
+    ]
+
+
+async def _mcp_handle_tool_call(mgr: MemoryManager, name: str, arguments: dict) -> dict:
+    """
+    Dispatch an MCP tool call to the appropriate MemoryManager method.
+
+    Args:
+        mgr: Initialized MemoryManager instance
+        name: Tool name (e.g., "memory_add")
+        arguments: Tool arguments dict
+
+    Returns:
+        MCP result dict with "content" list
+    """
+
+    def _text_result(text: str, is_error: bool = False) -> dict:
+        return {
+            "content": [{"type": "text", "text": text}],
+            "isError": is_error,
+        }
+
+    def _json_result(data) -> dict:
+        return _text_result(json.dumps(data, indent=2, default=_mcp_serialize))
+
+    try:
+        if name == "memory_add":
+            expires_at: Optional[datetime] = None
+            if arguments.get("expires"):
+                expires_at = _parse_expiry(arguments["expires"])
+
+            memory_id: str = await mgr.add_memory(
+                content=arguments["content"],
+                summary=arguments.get("summary"),
+                category=arguments.get("category", "general"),
+                subcategory=arguments.get("subcategory"),
+                importance=arguments.get("importance", "normal"),
+                source=arguments.get("source"),
+                source_context=arguments.get("source_context"),
+                conversation_id=arguments.get("conversation_id"),
+                tags=arguments.get("tags"),
+                related_to=arguments.get("related_to"),
+                pinned=arguments.get("pin", False),
+                metadata=arguments.get("metadata"),
+                confidence=arguments.get("confidence", 1.0),
+                expires_at=expires_at,
+            )
+            return _json_result({"status": "created", "id": memory_id})
+
+        elif name == "memory_show":
+            mem: Optional[dict] = await mgr.get_memory(arguments["id"])
+            if not mem:
+                return _text_result(f"Memory not found: {arguments['id']}", is_error=True)
+            return _json_result(mem)
+
+        elif name == "memory_list":
+            memories: list[dict] = await mgr.list_memories(
+                category=arguments.get("category"),
+                subcategory=arguments.get("subcategory"),
+                importance=arguments.get("importance"),
+                tag=arguments.get("tags"),
+                source=arguments.get("source"),
+                pinned=True if arguments.get("pinned") else None,
+                include_archived=arguments.get("include_archived", False),
+                only_archived=arguments.get("only_archived", False),
+                limit=arguments.get("limit", 50),
+                offset=arguments.get("offset", 0),
+                order_by=arguments.get("sort", "created_at"),
+                descending=not arguments.get("ascending", False),
+            )
+            return _json_result(memories)
+
+        elif name == "memory_search":
+            mode: str = arguments.get("mode", "fuzzy")
+            query: str = arguments["query"]
+            category: Optional[str] = arguments.get("category")
+            include_archived: bool = arguments.get("include_archived", False)
+            limit: int = arguments.get("limit", 25)
+
+            if mode == "semantic":
+                results: list[dict] = await mgr.semantic_search(
+                    query=query, category=category,
+                    include_archived=include_archived, limit=limit,
+                )
+            else:
+                results = await mgr.search_memories(
+                    query=query, category=category,
+                    include_archived=include_archived, limit=limit,
+                    exact=(mode == "exact"),
+                )
+            return _json_result(results)
+
+        elif name == "memory_update":
+            mid: str = arguments.pop("id")
+            update_fields: dict = {}
+            for key in ("content", "summary", "category", "subcategory",
+                        "importance", "source", "source_context", "tags",
+                        "is_pinned", "is_archived", "metadata", "confidence"):
+                if key in arguments:
+                    update_fields[key] = arguments[key]
+            if "expires_at" in arguments:
+                update_fields["expires_at"] = _parse_expiry(arguments["expires_at"])
+            if not update_fields:
+                return _text_result("No fields to update", is_error=True)
+            updated: bool = await mgr.update_memory(mid, **update_fields)
+            if updated:
+                return _json_result({"status": "updated", "id": mid})
+            return _text_result(f"Memory not found: {mid}", is_error=True)
+
+        elif name == "memory_archive":
+            value: bool = not arguments.get("unarchive", False)
+            updated = await mgr.update_memory(arguments["id"], is_archived=value)
+            if updated:
+                action: str = "unarchived" if arguments.get("unarchive") else "archived"
+                return _json_result({"status": action, "id": arguments["id"]})
+            return _text_result(f"Memory not found: {arguments['id']}", is_error=True)
+
+        elif name == "memory_pin":
+            value = not arguments.get("unpin", False)
+            updated = await mgr.update_memory(arguments["id"], is_pinned=value)
+            if updated:
+                action = "unpinned" if arguments.get("unpin") else "pinned"
+                return _json_result({"status": action, "id": arguments["id"]})
+            return _text_result(f"Memory not found: {arguments['id']}", is_error=True)
+
+        elif name == "memory_delete":
+            deleted: bool = await mgr.delete_memory(arguments["id"])
+            if deleted:
+                return _json_result({"status": "deleted", "id": arguments["id"]})
+            return _text_result(f"Memory not found: {arguments['id']}", is_error=True)
+
+        elif name == "memory_tag":
+            full_id: Optional[str] = await mgr._resolve_uuid(arguments["id"])
+            if not full_id:
+                return _text_result(f"Memory not found: {arguments['id']}", is_error=True)
+            tag_names: list[str] = arguments["tags"]
+            if arguments.get("remove", False):
+                for tag_name in tag_names:
+                    await mgr.pool.execute(
+                        "UPDATE memories SET tags = array_remove(tags, $1) WHERE id = $2",
+                        tag_name, full_id,
+                    )
+                return _json_result({"status": "tags_removed", "id": full_id, "tags": tag_names})
+            else:
+                for tag_name in tag_names:
+                    await mgr.pool.execute(
+                        """
+                        UPDATE memories
+                        SET tags = CASE
+                            WHEN NOT ($1 = ANY(tags)) THEN array_append(tags, $1)
+                            ELSE tags
+                        END
+                        WHERE id = $2
+                        """,
+                        tag_name, full_id,
+                    )
+                return _json_result({"status": "tags_added", "id": full_id, "tags": tag_names})
+
+        elif name == "memory_stats":
+            stats: dict = await mgr.get_stats()
+            return _json_result(stats)
+
+        elif name == "memory_export":
+            include_archived: bool = arguments.get("include_archived", True)
+            memories = await mgr.list_memories(
+                include_archived=include_archived, limit=100000,
+            )
+            return _json_result(memories)
+
+        elif name == "memory_import":
+            mem_list: list[dict] = arguments["memories"]
+            count: int = 0
+            for mem_data in mem_list:
+                await mgr.add_memory(
+                    content=mem_data.get("content", ""),
+                    summary=mem_data.get("summary"),
+                    category=mem_data.get("category", "general"),
+                    subcategory=mem_data.get("subcategory"),
+                    importance=mem_data.get("importance", "normal"),
+                    source=mem_data.get("source"),
+                    tags=mem_data.get("tags", []),
+                    metadata=mem_data.get("metadata"),
+                )
+                count += 1
+            return _json_result({"status": "imported", "count": count})
+
+        elif name == "memory_prune":
+            do_delete: bool = arguments.get("delete", False)
+            dry_run: bool = arguments.get("dry_run", False)
+
+            expired_count: int = await mgr.pool.fetchval(
+                "SELECT COUNT(*) FROM memories "
+                "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP "
+                "AND is_archived = FALSE"
+            )
+
+            if expired_count == 0:
+                return _json_result({"status": "nothing_to_prune", "count": 0})
+
+            if dry_run:
+                rows = await mgr.pool.fetch(
+                    "SELECT id, summary, expires_at FROM memories "
+                    "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP "
+                    "AND is_archived = FALSE ORDER BY expires_at ASC"
+                )
+                preview: list[dict] = [
+                    {"id": str(r["id"]), "summary": r["summary"], "expires_at": r["expires_at"]}
+                    for r in rows
+                ]
+                return _json_result({"status": "dry_run", "count": len(preview), "memories": preview})
+
+            if do_delete:
+                result_str: str = await mgr.pool.execute(
+                    "DELETE FROM memories "
+                    "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP"
+                )
+                count = int(result_str.split(" ")[-1])
+                return _json_result({"status": "deleted", "count": count})
+            else:
+                result_str = await mgr.pool.execute(
+                    "UPDATE memories SET is_archived = TRUE "
+                    "WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP "
+                    "AND is_archived = FALSE"
+                )
+                count = int(result_str.split(" ")[-1])
+                return _json_result({"status": "archived", "count": count})
+
+        elif name == "memory_backfill":
+            include_archived = arguments.get("include_archived", False)
+            conditions: list[str] = ["embedding IS NULL"]
+            if not include_archived:
+                conditions.append("is_archived = FALSE")
+            where: str = " AND ".join(conditions)
+            rows = await mgr.pool.fetch(
+                f"SELECT id, content, summary FROM memories WHERE {where} ORDER BY created_at ASC"
+            )
+            total: int = len(rows)
+            if total == 0:
+                return _json_result({"status": "complete", "message": "All memories already have embeddings"})
+            success: int = 0
+            failed: int = 0
+            for row in rows:
+                embed_text: str = f"{row['summary'] or ''} {row['content']}"
+                embedding: Optional[list[float]] = await generate_embedding(embed_text)
+                if embedding:
+                    await mgr.pool.execute(
+                        "UPDATE memories SET embedding = $1 WHERE id = $2",
+                        str(embedding), row["id"],
+                    )
+                    success += 1
+                else:
+                    failed += 1
+            return _json_result({"status": "complete", "total": total, "embedded": success, "failed": failed})
+
+        elif name == "memory_bootstrap":
+            fmt: str = arguments.get("format", "text")
+            recent_limit: int = arguments.get("limit", 5)
+            seen_ids: set[str] = set()
+            sections: list[tuple[str, list[dict]]] = []
+
+            pinned: list[dict] = await mgr.list_memories(pinned=True, limit=100)
+            sections.append(("PINNED", pinned))
+            decisions: list[dict] = await mgr.list_memories(category="decision", limit=100)
+            sections.append(("DECISIONS", decisions))
+            preferences: list[dict] = await mgr.list_memories(category="preference", limit=100)
+            sections.append(("PREFERENCES", preferences))
+            critical: list[dict] = await mgr.list_memories(importance="critical", limit=100)
+            sections.append(("CRITICAL", critical))
+            for cat in ("project", "technical", "learning", "workflow"):
+                recent: list[dict] = await mgr.list_memories(category=cat, limit=recent_limit)
+                sections.append((f"RECENT ({cat})", recent))
+
+            if fmt == "json":
+                result_data: dict = {"sections": {}, "total": 0}
+                total_count: int = 0
+                for section_name, memories in sections:
+                    entries: list[dict] = []
+                    for mem in memories:
+                        mid: str = str(mem["id"])
+                        if mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
+                        entries.append({
+                            "id": mid[:8],
+                            "summary": (mem.get("summary") or mem.get("content", "")[:120]),
+                            "category": mem.get("category", "general"),
+                            "tags": mem.get("tags") or [],
+                        })
+                        total_count += 1
+                    if entries:
+                        result_data["sections"][section_name] = entries
+                result_data["total"] = total_count
+                return _json_result(result_data)
+            else:
+                output_lines: list[str] = ["=== AGENT MEMORIES BOOTSTRAP ==="]
+                total_count = 0
+                for section_name, memories in sections:
+                    lines: list[str] = []
+                    for mem in memories:
+                        mid = str(mem["id"])
+                        if mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
+                        lines.append(_bootstrap_format_line(mem))
+                        total_count += 1
+                    if lines:
+                        output_lines.append(f"\n## {section_name}")
+                        output_lines.extend(lines)
+                if total_count == 0:
+                    output_lines.append("No memories stored yet.")
+                else:
+                    output_lines.insert(1, f"[{total_count} memories injected]")
+                output_lines.append("\n=== END BOOTSTRAP ===")
+                return _text_result("\n".join(output_lines))
+
+        elif name == "memory_bootstrap_slim":
+            fmt: str = arguments.get("format", "text")
+            seen_ids: set[str] = set()
+            sections: list[tuple[str, list[dict]]] = []
+
+            pinned: list[dict] = await mgr.list_memories(pinned=True, limit=100)
+            sections.append(("PINNED", pinned))
+            critical: list[dict] = await mgr.list_memories(importance="critical", limit=100)
+            sections.append(("CRITICAL", critical))
+
+            if fmt == "json":
+                result_data: dict = {"sections": {}, "total": 0}
+                total_count: int = 0
+                for section_name, memories in sections:
+                    entries: list[dict] = []
+                    for mem in memories:
+                        mid: str = str(mem["id"])
+                        if mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
+                        entries.append({
+                            "id": mid[:8],
+                            "summary": (mem.get("summary") or mem.get("content", "")[:120]),
+                            "category": mem.get("category", "general"),
+                            "tags": mem.get("tags") or [],
+                        })
+                        total_count += 1
+                    if entries:
+                        result_data["sections"][section_name] = entries
+                result_data["total"] = total_count
+                return _json_result(result_data)
+            else:
+                output_lines: list[str] = ["=== AGENT MEMORIES BOOTSTRAP (SLIM) ==="]
+                total_count = 0
+                for section_name, memories in sections:
+                    lines: list[str] = []
+                    for mem in memories:
+                        mid = str(mem["id"])
+                        if mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
+                        lines.append(_bootstrap_format_line(mem))
+                        total_count += 1
+                    if lines:
+                        output_lines.append(f"\n## {section_name}")
+                        output_lines.extend(lines)
+                if total_count == 0:
+                    output_lines.append("No memories stored yet.")
+                else:
+                    output_lines.insert(1, f"[{total_count} memories injected]")
+                output_lines.append("\n=== END BOOTSTRAP ===")
+                return _text_result("\n".join(output_lines))
+
+        else:
+            return _text_result(f"Unknown tool: {name}", is_error=True)
+
+    except Exception as e:
+        return _text_result(f"Error: {e}", is_error=True)
+
+
+async def cmd_mcp(mgr: MemoryManager, _args: argparse.Namespace) -> None:
+    """
+    Run the MCP stdio server.
+
+    Reads newline-delimited JSON-RPC 2.0 messages from stdin,
+    dispatches to tool handlers, writes responses to stdout.
+    """
+    tools: list[dict] = _mcp_tool_definitions()
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, sys.stdin.buffer)
+
+    def _write(msg: dict) -> None:
+        line: str = json.dumps(msg, default=_mcp_serialize) + "\n"
+        sys.stdout.buffer.write(line.encode("utf-8"))
+        sys.stdout.buffer.flush()
+
+    def _response(req_id, result: dict) -> dict:
+        return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+    def _error(req_id, code: int, message: str) -> dict:
+        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+    while True:
+        try:
+            line_bytes: bytes = await reader.readline()
+            if not line_bytes:
+                break  # EOF
+            line_str: str = line_bytes.decode("utf-8").strip()
+            if not line_str:
+                continue
+
+            msg: dict = json.loads(line_str)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            _write(_error(None, -32700, f"Parse error: {e}"))
+            continue
+
+        req_id = msg.get("id")
+        method: str = msg.get("method", "")
+        params: dict = msg.get("params", {})
+
+        # Notifications (no id) — just acknowledge silently
+        if req_id is None:
+            continue
+
+        if method == "initialize":
+            _write(_response(req_id, {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {
+                    "tools": {},
+                },
+                "serverInfo": {
+                    "name": MCP_SERVER_NAME,
+                    "version": MCP_SERVER_VERSION,
+                },
+            }))
+
+        elif method == "tools/list":
+            _write(_response(req_id, {"tools": tools}))
+
+        elif method == "tools/call":
+            tool_name: str = params.get("name", "")
+            tool_args: dict = params.get("arguments", {})
+            result: dict = await _mcp_handle_tool_call(mgr, tool_name, tool_args)
+            _write(_response(req_id, result))
+
+        elif method == "ping":
+            _write(_response(req_id, {}))
+
+        else:
+            _write(_error(req_id, -32601, f"Method not found: {method}"))
+
+
+# =============================================================================
 # Argument parsing and main
 # =============================================================================
 
@@ -1982,6 +2696,12 @@ importance: """ + ", ".join(IMPORTANCE_LEVELS),
         help="Number of recent memories per category (default: 5)",
     )
 
+    # --- mcp ---
+    subparsers.add_parser(
+        "mcp",
+        help="Run MCP stdio server (Model Context Protocol over JSON-RPC 2.0)",
+    )
+
     args: argparse.Namespace = parser.parse_args()
 
     if args.license:
@@ -2014,6 +2734,7 @@ importance: """ + ", ".join(IMPORTANCE_LEVELS),
             "bootstrap": cmd_bootstrap,
             "prune": cmd_prune,
             "backfill": cmd_backfill,
+            "mcp": cmd_mcp,
         }
 
         handler = dispatch.get(args.command)
