@@ -21,6 +21,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+extern char **environ;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Constants
@@ -1365,6 +1371,49 @@ print_memory_table (GPtrArray *memories, const gchar **columns)
  * FZF integration
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Helper: run fzf with argv, stdin from file descriptor, capture stdout selection.
+ * Uses posix_spawn for zero shell overhead. fzf opens /dev/tty for UI. */
+static gchar *
+_run_fzf (const gchar *fzf_path, gchar **argv, gint stdin_fd)
+{
+    gint stdout_pipe[2];
+    if (pipe (stdout_pipe) < 0)
+        return NULL;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init (&actions);
+    posix_spawn_file_actions_adddup2 (&actions, stdin_fd, STDIN_FILENO);
+    posix_spawn_file_actions_adddup2 (&actions, stdout_pipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose (&actions, stdout_pipe[0]);
+    posix_spawn_file_actions_addclose (&actions, stdout_pipe[1]);
+    posix_spawn_file_actions_addclose (&actions, stdin_fd);
+
+    pid_t pid;
+    gint err = posix_spawnp (&pid, fzf_path, &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy (&actions);
+    close (stdout_pipe[1]);
+    close (stdin_fd);
+
+    if (err != 0) {
+        close (stdout_pipe[0]);
+        return NULL;
+    }
+
+    /* Read selection from fzf stdout */
+    char buf[512] = {0};
+    ssize_t n = read (stdout_pipe[0], buf, sizeof (buf) - 1);
+    close (stdout_pipe[0]);
+
+    gint status;
+    waitpid (pid, &status, 0);
+
+    if (n <= 0)
+        return NULL;
+    buf[n] = '\0';
+    g_strstrip (buf);
+    return buf[0] ? g_strdup (buf) : NULL;
+}
+
 static gchar *
 fzf_select_memory (PGconn *conn, const gchar *header, gboolean include_archived)
 {
@@ -1375,9 +1424,11 @@ fzf_select_memory (PGconn *conn, const gchar *header, gboolean include_archived)
         return NULL;
     }
 
+    /* Fetch everything in one query — no psql spawning for preview */
     const gchar *where = include_archived ? "TRUE" : "NOT is_archived";
     g_autofree gchar *sql = g_strdup_printf (
-        "SELECT id, summary, category, importance, tags, is_pinned, created_at "
+        "SELECT id, summary, category, importance, subcategory, source, "
+        "tags, is_pinned, created_at, access_count, content "
         "FROM memories WHERE %s ORDER BY is_pinned DESC, created_at DESC", where);
 
     PGresult *res = PQexec (conn, sql);
@@ -1388,105 +1439,113 @@ fzf_select_memory (PGconn *conn, const gchar *header, gboolean include_archived)
         return NULL;
     }
 
-    /* Build fzf input */
-    GString *input = g_string_new (NULL);
-    for (gint i = 0; i < PQntuples (res); i++) {
-        const gchar *id = PQgetvalue (res, i, 0);
-        const gchar *summary = PQgetvalue (res, i, 1);
-        const gchar *cat = PQgetvalue (res, i, 2);
-        const gchar *imp = PQgetvalue (res, i, 3);
-        gboolean pin = g_strcmp0 (PQgetvalue (res, i, 5), "t") == 0;
-        const gchar *created = PQgetvalue (res, i, 6);
+    /* Create temp dir for preview files */
+    g_autofree gchar *tmpdir = g_strdup ("/tmp/agent_memories_fzf_XXXXXX");
+    if (!g_mkdtemp (tmpdir)) {
+        PQclear (res);
+        return NULL;
+    }
 
+    /* Build fzf input + write per-memory preview files (plain text, instant cat) */
+    GString *input = g_string_new (NULL);
+    gint nrows = PQntuples (res);
+    for (gint i = 0; i < nrows; i++) {
+        const gchar *id       = PQgetvalue (res, i, 0);
+        const gchar *summary  = PQgetvalue (res, i, 1);
+        const gchar *cat      = PQgetvalue (res, i, 2);
+        const gchar *imp      = PQgetvalue (res, i, 3);
+        const gchar *subcat   = PQgetvalue (res, i, 4);
+        const gchar *source   = PQgetvalue (res, i, 5);
+        const gchar *tags_raw = PQgetvalue (res, i, 6);
+        gboolean pin = g_strcmp0 (PQgetvalue (res, i, 7), "t") == 0;
+        const gchar *created  = PQgetvalue (res, i, 8);
+        const gchar *acc_cnt  = PQgetvalue (res, i, 9);
+        const gchar *content  = PQgetvalue (res, i, 10);
+
+        /* fzf list line */
         g_string_append_printf (input, "%.8s %c | %-12.12s | %-8.8s | %-50.50s | %.10s\n",
             id, pin ? '*' : ' ', cat, imp, summary, created);
+
+        /* Write preview file: tmpdir/<8-char-id>.txt */
+        g_autofree gchar *preview_file = g_strdup_printf ("%s/%.8s.txt", tmpdir, id);
+        /* Parse {tag1,tag2} → "tag1, tag2" */
+        g_autofree gchar *tags_pretty = NULL;
+        if (tags_raw && tags_raw[0] == '{') {
+            g_autofree gchar *inner = g_strndup (tags_raw + 1, strlen (tags_raw) - 2);
+            gchar **parts = g_strsplit (inner, ",", -1);
+            tags_pretty = g_strjoinv (", ", parts);
+            g_strfreev (parts);
+        }
+
+        GString *pv = g_string_new (NULL);
+        g_string_append_printf (pv,
+            "━━━ MEMORY ━━━\n"
+            "ID: %s\n"
+            "Category: %s/%s\n"
+            "Importance: %s\n"
+            "Source: %s\n"
+            "Pinned: %s\n"
+            "Tags: %s\n"
+            "Created: %.16s\n"
+            "Accessed: %s times\n"
+            "\n━━━ SUMMARY ━━━\n%s\n"
+            "\n━━━ CONTENT ━━━\n%s\n",
+            id,
+            cat[0] ? cat : "-", subcat[0] ? subcat : "-",
+            imp[0] ? imp : "normal",
+            source[0] ? source : "-",
+            pin ? "yes" : "no",
+            tags_pretty ? tags_pretty : (tags_raw[0] ? tags_raw : "-"),
+            created,
+            acc_cnt,
+            summary[0] ? summary : "-",
+            content[0] ? content : "-");
+        g_file_set_contents (preview_file, pv->str, pv->len, NULL);
+        g_string_free (pv, TRUE);
     }
     PQclear (res);
 
-    /* Build preview script */
-    const gchar *dbhost = g_getenv ("AGENT_MEMORIES_DB_HOST");
-    const gchar *dbport = g_getenv ("AGENT_MEMORIES_DB_PORT");
-    const gchar *dbname = g_getenv ("AGENT_MEMORIES_DB_NAME");
-    const gchar *dbuser = g_getenv ("AGENT_MEMORIES_DB_USER");
-    const gchar *dbpass = g_getenv ("AGENT_MEMORIES_DB_PASSWORD");
-
-    g_autofree gchar *preview_script = g_strdup_printf (
-        "#!/bin/bash\n"
-        "%s%s%s"
-        "uuid=\"${1%%%% *}\"\n"
-        "full_uuid=$(psql -h %s -p %s -d %s -U %s -t -c "
-        "\"SELECT id FROM memories WHERE id::text LIKE '$uuid%%' LIMIT 1\" 2>/dev/null | tr -d ' ')\n"
-        "[ -z \"$full_uuid\" ] && echo \"Memory not found\" && exit 1\n"
-        "psql -h %s -p %s -d %s -U %s -t -A -c \"\n"
-        "SELECT 'ID: ' || id || E'\\n' || 'Category: ' || COALESCE(category, '-') || E'\\n' || "
-        "'Importance: ' || COALESCE(importance, 'normal') || E'\\n' || "
-        "'Tags: ' || COALESCE(array_to_string(tags, ', '), '-') || E'\\n' || "
-        "'Created: ' || to_char(created_at, 'YYYY-MM-DD HH24:MI') || E'\\n' || "
-        "E'\\n━━━ SUMMARY ━━━\\n' || COALESCE(summary, '-') || E'\\n' || "
-        "E'\\n━━━ CONTENT ━━━\\n' || COALESCE(content, '-') "
-        "FROM memories WHERE id = '$full_uuid'::uuid\" 2>/dev/null\n",
-        dbpass && *dbpass ? "PGPASSWORD='" : "",
-        dbpass && *dbpass ? dbpass : "",
-        dbpass && *dbpass ? "'\n" : "",
-        dbhost ? dbhost : "127.0.0.1",
-        dbport ? dbport : "5432",
-        dbname ? dbname : "agent_memories",
-        dbuser ? dbuser : "postgres",
-        dbhost ? dbhost : "127.0.0.1",
-        dbport ? dbport : "5432",
-        dbname ? dbname : "agent_memories",
-        dbuser ? dbuser : "postgres"
-    );
-
-    /* Write preview script to temp file */
-    g_autofree gchar *preview_path = NULL;
-    gint preview_fd = g_file_open_tmp ("agent_memories_preview_XXXXXX.sh", &preview_path, NULL);
-    if (preview_fd >= 0) {
-        write (preview_fd, preview_script, strlen (preview_script));
-        close (preview_fd);
-        chmod (preview_path, 0755);
-    }
-
-    /* Write input to temp file */
-    g_autofree gchar *input_path = NULL;
-    gint input_fd = g_file_open_tmp ("agent_memories_fzf_XXXXXX.txt", &input_path, NULL);
-    if (input_fd >= 0) {
-        write (input_fd, input->str, input->len);
-        close (input_fd);
-    }
+    /* Write fzf input to temp file */
+    g_autofree gchar *input_path = g_strdup_printf ("%s/_input.txt", tmpdir);
+    g_file_set_contents (input_path, input->str, input->len, NULL);
     g_string_free (input, TRUE);
 
-    /* Run fzf */
-    g_autofree gchar *preview_arg = g_strdup_printf ("%s {}", preview_path);
+    /* Preview command: just cat the pre-built file — instant, zero subprocess overhead */
+    /* fzf's {1} = first whitespace-delimited field = the 8-char UUID */
+    g_autofree gchar *preview_cmd = g_strdup_printf ("cat %s/{1}.txt", tmpdir);
     g_autofree gchar *header_arg = g_strdup_printf ("%s (Ctrl-C to cancel)", header);
 
-    gchar *fzf_argv[] = {
-        fzf_path,
-        "--preview", preview_arg,
-        "--preview-window", "down:60%:wrap",
-        "--header", header_arg,
-        "--bind", "ctrl-/:toggle-preview",
-        NULL
-    };
-
-    /* Redirect fzf's stdin from the input file via popen (needs real shell for <) */
-    g_autofree gchar *cmd = g_strdup_printf (
-        "%s --preview '%s {}' --preview-window 'down:60%%:wrap' "
-        "--header '%s' --bind 'ctrl-/:toggle-preview' < %s",
-        fzf_path, preview_path, header_arg, input_path);
-
-    FILE *fzf_pipe = popen (cmd, "r");
+    /* Run fzf via posix_spawn — no shell overhead */
     gchar *stdout_data = NULL;
-    if (fzf_pipe) {
-        char buf[512] = {0};
-        if (fgets (buf, sizeof (buf), fzf_pipe) != NULL)
-            stdout_data = g_strdup (buf);
-        pclose (fzf_pipe);
+    gint input_fd = open (input_path, O_RDONLY);
+    if (input_fd < 0) goto cleanup;
+
+    {
+        gchar *fzf_argv[] = {
+            fzf_path,
+            "--preview", preview_cmd,
+            "--preview-window", "down:60%:wrap",
+            "--header", header_arg,
+            "--bind", "ctrl-/:toggle-preview",
+            "--ansi",
+            NULL
+        };
+        stdout_data = _run_fzf (fzf_path, fzf_argv, input_fd);
     }
 
-    /* Cleanup temp files */
-    g_unlink (preview_path);
-    g_unlink (input_path);
+cleanup:
+    /* Remove temp dir and all files */
+    {
+        g_autoptr (GDir) dir = g_dir_open (tmpdir, 0, NULL);
+        if (dir) {
+            const gchar *name;
+            while ((name = g_dir_read_name (dir)) != NULL) {
+                g_autofree gchar *path = g_build_filename (tmpdir, name, NULL);
+                g_unlink (path);
+            }
+        }
+        g_rmdir (tmpdir);
+    }
 
     if (!stdout_data || !*stdout_data) {
         g_free (stdout_data);
@@ -1494,7 +1553,6 @@ fzf_select_memory (PGconn *conn, const gchar *header, gboolean include_archived)
     }
 
     /* Extract short UUID from selection */
-    g_strstrip (stdout_data);
     gchar *space = strchr (stdout_data, ' ');
     if (space) *space = '\0';
 
@@ -1530,34 +1588,41 @@ fzf_search_memory (PGconn *conn, const gchar *initial_query)
         const gchar *cat = PQgetvalue (res, i, 2);
         const gchar *content = PQgetvalue (res, i, 3);
         g_autofree gchar *snippet = g_strndup (content, 100);
-        /* Replace newlines in snippet */
         for (gchar *p = snippet; *p; p++) if (*p == '\n') *p = ' ';
         g_string_append_printf (input, "%.8s | %-12.12s | %-60.60s | %s\n",
             id, cat, summary, snippet);
     }
     PQclear (res);
 
-    g_autofree gchar *cmd = g_strdup_printf (
-        "echo '%s' | %s --header 'Search memories (type to filter)' --query '%s'",
-        input->str, fzf_path, initial_query ? initial_query : "");
+    /* Write to temp file — avoids embedding content in shell command string */
+    g_autofree gchar *input_path = NULL;
+    gint tmp_fd = g_file_open_tmp ("agent_memories_search_XXXXXX.txt", &input_path, NULL);
+    if (tmp_fd >= 0) {
+        write (tmp_fd, input->str, input->len);
+        /* lseek back to start so fzf can read it */
+        lseek (tmp_fd, 0, SEEK_SET);
+    }
     g_string_free (input, TRUE);
 
-    /* popen needed — g_spawn_command_line_sync doesn't support shell pipes */
-    FILE *fzf_pipe = popen (cmd, "r");
-    gchar *stdout_data = NULL;
-    if (fzf_pipe) {
-        char buf[512] = {0};
-        if (fgets (buf, sizeof (buf), fzf_pipe) != NULL)
-            stdout_data = g_strdup (buf);
-        pclose (fzf_pipe);
-    }
+    if (tmp_fd < 0)
+        return NULL;
+
+    /* Run fzf via posix_spawn — direct argv, no shell parsing */
+    gchar *fzf_argv[] = {
+        fzf_path,
+        "--header", "Search memories (type to filter)",
+        "--query", (gchar *)(initial_query ? initial_query : ""),
+        NULL
+    };
+
+    gchar *stdout_data = _run_fzf (fzf_path, fzf_argv, tmp_fd);
+    g_unlink (input_path);
 
     if (!stdout_data || !*stdout_data) {
         g_free (stdout_data);
         return NULL;
     }
 
-    g_strstrip (stdout_data);
     gchar *space = strchr (stdout_data, ' ');
     if (space) *space = '\0';
 
