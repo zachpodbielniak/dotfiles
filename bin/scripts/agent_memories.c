@@ -1,5 +1,5 @@
-#!/usr/local/bin/crispy
-#define CRISPY_PARAMS "-std=gnu11 -O2 $(pkg-config --cflags --libs libdex-1 json-glib-1.0 libsoup-3.0 mcp-glib-1.0) -lpq -Wno-unused-function"
+#!/usr/bin/crispy
+#define CRISPY_PARAMS "-std=gnu89 -O2 $(pkg-config --cflags --libs libdex-1 json-glib-1.0 libsoup-3.0 mcp-glib-1.0) -lpq -Wno-unused-function"
 
 /*
  * agent_memories.c — Persistent AI agent memory store
@@ -194,7 +194,9 @@ _memory_from_row (PGresult *res, gint row)
     Memory *m = g_new0 (Memory, 1);
     gint ncols = PQnfields (res);
 
-    for (gint c = 0; c < ncols; c++) {
+    gint c;
+
+    for (c = 0; c < ncols; c++) {
         const gchar *name = PQfname (res, c);
         if (g_strcmp0 (name, "id") == 0)
             m->id = _pg_val (res, row, c);
@@ -252,7 +254,8 @@ _memories_from_result (PGresult *res)
 {
     GPtrArray *arr = g_ptr_array_new_with_free_func ((GDestroyNotify)memory_free);
     gint nrows = PQntuples (res);
-    for (gint i = 0; i < nrows; i++)
+    gint i;
+    for (i = 0; i < nrows; i++)
         g_ptr_array_add (arr, _memory_from_row (res, i));
     return arr;
 }
@@ -426,7 +429,8 @@ generate_embedding_sync (SoupSession *soup, const gchar *ollama_url,
                 JsonArray *vec = json_array_get_array_element (embeddings, 0);
                 guint vlen = json_array_get_length (vec);
                 GString *s = g_string_new ("[");
-                for (guint i = 0; i < vlen; i++) {
+                guint i;
+                for (i = 0; i < vlen; i++) {
                     if (i > 0) g_string_append_c (s, ',');
                     g_string_append_printf (s, "%.8g",
                         json_array_get_double_element (vec, i));
@@ -512,7 +516,8 @@ db_add_memory (AppState *app, const gchar *content, const gchar *summary,
 
     /* Build tags array literal */
     GString *tags_lit = g_string_new ("{");
-    for (gint i = 0; i < n_tags; i++) {
+    gint i;
+    for (i = 0; i < n_tags; i++) {
         if (i > 0) g_string_append_c (tags_lit, ',');
         g_string_append_printf (tags_lit, "\"%s\"", tags[i]);
     }
@@ -649,7 +654,8 @@ db_update_memory (AppState *app, const gchar *id_prefix,
     g_string_free (sets, TRUE);
 
     const gchar **p = g_new0 (const gchar *, params->len);
-    for (guint i = 0; i < params->len; i++)
+    guint i;
+    for (i = 0; i < params->len; i++)
         p[i] = g_ptr_array_index (params, i);
 
     PGresult *res = PQexecParams (app->conn, sql,
@@ -744,7 +750,8 @@ db_list_memories (PGconn *conn, const gchar *category, const gchar *subcategory,
     if (filter_tags && n_filter_tags > 0) {
         /* Build array literal for @> operator */
         GString *tag_lit = g_string_new ("{");
-        for (gint i = 0; i < n_filter_tags; i++) {
+        gint i;
+        for (i = 0; i < n_filter_tags; i++) {
             if (i > 0) g_string_append_c (tag_lit, ',');
             g_string_append_printf (tag_lit, "\"%s\"", filter_tags[i]);
         }
@@ -765,7 +772,8 @@ db_list_memories (PGconn *conn, const gchar *category, const gchar *subcategory,
 
     /* Validate order_by */
     const gchar *safe_order = "created_at";
-    for (gint i = 0; ALL_COLUMNS[i]; i++) {
+    gint i;
+    for (i = 0; ALL_COLUMNS[i]; i++) {
         if (g_strcmp0 (order_by, ALL_COLUMNS[i]) == 0) {
             safe_order = order_by;
             break;
@@ -780,8 +788,9 @@ db_list_memories (PGconn *conn, const gchar *category, const gchar *subcategory,
     g_ptr_array_add (plist, offset_str);
 
     const gchar **p = g_new0 (const gchar *, plist->len);
-    for (guint i = 0; i < plist->len; i++)
-        p[i] = g_ptr_array_index (plist, i);
+    guint j;
+    for (j = 0; j < plist->len; j++)
+        p[j] = g_ptr_array_index (plist, j);
 
     PGresult *res = PQexecParams (conn, sql->str,
         plist->len, NULL, p, NULL, NULL, 0);
@@ -845,7 +854,8 @@ db_search_fuzzy (PGconn *conn, const gchar *query, const gchar *category,
     g_ptr_array_add (plist, limit_str);
 
     const gchar **p = g_new0 (const gchar *, plist->len);
-    for (guint i = 0; i < plist->len; i++)
+    guint i;
+    for (i = 0; i < plist->len; i++)
         p[i] = g_ptr_array_index (plist, i);
 
     PGresult *res = PQexecParams (conn, sql->str,
@@ -896,7 +906,8 @@ db_search_exact (PGconn *conn, const gchar *query, const gchar *category,
     g_ptr_array_add (plist, limit_str);
 
     const gchar **p = g_new0 (const gchar *, plist->len);
-    for (guint i = 0; i < plist->len; i++)
+    guint i;
+    for (i = 0; i < plist->len; i++)
         p[i] = g_ptr_array_index (plist, i);
 
     PGresult *res = PQexecParams (conn, sql->str,
@@ -952,7 +963,8 @@ db_search_semantic (AppState *app, const gchar *query, const gchar *category,
     g_ptr_array_add (plist, limit_str);
 
     const gchar **p = g_new0 (const gchar *, plist->len);
-    for (guint i = 0; i < plist->len; i++)
+    guint i;
+    for (i = 0; i < plist->len; i++)
         p[i] = g_ptr_array_index (plist, i);
 
     PGresult *res = PQexecParams (app->conn, sql->str,
@@ -961,7 +973,8 @@ db_search_semantic (AppState *app, const gchar *query, const gchar *category,
     GPtrArray *result = g_ptr_array_new_with_free_func ((GDestroyNotify)memory_free);
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
         gint n = PQntuples (res);
-        for (gint i = 0; i < n; i++) {
+        gint i;
+        for (i = 0; i < n; i++) {
             Memory *m = _memory_from_row (res, i);
             if (m->similarity >= 0.5)
                 g_ptr_array_add (result, m);
@@ -1017,7 +1030,8 @@ db_get_stats (PGconn *conn)
         "SELECT category, COUNT(*) as count FROM memories "
         "WHERE is_archived = FALSE GROUP BY category ORDER BY count DESC");
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
-        for (gint i = 0; i < PQntuples (res); i++) {
+        gint i;
+        for (i = 0; i < PQntuples (res); i++) {
             json_builder_begin_object (b);
             json_builder_set_member_name (b, "category");
             json_builder_add_string_value (b, PQgetvalue (res, i, 0));
@@ -1036,7 +1050,8 @@ db_get_stats (PGconn *conn)
         "SELECT importance, COUNT(*) as count FROM memories "
         "WHERE is_archived = FALSE GROUP BY importance ORDER BY count DESC");
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
-        for (gint i = 0; i < PQntuples (res); i++) {
+        gint i;
+        for (i = 0; i < PQntuples (res); i++) {
             json_builder_begin_object (b);
             json_builder_set_member_name (b, "importance");
             json_builder_add_string_value (b, PQgetvalue (res, i, 0));
@@ -1055,7 +1070,8 @@ db_get_stats (PGconn *conn)
         "SELECT unnest(tags) as tag, COUNT(*) as count FROM memories "
         "WHERE is_archived = FALSE GROUP BY tag ORDER BY count DESC LIMIT 20");
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
-        for (gint i = 0; i < PQntuples (res); i++) {
+        gint i;
+        for (i = 0; i < PQntuples (res); i++) {
             json_builder_begin_object (b);
             json_builder_set_member_name (b, "tag");
             json_builder_add_string_value (b, PQgetvalue (res, i, 0));
@@ -1074,7 +1090,8 @@ db_get_stats (PGconn *conn)
         "SELECT id, summary, access_count FROM memories "
         "WHERE access_count > 0 ORDER BY access_count DESC LIMIT 10");
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
-        for (gint i = 0; i < PQntuples (res); i++) {
+        gint i;
+        for (i = 0; i < PQntuples (res); i++) {
             json_builder_begin_object (b);
             json_builder_set_member_name (b, "id");
             json_builder_add_string_value (b, PQgetvalue (res, i, 0));
@@ -1130,7 +1147,8 @@ memory_to_json_node (Memory *m)
     json_builder_set_member_name (b, "tags");
     json_builder_begin_array (b);
     if (m->tags) {
-        for (gint i = 0; i < m->n_tags; i++)
+        gint i;
+        for (i = 0; i < m->n_tags; i++)
             json_builder_add_string_value (b, m->tags[i]);
     }
     json_builder_end_array (b);
@@ -1184,7 +1202,8 @@ memory_array_to_json (GPtrArray *memories)
 {
     JsonBuilder *b = json_builder_new ();
     json_builder_begin_array (b);
-    for (guint i = 0; i < memories->len; i++) {
+    guint i;
+    for (i = 0; i < memories->len; i++) {
         Memory *m = g_ptr_array_index (memories, i);
         JsonNode *n = memory_to_json_node (m);
         json_builder_add_value (b, n);
@@ -1279,7 +1298,8 @@ print_memory_detail (Memory *m)
     g_print ("\n%s\n", ch);
     if (m->content) {
         gchar **lines = g_strsplit (m->content, "\n", -1);
-        for (gint i = 0; lines[i]; i++)
+        gint i;
+        for (i = 0; lines[i]; i++)
             g_print ("  %s\n", lines[i]);
         g_strfreev (lines);
     } else {
@@ -1306,7 +1326,8 @@ print_memory_table (GPtrArray *memories, const gchar **columns)
     /* Print header */
     GString *hdr = g_string_new (NULL);
     gint total_width = 0;
-    for (gint i = 0; cols[i]; i++) {
+    gint i;
+    for (i = 0; cols[i]; i++) {
         if (i > 0) g_string_append (hdr, " | ");
         gint w = 20;
         if (g_strcmp0 (cols[i], "id") == 0) w = 8;
@@ -1324,14 +1345,16 @@ print_memory_table (GPtrArray *memories, const gchar **columns)
     }
     g_autofree gchar *bold_hdr = _bold (hdr->str);
     g_print ("%s\n", bold_hdr);
-    for (gint i = 0; i < total_width; i++) g_print ("-");
+    for (i = 0; i < total_width; i++) g_print ("-");
     g_print ("\n");
     g_string_free (hdr, TRUE);
 
     /* Print rows */
-    for (guint r = 0; r < memories->len; r++) {
+    guint r;
+    for (r = 0; r < memories->len; r++) {
         Memory *m = g_ptr_array_index (memories, r);
-        for (gint i = 0; cols[i]; i++) {
+        gint i;
+        for (i = 0; cols[i]; i++) {
             if (i > 0) g_print (" | ");
             const gchar *col = cols[i];
             gint w = 20;
@@ -1345,7 +1368,8 @@ print_memory_table (GPtrArray *memories, const gchar **columns)
                 w = 25;
                 if (m->tags && m->n_tags > 0) {
                     GString *ts = g_string_new (NULL);
-                    for (gint t = 0; t < MIN (m->n_tags, 3); t++) {
+                    gint t;
+                    for (t = 0; t < MIN (m->n_tags, 3); t++) {
                         if (t > 0) g_string_append_c (ts, ',');
                         g_string_append (ts, m->tags[t]);
                     }
@@ -1449,7 +1473,8 @@ fzf_select_memory (PGconn *conn, const gchar *header, gboolean include_archived)
     /* Build fzf input + write per-memory preview files (plain text, instant cat) */
     GString *input = g_string_new (NULL);
     gint nrows = PQntuples (res);
-    for (gint i = 0; i < nrows; i++) {
+    gint i;
+    for (i = 0; i < nrows; i++) {
         const gchar *id       = PQgetvalue (res, i, 0);
         const gchar *summary  = PQgetvalue (res, i, 1);
         const gchar *cat      = PQgetvalue (res, i, 2);
@@ -1582,13 +1607,17 @@ fzf_search_memory (PGconn *conn, const gchar *initial_query)
     }
 
     GString *input = g_string_new (NULL);
-    for (gint i = 0; i < PQntuples (res); i++) {
+    gint i;
+    for (i = 0; i < PQntuples (res); i++) {
         const gchar *id = PQgetvalue (res, i, 0);
         const gchar *summary = PQgetvalue (res, i, 1);
         const gchar *cat = PQgetvalue (res, i, 2);
         const gchar *content = PQgetvalue (res, i, 3);
         g_autofree gchar *snippet = g_strndup (content, 100);
-        for (gchar *p = snippet; *p; p++) if (*p == '\n') *p = ' ';
+        {
+            gchar *p;
+            for (p = snippet; *p; p++) if (*p == '\n') *p = ' ';
+        }
         g_string_append_printf (input, "%.8s | %-12.12s | %-60.60s | %s\n",
             id, cat, summary, snippet);
     }
@@ -1663,7 +1692,9 @@ bootstrap_text (PGconn *conn, gint recent_limit, gboolean slim)
 
     Section *sections = slim ? sections_slim : sections_full;
 
-    for (gint s = 0; sections[s].name; s++) {
+    gint s;
+
+    for (s = 0; sections[s].name; s++) {
         gint lim = sections[s].limit ? sections[s].limit : recent_limit;
         GPtrArray *mems = db_list_memories (conn,
             sections[s].cat, NULL, sections[s].imp, NULL, 0, NULL,
@@ -1671,7 +1702,8 @@ bootstrap_text (PGconn *conn, gint recent_limit, gboolean slim)
             FALSE, FALSE, lim, 0, "created_at", TRUE);
 
         GString *sec_out = g_string_new (NULL);
-        for (guint i = 0; i < mems->len; i++) {
+        guint i;
+        for (i = 0; i < mems->len; i++) {
             Memory *m = g_ptr_array_index (mems, i);
             if (g_hash_table_contains (seen, m->id)) continue;
             g_hash_table_add (seen, g_strdup (m->id));
@@ -1736,7 +1768,9 @@ bootstrap_json (PGconn *conn, gint recent_limit, gboolean slim)
     };
     Section *sections = slim ? sections_slim : sections_full;
 
-    for (gint s = 0; sections[s].name; s++) {
+    gint s;
+
+    for (s = 0; sections[s].name; s++) {
         gint lim = sections[s].limit ? sections[s].limit : recent_limit;
         GPtrArray *mems = db_list_memories (conn,
             sections[s].cat, NULL, sections[s].imp, NULL, 0, NULL,
@@ -1747,7 +1781,9 @@ bootstrap_json (PGconn *conn, gint recent_limit, gboolean slim)
         json_builder_begin_array (sec);
         gint sec_count = 0;
 
-        for (guint i = 0; i < mems->len; i++) {
+        guint i;
+
+        for (i = 0; i < mems->len; i++) {
             Memory *m = g_ptr_array_index (mems, i);
             if (g_hash_table_contains (seen, m->id)) continue;
             g_hash_table_add (seen, g_strdup (m->id));
@@ -1761,8 +1797,11 @@ bootstrap_json (PGconn *conn, gint recent_limit, gboolean slim)
             json_builder_add_string_value (sec, m->category ? m->category : "general");
             json_builder_set_member_name (sec, "tags");
             json_builder_begin_array (sec);
-            if (m->tags) for (gint t = 0; t < m->n_tags; t++)
-                json_builder_add_string_value (sec, m->tags[t]);
+            if (m->tags) {
+                gint t;
+                for (t = 0; t < m->n_tags; t++)
+                    json_builder_add_string_value (sec, m->tags[t]);
+            }
             json_builder_end_array (sec);
             json_builder_end_object (sec);
             sec_count++;
@@ -1925,7 +1964,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
             JsonArray *ta = json_object_get_array_member (args, "tags");
             n_tags = json_array_get_length (ta);
             tags = g_new0 (gchar *, n_tags + 1);
-            for (gint i = 0; i < n_tags; i++)
+            gint i;
+            for (i = 0; i < n_tags; i++)
                 tags[i] = g_strdup (json_array_get_string_element (ta, i));
         }
 
@@ -1984,7 +2024,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
             JsonArray *ta = json_object_get_array_member (args, "tags");
             n_filter = json_array_get_length (ta);
             filter_tags = g_new0 (gchar *, n_filter + 1);
-            for (gint i = 0; i < n_filter; i++)
+            gint i;
+            for (i = 0; i < n_filter; i++)
                 filter_tags[i] = g_strdup (json_array_get_string_element (ta, i));
         }
 
@@ -2025,7 +2066,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
             "content", "summary", "category", "subcategory", "importance",
             "source", "source_context", NULL
         };
-        for (gint i = 0; update_keys[i]; i++) {
+        gint i;
+        for (i = 0; update_keys[i]; i++) {
             const gchar *v = _json_get_string (args, update_keys[i], NULL);
             if (v) g_hash_table_insert (fields, (gpointer)update_keys[i], g_strdup (v));
         }
@@ -2041,7 +2083,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
         if (json_object_has_member (args, "tags")) {
             JsonArray *ta = json_object_get_array_member (args, "tags");
             GString *t = g_string_new ("{");
-            for (guint i = 0; i < json_array_get_length (ta); i++) {
+            guint i;
+            for (i = 0; i < json_array_get_length (ta); i++) {
                 if (i > 0) g_string_append_c (t, ',');
                 g_string_append_printf (t, "\"%s\"", json_array_get_string_element (ta, i));
             }
@@ -2119,7 +2162,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
         if (!full_id) return _mcp_text_result ("Memory not found", TRUE);
 
         JsonArray *ta = json_object_get_array_member (args, "tags");
-        for (guint i = 0; i < json_array_get_length (ta); i++) {
+        guint i;
+        for (i = 0; i < json_array_get_length (ta); i++) {
             const gchar *tag = json_array_get_string_element (ta, i);
             const gchar *params[] = { tag, full_id };
             PGresult *res;
@@ -2158,7 +2202,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
     if (g_strcmp0 (name, "memory_import") == 0) {
         JsonArray *mem_arr = json_object_get_array_member (args, "memories");
         gint count = 0;
-        for (guint i = 0; i < json_array_get_length (mem_arr); i++) {
+        guint i;
+        for (i = 0; i < json_array_get_length (mem_arr); i++) {
             JsonObject *mo = json_array_get_object_element (mem_arr, i);
             const gchar *content = _json_get_string (mo, "content", "");
             const gchar *summary = _json_get_string (mo, "summary", NULL);
@@ -2173,7 +2218,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
                 JsonArray *ta = json_object_get_array_member (mo, "tags");
                 n_tags = json_array_get_length (ta);
                 tags = g_new0 (gchar *, n_tags + 1);
-                for (gint t = 0; t < n_tags; t++)
+                gint t;
+                for (t = 0; t < n_tags; t++)
                     tags[t] = g_strdup (json_array_get_string_element (ta, t));
             }
 
@@ -2210,7 +2256,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
             json_builder_set_member_name (b, "count"); json_builder_add_int_value (b, PQntuples (res));
             json_builder_set_member_name (b, "memories");
             json_builder_begin_array (b);
-            for (gint i = 0; i < PQntuples (res); i++) {
+            gint i;
+            for (i = 0; i < PQntuples (res); i++) {
                 json_builder_begin_object (b);
                 json_builder_set_member_name (b, "id"); json_builder_add_string_value (b, PQgetvalue (res, i, 0));
                 json_builder_set_member_name (b, "summary"); json_builder_add_string_value (b, PQgetvalue (res, i, 1));
@@ -2255,7 +2302,8 @@ mcp_handle_tool_call (McpServer *server, const gchar *name, JsonObject *args, gp
         }
 
         gint success = 0, failed = 0;
-        for (gint i = 0; i < total; i++) {
+        gint i;
+        for (i = 0; i < total; i++) {
             const gchar *id = PQgetvalue (res, i, 0);
             const gchar *content = PQgetvalue (res, i, 1);
             const gchar *summary = PQgetvalue (res, i, 2);
@@ -2329,7 +2377,9 @@ cmd_mcp (AppState *app)
     json_parser_load_from_data (tools_parser, MCP_TOOLS_JSON, -1, NULL);
     JsonArray *tools_arr = json_node_get_array (json_parser_get_root (tools_parser));
 
-    for (guint i = 0; i < json_array_get_length (tools_arr); i++) {
+    guint i;
+
+    for (i = 0; i < json_array_get_length (tools_arr); i++) {
         JsonNode *tool_node = json_array_get_element (tools_arr, i);
         GError *err = NULL;
         McpTool *tool = mcp_tool_new_from_json (tool_node, &err);
@@ -2526,7 +2576,8 @@ cmd_list (AppState *app, gint argc, gchar **argv)
         g_autofree gchar *json = memory_array_to_json (mems);
         g_print ("%s\n", json);
     } else if (format && (g_strcmp0 (format, "markdown") == 0 || g_strcmp0 (format, "md") == 0)) {
-        for (guint i = 0; i < mems->len; i++) {
+        guint i;
+        for (i = 0; i < mems->len; i++) {
             Memory *m = g_ptr_array_index (mems, i);
             g_print ("- **%.8s** [%s] %s\n", m->id, m->category ? m->category : "",
                      m->summary ? m->summary : "");
@@ -2538,7 +2589,8 @@ cmd_list (AppState *app, gint argc, gchar **argv)
             gchar **split = g_strsplit (cols, ",", -1);
             gint n = g_strv_length (split);
             custom_cols = g_new0 (const gchar *, n + 1);
-            for (gint i = 0; i < n; i++) {
+            gint i;
+            for (i = 0; i < n; i++) {
                 g_strstrip (split[i]);
                 custom_cols[i] = split[i];
             }
@@ -2625,7 +2677,9 @@ _parse_edited_text (const gchar *text)
     GString *multiline_val = NULL;
     gchar *multiline_key = NULL;
 
-    for (gint i = 0; lines[i]; i++) {
+    gint i;
+
+    for (i = 0; lines[i]; i++) {
         const gchar *line = lines[i];
 
         /* Skip comment lines */
@@ -2723,7 +2777,8 @@ _memory_to_editable_text (Memory *mem)
     g_string_append (s, "content: |\n");
     if (mem->content) {
         g_auto (GStrv) clines = g_strsplit (mem->content, "\n", -1);
-        for (gint i = 0; clines[i]; i++)
+        gint i;
+        for (i = 0; clines[i]; i++)
             g_string_append_printf (s, "  %s\n", clines[i]);
     }
 
@@ -2801,7 +2856,8 @@ cmd_edit (AppState *app, gint argc, gchar **argv)
     /* Strip comment lines and check for empty */
     GString *clean = g_string_new (NULL);
     g_auto (GStrv) elines = g_strsplit (edited, "\n", -1);
-    for (gint i = 0; elines[i]; i++) {
+    gint i;
+    for (i = 0; elines[i]; i++) {
         if (!g_str_has_prefix (g_strstrip (elines[i]), "#"))
             g_string_append_printf (clean, "%s\n", elines[i]);
     }
@@ -2821,7 +2877,8 @@ cmd_edit (AppState *app, gint argc, gchar **argv)
     if (tags_raw) {
         g_auto (GStrv) tag_parts = g_strsplit (tags_raw, ",", -1);
         GString *pg_arr = g_string_new ("{");
-        for (gint i = 0; tag_parts[i]; i++) {
+        gint i;
+        for (i = 0; tag_parts[i]; i++) {
             gchar *t = g_strstrip (tag_parts[i]);
             if (t[0] == '\0') continue;
             if (pg_arr->len > 1) g_string_append_c (pg_arr, ',');
@@ -3038,7 +3095,9 @@ cmd_tag (AppState *app, gint argc, gchar **argv)
         return 1;
     }
 
-    for (gint i = tag_start; i < argc; i++) {
+    gint i;
+
+    for (i = tag_start; i < argc; i++) {
         const gchar *params[] = { argv[i], full_id };
         PGresult *res;
         if (remove)
@@ -3090,7 +3149,8 @@ cmd_stats (AppState *app, gint argc, gchar **argv)
         if (json_array_get_length (by_cat) > 0) {
             g_autofree gchar *h = _bold ("  By Category:");
             g_print ("%s\n", h);
-            for (guint i = 0; i < json_array_get_length (by_cat); i++) {
+            guint i;
+            for (i = 0; i < json_array_get_length (by_cat); i++) {
                 JsonObject *r = json_array_get_object_element (by_cat, i);
                 g_print ("    %-15s %ld\n",
                     json_object_get_string_member (r, "category"),
@@ -3103,7 +3163,8 @@ cmd_stats (AppState *app, gint argc, gchar **argv)
         if (json_array_get_length (by_imp) > 0) {
             g_autofree gchar *h = _bold ("  By Importance:");
             g_print ("%s\n", h);
-            for (guint i = 0; i < json_array_get_length (by_imp); i++) {
+            guint i;
+            for (i = 0; i < json_array_get_length (by_imp); i++) {
                 JsonObject *r = json_array_get_object_element (by_imp, i);
                 g_print ("    %-15s %ld\n",
                     json_object_get_string_member (r, "importance"),
@@ -3116,7 +3177,8 @@ cmd_stats (AppState *app, gint argc, gchar **argv)
         if (json_array_get_length (top_tags) > 0) {
             g_autofree gchar *h = _bold ("  Top Tags:");
             g_print ("%s\n", h);
-            for (guint i = 0; i < json_array_get_length (top_tags); i++) {
+            guint i;
+            for (i = 0; i < json_array_get_length (top_tags); i++) {
                 JsonObject *r = json_array_get_object_element (top_tags, i);
                 g_print ("    %-20s %ld\n",
                     json_object_get_string_member (r, "tag"),
@@ -3129,7 +3191,8 @@ cmd_stats (AppState *app, gint argc, gchar **argv)
         if (json_array_get_length (most) > 0) {
             g_autofree gchar *h = _bold ("  Most Accessed:");
             g_print ("%s\n", h);
-            for (guint i = 0; i < json_array_get_length (most); i++) {
+            guint i;
+            for (i = 0; i < json_array_get_length (most); i++) {
                 JsonObject *r = json_array_get_object_element (most, i);
                 g_print ("    %.8s (%ldx) %.50s\n",
                     json_object_get_string_member (r, "id"),
@@ -3211,7 +3274,8 @@ cmd_import (AppState *app, gint argc, gchar **argv)
 
     JsonArray *arr = json_node_get_array (json_parser_get_root (parser));
     gint count = 0;
-    for (guint i = 0; i < json_array_get_length (arr); i++) {
+    guint i;
+    for (i = 0; i < json_array_get_length (arr); i++) {
         JsonObject *mo = json_array_get_object_element (arr, i);
         const gchar *content = _json_get_string (mo, "content", "");
         const gchar *summary = _json_get_string (mo, "summary", NULL);
@@ -3256,7 +3320,8 @@ cmd_prune (AppState *app, gint argc, gchar **argv)
         PGresult *res = PQexec (app->conn,
             "SELECT id, summary, expires_at FROM memories WHERE expires_at IS NOT NULL "
             "AND expires_at < CURRENT_TIMESTAMP AND is_archived = FALSE ORDER BY expires_at");
-        for (gint i = 0; i < PQntuples (res); i++)
+        gint i;
+        for (i = 0; i < PQntuples (res); i++)
             g_print ("  [%.8s] expired %s: %s\n",
                 PQgetvalue (res, i, 0), PQgetvalue (res, i, 2),
                 PQgetvalue (res, i, 1)[0] ? PQgetvalue (res, i, 1) : "(no summary)");
@@ -3307,7 +3372,9 @@ cmd_backfill (AppState *app, gint argc, gchar **argv)
     g_print ("Backfilling embeddings for %d memories...\n", total);
     gint success = 0, failed = 0;
 
-    for (gint i = 0; i < total; i++) {
+    gint i;
+
+    for (i = 0; i < total; i++) {
         const gchar *id = PQgetvalue (res, i, 0);
         const gchar *content = PQgetvalue (res, i, 1);
         const gchar *summary = PQgetvalue (res, i, 2);
