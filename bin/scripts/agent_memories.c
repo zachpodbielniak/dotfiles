@@ -780,11 +780,16 @@ db_list_memories (PGconn *conn, const gchar *category, const gchar *subcategory,
         }
     }
 
-    g_autofree gchar *limit_str = g_strdup_printf ("%d", limit);
     g_autofree gchar *offset_str = g_strdup_printf ("%d", offset);
-    g_string_append_printf (sql, " ORDER BY %s %s LIMIT $%d OFFSET $%d",
-        safe_order, descending ? "DESC" : "ASC", idx, idx + 1);
-    g_ptr_array_add (plist, limit_str);
+    if (limit < 0) {
+        g_string_append_printf (sql, " ORDER BY %s %s LIMIT ALL OFFSET $%d",
+            safe_order, descending ? "DESC" : "ASC", idx);
+    } else {
+        g_autofree gchar *limit_str = g_strdup_printf ("%d", limit);
+        g_string_append_printf (sql, " ORDER BY %s %s LIMIT $%d OFFSET $%d",
+            safe_order, descending ? "DESC" : "ASC", idx, idx + 1);
+        g_ptr_array_add (plist, limit_str);
+    }
     g_ptr_array_add (plist, offset_str);
 
     const gchar **p = g_new0 (const gchar *, plist->len);
@@ -2537,7 +2542,7 @@ cmd_list (AppState *app, gint argc, gchar **argv)
     g_autofree gchar *category = NULL, *subcategory = NULL, *importance = NULL;
     g_autofree gchar *source = NULL, *cols = NULL, *format = NULL, *sort = NULL;
     gchar **tags = NULL;
-    gboolean pinned = FALSE, include_archived = FALSE, only_archived = FALSE, ascending = FALSE;
+    gboolean pinned = FALSE, include_archived = FALSE, only_archived = FALSE, ascending = FALSE, all = FALSE;
     gint limit = 50, offset = 0;
 
     GOptionEntry entries[] = {
@@ -2551,7 +2556,8 @@ cmd_list (AppState *app, gint argc, gchar **argv)
         { "pinned",           0, 0, G_OPTION_ARG_NONE,         &pinned, "Only pinned", NULL },
         { "include-archived", 0, 0, G_OPTION_ARG_NONE,         &include_archived, "Include archived", NULL },
         { "only-archived",    0, 0, G_OPTION_ARG_NONE,         &only_archived, "Only archived", NULL },
-        { "limit",            0, 0, G_OPTION_ARG_INT,          &limit, "Max results", "N" },
+        { "all",              0, 0, G_OPTION_ARG_NONE,         &all, "List all (no limit)", NULL },
+        { "limit",            0, 0, G_OPTION_ARG_INT,          &limit, "Max results (default 50)", "N" },
         { "offset",           0, 0, G_OPTION_ARG_INT,          &offset, "Offset", "N" },
         { "sort",             0, 0, G_OPTION_ARG_STRING,       &sort, "Sort column", "COL" },
         { "ascending",        0, 0, G_OPTION_ARG_NONE,         &ascending, "Sort ascending", NULL },
@@ -2568,7 +2574,7 @@ cmd_list (AppState *app, gint argc, gchar **argv)
     gint n_tags = tags ? (gint)g_strv_length (tags) : 0;
     GPtrArray *mems = db_list_memories (app->conn, category, subcategory, importance,
         tags, n_tags, source, pinned ? 1 : -1,
-        include_archived, only_archived, limit, offset,
+        include_archived, only_archived, all ? -1 : limit, offset,
         sort ? sort : "created_at", !ascending);
     g_strfreev (tags);
 
