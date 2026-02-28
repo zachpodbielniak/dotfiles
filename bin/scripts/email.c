@@ -1,4 +1,4 @@
-#!/usr/local/bin/crispy
+#!/usr/bin/crispy
 #define CRISPY_PARAMS "-std=gnu89 -O2 $(pkg-config --cflags --libs yaml-glib-1.0 json-glib-1.0 mcp-glib-1.0) -letpan -Wno-unused-function"
 
 /*
@@ -31,6 +31,7 @@ typedef struct {
     gchar *from_addr;
     gchar *imap_host;
     gint   imap_port;
+    gboolean imap_starttls;
     gchar *smtp_host;
     gint   smtp_port;
     gchar *username;
@@ -108,8 +109,47 @@ load_config (const gchar *path)
     if (!cfg->smtp_port)
         cfg->smtp_port = 587;
 
+    /* Check for explicit imap_starttls setting, otherwise auto-detect:
+     * port 993 = direct SSL, anything else (143, 1143, etc.) = STARTTLS */
+    if (yaml_mapping_has_member (map, "imap_starttls"))
+        cfg->imap_starttls = (gboolean) yaml_mapping_get_int_member (map, "imap_starttls");
+    else
+        cfg->imap_starttls = (cfg->imap_port != 993);
+
     g_object_unref (parser);
     return cfg;
+}
+
+/*
+ * imap_connect:
+ * @imap: an existing mailimap session (from mailimap_new)
+ * @cfg: email config with host, port, and starttls flag
+ *
+ * Connects to the IMAP server using direct SSL (port 993) or
+ * plain+STARTTLS (port 143, 1143, etc.) based on cfg->imap_starttls.
+ *
+ * Returns: MAILIMAP_NO_ERROR on success, or a libetpan error code.
+ */
+static gint
+imap_connect (
+    mailimap       *imap,
+    EmailConfig    *cfg
+){
+    gint r;
+
+    if (cfg->imap_starttls) {
+        /* Plain connection, then upgrade to TLS */
+        r = mailimap_socket_connect (imap, cfg->imap_host, (uint16_t) cfg->imap_port);
+        if (r != MAILIMAP_NO_ERROR && r != MAILIMAP_NO_ERROR_AUTHENTICATED
+            && r != MAILIMAP_NO_ERROR_NON_AUTHENTICATED)
+            return r;
+
+        r = mailimap_socket_starttls (imap);
+        return r;
+    }
+
+    /* Direct SSL connection (port 993) */
+    return mailimap_ssl_connect (imap, cfg->imap_host, (uint16_t) cfg->imap_port);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -416,11 +456,13 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
         goto cleanup;
     }
 
-    r = mailimap_ssl_connect (imap, cfg->imap_host, (uint16_t) cfg->imap_port);
+    r = imap_connect (imap, cfg);
     if (r != MAILIMAP_NO_ERROR && r != MAILIMAP_NO_ERROR_AUTHENTICATED
         && r != MAILIMAP_NO_ERROR_NON_AUTHENTICATED) {
-        g_printerr ("read: IMAP SSL connect to %s:%d failed (error %d)\n",
+        g_printerr ("read: IMAP connect to %s:%d failed (error %d)\n",
                      cfg->imap_host, cfg->imap_port, r);
+        mailimap_free (imap);
+        imap = NULL;
         goto cleanup;
     }
 
@@ -674,10 +716,12 @@ cmd_rm (EmailConfig *cfg, int argc, char **argv)
 
     /* Connect IMAP */
     imap = mailimap_new (0, NULL);
-    r = mailimap_ssl_connect (imap, cfg->imap_host, (uint16_t) cfg->imap_port);
+    r = imap_connect (imap, cfg);
     if (r != MAILIMAP_NO_ERROR && r != MAILIMAP_NO_ERROR_AUTHENTICATED
         && r != MAILIMAP_NO_ERROR_NON_AUTHENTICATED) {
         g_printerr ("rm: IMAP connect failed (error %d)\n", r);
+        mailimap_free (imap);
+        imap = NULL;
         goto cleanup;
     }
 
@@ -956,7 +1000,7 @@ mcp_handle_read (EmailConfig *cfg, JsonObject *args)
     mark_read = _json_get_bool (args, "mark_read", FALSE);
 
     imap = mailimap_new (0, NULL);
-    r = mailimap_ssl_connect (imap, cfg->imap_host, (uint16_t) cfg->imap_port);
+    r = imap_connect (imap, cfg);
     if (r != MAILIMAP_NO_ERROR && r != MAILIMAP_NO_ERROR_AUTHENTICATED
         && r != MAILIMAP_NO_ERROR_NON_AUTHENTICATED) {
         mailimap_free (imap);
@@ -965,6 +1009,7 @@ mcp_handle_read (EmailConfig *cfg, JsonObject *args)
 
     r = mailimap_login (imap, cfg->username, cfg->password);
     if (r != MAILIMAP_NO_ERROR) {
+        mailimap_logout (imap);
         mailimap_free (imap);
         return _mcp_text_result ("IMAP login failed", TRUE);
     }
@@ -1159,7 +1204,7 @@ mcp_handle_rm (EmailConfig *cfg, JsonObject *args)
     folder = _json_get_string (args, "folder", "INBOX");
 
     imap = mailimap_new (0, NULL);
-    r = mailimap_ssl_connect (imap, cfg->imap_host, (uint16_t) cfg->imap_port);
+    r = imap_connect (imap, cfg);
     if (r != MAILIMAP_NO_ERROR && r != MAILIMAP_NO_ERROR_AUTHENTICATED
         && r != MAILIMAP_NO_ERROR_NON_AUTHENTICATED) {
         mailimap_free (imap);
@@ -1168,6 +1213,7 @@ mcp_handle_rm (EmailConfig *cfg, JsonObject *args)
 
     r = mailimap_login (imap, cfg->username, cfg->password);
     if (r != MAILIMAP_NO_ERROR) {
+        mailimap_logout (imap);
         mailimap_free (imap);
         return _mcp_text_result ("IMAP login failed", TRUE);
     }
