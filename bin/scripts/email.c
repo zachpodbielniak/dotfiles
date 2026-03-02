@@ -1,4 +1,4 @@
-#!/usr/bin/crispy
+#!/usr/bin/env crispy
 #define CRISPY_PARAMS "-std=gnu89 -O2 $(pkg-config --cflags --libs yaml-glib-1.0 json-glib-1.0 mcp-glib-1.0) -letpan -Wno-unused-function"
 
 /*
@@ -211,6 +211,62 @@ get_first_from_addr (struct mailimap_envelope *env)
         return addr->ad_mailbox_name;
 
     return "(unknown)";
+}
+
+static gchar *
+get_first_from_email (struct mailimap_envelope *env)
+{
+    clistiter *it;
+    struct mailimap_address *addr;
+
+    if (!env || !env->env_from || !env->env_from->frm_list)
+        return NULL;
+
+    it = clist_begin (env->env_from->frm_list);
+    if (!it)
+        return NULL;
+
+    addr = (struct mailimap_address *) clist_content (it);
+    if (addr->ad_mailbox_name && addr->ad_host_name)
+        return g_strdup_printf ("%s@%s", addr->ad_mailbox_name, addr->ad_host_name);
+    if (addr->ad_mailbox_name)
+        return g_strdup (addr->ad_mailbox_name);
+
+    return NULL;
+}
+
+static gchar **
+parse_csv_whitelist (const gchar *csv)
+{
+    gchar **parts;
+    guint i;
+
+    if (!csv || !*csv)
+        return NULL;
+
+    parts = g_strsplit (csv, ",", -1);
+    for (i = 0; parts[i]; i++)
+        g_strstrip (parts[i]);
+
+    return parts;
+}
+
+static gboolean
+is_whitelisted (const gchar *email, gchar **whitelist)
+{
+    guint i;
+
+    if (!whitelist)
+        return TRUE;
+    if (!email)
+        return FALSE;
+
+    for (i = 0; whitelist[i]; i++) {
+        if (g_ascii_strcasecmp (email, whitelist[i]) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -790,6 +846,12 @@ cleanup:
  * MCP Server
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+typedef struct {
+    EmailConfig *cfg;
+    gchar      **to_whitelist;
+    gchar      **from_whitelist;
+} McpContext;
+
 static const gchar *MCP_TOOLS_JSON =
 "["
 "  {\"name\":\"email_send\","
@@ -854,8 +916,9 @@ _mcp_text_result (const gchar *text, gboolean is_error)
 }
 
 static McpToolResult *
-mcp_handle_send (EmailConfig *cfg, JsonObject *args)
+mcp_handle_send (McpContext *mctx, JsonObject *args)
 {
+    EmailConfig *cfg = mctx->cfg;
     JsonArray *to_arr;
     JsonArray *cc_arr;
     JsonArray *bcc_arr;
@@ -875,6 +938,34 @@ mcp_handle_send (EmailConfig *cfg, JsonObject *args)
     to_arr = json_object_get_array_member (args, "to");
     if (!to_arr || json_array_get_length (to_arr) == 0)
         return _mcp_text_result ("'to' must have at least one address", TRUE);
+
+    /* Validate all recipients against to-whitelist */
+    if (mctx->to_whitelist) {
+        for (i = 0; i < json_array_get_length (to_arr); i++) {
+            const gchar *addr = json_array_get_string_element (to_arr, i);
+            if (!is_whitelisted (addr, mctx->to_whitelist))
+                return _mcp_text_result (
+                    g_strdup_printf ("Recipient not whitelisted: %s", addr), TRUE);
+        }
+        cc_arr = json_object_has_member (args, "cc") ? json_object_get_array_member (args, "cc") : NULL;
+        if (cc_arr) {
+            for (i = 0; i < json_array_get_length (cc_arr); i++) {
+                const gchar *addr = json_array_get_string_element (cc_arr, i);
+                if (!is_whitelisted (addr, mctx->to_whitelist))
+                    return _mcp_text_result (
+                        g_strdup_printf ("CC recipient not whitelisted: %s", addr), TRUE);
+            }
+        }
+        bcc_arr = json_object_has_member (args, "bcc") ? json_object_get_array_member (args, "bcc") : NULL;
+        if (bcc_arr) {
+            for (i = 0; i < json_array_get_length (bcc_arr); i++) {
+                const gchar *addr = json_array_get_string_element (bcc_arr, i);
+                if (!is_whitelisted (addr, mctx->to_whitelist))
+                    return _mcp_text_result (
+                        g_strdup_printf ("BCC recipient not whitelisted: %s", addr), TRUE);
+            }
+        }
+    }
 
     subject = _json_get_string (args, "subject", "(no subject)");
     body = _json_get_string (args, "body", "");
@@ -972,8 +1063,9 @@ mcp_handle_send (EmailConfig *cfg, JsonObject *args)
 }
 
 static McpToolResult *
-mcp_handle_read (EmailConfig *cfg, JsonObject *args)
+mcp_handle_read (McpContext *mctx, JsonObject *args)
 {
+    EmailConfig *cfg = mctx->cfg;
     const gchar *folder;
     gint64 limit;
     gboolean unread_only;
@@ -1130,6 +1222,15 @@ mcp_handle_read (EmailConfig *cfg, JsonObject *args)
 
         if (!env) continue;
 
+        /* Filter by from-whitelist */
+        if (mctx->from_whitelist) {
+            gchar *sender_email = get_first_from_email (env);
+            gboolean allowed = is_whitelisted (sender_email, mctx->from_whitelist);
+            g_free (sender_email);
+            if (!allowed)
+                continue;
+        }
+
         json_builder_begin_object (jb);
         json_builder_set_member_name (jb, "uid");
         json_builder_add_int_value (jb, uid);
@@ -1185,8 +1286,9 @@ mcp_handle_read (EmailConfig *cfg, JsonObject *args)
 }
 
 static McpToolResult *
-mcp_handle_rm (EmailConfig *cfg, JsonObject *args)
+mcp_handle_rm (McpContext *mctx, JsonObject *args)
 {
+    EmailConfig *cfg = mctx->cfg;
     JsonArray *uids_arr;
     const gchar *folder;
     mailimap *imap;
@@ -1259,7 +1361,7 @@ static McpToolResult *
 mcp_handle_tool_call (McpServer *server, const gchar *name,
                       JsonObject *args, gpointer user_data)
 {
-    EmailConfig *cfg = (EmailConfig *) user_data;
+    McpContext *mctx = (McpContext *) user_data;
     JsonObject *_empty_args = NULL;
 
     (void) server;
@@ -1270,17 +1372,17 @@ mcp_handle_tool_call (McpServer *server, const gchar *name,
     }
 
     if (g_strcmp0 (name, "email_send") == 0) {
-        McpToolResult *r = mcp_handle_send (cfg, args);
+        McpToolResult *r = mcp_handle_send (mctx, args);
         if (_empty_args) json_object_unref (_empty_args);
         return r;
     }
     if (g_strcmp0 (name, "email_read") == 0) {
-        McpToolResult *r = mcp_handle_read (cfg, args);
+        McpToolResult *r = mcp_handle_read (mctx, args);
         if (_empty_args) json_object_unref (_empty_args);
         return r;
     }
     if (g_strcmp0 (name, "email_rm") == 0) {
-        McpToolResult *r = mcp_handle_rm (cfg, args);
+        McpToolResult *r = mcp_handle_rm (mctx, args);
         if (_empty_args) json_object_unref (_empty_args);
         return r;
     }
@@ -1298,8 +1400,22 @@ on_client_disconnected (McpServer *server, gpointer user_data)
 }
 
 static gint
-cmd_mcp (EmailConfig *cfg)
+cmd_mcp (EmailConfig *cfg, int argc, char **argv)
 {
+    gchar *to_whitelist_csv = NULL;
+    gchar *from_whitelist_csv = NULL;
+
+    GOptionEntry entries[] = {
+        { "to-whitelist",   0, 0, G_OPTION_ARG_STRING, &to_whitelist_csv,
+          "CSV of allowed recipient addresses", "ADDRS" },
+        { "from-whitelist", 0, 0, G_OPTION_ARG_STRING, &from_whitelist_csv,
+          "CSV of allowed sender addresses",    "ADDRS" },
+        { NULL }
+    };
+
+    GOptionContext *ctx;
+    GError *error = NULL;
+    McpContext mctx;
     GMainLoop *loop;
     McpServer *server;
     McpStdioTransport *transport;
@@ -1307,10 +1423,41 @@ cmd_mcp (EmailConfig *cfg)
     JsonArray *tools_arr;
     guint i;
 
+    ctx = g_option_context_new ("- run as MCP server");
+    g_option_context_add_main_entries (ctx, entries, NULL);
+    if (!g_option_context_parse (ctx, &argc, &argv, &error)) {
+        g_printerr ("mcp: %s\n", error->message);
+        g_error_free (error);
+        g_option_context_free (ctx);
+        return 1;
+    }
+    g_option_context_free (ctx);
+
+    mctx.cfg = cfg;
+    mctx.to_whitelist = parse_csv_whitelist (to_whitelist_csv);
+    mctx.from_whitelist = parse_csv_whitelist (from_whitelist_csv);
+
     loop = g_main_loop_new (NULL, FALSE);
     server = mcp_server_new ("email", "1.0.0");
-    mcp_server_set_instructions (server,
-        "Email client for sending, reading, and deleting emails via IMAP/SMTP.");
+
+    {
+        GString *instructions = g_string_new (
+            "Email client for sending, reading, and deleting emails via IMAP/SMTP.");
+        if (mctx.to_whitelist) {
+            g_string_append (instructions,
+                " SEND RESTRICTION: You may only send to these addresses: ");
+            g_string_append (instructions, to_whitelist_csv);
+            g_string_append_c (instructions, '.');
+        }
+        if (mctx.from_whitelist) {
+            g_string_append (instructions,
+                " READ RESTRICTION: Only messages from these senders will be returned: ");
+            g_string_append (instructions, from_whitelist_csv);
+            g_string_append_c (instructions, '.');
+        }
+        mcp_server_set_instructions (server, instructions->str);
+        g_string_free (instructions, TRUE);
+    }
 
     g_signal_connect (server, "client-disconnected",
                       G_CALLBACK (on_client_disconnected), loop);
@@ -1324,7 +1471,7 @@ cmd_mcp (EmailConfig *cfg)
         GError *err = NULL;
         McpTool *tool = mcp_tool_new_from_json (tool_node, &err);
         if (tool) {
-            mcp_server_add_tool (server, tool, mcp_handle_tool_call, cfg, NULL);
+            mcp_server_add_tool (server, tool, mcp_handle_tool_call, &mctx, NULL);
             g_object_unref (tool);
         } else {
             g_warning ("Failed to register tool: %s", err ? err->message : "unknown");
@@ -1341,6 +1488,10 @@ cmd_mcp (EmailConfig *cfg)
     g_object_unref (transport);
     g_object_unref (tools_parser);
     g_object_unref (server);
+    g_strfreev (mctx.to_whitelist);
+    g_strfreev (mctx.from_whitelist);
+    g_free (to_whitelist_csv);
+    g_free (from_whitelist_csv);
 
     return 0;
 }
@@ -1394,20 +1545,22 @@ main (int argc, char **argv)
     argc--;
     argv++;
 
-    /* Allow --help without a config file */
-    for (i = 1; i < argc; i++) {
-        if (g_str_equal (argv[i], "--help") || g_str_equal (argv[i], "-h")) {
-            cfg = g_new0 (EmailConfig, 1);
-            if (g_str_equal (cmd, "send"))
-                ret = cmd_send (cfg, argc, argv);
-            else if (g_str_equal (cmd, "read"))
-                ret = cmd_read (cfg, argc, argv);
-            else if (g_str_equal (cmd, "rm"))
-                ret = cmd_rm (cfg, argc, argv);
-            else
-                print_usage (argv[0]);
-            free_config (cfg);
-            return ret;
+    /* Allow --help without a config file (except mcp, which has its own args) */
+    if (!g_str_equal (cmd, "mcp")) {
+        for (i = 1; i < argc; i++) {
+            if (g_str_equal (argv[i], "--help") || g_str_equal (argv[i], "-h")) {
+                cfg = g_new0 (EmailConfig, 1);
+                if (g_str_equal (cmd, "send"))
+                    ret = cmd_send (cfg, argc, argv);
+                else if (g_str_equal (cmd, "read"))
+                    ret = cmd_read (cfg, argc, argv);
+                else if (g_str_equal (cmd, "rm"))
+                    ret = cmd_rm (cfg, argc, argv);
+                else
+                    print_usage (argv[0]);
+                free_config (cfg);
+                return ret;
+            }
         }
     }
 
@@ -1422,7 +1575,7 @@ main (int argc, char **argv)
     } else if (g_str_equal (cmd, "rm")) {
         ret = cmd_rm (cfg, argc, argv);
     } else if (g_str_equal (cmd, "mcp")) {
-        ret = cmd_mcp (cfg);
+        ret = cmd_mcp (cfg, argc, argv);
     } else {
         g_printerr ("Unknown command: %s\n", cmd);
         print_usage (argv[0]);

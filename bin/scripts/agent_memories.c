@@ -1,4 +1,4 @@
-#!/usr/bin/crispy
+#!/usr/bin/env crispy
 #define CRISPY_PARAMS "-std=gnu89 -O2 $(pkg-config --cflags --libs libdex-1 json-glib-1.0 libsoup-3.0 mcp-glib-1.0) -lpq -Wno-unused-function"
 
 /*
@@ -780,12 +780,13 @@ db_list_memories (PGconn *conn, const gchar *category, const gchar *subcategory,
         }
     }
 
-    g_autofree gchar *offset_str = g_strdup_printf ("%d", offset);
+    gchar *offset_str = g_strdup_printf ("%d", offset);
+    gchar *limit_str = NULL;
     if (limit < 0) {
         g_string_append_printf (sql, " ORDER BY %s %s LIMIT ALL OFFSET $%d",
             safe_order, descending ? "DESC" : "ASC", idx);
     } else {
-        g_autofree gchar *limit_str = g_strdup_printf ("%d", limit);
+        limit_str = g_strdup_printf ("%d", limit);
         g_string_append_printf (sql, " ORDER BY %s %s LIMIT $%d OFFSET $%d",
             safe_order, descending ? "DESC" : "ASC", idx, idx + 1);
         g_ptr_array_add (plist, limit_str);
@@ -808,11 +809,8 @@ db_list_memories (PGconn *conn, const gchar *category, const gchar *subcategory,
 
     PQclear (res);
     g_free (p);
-    /* Free any dynamically allocated param strings (tag literal) */
-    if (filter_tags && n_filter_tags > 0 && plist->len > 0) {
-        /* The tag literal was added at a known position; we need to free it */
-        /* It's simpler to just track and free separately */
-    }
+    g_free (limit_str);
+    g_free (offset_str);
     g_string_free (sql, TRUE);
     g_ptr_array_free (plist, TRUE);
     return result;
