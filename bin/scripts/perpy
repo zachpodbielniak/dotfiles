@@ -17,284 +17,265 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-from os import environ
-from subprocess import run
-from sys import argv, exit, stdin, stderr
 import argparse
+import base64
 import json
+import re
+import select
+import struct
 import sys
 import time
-import select
+import urllib.error
+import urllib.request
 from datetime import datetime
+from os import environ
 from pathlib import Path
+from subprocess import run
 
 
-ctr_id: str|None = ""
-api_key: str|None = ""
+# === Distrobox re-exec ===
+ctr_id: str = environ.get("CONTAINER_ID", "")
+no_dbox_check: bool = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
 
-if ("CONTAINER_ID" in environ):
-    ctr_id = environ.get("CONTAINER_ID")
-
-# Check if distrobox check should be skipped
-no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
-
-# if we are not in the 'dev' distrobox re-exec the script
-# inside of the 'dev' distrobox
-if not no_dbox_check and ("dev" != ctr_id):
-    cmd: list[str] = [
-        "distrobox",
-        "enter",
-        "dev",
-        "--",
-        *argv
-    ]
-
+if not no_dbox_check and ctr_id != "dev":
+    cmd: list[str] = ["distrobox", "enter", "dev", "--", *sys.argv]
     run(cmd)
-    exit(0)
+    sys.exit(0)
 
-if ("PERPLEXITY_TOKEN" in environ):
-    api_key = environ.get("PERPLEXITY_TOKEN")
-else:
-    print("PERPLEXITY_TOKEN is not set")
-    exit(1)
+# === API key ===
+api_key: str | None = environ.get("PERPLEXITY_TOKEN")
+if not api_key:
+    print("PERPLEXITY_TOKEN is not set", file=sys.stderr)
+    sys.exit(1)
 
-# Parse arguments
-parser = argparse.ArgumentParser(description="Query Perplexity API")
-parser.add_argument("--prompt", help="Prompt to prepend to the input")
-parser.add_argument("--model", default="sonar-pro", help="Model to use (default: sonar-pro). Available models: sonar, sonar-pro, sonar-deep-research, sonar-reasoning-pro, reasoning-pro, r1-1776. Use --show-limits to see token limits per model.")
-parser.add_argument("--debug", action="store_true", help="Enable debug mode (shows request details)")
-parser.add_argument("--json", action="store_true", help="Return a clean JSON response without streaming")
-parser.add_argument("-S", "--no-streaming", action="store_true", help="Disable streaming mode for cleaner output capture")
-parser.add_argument("--embedding", action="store_true", help="Generate an embedding vector instead of a text response")
-parser.add_argument("-f", "--file", action="append", dest="files",
-                    help="Include file content in the context (can be specified multiple times)")
-parser.add_argument("-L", "--list-models", action="store_true",
-                    help="List available models from the Perplexity API")
-parser.add_argument("--show-limits", action="store_true",
-                    help="Show token limits for the specified model (or all known models)")
-parser.add_argument("--no-color", action="store_true",
-                    help="Disable colored output")
-parser.add_argument("--summary", action="store_true",
-                    help="Show usage summary with token counts, timing, and costs in a formatted table")
-parser.add_argument("--dry-run", action="store_true",
-                    help="Show what would be sent to the API without actually making the request")
-parser.add_argument("--no-preserve", action="store_true",
-                    help="Don't save the chat transaction to the second-brain markdown file")
-parser.add_argument("--use-context", action="store_true",
-                    help="Include today's chat history as context for the conversation")
-parser.add_argument("--use-context-from", 
-                    help="Include chat history from a specific date (YYYY-MM-DD format) as context")
-parser.add_argument("--personality", 
-                    help="Set a personality/role for the AI. Available: cfp, swe, teacher, doctor, lawyer, chef, therapist, scientist, historian, artist, coach, journalist, philosopher, librarian, tutor, consultant, translator, critic, comedian, mentor, investor, cybersecurity. You can also use custom descriptions.")
-parser.add_argument("--emojis", nargs="?", const="light", choices=["light", "heavy"],
-                    help="Encourage emoji usage in responses. 'light' (default) uses emojis sparingly, 'heavy' uses them frequently.")
-parser.add_argument("--enhance-emojis", action="store_true", 
-                    help="Post-process the response to add appropriate emojis using a secondary AI call.")
-args = parser.parse_args()
 
-# Personality definitions
-PERSONALITIES = {
-    "cfp": "You are a Certified Financial Planner (CFP) with extensive knowledge of personal finance, investment strategies, tax planning, retirement planning, and estate planning. Provide professional, ethical financial advice while always reminding users to consult with their own financial advisor for personalized guidance.",
-    
-    "swe": "You are a Senior Software Engineer with deep expertise in software architecture, design patterns, code quality, and best practices. Focus on writing clean, maintainable, and efficient code. Consider scalability, security, and performance in your recommendations.",
-    
-    "teacher": "You are a patient and encouraging teacher who excels at breaking down complex topics into understandable concepts. Use analogies, examples, and step-by-step explanations. Adapt your teaching style to the learner's level and encourage questions.",
-    
-    "doctor": "You are a knowledgeable medical professional who provides general health information and guidance. Always emphasize that your advice is educational only and users should consult with healthcare providers for medical diagnosis and treatment.",
-    
-    "lawyer": "You are a legal expert who provides general legal information and explains legal concepts clearly. Always clarify that this is not legal advice and users should consult with an attorney for specific legal matters.",
-    
-    "chef": "You are a professional chef with expertise in various cuisines, cooking techniques, and food science. Share recipes, cooking tips, and culinary knowledge with enthusiasm. Consider dietary restrictions and preferences when making suggestions.",
-    
-    "therapist": "You are a supportive mental health professional who provides emotional support and coping strategies. Always encourage users to seek professional help for serious mental health concerns while offering compassionate guidance.",
-    
-    "scientist": "You are a research scientist with broad knowledge across multiple scientific disciplines. Explain scientific concepts clearly, cite evidence-based information, and maintain scientific accuracy while making complex topics accessible.",
-    
-    "historian": "You are a historian with deep knowledge of world history, cultures, and historical analysis. Provide context, multiple perspectives, and help users understand how past events connect to the present.",
-    
-    "artist": "You are a creative artist with expertise in various art forms, techniques, and art history. Encourage creativity, provide constructive feedback, and help users explore their artistic expression.",
-    
-    "coach": "You are a life coach focused on helping people achieve their goals, overcome obstacles, and maximize their potential. Use motivational techniques, ask powerful questions, and help users create actionable plans.",
-    
-    "journalist": "You are an investigative journalist skilled in research, fact-checking, and clear communication. Help users understand complex issues, identify reliable sources, and think critically about information.",
-    
-    "philosopher": "You are a philosopher who explores deep questions about existence, ethics, knowledge, and reality. Engage in thoughtful dialogue, present multiple philosophical perspectives, and encourage critical thinking.",
-    
-    "librarian": "You are a research librarian with expertise in finding, evaluating, and organizing information. Help users with research strategies, source evaluation, and information literacy.",
-    
-    "tutor": "You are a subject-specific tutor who helps students understand difficult concepts, complete assignments, and prepare for exams. Focus on building understanding rather than just providing answers.",
-    
-    "consultant": "You are a business consultant with expertise in strategy, operations, and organizational development. Provide practical business advice, analyze problems systematically, and offer actionable recommendations.",
-    
-    "translator": "You are a professional translator and linguist with expertise in multiple languages and cultures. Help with translations, explain linguistic nuances, and provide cultural context.",
-    
-    "critic": "You are a thoughtful critic who analyzes literature, films, art, and media with depth and insight. Provide balanced critiques that consider both strengths and weaknesses while respecting different perspectives.",
-    
-    "comedian": "You are a witty comedian who uses humor appropriately to lighten conversations while remaining helpful. Balance entertainment with usefulness, and be sensitive to context and audience.",
-    
-    "mentor": "You are a wise mentor who guides others based on experience and wisdom. Offer perspective, share relevant experiences, and help mentees navigate challenges while encouraging their growth.",
-    
-    "investor": "You are an experienced investment professional with deep knowledge of financial markets, portfolio management, risk assessment, and investment strategies. Provide insights on stocks, bonds, real estate, alternative investments, and market analysis while emphasizing the importance of diversification and risk management.",
-    
-    "cybersecurity": "You are a cybersecurity expert with extensive knowledge of information security, threat analysis, network security, and digital privacy. Help users understand security best practices, identify vulnerabilities, and implement protective measures while staying current with emerging threats and security technologies."
+# === Constants ===
+API_BASE: str = "https://api.perplexity.ai"
+
+MODELS: dict = {
+    "sonar": {
+        "name": "Sonar",
+        "description": "Standard model with web search",
+        "context": 128_000,
+        "max_output": 8_000,
+    },
+    "sonar-pro": {
+        "name": "Sonar Pro",
+        "description": "Premium model with web search (default)",
+        "context": 200_000,
+        "max_output": 8_000,
+    },
+    "sonar-reasoning-pro": {
+        "name": "Sonar Reasoning Pro",
+        "description": "Premium reasoning model with web search",
+        "context": 200_000,
+        "max_output": 16_000,
+    },
+    "sonar-deep-research": {
+        "name": "Sonar Deep Research",
+        "description": "Multi-step deep research with web search",
+        "context": 200_000,
+        "max_output": 16_000,
+    },
 }
 
-def get_personality_prompt(personality_key):
-    """Get the personality prompt for the given key, or return empty string if not found."""
+# Pricing per 1M tokens (USD)
+PRICING: dict = {
+    "sonar": {"input": 1.00, "output": 1.00},
+    "sonar-pro": {"input": 3.00, "output": 15.00},
+    "sonar-reasoning-pro": {"input": 2.00, "output": 8.00},
+    "sonar-deep-research": {"input": 2.00, "output": 8.00},
+}
+
+EMBEDDING_MODELS: dict = {
+    "pplx-embed-v1-0.6b": {
+        "name": "Embed v1 0.6B",
+        "dimensions": 1024,
+        "price_per_m": 0.004,
+        "contextual": False,
+    },
+    "pplx-embed-v1-4b": {
+        "name": "Embed v1 4B",
+        "dimensions": 2560,
+        "price_per_m": 0.03,
+        "contextual": False,
+    },
+    "pplx-embed-context-v1-0.6b": {
+        "name": "Embed Context v1 0.6B",
+        "dimensions": 1024,
+        "price_per_m": 0.008,
+        "contextual": True,
+    },
+    "pplx-embed-context-v1-4b": {
+        "name": "Embed Context v1 4B",
+        "dimensions": 2560,
+        "price_per_m": 0.05,
+        "contextual": True,
+    },
+}
+
+PERSONALITIES: dict = {
+    "cfp": "You are a Certified Financial Planner (CFP) with extensive knowledge of personal finance, investment strategies, tax planning, retirement planning, and estate planning. Provide professional, ethical financial advice while always reminding users to consult with their own financial advisor for personalized guidance.",
+    "swe": "You are a Senior Software Engineer with deep expertise in software architecture, design patterns, code quality, and best practices. Focus on writing clean, maintainable, and efficient code. Consider scalability, security, and performance in your recommendations.",
+    "teacher": "You are a patient and encouraging teacher who excels at breaking down complex topics into understandable concepts. Use analogies, examples, and step-by-step explanations. Adapt your teaching style to the learner's level and encourage questions.",
+    "doctor": "You are a knowledgeable medical professional who provides general health information and guidance. Always emphasize that your advice is educational only and users should consult with healthcare providers for medical diagnosis and treatment.",
+    "lawyer": "You are a legal expert who provides general legal information and explains legal concepts clearly. Always clarify that this is not legal advice and users should consult with an attorney for specific legal matters.",
+    "chef": "You are a professional chef with expertise in various cuisines, cooking techniques, and food science. Share recipes, cooking tips, and culinary knowledge with enthusiasm. Consider dietary restrictions and preferences when making suggestions.",
+    "therapist": "You are a supportive mental health professional who provides emotional support and coping strategies. Always encourage users to seek professional help for serious mental health concerns while offering compassionate guidance.",
+    "scientist": "You are a research scientist with broad knowledge across multiple scientific disciplines. Explain scientific concepts clearly, cite evidence-based information, and maintain scientific accuracy while making complex topics accessible.",
+    "historian": "You are a historian with deep knowledge of world history, cultures, and historical analysis. Provide context, multiple perspectives, and help users understand how past events connect to the present.",
+    "artist": "You are a creative artist with expertise in various art forms, techniques, and art history. Encourage creativity, provide constructive feedback, and help users explore their artistic expression.",
+    "coach": "You are a life coach focused on helping people achieve their goals, overcome obstacles, and maximize their potential. Use motivational techniques, ask powerful questions, and help users create actionable plans.",
+    "journalist": "You are an investigative journalist skilled in research, fact-checking, and clear communication. Help users understand complex issues, identify reliable sources, and think critically about information.",
+    "philosopher": "You are a philosopher who explores deep questions about existence, ethics, knowledge, and reality. Engage in thoughtful dialogue, present multiple philosophical perspectives, and encourage critical thinking.",
+    "librarian": "You are a research librarian with expertise in finding, evaluating, and organizing information. Help users with research strategies, source evaluation, and information literacy.",
+    "tutor": "You are a subject-specific tutor who helps students understand difficult concepts, complete assignments, and prepare for exams. Focus on building understanding rather than just providing answers.",
+    "consultant": "You are a business consultant with expertise in strategy, operations, and organizational development. Provide practical business advice, analyze problems systematically, and offer actionable recommendations.",
+    "translator": "You are a professional translator and linguist with expertise in multiple languages and cultures. Help with translations, explain linguistic nuances, and provide cultural context.",
+    "critic": "You are a thoughtful critic who analyzes literature, films, art, and media with depth and insight. Provide balanced critiques that consider both strengths and weaknesses while respecting different perspectives.",
+    "comedian": "You are a witty comedian who uses humor appropriately to lighten conversations while remaining helpful. Balance entertainment with usefulness, and be sensitive to context and audience.",
+    "mentor": "You are a wise mentor who guides others based on experience and wisdom. Offer perspective, share relevant experiences, and help mentees navigate challenges while encouraging their growth.",
+    "investor": "You are an experienced investment professional with deep knowledge of financial markets, portfolio management, risk assessment, and investment strategies. Provide insights on stocks, bonds, real estate, alternative investments, and market analysis while emphasizing the importance of diversification and risk management.",
+    "cybersecurity": "You are a cybersecurity expert with extensive knowledge of information security, threat analysis, network security, and digital privacy. Help users understand security best practices, identify vulnerabilities, and implement protective measures while staying current with emerging threats and security technologies.",
+}
+
+
+# === Helper functions ===
+
+def api_request(endpoint: str, payload: dict, stream: bool = False, timeout: int = 120):
+    """Make an authenticated request to the Perplexity API.
+
+    Args:
+        endpoint: API endpoint path (e.g. /chat/completions)
+        payload: JSON request body
+        stream: if True, return the raw response object for streaming
+        timeout: request timeout in seconds
+
+    Returns:
+        parsed JSON dict for non-streaming, or the raw response object for streaming
+    """
+    url: str = f"{API_BASE}{endpoint}"
+    headers: dict = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    data: bytes = json.dumps(payload).encode("utf-8")
+    req: urllib.request.Request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    if stream:
+        return urllib.request.urlopen(req, timeout=timeout)
+    else:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+
+def get_model_limits(model: str) -> dict:
+    """Get context and output token limits for a model."""
+    if model in MODELS:
+        return {"input": MODELS[model]["context"], "output": MODELS[model]["max_output"]}
+    return {"input": 128_000, "output": 8_000}
+
+
+def get_personality_prompt(personality_key: str) -> str:
+    """Get the system prompt for a personality key, or treat as custom description."""
     if not personality_key:
         return ""
-    
-    personality_key = personality_key.lower()
-    if personality_key in PERSONALITIES:
-        return PERSONALITIES[personality_key] + "\n\n"
-    else:
-        # If not a predefined personality, treat it as a custom personality description
-        return f"You are {personality_key}.\n\n"
+    key: str = personality_key.lower()
+    if key in PERSONALITIES:
+        return PERSONALITIES[key] + "\n\n"
+    return f"You are {personality_key}.\n\n"
 
-def get_emoji_prompt(emoji_mode):
-    """Get the emoji prompt for the given mode."""
+
+def get_emoji_prompt(emoji_mode: str) -> str:
+    """Get the emoji instruction prompt for the given mode."""
     if not emoji_mode:
         return ""
-    
-    emoji_prompts = {
+    prompts: dict = {
         "light": "Feel free to use relevant emojis to enhance your response where appropriate.",
-        "heavy": "Use emojis frequently throughout your response to make it more engaging and expressive. Include emojis to highlight key points, convey emotions, and make the content more visually appealing."
+        "heavy": "Use emojis frequently throughout your response to make it more engaging and expressive. Include emojis to highlight key points, convey emotions, and make the content more visually appealing.",
     }
-    
-    return emoji_prompts.get(emoji_mode, emoji_prompts["light"]) + "\n\n"
+    return prompts.get(emoji_mode, prompts["light"]) + "\n\n"
 
-def get_model_limits(model):
-    """Get input and output token limits for different Perplexity models."""
-    # Model limits based on research and official documentation (as of December 2025)
-    model_limits = {
-        # Sonar models (Latest)
-        "sonar-pro": {"input": 200_000, "output": 8_000},  # 200k context, 8k max output
-        "sonar": {"input": 128_000, "output": 4_000},  # Lower tier than pro
-        "sonar-deep-research": {"input": 200_000, "output": 16_000},  # Most advanced Sonar variant (NEW - Dec 2025)
 
-        # Reasoning models
-        "sonar-reasoning-pro": {"input": 200_000, "output": 16_000},  # Reasoning + pro features
-        "reasoning-pro": {"input": 128_000, "output": 8_000},  # Reasoning without pro tier
-
-        # DeepSeek R1 based model
-        "r1-1776": {"input": 256_000, "output": 32_000},  # Premium reasoning model
-    }
-
-    # Get limits for the model, default to sonar-pro if not found
-    return model_limits.get(model, model_limits.get("sonar-pro", {"input": 200_000, "output": 8_000}))
-
-def enhance_with_emojis(text, model="sonar"):
-    """Enhance text with emojis using a secondary AI call."""
+def enhance_with_emojis(text: str, model: str = "sonar") -> str:
+    """Enhance text with emojis using a secondary API call."""
     if not text or not text.strip():
         return text
-    
-    enhancement_prompt = f"""Please add appropriate emojis to the following text to make it more engaging and expressive. Follow these guidelines:
 
-1. Add emojis that are relevant and enhance understanding
-2. Don't overdo it - use emojis strategically
-3. Maintain the original meaning and tone
-4. Place emojis at the BEGINNING of section headings, titles, and key points (e.g., "🚀 Getting Started" not "Getting Started 🚀")
-5. For bullet points and lists, place emojis at the start of each item
-6. Use emojis to emphasize important concepts, but place them before the text they're emphasizing
-7. Return only the enhanced text with emojis, no additional commentary
-
-Original text:
-{text}"""
+    enhancement_prompt: str = (
+        "Please add appropriate emojis to the following text to make it more engaging "
+        "and expressive. Follow these guidelines:\n\n"
+        "1. Add emojis that are relevant and enhance understanding\n"
+        "2. Don't overdo it - use emojis strategically\n"
+        "3. Maintain the original meaning and tone\n"
+        "4. Place emojis at the BEGINNING of section headings, titles, and key points\n"
+        "5. For bullet points and lists, place emojis at the start of each item\n"
+        "6. Use emojis to emphasize important concepts, but place them before the text\n"
+        "7. Return only the enhanced text with emojis, no additional commentary\n\n"
+        f"Original text:\n{text}"
+    )
 
     try:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        # Get model limits for enhancement
-        enhancement_model_limits = get_model_limits(model)
-        max_output = min(len(text.split()) * 2 + 1000, enhancement_model_limits["output"])
-        
-        data = {
+        payload: dict = {
             "model": model,
-            "max_tokens": max_output,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": enhancement_prompt
-                }
-            ]
+            "messages": [{"role": "user", "content": enhancement_prompt}],
         }
-        
-        response = requests.post("https://api.perplexity.ai/chat/completions", 
-                               headers=headers, 
-                               json=data, 
-                               timeout=30)
-        
-        if response.status_code == 200:
-            response_data = response.json()
-            if "choices" in response_data and len(response_data["choices"]) > 0:
-                return response_data["choices"][0]["message"]["content"].strip()
-        
-        # Return original text if enhancement fails
+        response: dict = api_request("/chat/completions", payload, timeout=30)
+        if "choices" in response and len(response["choices"]) > 0:
+            return response["choices"][0]["message"]["content"].strip()
         return text
-        
     except Exception as e:
         print(f"Warning: Emoji enhancement failed ({e}), returning original text", file=sys.stderr)
         return text
 
-def load_context_from_file(date_str):
+
+def load_context_from_file(date_str: str, debug: bool = False) -> str | None:
     """Load chat history from a specific date's markdown file."""
-    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
-    filename = f"{date_str}.md"
-    file_path = base_path / filename
-    
+    base_path: Path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    file_path: Path = base_path / f"{date_str}.md"
+
     if not file_path.exists():
-        if args.debug:
+        if debug:
             print(f"Debug: No context file found at {file_path}", file=sys.stderr)
         return None
-    
+
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        if args.debug:
-            print(f"Debug: Loaded {len(content)} characters of context from {filename}", file=sys.stderr)
-        
+            content: str = f.read()
+        if debug:
+            print(f"Debug: Loaded {len(content)} characters of context from {date_str}.md", file=sys.stderr)
         return f"=== Previous Chat History from {date_str} ===\n\n{content}\n\n=== End of Previous Chat History ===\n\n"
     except Exception as e:
         print(f"Warning: Could not load context from {file_path}: {e}", file=sys.stderr)
         return None
 
-def calculate_cost(model, input_tokens, output_tokens):
-    """Calculate cost based on Perplexity pricing (as of 2025)."""
-    # Pricing per 1M tokens (in dollars) - Updated from official pricing page
-    pricing = {
-        # Sonar models
-        "sonar-pro": {"input": 3.00, "output": 15.00},
-        "sonar": {"input": 1.00, "output": 1.00},
-        
-        # Reasoning models
-        "sonar-reasoning-pro": {"input": 2.00, "output": 8.00},
-        "reasoning-pro": {"input": 1.00, "output": 5.00},
-        
-        # DeepSeek R1 based model
-        "r1-1776": {"input": 2.00, "output": 8.00},
-    }
-    
-    # Get pricing for the model, default to sonar-pro if not found
-    model_pricing = pricing.get(model, pricing.get("sonar-pro"))
-    
-    # Calculate costs (convert from per million to actual tokens)
-    input_cost = (input_tokens / 1_000_000) * model_pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * model_pricing["output"]
-    total_cost = input_cost + output_cost
-    
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> dict:
+    """Calculate cost based on Perplexity pricing (per 1M tokens)."""
+    model_pricing: dict = PRICING.get(model, PRICING["sonar-pro"])
+    input_cost: float = (input_tokens / 1_000_000) * model_pricing["input"]
+    output_cost: float = (output_tokens / 1_000_000) * model_pricing["output"]
     return {
         "input_cost": input_cost,
         "output_cost": output_cost,
-        "total_cost": total_cost
+        "total_cost": input_cost + output_cost,
     }
 
-def print_summary_table(model, input_tokens, output_tokens, total_time, first_token_time, cost_info, is_estimated=False, use_color=True):
-    """Print a formatted summary table with color support."""
-    # ANSI color codes (conditionally set based on use_color)
+
+def print_summary_table(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    total_time: float,
+    first_token_time: float | None,
+    cost_info: dict,
+    is_estimated: bool = False,
+    use_color: bool = True,
+    citations: list | None = None,
+):
+    """Print a formatted summary table with usage stats."""
     if use_color:
         CYAN = '\033[96m'
         GREEN = '\033[92m'
@@ -305,109 +286,158 @@ def print_summary_table(model, input_tokens, output_tokens, total_time, first_to
         END = '\033[0m'
     else:
         CYAN = GREEN = YELLOW = BLUE = MAGENTA = BOLD = END = ''
-    
-    # Calculate total tokens
-    total_tokens = input_tokens + output_tokens
-    
-    # Table width (inner content width)
-    width = 50
-    
-    # Helper to strip ANSI codes
-    import re
+
+    total_tokens: int = input_tokens + output_tokens
+    width: int = 50
+
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    
-    def strip_ansi(text):
+
+    def strip_ansi(text: str) -> str:
         return ansi_escape.sub('', text)
-    
-    # Helper to create a padded line
-    def make_line(left, right, left_width=22):
-        """Create a line with left and right parts, properly padded."""
-        left_plain = strip_ansi(left)
-        right_plain = strip_ansi(right)
-        
-        # Total inner content must be exactly 48 characters
-        # Left part: left_text + padding to reach left_width
-        left_part = left + ' ' * (left_width - len(left_plain))
-        
-        # Right part: right_text + padding to fill remaining space
-        remaining_width = 48 - left_width - 1  # -1 for space between left and right
-        right_part = right + ' ' * (remaining_width - len(right_plain))
-        
-        # Combine: left_part + space + right_part = exactly 48 chars
-        content = f"{left_part} {right_part}"
-        
+
+    def make_line(left: str, right: str, left_width: int = 22) -> str:
+        left_plain: str = strip_ansi(left)
+        right_plain: str = strip_ansi(right)
+        left_part: str = left + ' ' * (left_width - len(left_plain))
+        remaining_width: int = 48 - left_width - 1
+        right_part: str = right + ' ' * (remaining_width - len(right_plain))
+        content: str = f"{left_part} {right_part}"
         return f"{CYAN}║{END} {content} {CYAN}║{END}"
-    
-    # Build the table
+
     print(f"\n{BOLD}{CYAN}╔{'═' * width}╗{END}", file=sys.stderr)
-    
-    # Title
-    title = "API Usage Summary"
-    title_pad_left = (width - len(title)) // 2
-    title_pad_right = width - len(title) - title_pad_left
+
+    title: str = "API Usage Summary"
+    title_pad_left: int = (width - len(title)) // 2
+    title_pad_right: int = width - len(title) - title_pad_left
     print(f"{BOLD}{CYAN}║{' ' * title_pad_left}{title}{' ' * title_pad_right}║{END}", file=sys.stderr)
-    
+
     print(f"{BOLD}{CYAN}╠{'═' * width}╣{END}", file=sys.stderr)
-    
-    # Model info
-    model_display = model if len(model) <= 30 else model[:27] + "..."
+
+    model_display: str = model if len(model) <= 30 else model[:27] + "..."
     print(make_line(f"{BOLD}Model:{END}", f"{GREEN}{model_display}{END}"), file=sys.stderr)
     print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
-    
-    # Token usage
+
     print(make_line(f"{BOLD}Token Usage:{END}", ""), file=sys.stderr)
-    
-    est_marker = " (est)" if is_estimated else ""
+    est_marker: str = " (est)" if is_estimated else ""
     print(make_line("  Input:", f"{YELLOW}{input_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
     print(make_line("  Output:", f"{YELLOW}{output_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
     print(make_line("  Total:", f"{BOLD}{YELLOW}{total_tokens:,}{est_marker}{END} tokens"), file=sys.stderr)
     print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
-    
-    # Performance
+
     print(make_line(f"{BOLD}Performance:{END}", ""), file=sys.stderr)
-    
     if first_token_time:
         print(make_line("  Time to first token:", f"{BLUE}{first_token_time:.2f}s{END}"), file=sys.stderr)
-    
     print(make_line("  Total time:", f"{BLUE}{total_time:.2f}s{END}"), file=sys.stderr)
-    
     if output_tokens > 0 and total_time > 0:
-        tokens_per_sec = output_tokens / total_time
+        tokens_per_sec: float = output_tokens / total_time
         print(make_line("  Tokens/second:", f"{BLUE}{tokens_per_sec:.1f}{END}"), file=sys.stderr)
-    
     print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
-    
-    # Cost
+
     print(make_line(f"{BOLD}Cost Breakdown:{END}", ""), file=sys.stderr)
-    
     print(make_line("  Input cost:", f"{MAGENTA}${cost_info['input_cost']:.6f}{END}"), file=sys.stderr)
     print(make_line("  Output cost:", f"{MAGENTA}${cost_info['output_cost']:.6f}{END}"), file=sys.stderr)
     print(make_line(f"  {BOLD}Total cost:{END}", f"{BOLD}{MAGENTA}${cost_info['total_cost']:.6f}{END}"), file=sys.stderr)
-    
+
+    if citations:
+        print(f"{CYAN}╠{'─' * width}╣{END}", file=sys.stderr)
+        print(make_line(f"{BOLD}Citations:{END}", f"{GREEN}{len(citations)}{END} sources"), file=sys.stderr)
+
     print(f"{BOLD}{CYAN}╚{'═' * width}╝{END}", file=sys.stderr)
 
-def save_chat_transaction(provider, model, prompt, response, metadata=None):
+
+def print_citations(citations: list, use_color: bool = True):
+    """Print citation URLs after the response."""
+    if not citations:
+        return
+
+    if use_color:
+        CYAN = '\033[96m'
+        BOLD = '\033[1m'
+        END = '\033[0m'
+    else:
+        CYAN = BOLD = END = ''
+
+    print(f"\n{BOLD}{CYAN}Citations:{END}", file=sys.stderr)
+    for i, url in enumerate(citations, 1):
+        print(f"  [{i}] {CYAN}{url}{END}", file=sys.stderr)
+
+
+def print_related_questions(questions: list, use_color: bool = True):
+    """Print related questions after the response."""
+    if not questions:
+        return
+
+    if use_color:
+        YELLOW = '\033[93m'
+        BOLD = '\033[1m'
+        END = '\033[0m'
+    else:
+        YELLOW = BOLD = END = ''
+
+    print(f"\n{BOLD}{YELLOW}Related Questions:{END}", file=sys.stderr)
+    for i, q in enumerate(questions, 1):
+        print(f"  {YELLOW}{i}. {q}{END}", file=sys.stderr)
+
+
+def print_search_results(results: list, use_color: bool = True):
+    """Print formatted search results from the /search API."""
+    if use_color:
+        CYAN = '\033[96m'
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        BLUE = '\033[94m'
+        BOLD = '\033[1m'
+        DIM = '\033[2m'
+        END = '\033[0m'
+    else:
+        CYAN = GREEN = YELLOW = BLUE = BOLD = DIM = END = ''
+
+    if not results:
+        print(f"{YELLOW}No results found.{END}")
+        return
+
+    for i, r in enumerate(results, 1):
+        title: str = r.get("title", "Untitled")
+        url: str = r.get("url", "")
+        snippet: str = r.get("snippet", "")
+        date: str | None = r.get("date")
+        last_updated: str | None = r.get("last_updated")
+
+        print(f"{BOLD}{GREEN}[{i}]{END} {BOLD}{title}{END}")
+        print(f"    {CYAN}{url}{END}")
+        if date:
+            date_str: str = f"Published: {date}"
+            if last_updated:
+                date_str += f" | Updated: {last_updated}"
+            print(f"    {DIM}{date_str}{END}")
+        if snippet:
+            # Wrap snippet lines with indentation
+            wrapped: str = snippet.replace("\n", "\n    ")
+            print(f"    {wrapped}")
+        print()
+
+
+def save_chat_transaction(
+    provider: str,
+    model: str,
+    prompt: str,
+    response: str,
+    metadata: dict | None = None,
+):
     """Save chat transaction to markdown file organized by date."""
-    # Create directory structure if it doesn't exist
-    base_path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
+    base_path: Path = Path("/var/home/zach/Documents/notes/03_resources/ai_chats/providers")
     base_path.mkdir(parents=True, exist_ok=True)
-    
-    # Generate filename based on today's date
-    today = datetime.now()
-    filename = today.strftime("%Y-%m-%d.md")
-    file_path = base_path / filename
-    
-    # Generate timestamp for section header
-    timestamp = today.strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Prepare content
-    content = f"\n# {timestamp}\n\n"
+
+    today: datetime = datetime.now()
+    file_path: Path = base_path / today.strftime("%Y-%m-%d.md")
+    timestamp: str = today.strftime("%Y-%m-%d %H:%M:%S")
+
+    content: str = f"\n# {timestamp}\n\n"
     content += f"## Prompt\n\n```\n{prompt}\n```\n\n"
     content += f"## Response\n\n{response}\n\n"
-    
-    # Add metadata if provided
+
     if metadata:
-        content += f"## Metadata\n\n"
+        content += "## Metadata\n\n"
         content += f"- **Provider**: {provider}\n"
         content += f"- **Model**: {model}\n"
         if 'input_tokens' in metadata:
@@ -417,510 +447,819 @@ def save_chat_transaction(provider, model, prompt, response, metadata=None):
         if 'total_tokens' in metadata:
             content += f"- **Total Tokens**: {metadata['total_tokens']:,}\n"
         if 'cost_info' in metadata:
-            cost_info = metadata['cost_info']
-            content += f"- **Input Cost**: ${cost_info['input_cost']:.6f}\n"
-            content += f"- **Output Cost**: ${cost_info['output_cost']:.6f}\n"
-            content += f"- **Total Cost**: ${cost_info['total_cost']:.6f}\n"
+            ci: dict = metadata['cost_info']
+            content += f"- **Input Cost**: ${ci['input_cost']:.6f}\n"
+            content += f"- **Output Cost**: ${ci['output_cost']:.6f}\n"
+            content += f"- **Total Cost**: ${ci['total_cost']:.6f}\n"
         if 'total_time' in metadata:
             content += f"- **Total Time**: {metadata['total_time']:.2f}s\n"
         if 'first_token_time' in metadata and metadata['first_token_time']:
             content += f"- **Time to First Token**: {metadata['first_token_time']:.2f}s\n"
         if 'stream_mode' in metadata:
             content += f"- **Streaming**: {metadata['stream_mode']}\n"
-    
+        if 'citations' in metadata and metadata['citations']:
+            content += f"- **Citations**: {len(metadata['citations'])} sources\n"
+            for i, url in enumerate(metadata['citations'], 1):
+                content += f"  - [{i}] {url}\n"
+
     content += "\n---\n"
-    
-    # Write to file (append if exists)
+
     try:
         with open(file_path, 'a', encoding='utf-8') as f:
             f.write(content)
     except Exception as e:
         print(f"Warning: Could not save chat transaction: {e}", file=sys.stderr)
 
-# Import perplexipy outside of conditional logic
-try:
-    from perplexipy import PerplexityClient
-    client: PerplexityClient = None
-except ImportError:
-    PerplexityClient = None
-    client = None
 
-# Handle list-models option first
+def decode_embedding(b64_string: str) -> list[float]:
+    """Decode a base64-encoded int8 embedding vector to a list of floats.
+
+    The Perplexity embedding API returns base64-encoded signed int8 values.
+    We decode and normalize to float range [-1.0, 1.0] for compatibility
+    with cosine similarity and other distance metrics.
+    """
+    raw: bytes = base64.b64decode(b64_string)
+    values: tuple = struct.unpack(f'{len(raw)}b', raw)
+    return [v / 127.0 for v in values]
+
+
+# === Argument parsing ===
+
+model_choices: list[str] = list(MODELS.keys())
+model_help: str = (
+    "Model to use (default: sonar-pro). Available: "
+    + ", ".join(model_choices)
+    + ". Use -L/--list-models for details."
+)
+
+parser: argparse.ArgumentParser = argparse.ArgumentParser(
+    description="Query the Perplexity API from the command line",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog="""examples:
+  echo "What is Rust?" | perpy
+  perpy --prompt "Explain quantum computing"
+  perpy --model sonar-reasoning-pro --prompt "Solve: what is 127 * 343?"
+  perpy --search-mode academic --prompt "latest research on mRNA vaccines"
+  perpy -f code.py --prompt "Review this code"
+  perpy --model sonar-deep-research --prompt "comprehensive analysis of EV market"
+  perpy --embedding --prompt "hello world"
+  perpy --disable-search --prompt "write a haiku about rain"
+  perpy --search --prompt "linux kernel 6.x performance improvements"
+  perpy --search --prompt "rust async" --search-domain-filter github.com --max-results 5
+""",
+)
+
+# Core options
+parser.add_argument("--prompt", help="Prompt to send (can also pipe via stdin)")
+parser.add_argument("--model", default="sonar-pro", choices=model_choices, help=model_help)
+parser.add_argument("--debug", action="store_true", help="Enable debug mode (shows request details)")
+
+# Output format
+parser.add_argument("--json", action="store_true", help="Return response without streaming")
+parser.add_argument("-S", "--no-streaming", action="store_true", help="Disable streaming mode")
+parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+parser.add_argument("--summary", action="store_true", help="Show usage summary with token counts, timing, and costs")
+parser.add_argument("--citations", action="store_true", help="Display citation URLs after the response")
+
+# File input
+parser.add_argument("-f", "--file", action="append", dest="files",
+                    help="Include file content in context (repeatable)")
+
+# Model listing
+parser.add_argument("-L", "--list-models", action="store_true", help="List available models")
+parser.add_argument("--show-limits", action="store_true", help="Show token limits for models")
+
+# Search options
+parser.add_argument("--search-mode", choices=["web", "academic", "sec"],
+                    help="Search source: web (default), academic (scholarly), sec (SEC filings)")
+parser.add_argument("--search-domain-filter", action="append", dest="search_domains",
+                    help="Limit search to specific domains (repeatable, e.g. --search-domain-filter github.com)")
+parser.add_argument("--search-recency-filter", choices=["hour", "day", "week", "month", "year"],
+                    help="Filter search results by recency")
+parser.add_argument("--search-language-filter",
+                    help="Filter search by language (ISO 639-1 code, e.g. en, fr, de)")
+parser.add_argument("--search-after-date",
+                    help="Only return results published after this date (MM/DD/YYYY)")
+parser.add_argument("--search-before-date",
+                    help="Only return results published before this date (MM/DD/YYYY)")
+parser.add_argument("--search-context-size", choices=["low", "medium", "high"], default="low",
+                    help="Amount of search context to include (default: low)")
+parser.add_argument("--disable-search", action="store_true",
+                    help="Disable web search; model responds from training data only")
+parser.add_argument("--enable-search-classifier", action="store_true",
+                    help="Let the model decide if web search is needed")
+
+# Generation options
+parser.add_argument("--temperature", type=float,
+                    help="Sampling temperature (0.0-2.0). Higher = more random")
+parser.add_argument("--top-p", type=float,
+                    help="Nucleus sampling parameter (0.0-1.0)")
+parser.add_argument("--max-tokens", type=int,
+                    help="Maximum output tokens (overrides model default)")
+parser.add_argument("--reasoning-effort", choices=["minimal", "low", "medium", "high"],
+                    help="Control reasoning depth (for sonar-reasoning-pro)")
+parser.add_argument("--language-preference",
+                    help="Preferred response language (ISO 639-1 code, e.g. en, fr, de)")
+
+# Response enrichment
+parser.add_argument("--return-images", action="store_true",
+                    help="Include image results in the response")
+parser.add_argument("--return-related-questions", action="store_true",
+                    help="Generate suggested follow-up questions")
+
+# Search API (raw web search, no LLM)
+parser.add_argument("--search", action="store_true",
+                    help="Use the Search API for raw ranked results (no LLM). $5/1K requests flat rate.")
+parser.add_argument("--max-results", type=int, default=10,
+                    help="Max search results to return (1-20, default: 10). Only with --search.")
+parser.add_argument("--country",
+                    help="ISO 3166-1 alpha-2 country code for search localization (e.g. US, GB, DE). Only with --search.")
+parser.add_argument("--links-only", action="store_true",
+                    help="With --search, output only the URLs (one per line)")
+
+# Embedding
+parser.add_argument("--embedding", action="store_true",
+                    help="Generate an embedding vector instead of a text response")
+parser.add_argument("--embedding-model", default="pplx-embed-v1-0.6b",
+                    choices=list(EMBEDDING_MODELS.keys()),
+                    help="Embedding model to use (default: pplx-embed-v1-0.6b)")
+
+# Personality and emoji
+parser.add_argument("--personality",
+                    help="Set a personality/role. Builtins: " + ", ".join(PERSONALITIES.keys()) + ". Or use a custom description.")
+parser.add_argument("--emojis", nargs="?", const="light", choices=["light", "heavy"],
+                    help="Encourage emoji usage ('light' default, or 'heavy')")
+parser.add_argument("--enhance-emojis", action="store_true",
+                    help="Post-process the response to add emojis via a secondary AI call")
+
+# Workflow
+parser.add_argument("--dry-run", action="store_true",
+                    help="Show what would be sent without making the API call")
+parser.add_argument("--no-preserve", action="store_true",
+                    help="Don't save the chat transaction to the second-brain markdown file")
+parser.add_argument("--use-context", action="store_true",
+                    help="Include today's chat history as conversation context")
+parser.add_argument("--use-context-from",
+                    help="Include chat history from a specific date (YYYY-MM-DD)")
+
+args: argparse.Namespace = parser.parse_args()
+
+
+# === Handle info commands ===
+
+def use_colors() -> bool:
+    return not args.no_color and environ.get("NO_COLOR", "").lower() not in ("1", "true")
+
+
 if args.list_models:
-    # Check if colors should be disabled
-    use_colors = not args.no_color and environ.get("NO_COLOR", "").lower() not in ("1", "true")
-    
-    # ANSI color codes (conditionally set based on use_colors)
-    class Colors:
-        HEADER = '\033[95m' if use_colors else ''
-        BLUE = '\033[94m' if use_colors else ''
-        CYAN = '\033[96m' if use_colors else ''
-        GREEN = '\033[92m' if use_colors else ''
-        YELLOW = '\033[93m' if use_colors else ''
-        RED = '\033[91m' if use_colors else ''
-        BOLD = '\033[1m' if use_colors else ''
-        UNDERLINE = '\033[4m' if use_colors else ''
-        END = '\033[0m' if use_colors else ''
-    
-    # Note: Perplexity doesn't provide a public models listing endpoint
-    # Maintaining a curated list of known models
-    models = [
-        ("sonar-pro", "Sonar Pro", "Premium model with web search (default)"),
-        ("sonar", "Sonar", "Standard model with web search"),
-        ("reasoning-pro", "Reasoning Pro", "Advanced reasoning model"),
-        ("sonar-reasoning-pro", "Sonar Reasoning Pro", "Premium reasoning model"),
-        ("r1-1776", "R1-1776", "Revolutionary reasoning model"),
-    ]
-    
-    # Calculate column widths
-    max_model = max(len(model[0]) for model in models)
-    max_name = max(len(model[1]) for model in models)
-    max_desc = max(len(model[2]) for model in models)
-    
-    # Ensure minimum widths
-    max_model = max(max_model, len("Model ID"))
+    colors: bool = use_colors()
+
+    class C:
+        HEADER = '\033[95m' if colors else ''
+        BLUE = '\033[94m' if colors else ''
+        CYAN = '\033[96m' if colors else ''
+        GREEN = '\033[92m' if colors else ''
+        YELLOW = '\033[93m' if colors else ''
+        BOLD = '\033[1m' if colors else ''
+        END = '\033[0m' if colors else ''
+
+    print(f"\n{C.BOLD}{C.CYAN}Available Chat Models:{C.END}")
+
+    max_id: int = max(len(m) for m in MODELS)
+    max_name: int = max(len(v["name"]) for v in MODELS.values())
+    max_desc: int = max(len(v["description"]) for v in MODELS.values())
+    max_id = max(max_id, len("Model ID"))
     max_name = max(max_name, len("Name"))
     max_desc = max(max_desc, len("Description"))
-    
-    # Print header
-    print(f"\n{Colors.BOLD}{Colors.CYAN}Available Perplexity Models:{Colors.END}")
-    print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
-    
-    # Print table header
-    print(f"{Colors.BOLD}{Colors.HEADER}{'Model ID':<{max_model}} {'Name':<{max_name}} {'Description':<{max_desc}}{Colors.END}")
-    print(f"{Colors.BOLD}{'─' * max_model} {'─' * max_name} {'─' * max_desc}{Colors.END}")
-    
-    # Print table rows
-    for i, (model_id, name, description) in enumerate(models):
-        # Alternate row colors
-        color = Colors.CYAN if i % 2 == 0 else Colors.BLUE
-        name_color = Colors.GREEN
-        desc_color = Colors.YELLOW
-        
-        print(f"{color}{model_id:<{max_model}}{Colors.END} "
-              f"{name_color}{name:<{max_name}}{Colors.END} "
-              f"{desc_color}{description:<{max_desc}}{Colors.END}")
-    
-    print(f"{Colors.BOLD}{'─' * (max_model + max_name + max_desc + 6)}{Colors.END}")
-    print(f"{Colors.BOLD}Total models: {Colors.GREEN}{len(models)}{Colors.END}\n")
-    
-    exit(0)
 
-# Handle show-limits option
+    print(f"{C.BOLD}{'─' * (max_id + max_name + max_desc + 6)}{C.END}")
+    print(f"{C.BOLD}{C.HEADER}{'Model ID':<{max_id}} {'Name':<{max_name}} {'Description':<{max_desc}}{C.END}")
+    print(f"{C.BOLD}{'─' * max_id} {'─' * max_name} {'─' * max_desc}{C.END}")
+
+    for i, (model_id, info) in enumerate(MODELS.items()):
+        color = C.CYAN if i % 2 == 0 else C.BLUE
+        print(f"{color}{model_id:<{max_id}}{C.END} "
+              f"{C.GREEN}{info['name']:<{max_name}}{C.END} "
+              f"{C.YELLOW}{info['description']:<{max_desc}}{C.END}")
+
+    print(f"{C.BOLD}{'─' * (max_id + max_name + max_desc + 6)}{C.END}")
+    print(f"{C.BOLD}Total: {C.GREEN}{len(MODELS)}{C.END}\n")
+
+    print(f"{C.BOLD}{C.CYAN}Available Embedding Models:{C.END}")
+
+    max_eid: int = max(len(m) for m in EMBEDDING_MODELS)
+    max_ename: int = max(len(v["name"]) for v in EMBEDDING_MODELS.values())
+    max_eid = max(max_eid, len("Model ID"))
+    max_ename = max(max_ename, len("Name"))
+
+    print(f"{C.BOLD}{'─' * (max_eid + max_ename + 20)}{C.END}")
+    print(f"{C.BOLD}{C.HEADER}{'Model ID':<{max_eid}} {'Name':<{max_ename}} {'Dims':<6} {'$/1M':<8}{C.END}")
+    print(f"{C.BOLD}{'─' * max_eid} {'─' * max_ename} {'─' * 6} {'─' * 8}{C.END}")
+
+    for i, (model_id, info) in enumerate(EMBEDDING_MODELS.items()):
+        color = C.CYAN if i % 2 == 0 else C.BLUE
+        ctx_marker: str = " (ctx)" if info.get("contextual") else ""
+        print(f"{color}{model_id:<{max_eid}}{C.END} "
+              f"{C.GREEN}{info['name'] + ctx_marker:<{max_ename + 6}}{C.END} "
+              f"{C.YELLOW}{info['dimensions']:<6}{C.END} "
+              f"{C.YELLOW}${info['price_per_m']:<7.3f}{C.END}")
+
+    print(f"{C.BOLD}{'─' * (max_eid + max_ename + 20)}{C.END}")
+    print(f"{C.BOLD}Total: {C.GREEN}{len(EMBEDDING_MODELS)}{C.END}\n")
+    sys.exit(0)
+
 if args.show_limits:
-    # Check if colors should be disabled
-    use_colors = not args.no_color and environ.get("NO_COLOR", "").lower() not in ("1", "true")
-    
-    # ANSI color codes
-    class Colors:
-        HEADER = '\033[95m' if use_colors else ''
-        BLUE = '\033[94m' if use_colors else ''
-        CYAN = '\033[96m' if use_colors else ''
-        GREEN = '\033[92m' if use_colors else ''
-        YELLOW = '\033[93m' if use_colors else ''
-        RED = '\033[91m' if use_colors else ''
-        BOLD = '\033[1m' if use_colors else ''
-        UNDERLINE = '\033[4m' if use_colors else ''
-        END = '\033[0m' if use_colors else ''
-    
-    print(f"\n{Colors.BOLD}{Colors.CYAN}Perplexity Model Token Limits:{Colors.END}")
-    print(f"{Colors.BOLD}{'─' * 70}{Colors.END}")
-    
-    # Get all model limits
-    models_to_show = ["sonar-pro", "sonar", "sonar-reasoning-pro", "reasoning-pro", "r1-1776"]
-    if args.model and args.model not in models_to_show:
-        models_to_show = [args.model] + models_to_show
-    
-    # Print table header
-    print(f"{Colors.BOLD}{Colors.HEADER}{'Model':<25} {'Input Limit':<15} {'Output Limit':<15}{Colors.END}")
-    print(f"{Colors.BOLD}{'─' * 25} {'─' * 15} {'─' * 15}{Colors.END}")
-    
-    # Print model limits
-    for i, model in enumerate(models_to_show):
-        limits = get_model_limits(model)
-        
-        # Alternate row colors
-        color = Colors.CYAN if i % 2 == 0 else Colors.BLUE
-        input_color = Colors.GREEN
-        output_color = Colors.YELLOW
-        
-        # Format token counts with commas
-        input_tokens = f"{limits['input']:,} tokens"
-        output_tokens = f"{limits['output']:,} tokens"
-        
-        print(f"{color}{model:<25}{Colors.END} "
-              f"{input_color}{input_tokens:<15}{Colors.END} "
-              f"{output_color}{output_tokens:<15}{Colors.END}")
-    
-    print(f"{Colors.BOLD}{'─' * 70}{Colors.END}")
-    
-    # Show specific model if requested
-    if args.model:
-        limits = get_model_limits(args.model)
-        print(f"\n{Colors.BOLD}Current model ({args.model}) limits:{Colors.END}")
-        print(f"  Input: {Colors.GREEN}{limits['input']:,}{Colors.END} tokens")
-        print(f"  Output: {Colors.YELLOW}{limits['output']:,}{Colors.END} tokens")
-    
-    print()
-    exit(0)
+    colors = use_colors()
 
-# Print debug info if requested
+    class C:
+        HEADER = '\033[95m' if colors else ''
+        BLUE = '\033[94m' if colors else ''
+        CYAN = '\033[96m' if colors else ''
+        GREEN = '\033[92m' if colors else ''
+        YELLOW = '\033[93m' if colors else ''
+        BOLD = '\033[1m' if colors else ''
+        END = '\033[0m' if colors else ''
+
+    print(f"\n{C.BOLD}{C.CYAN}Perplexity Model Token Limits:{C.END}")
+    print(f"{C.BOLD}{'─' * 70}{C.END}")
+
+    print(f"{C.BOLD}{C.HEADER}{'Model':<25} {'Context Window':<18} {'Max Output':<15} {'Input $/1M':<12} {'Output $/1M':<12}{C.END}")
+    print(f"{C.BOLD}{'─' * 25} {'─' * 18} {'─' * 15} {'─' * 12} {'─' * 12}{C.END}")
+
+    for i, (model_id, info) in enumerate(MODELS.items()):
+        color = C.CYAN if i % 2 == 0 else C.BLUE
+        pricing: dict = PRICING.get(model_id, {})
+        ctx: str = f"{info['context']:,} tokens"
+        out: str = f"{info['max_output']:,} tokens"
+        inp_price: str = f"${pricing.get('input', 0):.2f}"
+        out_price: str = f"${pricing.get('output', 0):.2f}"
+
+        print(f"{color}{model_id:<25}{C.END} "
+              f"{C.GREEN}{ctx:<18}{C.END} "
+              f"{C.YELLOW}{out:<15}{C.END} "
+              f"{C.BLUE}{inp_price:<12}{C.END} "
+              f"{C.BLUE}{out_price:<12}{C.END}")
+
+    print(f"{C.BOLD}{'─' * 70}{C.END}")
+
+    if args.model:
+        limits: dict = get_model_limits(args.model)
+        print(f"\n{C.BOLD}Current model ({args.model}) limits:{C.END}")
+        print(f"  Context: {C.GREEN}{limits['input']:,}{C.END} tokens")
+        print(f"  Max output: {C.YELLOW}{limits['output']:,}{C.END} tokens")
+
+    print()
+    sys.exit(0)
+
+
+# === Debug info ===
+
 if args.debug:
-    print(f"Debug: Using Perplexity API", file=sys.stderr)
+    print(f"Debug: Using Perplexity API (direct, no perplexipy)", file=sys.stderr)
     print(f"Debug: API key (partially hidden): {api_key[:5]}...{api_key[-4:]}", file=sys.stderr)
     print(f"Debug: Model: {args.model}", file=sys.stderr)
-    model_limits = get_model_limits(args.model)
-    print(f"Debug: Model limits - Input: {model_limits['input']:,} tokens, Output: {model_limits['output']:,} tokens", file=sys.stderr)
+    limits = get_model_limits(args.model)
+    print(f"Debug: Model limits - Context: {limits['input']:,}, Max output: {limits['output']:,}", file=sys.stderr)
 
-# Read file contents if any files were specified
-file_contents = []
+
+# === Read input ===
+
+file_contents: list[str] = []
 if args.files:
     for file_path in args.files:
         try:
             with open(file_path, 'r') as f:
-                file_content = f.read()
-                file_contents.append(f"=== File: {file_path} ===\n{file_content}\n")
+                file_contents.append(f"=== File: {file_path} ===\n{f.read()}\n")
         except IOError as e:
-            print(f"Warning: Could not read file {file_path}: {e}", file=stderr)
+            print(f"Warning: Could not read file {file_path}: {e}", file=sys.stderr)
 
-# Read from standard input only if there's data available
-query = ""
-# Check if stdin has data (not a terminal and has content)
-if not stdin.isatty() or stdin in select.select([stdin], [], [], 0)[0]:
-    query = stdin.read()
-# If no stdin and no prompt/files provided, show error
-elif not args.prompt and not args.files:
-    print("Error: No input provided. Use --prompt, -f/--file, or pipe input via stdin", file=stderr)
-    exit(1)
+query: str = ""
+if not sys.stdin.isatty() or sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+    query = sys.stdin.read()
+elif not args.prompt and not args.files and not args.embedding:
+    print("Error: No input provided. Use --prompt, -f/--file, or pipe input via stdin", file=sys.stderr)
+    sys.exit(1)
 
-# Combine file contents with query
-combined_parts = []
-
-# Add file contents first if any
+# Combine inputs
+combined_parts: list[str] = []
 if file_contents:
     combined_parts.extend(file_contents)
-
-# Add prompt if provided
 if args.prompt:
     combined_parts.append(args.prompt)
-
-# Add stdin content if any
 if query:
     combined_parts.append(query)
 
-# Combine all parts
-if combined_parts:
-    query = "\n".join(combined_parts)
-else:
-    query = ""
+query = "\n".join(combined_parts) if combined_parts else ""
 
-# Check if input might exceed model's context window
+# Warn if input might exceed context window
 if query and not args.embedding:
-    estimated_input_tokens = len(query) // 4  # Rough estimate: 4 chars per token
-    model_limits = get_model_limits(args.model)
-    if estimated_input_tokens > model_limits["input"]:
-        print(f"Warning: Input text (~{estimated_input_tokens:,} tokens) may exceed model's context limit ({model_limits['input']:,} tokens).", file=sys.stderr)
-        print(f"Consider using a model with larger context window or reducing input size.", file=sys.stderr)
+    estimated_input_tokens: int = len(query) // 4
+    limits = get_model_limits(args.model)
+    if estimated_input_tokens > limits["input"]:
+        print(f"Warning: Input text (~{estimated_input_tokens:,} tokens) may exceed model context ({limits['input']:,} tokens).", file=sys.stderr)
+        print(f"Consider using a model with larger context or reducing input size.", file=sys.stderr)
 
-# Load context if requested
-context_parts = []
+# Load conversation context
+context_parts: list[str] = []
 
-# Load today's context if --use-context is specified
 if args.use_context:
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    context = load_context_from_file(today_str)
+    today_str: str = datetime.now().strftime("%Y-%m-%d")
+    context: str | None = load_context_from_file(today_str, debug=args.debug)
     if context:
         context_parts.append(context)
 
-# Load specific date's context if --use-context-from is specified
 if args.use_context_from:
     try:
-        # Validate date format
         datetime.strptime(args.use_context_from, "%Y-%m-%d")
-        context = load_context_from_file(args.use_context_from)
+        context = load_context_from_file(args.use_context_from, debug=args.debug)
         if context:
             context_parts.append(context)
     except ValueError:
-        print(f"Error: Invalid date format '{args.use_context_from}'. Use YYYY-MM-DD format.", file=stderr)
-        exit(1)
+        print(f"Error: Invalid date format '{args.use_context_from}'. Use YYYY-MM-DD.", file=sys.stderr)
+        sys.exit(1)
 
-# Prepend context to query if any context was loaded
 if context_parts:
-    context_str = "\n".join(context_parts)
-    if query:
-        query = context_str + "\nCurrent Query:\n" + query
-    else:
-        query = context_str
+    context_str: str = "\n".join(context_parts)
+    query = context_str + "\nCurrent Query:\n" + query if query else context_str
 
-# Prepend personality and emoji prompts if specified
-prompt_parts = []
-
-# Add personality prompt if specified
+# Prepend personality and emoji prompts
+prompt_parts: list[str] = []
 if args.personality:
-    personality_prompt = get_personality_prompt(args.personality)
-    if personality_prompt:
-        prompt_parts.append(personality_prompt)
-
-# Add emoji prompt if specified
+    p: str = get_personality_prompt(args.personality)
+    if p:
+        prompt_parts.append(p)
 if args.emojis:
-    emoji_prompt = get_emoji_prompt(args.emojis)
-    if emoji_prompt:
-        prompt_parts.append(emoji_prompt)
-
-# Combine prompts with original query
+    e: str = get_emoji_prompt(args.emojis)
+    if e:
+        prompt_parts.append(e)
 if prompt_parts:
-    combined_prompt = "".join(prompt_parts)
-    if query:
-        query = combined_prompt + query
-    else:
-        query = combined_prompt.rstrip()  # Remove trailing newlines if no other content
+    combined_prompt: str = "".join(prompt_parts)
+    query = combined_prompt + query if query else combined_prompt.rstrip()
 
-# Print debug info for query if requested
 if args.debug:
     print(f"Debug: Query: {query[:100]}{'...' if len(query) > 100 else ''}", file=sys.stderr)
 
-# Handle dry-run mode
+
+# === Dry-run mode ===
+
 if args.dry_run:
     print("=== DRY-RUN MODE ===", file=sys.stderr)
-    print("API provider: Perplexity", file=sys.stderr)
+    print("API provider: Perplexity (direct HTTP)", file=sys.stderr)
     print(f"API key (partially hidden): {api_key[:5]}...{api_key[-4:]}", file=sys.stderr)
-    
-    # Mode-specific information
+
     if args.embedding:
-        print("\nMode: Embedding generation", file=sys.stderr)
-        print("API endpoint: (handled by perplexipy library)", file=sys.stderr)
-        print("HTTP method: POST", file=sys.stderr)
-        print(f"Embedding model: sonar-small-online", file=sys.stderr)
-        print("Request format: client.get_embedding(text, model='sonar-small-online')", file=sys.stderr)
-        
-        # Show truncated prompt
-        if query and len(query) <= 1000:
-            print(f"\nFull prompt:\n{query}", file=sys.stderr)
-        elif query:
-            print(f"\nFull prompt (truncated):\n{query[:1000]}... [truncated]", file=sys.stderr)
+        print(f"\nMode: Embedding generation", file=sys.stderr)
+        print(f"Endpoint: POST {API_BASE}/v1/embeddings", file=sys.stderr)
+        print(f"Embedding model: {args.embedding_model}", file=sys.stderr)
+        em_info: dict = EMBEDDING_MODELS.get(args.embedding_model, {})
+        print(f"Dimensions: {em_info.get('dimensions', 'unknown')}", file=sys.stderr)
+    elif args.search:
+        print(f"\nMode: Web Search (raw results, no LLM)", file=sys.stderr)
+        print(f"Endpoint: POST {API_BASE}/search", file=sys.stderr)
+        print(f"Max results: {args.max_results}", file=sys.stderr)
+        print(f"Cost: ~$0.005 per request (flat rate)", file=sys.stderr)
+        if args.country:
+            print(f"Country: {args.country}", file=sys.stderr)
+        if args.search_domains:
+            print(f"Domain filter: {', '.join(args.search_domains)}", file=sys.stderr)
+        if args.search_recency_filter:
+            print(f"Recency filter: {args.search_recency_filter}", file=sys.stderr)
+        if args.search_language_filter:
+            print(f"Language filter: {args.search_language_filter}", file=sys.stderr)
     else:
-        print("\nMode: Text generation", file=sys.stderr)
-        print("API endpoint: (handled by perplexipy library)", file=sys.stderr)
-        print("HTTP method: POST", file=sys.stderr)
+        print(f"\nMode: Chat completion", file=sys.stderr)
+        print(f"Endpoint: POST {API_BASE}/chat/completions", file=sys.stderr)
         print(f"Model: {args.model}", file=sys.stderr)
         print(f"Streaming: {not (args.json or args.no_streaming)}", file=sys.stderr)
-        
-        if args.json or args.no_streaming:
-            print("Request format: client.query(prompt)", file=sys.stderr)
-        else:
-            print("Request format: client.queryStreamable(prompt)", file=sys.stderr)
-        
-        # Show truncated prompt
-        if query and len(query) <= 1000:
-            print(f"\nFull prompt:\n{query}", file=sys.stderr)
-        elif query:
-            print(f"\nFull prompt (truncated):\n{query[:1000]}... [truncated]", file=sys.stderr)
-    
-    print("\nNote: Using perplexipy library for API interactions", file=sys.stderr)
-    print("Library handles request formatting and endpoint details internally", file=sys.stderr)
-    
+        if args.search_mode:
+            print(f"Search mode: {args.search_mode}", file=sys.stderr)
+        if args.search_domains:
+            print(f"Domain filter: {', '.join(args.search_domains)}", file=sys.stderr)
+        if args.search_recency_filter:
+            print(f"Recency filter: {args.search_recency_filter}", file=sys.stderr)
+        if args.disable_search:
+            print(f"Search: DISABLED", file=sys.stderr)
+        if args.reasoning_effort:
+            print(f"Reasoning effort: {args.reasoning_effort}", file=sys.stderr)
+        if args.temperature is not None:
+            print(f"Temperature: {args.temperature}", file=sys.stderr)
+        if args.top_p is not None:
+            print(f"Top-p: {args.top_p}", file=sys.stderr)
+        if args.max_tokens is not None:
+            print(f"Max tokens: {args.max_tokens}", file=sys.stderr)
+
+    if query and len(query) <= 1000:
+        print(f"\nFull prompt:\n{query}", file=sys.stderr)
+    elif query:
+        print(f"\nFull prompt (truncated):\n{query[:1000]}... [truncated]", file=sys.stderr)
+
     print("=== END DRY-RUN ===", file=sys.stderr)
-    exit(0)
+    sys.exit(0)
 
-# Check if PerplexityClient is available and create client
-if PerplexityClient is None:
-    print("Error: perplexipy library not found. Please ensure it's installed in the 'dev' distrobox.", file=sys.stderr)
-    exit(1)
 
-client = PerplexityClient(key=api_key)
-client.model = args.model
+# === Embedding mode ===
 
-# Execute the API call based on the request type
 if args.embedding:
-    # Use the get_embedding method for embeddings
-    # Note: Default to sonar-small-online model for embeddings
-    embedding_model = "sonar-small-online"
     if args.debug:
-        print(f"Debug: Generating embedding with model {embedding_model}", file=sys.stderr)
-    
-    # Track timing if summary mode
-    start_time = time.time() if args.summary else None
-    
+        print(f"Debug: Generating embedding with model {args.embedding_model}", file=sys.stderr)
+
+    start_time: float = time.time() if args.summary else 0.0
+
     try:
-        # Generate embedding
-        embedding = client.get_embedding(query, model=embedding_model)
-        # Output as JSON for semantic_search to parse
+        payload: dict = {
+            "model": args.embedding_model,
+            "input": query if query else "",
+        }
+
+        em_info = EMBEDDING_MODELS.get(args.embedding_model, {})
+        if em_info.get("dimensions"):
+            payload["dimensions"] = em_info["dimensions"]
+
+        response: dict = api_request("/v1/embeddings", payload, timeout=60)
+
+        embedding: list[float] = []
+        if "data" in response and len(response["data"]) > 0:
+            b64_embedding: str = response["data"][0].get("embedding", "")
+            if b64_embedding:
+                embedding = decode_embedding(b64_embedding)
+
         print(json.dumps({"embedding": embedding}))
-        
-        # Summary output for embeddings
+
         if args.summary:
-            end_time = time.time()
-            total_time = end_time - start_time
-            
-            # Add newline before summary
-            print(file=sys.stderr)
-            
-            # For embeddings, estimate token count
-            estimated_tokens = len(query) // 4
-            
-            # Calculate cost
-            cost_info = calculate_cost(
-                "sonar",  # Use sonar for embedding cost estimation
-                estimated_tokens,
-                0  # Embeddings have no output tokens
-            )
-            
-            # Print summary table
+            end_time: float = time.time()
+            total_time: float = end_time - start_time
+            usage: dict = response.get("usage", {})
+            input_tokens: int = usage.get("prompt_tokens", len(query) // 4)
+            price: float = em_info.get("price_per_m", 0.004)
+            cost_info: dict = {
+                "input_cost": (input_tokens / 1_000_000) * price,
+                "output_cost": 0.0,
+                "total_cost": (input_tokens / 1_000_000) * price,
+            }
             print_summary_table(
-                model="sonar-small-online",
-                input_tokens=estimated_tokens,
+                model=args.embedding_model,
+                input_tokens=input_tokens,
                 output_tokens=0,
                 total_time=total_time,
                 first_token_time=None,
                 cost_info=cost_info,
-                is_estimated=True,
-                use_color=not args.no_color
+                is_estimated=False,
+                use_color=use_colors(),
             )
+
+    except urllib.error.HTTPError as e:
+        error_body: str = e.read().decode("utf-8", errors="replace")
+        print(f"Error: API returned {e.code}: {error_body}", file=sys.stderr)
+        print(json.dumps({"embedding": []}))
     except Exception as e:
         if args.debug:
             print(f"Debug: Error generating embedding: {e}", file=sys.stderr)
-        # Fallback to empty embedding
         print(json.dumps({"embedding": []}))
-        
-# Execute normal query with or without streaming
-elif args.json or args.no_streaming:
-    # Use non-streaming version for clean output
-    if args.debug:
-        print(f"Debug: Executing non-streaming query", file=sys.stderr)
-    
-    # Track timing if summary mode
-    start_time = time.time() if args.summary else None
-    
-    result = client.query(query)
-    
-    # Enhance with emojis if requested
-    if args.enhance_emojis and result:
-        print("Enhancing response with emojis...", file=sys.stderr)
-        result = enhance_with_emojis(result)
-    
-    print(result)
-    
-    # Summary output for non-streaming
-    if args.summary:
-        end_time = time.time()
-        total_time = end_time - start_time
-        
-        # Add newline before summary
-        print(file=sys.stderr)
-        
-        # Estimate tokens (Perplexipy doesn't provide token counts)
-        estimated_input_tokens = len(query) // 4
-        estimated_output_tokens = len(result) // 4
-        
-        # Calculate cost
-        cost_info = calculate_cost(
-            args.model,
-            estimated_input_tokens,
-            estimated_output_tokens
-        )
-        
-        # Print summary table
-        print_summary_table(
-            model=args.model,
-            input_tokens=estimated_input_tokens,
-            output_tokens=estimated_output_tokens,
-            total_time=total_time,
-            first_token_time=None,
-            cost_info=cost_info,
-            is_estimated=True,
-            use_color=not args.no_color
-        )
-    
-    # Save chat transaction if not disabled
-    if not args.no_preserve and not args.embedding:
-        # Prepare metadata
-        metadata = {
-            'stream_mode': False,
-            'input_tokens': estimated_input_tokens,
-            'output_tokens': estimated_output_tokens,
-            'total_tokens': estimated_input_tokens + estimated_output_tokens,
-            'cost_info': cost_info,
-            'total_time': total_time
-        }
-        
-        save_chat_transaction("Perplexity", args.model, query, result, metadata)
-else:
-    # Use streaming version for interactive output
-    if args.debug:
-        print(f"Debug: Executing streaming query", file=sys.stderr)
-    
-    # Track timing if summary mode
-    start_time = time.time() if args.summary else None
-    first_token_time = None
-    accumulated_content = ""
-    
-    results = client.queryStreamable(query)
-    for result in results:
-        # Track first token time
-        if args.summary and first_token_time is None and result:
-            first_token_time = time.time()
-        
-        # flush since it may not have a '\n' to give it
-        # a streaming output appearance
-        if not args.enhance_emojis:
-            print(result, end="", flush=True)
-        accumulated_content += result
-    
-    # Enhance with emojis if requested (after streaming is complete)
-    if args.enhance_emojis and accumulated_content:
-        print("Enhancing response with emojis...", file=sys.stderr)
-        enhanced_content = enhance_with_emojis(accumulated_content)
-        print(enhanced_content)
-    elif not args.enhance_emojis:
-        # Add newline if we were streaming normally
-        print()
-    
-    # Summary output for streaming
-    if args.summary:
-        end_time = time.time()
-        total_time = end_time - start_time
-        
-        # Add newline before summary
-        print(file=sys.stderr)
-        
-        # Estimate tokens (Perplexipy doesn't provide token counts)
-        estimated_input_tokens = len(query) // 4
-        estimated_output_tokens = len(accumulated_content) // 4
-        
-        # Calculate cost
-        cost_info = calculate_cost(
-            args.model,
-            estimated_input_tokens,
-            estimated_output_tokens
-        )
-        
-        # Calculate time to first token
-        ttft = (first_token_time - start_time) if first_token_time else None
-        
-        # Print summary table
-        print_summary_table(
-            model=args.model,
-            input_tokens=estimated_input_tokens,
-            output_tokens=estimated_output_tokens,
-            total_time=total_time,
-            first_token_time=ttft,
-            cost_info=cost_info,
-            is_estimated=True,
-            use_color=not args.no_color
-        )
-    
-    # Save chat transaction if not disabled (for streaming)
-    if not args.no_preserve and not args.embedding and accumulated_content:
-        # Prepare metadata
-        metadata = {
-            'stream_mode': True,
-            'input_tokens': estimated_input_tokens,
-            'output_tokens': estimated_output_tokens,
-            'total_tokens': estimated_input_tokens + estimated_output_tokens,
-            'cost_info': cost_info,
-            'total_time': total_time,
-            'first_token_time': ttft
-        }
-        
-        save_chat_transaction("Perplexity", args.model, query, accumulated_content, metadata)
 
+    sys.exit(0)
+
+
+# === Search API mode ===
+
+if args.search:
+    if args.debug:
+        print("Debug: Using Search API (/search endpoint)", file=sys.stderr)
+
+    search_payload: dict = {
+        "query": query,
+        "max_results": max(1, min(20, args.max_results)),
+    }
+
+    if args.country:
+        search_payload["country"] = args.country
+    if args.search_domains:
+        search_payload["search_domain_filter"] = args.search_domains
+    if args.search_recency_filter:
+        search_payload["search_recency_filter"] = args.search_recency_filter
+    if args.search_language_filter:
+        search_payload["search_language_filter"] = [args.search_language_filter]
+    if args.search_after_date:
+        search_payload["search_after_date_filter"] = args.search_after_date
+    if args.search_before_date:
+        search_payload["search_before_date_filter"] = args.search_before_date
+
+    if args.debug:
+        print(f"Debug: Payload: {json.dumps(search_payload, indent=2)}", file=sys.stderr)
+
+    if args.dry_run:
+        print("=== DRY-RUN MODE ===", file=sys.stderr)
+        print(f"Endpoint: POST {API_BASE}/search", file=sys.stderr)
+        print(f"Payload: {json.dumps(search_payload, indent=2)}", file=sys.stderr)
+        print("=== END DRY-RUN ===", file=sys.stderr)
+        sys.exit(0)
+
+    start_time = time.time() if args.summary else 0.0
+
+    try:
+        response = api_request("/search", search_payload, timeout=30)
+        results: list = response.get("results", [])
+
+        if args.links_only:
+            for r in results:
+                print(r.get("url", ""))
+        elif args.json or args.no_streaming:
+            print(json.dumps(response, indent=2))
+        else:
+            print_search_results(results, use_color=use_colors())
+
+        if args.summary:
+            end_time = time.time()
+            total_time = end_time - start_time
+            print(f"\nSearch completed in {total_time:.2f}s | {len(results)} results | Cost: ~$0.005", file=sys.stderr)
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        print(f"Error: API returned {e.code}: {error_body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Error: Could not connect to API: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+    sys.exit(0)
+
+
+# === Build chat completion request ===
+
+def build_payload(query_text: str, stream: bool = False) -> dict:
+    """Build the chat/completions request payload from args and query text."""
+    messages: list[dict] = []
+
+    # Add system message if personality is set
+    if args.personality:
+        system_content: str = get_personality_prompt(args.personality).strip()
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+            # Remove personality from user query since it's now in system message
+            personality_prompt: str = get_personality_prompt(args.personality)
+            if query_text.startswith(personality_prompt):
+                query_text = query_text[len(personality_prompt):]
+
+    messages.append({"role": "user", "content": query_text})
+
+    payload: dict = {
+        "model": args.model,
+        "messages": messages,
+        "stream": stream,
+    }
+
+    # Generation parameters
+    if args.max_tokens is not None:
+        payload["max_tokens"] = args.max_tokens
+    if args.temperature is not None:
+        payload["temperature"] = args.temperature
+    if args.top_p is not None:
+        payload["top_p"] = args.top_p
+
+    # Search options
+    if args.disable_search:
+        payload["disable_search"] = True
+    if args.enable_search_classifier:
+        payload["enable_search_classifier"] = True
+    if args.search_mode:
+        payload["search_mode"] = args.search_mode
+    if args.search_domains:
+        payload["search_domain_filter"] = args.search_domains
+    if args.search_recency_filter:
+        payload["search_recency_filter"] = args.search_recency_filter
+    if args.search_language_filter:
+        payload["search_language_filter"] = args.search_language_filter
+    if args.search_after_date:
+        payload["search_after_date_filter"] = args.search_after_date
+    if args.search_before_date:
+        payload["search_before_date_filter"] = args.search_before_date
+
+    # Web search options
+    web_search_opts: dict = {}
+    if args.search_context_size and args.search_context_size != "low":
+        web_search_opts["search_context_size"] = args.search_context_size
+    if web_search_opts:
+        payload["web_search_options"] = web_search_opts
+
+    # Response enrichment
+    if args.return_images:
+        payload["return_images"] = True
+    if args.return_related_questions:
+        payload["return_related_questions"] = True
+
+    # Reasoning
+    if args.reasoning_effort:
+        payload["reasoning_effort"] = args.reasoning_effort
+
+    # Language preference
+    if args.language_preference:
+        payload["language_preference"] = args.language_preference
+
+    return payload
+
+
+# === Execute chat completion ===
+
+# Use longer timeout for deep research
+timeout: int = 600 if args.model == "sonar-deep-research" else 120
+
+if args.json or args.no_streaming:
+    # Non-streaming mode
+    if args.debug:
+        print("Debug: Executing non-streaming query", file=sys.stderr)
+
+    start_time = time.time() if args.summary else 0.0
+
+    try:
+        payload = build_payload(query, stream=False)
+
+        if args.debug:
+            print(f"Debug: Payload: {json.dumps(payload, indent=2)[:500]}", file=sys.stderr)
+
+        response = api_request("/chat/completions", payload, timeout=timeout)
+
+        result: str = ""
+        if "choices" in response and len(response["choices"]) > 0:
+            result = response["choices"][0]["message"]["content"]
+
+        citations_list: list = response.get("citations", [])
+        related_questions: list = response.get("related_questions", [])
+
+        # Enhance with emojis if requested
+        if args.enhance_emojis and result:
+            print("Enhancing response with emojis...", file=sys.stderr)
+            result = enhance_with_emojis(result)
+
+        print(result)
+
+        # Show citations if requested
+        if args.citations:
+            print_citations(citations_list, use_color=use_colors())
+        if args.return_related_questions and related_questions:
+            print_related_questions(related_questions, use_color=use_colors())
+
+        # Usage stats from API response
+        usage = response.get("usage", {})
+        input_tokens = usage.get("prompt_tokens", len(query) // 4)
+        output_tokens: int = usage.get("completion_tokens", len(result) // 4)
+        is_estimated: bool = "prompt_tokens" not in usage
+
+        cost_info = calculate_cost(args.model, input_tokens, output_tokens)
+
+        if args.summary:
+            end_time = time.time()
+            total_time = end_time - start_time
+            print_summary_table(
+                model=args.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_time=total_time,
+                first_token_time=None,
+                cost_info=cost_info,
+                is_estimated=is_estimated,
+                use_color=use_colors(),
+                citations=citations_list,
+            )
+
+        # Save chat transaction
+        if not args.no_preserve:
+            total_time_val: float = time.time() - start_time if start_time else 0.0
+            metadata: dict = {
+                'stream_mode': False,
+                'input_tokens': input_tokens,
+                'output_tokens': output_tokens,
+                'total_tokens': input_tokens + output_tokens,
+                'cost_info': cost_info,
+                'total_time': total_time_val,
+                'citations': citations_list,
+            }
+            save_chat_transaction("Perplexity", args.model, query, result, metadata)
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        print(f"Error: API returned {e.code}: {error_body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Error: Could not connect to API: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+else:
+    # Streaming mode
+    if args.debug:
+        print("Debug: Executing streaming query", file=sys.stderr)
+
+    start_time = time.time() if args.summary else 0.0
+    first_token_time: float | None = None
+    accumulated_content: str = ""
+    citations_list = []
+    related_questions = []
+    usage = {}
+
+    try:
+        payload = build_payload(query, stream=True)
+
+        if args.debug:
+            print(f"Debug: Payload: {json.dumps(payload, indent=2)[:500]}", file=sys.stderr)
+
+        resp = api_request("/chat/completions", payload, stream=True, timeout=timeout)
+
+        for raw_line in resp:
+            line: str = raw_line.decode("utf-8").rstrip("\n\r")
+
+            if not line or not line.startswith("data: "):
+                continue
+
+            data: str = line[6:]
+            if data.strip() == "[DONE]":
+                break
+
+            try:
+                chunk: dict = json.loads(data)
+            except json.JSONDecodeError:
+                if args.debug:
+                    print(f"Debug: Could not parse SSE chunk: {data[:100]}", file=sys.stderr)
+                continue
+
+            # Extract content delta
+            if "choices" in chunk and len(chunk["choices"]) > 0:
+                delta: dict = chunk["choices"][0].get("delta", {})
+                content: str = delta.get("content", "")
+
+                if content:
+                    if args.summary and first_token_time is None:
+                        first_token_time = time.time()
+
+                    if not args.enhance_emojis:
+                        print(content, end="", flush=True)
+                    accumulated_content += content
+
+            # Capture usage from final chunk
+            if "usage" in chunk:
+                usage = chunk["usage"]
+            if "citations" in chunk:
+                citations_list = chunk["citations"]
+            if "related_questions" in chunk:
+                related_questions = chunk["related_questions"]
+
+        resp.close()
+
+        # Enhance with emojis if requested (after streaming completes)
+        if args.enhance_emojis and accumulated_content:
+            print("Enhancing response with emojis...", file=sys.stderr)
+            enhanced: str = enhance_with_emojis(accumulated_content)
+            print(enhanced)
+        elif not args.enhance_emojis:
+            print()
+
+        # Show citations if requested
+        if args.citations:
+            print_citations(citations_list, use_color=use_colors())
+        if args.return_related_questions and related_questions:
+            print_related_questions(related_questions, use_color=use_colors())
+
+        # Usage stats
+        input_tokens = usage.get("prompt_tokens", len(query) // 4)
+        output_tokens = usage.get("completion_tokens", len(accumulated_content) // 4)
+        is_estimated = "prompt_tokens" not in usage
+
+        cost_info = calculate_cost(args.model, input_tokens, output_tokens)
+
+        if args.summary:
+            end_time = time.time()
+            total_time = end_time - start_time
+            ttft: float | None = (first_token_time - start_time) if first_token_time else None
+
+            print_summary_table(
+                model=args.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_time=total_time,
+                first_token_time=ttft,
+                cost_info=cost_info,
+                is_estimated=is_estimated,
+                use_color=use_colors(),
+                citations=citations_list,
+            )
+
+        # Save chat transaction
+        if not args.no_preserve and accumulated_content:
+            total_time_val = time.time() - start_time if start_time else 0.0
+            ttft_val: float | None = (first_token_time - start_time) if first_token_time else None
+            metadata = {
+                'stream_mode': True,
+                'input_tokens': input_tokens,
+                'output_tokens': output_tokens,
+                'total_tokens': input_tokens + output_tokens,
+                'cost_info': cost_info,
+                'total_time': total_time_val,
+                'first_token_time': ttft_val,
+                'citations': citations_list,
+            }
+            save_chat_transaction("Perplexity", args.model, query, accumulated_content, metadata)
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        print(f"Error: API returned {e.code}: {error_body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Error: Could not connect to API: {e.reason}", file=sys.stderr)
+        sys.exit(1)
