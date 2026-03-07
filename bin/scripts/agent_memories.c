@@ -2407,6 +2407,48 @@ cmd_mcp (AppState *app)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Tag helpers
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Merge a CSV --tags string into an existing --tag string array.
+ * Splits `csv` on commas, trims whitespace, appends each tag to `*tags`.
+ * Updates `*n_tags` with the new count.
+ */
+static void
+_merge_csv_tags (const gchar *csv, gchar ***tags, gint *n_tags)
+{
+    gchar **parts;
+    gint    i, n_parts, n_existing;
+
+    if (csv == NULL || *csv == '\0')
+        return;
+
+    parts = g_strsplit (csv, ",", -1);
+    n_parts = (gint)g_strv_length (parts);
+    n_existing = *tags ? (gint)g_strv_length (*tags) : 0;
+
+    /* Build a new array: existing tags + csv tags + NULL */
+    gchar **merged = g_new0 (gchar *, n_existing + n_parts + 1);
+
+    for (i = 0; i < n_existing; i++)
+        merged[i] = g_strdup ((*tags)[i]);
+
+    gint out = n_existing;
+    for (i = 0; i < n_parts; i++) {
+        gchar *t = g_strstrip (parts[i]);
+        if (*t != '\0')
+            merged[out++] = g_strdup (t);
+    }
+    merged[out] = NULL;
+
+    g_strfreev (parts);
+    g_strfreev (*tags);
+    *tags   = merged;
+    *n_tags = out;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * CLI command handlers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -2416,7 +2458,7 @@ cmd_add (AppState *app, gint argc, gchar **argv)
     g_autofree gchar *summary = NULL, *category = NULL, *subcategory = NULL;
     g_autofree gchar *importance = NULL, *source = NULL, *source_context = NULL;
     g_autofree gchar *conversation_id = NULL, *related_to = NULL;
-    g_autofree gchar *metadata_str = NULL, *expires = NULL;
+    g_autofree gchar *metadata_str = NULL, *expires = NULL, *tags_csv = NULL;
     gchar **tags = NULL;
     gboolean pin = FALSE;
     gdouble confidence = 1.0;
@@ -2430,6 +2472,7 @@ cmd_add (AppState *app, gint argc, gchar **argv)
         { "source-context",    0, 0, G_OPTION_ARG_STRING,       &source_context, "Source context", "CTX" },
         { "conversation-id",   0, 0, G_OPTION_ARG_STRING,       &conversation_id, "Conversation ID", "ID" },
         { "tag",             't', 0, G_OPTION_ARG_STRING_ARRAY, &tags, "Tag (repeatable)", "TAG" },
+        { "tags",              0, 0, G_OPTION_ARG_STRING,       &tags_csv, "Tags (comma-separated)", "TAGS" },
         { "related-to",        0, 0, G_OPTION_ARG_STRING,       &related_to, "Related memory UUID", "UUID" },
         { "pin",               0, 0, G_OPTION_ARG_NONE,         &pin, "Pin this memory", NULL },
         { "metadata",          0, 0, G_OPTION_ARG_STRING,       &metadata_str, "JSON metadata", "JSON" },
@@ -2467,6 +2510,7 @@ cmd_add (AppState *app, gint argc, gchar **argv)
     }
 
     gint n_tags = tags ? (gint)g_strv_length (tags) : 0;
+    _merge_csv_tags (tags_csv, &tags, &n_tags);
     g_autofree gchar *exp_str = expires ? parse_expiry (expires) : NULL;
 
     gchar *mid = db_add_memory (app, content, summary, category, subcategory,
@@ -2539,6 +2583,7 @@ cmd_list (AppState *app, gint argc, gchar **argv)
 {
     g_autofree gchar *category = NULL, *subcategory = NULL, *importance = NULL;
     g_autofree gchar *source = NULL, *cols = NULL, *format = NULL, *sort = NULL;
+    g_autofree gchar *tags_csv = NULL;
     gchar **tags = NULL;
     gboolean pinned = FALSE, include_archived = FALSE, only_archived = FALSE, ascending = FALSE, all = FALSE;
     gint limit = 50, offset = 0;
@@ -2551,6 +2596,7 @@ cmd_list (AppState *app, gint argc, gchar **argv)
         { "importance",       0, 0, G_OPTION_ARG_STRING,       &importance, "Filter importance", "IMP" },
         { "source",           0, 0, G_OPTION_ARG_STRING,       &source, "Filter source", "SRC" },
         { "tag",            't', 0, G_OPTION_ARG_STRING_ARRAY, &tags, "Filter tag", "TAG" },
+        { "tags",              0, 0, G_OPTION_ARG_STRING,       &tags_csv, "Filter tags (comma-separated)", "TAGS" },
         { "pinned",           0, 0, G_OPTION_ARG_NONE,         &pinned, "Only pinned", NULL },
         { "include-archived", 0, 0, G_OPTION_ARG_NONE,         &include_archived, "Include archived", NULL },
         { "only-archived",    0, 0, G_OPTION_ARG_NONE,         &only_archived, "Only archived", NULL },
@@ -2570,6 +2616,7 @@ cmd_list (AppState *app, gint argc, gchar **argv)
     }
 
     gint n_tags = tags ? (gint)g_strv_length (tags) : 0;
+    _merge_csv_tags (tags_csv, &tags, &n_tags);
     GPtrArray *mems = db_list_memories (app->conn, category, subcategory, importance,
         tags, n_tags, source, pinned ? 1 : -1,
         include_archived, only_archived, all ? -1 : limit, offset,
