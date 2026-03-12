@@ -3,6 +3,20 @@ stow: dep_dirs
     #!/usr/bin/env bash
     set -euxo pipefail
 
+    # build ignore flags for all known hostnames except the current host
+    CURRENT_HOST=$(hostname -s)
+    KNOWN_HOSTS=(lt-zach hacbook libreclaw-00 srv-zach)
+    IGNORE_FLAGS=()
+    for h in "${KNOWN_HOSTS[@]}"; do
+        if [[ "$h" != "$CURRENT_HOST" ]]; then
+            IGNORE_FLAGS+=("--ignore=${h}")
+            # srv-zach also appears without hyphen in one mount filename
+            if [[ "$h" == "srv-zach" ]]; then
+                IGNORE_FLAGS+=("--ignore=srvzach")
+            fi
+        fi
+    done
+
     stow \
         --ignore=LICENSE \
         --ignore=Justfile \
@@ -14,6 +28,7 @@ stow: dep_dirs
         --ignore=share \
         --ignore=.gitconfig \
         --ignore=deps \
+        "${IGNORE_FLAGS[@]}" \
         .
 
     # stow vimban submodule as its own package
@@ -36,6 +51,20 @@ stow_alt: dep_dirs
     #!/usr/bin/env bash
     set -euxo pipefail
 
+    # build ignore flags for all known hostnames except the current host
+    CURRENT_HOST=$(hostname -s)
+    KNOWN_HOSTS=(lt-zach hacbook libreclaw-00 srv-zach)
+    IGNORE_FLAGS=()
+    for h in "${KNOWN_HOSTS[@]}"; do
+        if [[ "$h" != "$CURRENT_HOST" ]]; then
+            IGNORE_FLAGS+=("--ignore=${h}")
+            # srv-zach also appears without hyphen in one mount filename
+            if [[ "$h" == "srv-zach" ]]; then
+                IGNORE_FLAGS+=("--ignore=srvzach")
+            fi
+        fi
+    done
+
     stow \
         --ignore=LICENSE \
         --ignore=Justfile \
@@ -47,6 +76,7 @@ stow_alt: dep_dirs
         --ignore=share \
         --ignore=.gitconfig \
         --ignore=deps \
+        "${IGNORE_FLAGS[@]}" \
         .
 
     # stow vimban submodule as its own package
@@ -75,10 +105,23 @@ unstow:
 
 # dry-run
 dry: dep_dirs
-    #!/usr/bin/env bash 
+    #!/usr/bin/env bash
     set -euxo pipefail
 
-    stow --ignore=Justfile --simulate -v .
+    # build ignore flags for all known hostnames except the current host
+    CURRENT_HOST=$(hostname -s)
+    KNOWN_HOSTS=(lt-zach hacbook libreclaw-00 srv-zach)
+    IGNORE_FLAGS=()
+    for h in "${KNOWN_HOSTS[@]}"; do
+        if [[ "$h" != "$CURRENT_HOST" ]]; then
+            IGNORE_FLAGS+=("--ignore=${h}")
+            if [[ "$h" == "srv-zach" ]]; then
+                IGNORE_FLAGS+=("--ignore=srvzach")
+            fi
+        fi
+    done
+
+    stow --ignore=Justfile --simulate -v "${IGNORE_FLAGS[@]}" .
 
 
 # test on the whole repo
