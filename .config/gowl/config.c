@@ -73,8 +73,20 @@ gowl_config_init(void)
         "mfact", 0.55,
         NULL);
 
+    return TRUE;
+}
+
+/*
+ * gowl_config_ready:
+ *
+ * Called once after the compositor is fully started and the
+ * Wayland display is ready to accept clients.  Use this to
+ * spawn status bars, notification daemons, or other Wayland
+ * clients that need a running compositor.
+ */
+G_MODULE_EXPORT void
+gowl_config_ready(void)
+{
     /* Launch the status bar */
     spawn_gowlbar();
-
-    return TRUE;
 }
