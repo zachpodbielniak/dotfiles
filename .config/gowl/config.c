@@ -9,7 +9,11 @@
  * #define GOWL_BUILD_ARGS "-I/custom/path"
  */
 
+#define CRISPY_PARAMS "$(pkg-config --cflags wlroots-0.19)"
+
+#define WLR_USE_UNSTABLE
 #include <gowl/gowl.h>
+#include <wlr/types/wlr_output.h>
 
 /*
  * Extern references to compositor objects.
@@ -77,6 +81,40 @@ gowl_config_init(void)
 }
 
 /*
+ * configure_monitors:
+ *
+ * Hostname-conditional monitor configuration.  On libreclaw-00,
+ * sets Virtual-1 to 1920x1200@60Hz (the VM's preferred mode
+ * is only 1280x800).
+ */
+static void
+configure_monitors(void)
+{
+    GList *monitors;
+    GList *l;
+
+    if (g_strcmp0(g_get_host_name(), "libreclaw-00") != 0)
+        return;
+
+    monitors = gowl_compositor_get_monitors(gowl_compositor);
+    for (l = monitors; l != NULL; l = l->next) {
+        GowlMonitor *mon = GOWL_MONITOR(l->data);
+        const gchar *name = gowl_monitor_get_name(mon);
+
+        if (g_strcmp0(name, "Virtual-1") == 0) {
+            struct wlr_output *output = gowl_monitor_get_wlr_output(mon);
+            struct wlr_output_state state;
+
+            wlr_output_state_init(&state);
+            wlr_output_state_set_custom_mode(&state, 1920, 1200, 60000);
+            wlr_output_commit_state(output, &state);
+            wlr_output_state_finish(&state);
+            break;
+        }
+    }
+}
+
+/*
  * gowl_config_ready:
  *
  * Called once after the compositor is fully started and the
@@ -87,6 +125,9 @@ gowl_config_init(void)
 G_MODULE_EXPORT void
 gowl_config_ready(void)
 {
+    /* Apply monitor overrides */
+    configure_monitors();
+
     /* Launch the status bar */
     spawn_gowlbar();
 }
