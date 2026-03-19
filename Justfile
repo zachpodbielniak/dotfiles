@@ -157,6 +157,10 @@ dep_dirs:
     mkdir -p $HOME/.config/mpd
     mkdir -p $HOME/.config/tmux/plugins
     mkdir -p $HOME/.config/vimban
+    
+    mkdir -p $HOME/.claude/agents
+    mkdir -p $HOME/.claude/agent-memory
+    mkdir -p $HOME/.opencode/skills
 
 
 # install deps
