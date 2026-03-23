@@ -162,6 +162,8 @@ dep_dirs:
     mkdir -p $HOME/.claude/agent-memory
     mkdir -p $HOME/.opencode/skills
 
+    mkdir -p $HOME/.librewolf/native-messaging-hosts
+
 
 # install deps
 bootstrap:
