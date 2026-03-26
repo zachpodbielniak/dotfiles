@@ -136,6 +136,9 @@ _have bat && alias cat="bat --theme='Catppuccin Mocha' --paging=never"
 # mutt alias 
 _have neomutt && alias mutt="neomutt" && alias m="mutt" 
 
+# system command aliases 
+alias ls="ls --color=auto"
+
 # common things
 alias flatpak="flatpak --user"
 alias gpia="curl https://icanhazip.com"
