@@ -56,7 +56,7 @@ _set_editor() {
 _path_prepend \
     "${HOME}/.local/bin" \
     "${HOME}/.cargo/bin" \
-    "/var/home/linuxbrew/.linuxbrew/bin" \
+    "${HOME}/../linuxbrew/.linuxbrew/bin" \
     "/nix/var/nix/profiles/default/bin" \
     "${HOME}/perl5/bin" \
     "${HOME}/bin" \
