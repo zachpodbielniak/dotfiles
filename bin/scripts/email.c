@@ -861,8 +861,41 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 				 "------------------------", "-------");
 	}
 
-	for (it = clist_begin (fetch_result); it; it = clist_next (it)) {
-		struct mailimap_msg_att *msg_att;
+	/* Collect fetch results into a GPtrArray so we can sort by UID desc */
+	GPtrArray *msg_arr = g_ptr_array_new ();
+	for (it = clist_begin (fetch_result); it; it = clist_next (it))
+		g_ptr_array_add (msg_arr, clist_content (it));
+
+	/* Sort by UID descending — extract UID from each msg_att for comparison */
+	g_ptr_array_sort (msg_arr, (GCompareFunc) ({
+		int _cmp (gconstpointer a, gconstpointer b) {
+			struct mailimap_msg_att *ma = *(struct mailimap_msg_att **) a;
+			struct mailimap_msg_att *mb = *(struct mailimap_msg_att **) b;
+			uint32_t ua = 0, ub = 0;
+			clistiter *ci;
+			for (ci = clist_begin (ma->att_list); ci; ci = clist_next (ci)) {
+				struct mailimap_msg_att_item *it2 = clist_content (ci);
+				if (it2->att_type == MAILIMAP_MSG_ATT_ITEM_STATIC &&
+					it2->att_data.att_static->att_type == MAILIMAP_MSG_ATT_UID) {
+					ua = it2->att_data.att_static->att_data.att_uid;
+					break;
+				}
+			}
+			for (ci = clist_begin (mb->att_list); ci; ci = clist_next (ci)) {
+				struct mailimap_msg_att_item *it2 = clist_content (ci);
+				if (it2->att_type == MAILIMAP_MSG_ATT_ITEM_STATIC &&
+					it2->att_data.att_static->att_type == MAILIMAP_MSG_ATT_UID) {
+					ub = it2->att_data.att_static->att_data.att_uid;
+					break;
+				}
+			}
+			return (ub > ua) ? 1 : (ub < ua) ? -1 : 0;
+		};
+		_cmp;
+	}));
+
+	for (guint mi = 0; mi < msg_arr->len; mi++) {
+		struct mailimap_msg_att *msg_att = g_ptr_array_index (msg_arr, mi);
 		clistiter *ait;
 		struct mailimap_envelope *env = NULL;
 		uint32_t uid = 0;
@@ -1145,6 +1178,8 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 			mailimap_store_att_flags_free (store_flags);
 		}
 	}
+
+	g_ptr_array_free (msg_arr, TRUE);
 
 	/* Finalize JSON output */
 	if (json_output && jb) {
