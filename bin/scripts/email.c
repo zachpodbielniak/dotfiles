@@ -205,6 +205,27 @@ format_rfc2822_date (void)
 	return g_strdup (buf);
 }
 
+/* Decode RFC 2047 MIME encoded-words (e.g. =?utf-8?q?Hello?=) to UTF-8 */
+static gchar *
+decode_mime_header (const gchar *raw)
+{
+	char *decoded = NULL;
+	size_t idx = 0;
+	int r;
+
+	if (!raw || !*raw)
+		return g_strdup ("");
+
+	r = mailmime_encoded_phrase_parse ("utf-8", raw, strlen (raw),
+									   &idx, "utf-8", &decoded);
+	if (r != MAILIMF_NO_ERROR || !decoded)
+		return g_strdup (raw);
+
+	gchar *result = g_strdup (decoded);
+	free (decoded);
+	return result;
+}
+
 static const gchar *
 get_first_from_addr (struct mailimap_envelope *env)
 {
@@ -918,7 +939,10 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 			json_builder_set_member_name (jb, "from");
 			json_builder_add_string_value (jb, get_first_from_addr (env));
 			json_builder_set_member_name (jb, "subject");
-			json_builder_add_string_value (jb, env->env_subject ? env->env_subject : "");
+			{
+				g_autofree gchar *subj_dec = decode_mime_header (env->env_subject);
+				json_builder_add_string_value (jb, subj_dec);
+			}
 			json_builder_set_member_name (jb, "seen");
 			json_builder_add_boolean_value (jb, is_seen);
 			json_builder_set_member_name (jb, "flagged");
@@ -929,12 +953,94 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 				json_builder_set_member_name (jb, "body");
 				json_builder_add_string_value (jb, body_copy);
 			}
+
+			/* Extract content_type and charset from BODYSTRUCTURE */
+			if ((full || uid_val) && bodystructure) {
+				const gchar *ct_type = NULL;
+				const gchar *ct_subtype = NULL;
+				struct mailimap_body_fld_param *ct_params = NULL;
+
+				if (bodystructure->bd_type == MAILIMAP_BODY_1PART) {
+					struct mailimap_body_type_1part *op;
+					op = bodystructure->bd_data.bd_body_1part;
+					if (op->bd_type == MAILIMAP_BODY_TYPE_1PART_TEXT) {
+						ct_type = "text";
+						ct_subtype = op->bd_data.bd_type_text->bd_media_text;
+						ct_params = op->bd_data.bd_type_text->bd_fields->bd_parameter;
+					} else if (op->bd_type == MAILIMAP_BODY_TYPE_1PART_BASIC) {
+						struct mailimap_media_basic *mb;
+						mb = op->bd_data.bd_type_basic->bd_media_basic;
+						if (mb) {
+							switch (mb->med_type) {
+							case MAILIMAP_MEDIA_BASIC_APPLICATION: ct_type = "application"; break;
+							case MAILIMAP_MEDIA_BASIC_AUDIO:       ct_type = "audio";       break;
+							case MAILIMAP_MEDIA_BASIC_IMAGE:       ct_type = "image";       break;
+							case MAILIMAP_MEDIA_BASIC_MESSAGE:     ct_type = "message";     break;
+							case MAILIMAP_MEDIA_BASIC_VIDEO:       ct_type = "video";       break;
+							default:                               ct_type = mb->med_basic_type; break;
+							}
+							ct_subtype = mb->med_subtype;
+						}
+						ct_params = op->bd_data.bd_type_basic->bd_fields->bd_parameter;
+					}
+				} else if (bodystructure->bd_type == MAILIMAP_BODY_MPART) {
+					/* For multipart, find the first text part */
+					struct mailimap_body_type_mpart *mpart;
+					clistiter *mpit;
+					mpart = bodystructure->bd_data.bd_body_mpart;
+					if (mpart && mpart->bd_list) {
+						for (mpit = clist_begin (mpart->bd_list); mpit; mpit = clist_next (mpit)) {
+							struct mailimap_body *bpart;
+							bpart = (struct mailimap_body *) clist_content (mpit);
+							if (bpart->bd_type == MAILIMAP_BODY_1PART) {
+								struct mailimap_body_type_1part *op2;
+								op2 = bpart->bd_data.bd_body_1part;
+								if (op2->bd_type == MAILIMAP_BODY_TYPE_1PART_TEXT) {
+									ct_type = "text";
+									ct_subtype = op2->bd_data.bd_type_text->bd_media_text;
+									ct_params = op2->bd_data.bd_type_text->bd_fields->bd_parameter;
+									break;
+								}
+							}
+						}
+					}
+				}
+
+				if (ct_type && ct_subtype) {
+					g_autofree gchar *full_ct = g_strdup_printf ("%s/%s",
+						ct_type, ct_subtype);
+					/* Lowercase it */
+					gchar *p;
+					for (p = full_ct; *p; p++)
+						*p = g_ascii_tolower (*p);
+					json_builder_set_member_name (jb, "content_type");
+					json_builder_add_string_value (jb, full_ct);
+				}
+
+				/* Extract charset from body field params */
+				if (ct_params && ct_params->pa_list) {
+					clistiter *cpit;
+					for (cpit = clist_begin (ct_params->pa_list); cpit; cpit = clist_next (cpit)) {
+						struct mailimap_single_body_fld_param *prm;
+						prm = (struct mailimap_single_body_fld_param *) clist_content (cpit);
+						if (prm->pa_name && g_ascii_strcasecmp (prm->pa_name, "charset") == 0) {
+							json_builder_set_member_name (jb, "charset");
+							json_builder_add_string_value (jb, prm->pa_value ? prm->pa_value : "utf-8");
+							break;
+						}
+					}
+				}
+			}
+
 			json_builder_end_object (jb);
 		} else if (full || uid_val) {
 			g_print ("UID: %u\n", (unsigned) uid);
 			g_print ("Date: %s\n", env->env_date ? env->env_date : "(none)");
 			g_print ("From: %s\n", get_first_from_addr (env));
-			g_print ("Subject: %s\n", env->env_subject ? env->env_subject : "(none)");
+			{
+				g_autofree gchar *subj_dec = decode_mime_header (env->env_subject);
+				g_print ("Subject: %s\n", subj_dec);
+			}
 			g_print ("Status: %s%s\n",
 				is_seen ? "read" : "unread",
 				is_flagged ? ", flagged" : "");
@@ -1015,9 +1121,11 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 
 			g_strlcpy (from_trunc, get_first_from_addr (env), sizeof (from_trunc));
 
-			g_print ("%-8s  %-26s  %-24s  %s\n",
-					 uid_str, date_trunc, from_trunc,
-					 env->env_subject ? env->env_subject : "(none)");
+			{
+				g_autofree gchar *subj_dec = decode_mime_header (env->env_subject);
+				g_print ("%-8s  %-26s  %-24s  %s\n",
+						 uid_str, date_trunc, from_trunc, subj_dec);
+			}
 		}
 
 		/* Mark as read if requested */
@@ -1787,7 +1895,10 @@ cmd_search (EmailConfig *cfg, int argc, char **argv)
 			json_builder_set_member_name (jb, "from");
 			json_builder_add_string_value (jb, get_first_from_addr (env));
 			json_builder_set_member_name (jb, "subject");
-			json_builder_add_string_value (jb, env->env_subject ? env->env_subject : "");
+			{
+				g_autofree gchar *subj_dec = decode_mime_header (env->env_subject);
+				json_builder_add_string_value (jb, subj_dec);
+			}
 			json_builder_end_object (jb);
 		} else {
 			gchar uid_str[16];
@@ -1801,9 +1912,11 @@ cmd_search (EmailConfig *cfg, int argc, char **argv)
 				g_strlcpy (date_trunc, "(none)", sizeof (date_trunc));
 			g_strlcpy (from_trunc, get_first_from_addr (env), sizeof (from_trunc));
 
-			g_print ("%-8s  %-26s  %-24s  %s\n",
-				uid_str, date_trunc, from_trunc,
-				env->env_subject ? env->env_subject : "(none)");
+			{
+				g_autofree gchar *subj_dec = decode_mime_header (env->env_subject);
+				g_print ("%-8s  %-26s  %-24s  %s\n",
+					uid_str, date_trunc, from_trunc, subj_dec);
+			}
 		}
 	}
 
@@ -2470,7 +2583,10 @@ mcp_handle_read (McpContext *mctx, JsonObject *args)
 		json_builder_set_member_name (jb, "from");
 		json_builder_add_string_value (jb, get_first_from_addr (env));
 		json_builder_set_member_name (jb, "subject");
-		json_builder_add_string_value (jb, env->env_subject ? env->env_subject : "");
+		{
+			g_autofree gchar *subj_dec = decode_mime_header (env->env_subject);
+			json_builder_add_string_value (jb, subj_dec);
+		}
 
 		if ((full || uid_val) && body_text && body_len > 0) {
 			g_autofree gchar *body_copy = g_strndup (body_text, body_len);
@@ -3154,7 +3270,10 @@ mcp_handle_search (McpContext *mctx, JsonObject *args)
 		json_builder_set_member_name (jb, "from");
 		json_builder_add_string_value (jb, get_first_from_addr (env));
 		json_builder_set_member_name (jb, "subject");
-		json_builder_add_string_value (jb, env->env_subject ? env->env_subject : "");
+		{
+			g_autofree gchar *subj_dec = decode_mime_header (env->env_subject);
+			json_builder_add_string_value (jb, subj_dec);
+		}
 		json_builder_end_object (jb);
 	}
 
