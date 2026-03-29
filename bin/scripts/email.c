@@ -712,6 +712,8 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 	gint r;
 	gint ret = 1;
 	JsonBuilder *jb = NULL;
+	GPtrArray *msg_arr = NULL;
+	guint mi;
 
 	ctx = g_option_context_new ("- read emails");
 	g_option_context_add_main_entries (ctx, entries, NULL);
@@ -862,7 +864,7 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 	}
 
 	/* Collect fetch results into a GPtrArray so we can sort by UID desc */
-	GPtrArray *msg_arr = g_ptr_array_new ();
+	msg_arr = g_ptr_array_new ();
 	for (it = clist_begin (fetch_result); it; it = clist_next (it))
 		g_ptr_array_add (msg_arr, clist_content (it));
 
@@ -894,7 +896,7 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 		_cmp;
 	}));
 
-	for (guint mi = 0; mi < msg_arr->len; mi++) {
+	for (mi = 0; mi < msg_arr->len; mi++) {
 		struct mailimap_msg_att *msg_att = g_ptr_array_index (msg_arr, mi);
 		clistiter *ait;
 		struct mailimap_envelope *env = NULL;
@@ -905,8 +907,6 @@ cmd_read (EmailConfig *cfg, int argc, char **argv)
 		struct mailimap_msg_att_dynamic *dynamic_flags = NULL;
 		gboolean is_seen = FALSE;
 		gboolean is_flagged = FALSE;
-
-		msg_att = (struct mailimap_msg_att *) clist_content (it);
 
 		for (ait = clist_begin (msg_att->att_list); ait; ait = clist_next (ait)) {
 			struct mailimap_msg_att_item *item;
