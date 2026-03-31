@@ -250,9 +250,9 @@
   :config
   (setq matrix-cmd "matrixctl")
   (map! :leader
-        :desc "Matrix rooms"   "x x" #'matrix-open
-        :desc "Matrix rooms"   "x r" #'matrix-rooms
-        :desc "Matrix tail"    "x t" #'matrix-tail))
+        :desc "Matrix open"  "M M" #'matrix-open
+        :desc "Matrix rooms" "M r" #'matrix-rooms
+        :desc "Matrix tail"  "M t" #'matrix-tail))
 
 ;;; Git forge management (port of gitctl-nvim; backend: gitctl)
 (use-package! gitctl-emacs
