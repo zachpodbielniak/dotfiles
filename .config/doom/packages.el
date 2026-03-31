@@ -87,3 +87,48 @@
   :recipe (:type git
            :host nil
            :repo "https://git.podbielniak.com/zachpodbielniak/email-emacs"))
+
+
+;;; --- Phase 6: Custom Emacs ports of nvim plugins ---
+
+;; matrix-emacs: Matrix chat client (port of matrix-nvim)
+(package! matrix-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/matrix-emacs"))
+
+;; gitctl-emacs: Git forge management UI (port of gitctl-nvim)
+(package! gitctl-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/gitctl-emacs"))
+
+;; vimban-emacs: Kanban/ticket management (port of vimban-nvim)
+(package! vimban-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/vimban-emacs"))
+
+;; possessions-emacs: Personal inventory tracker (port of possessions-nvim)
+(package! possessions-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/possessions-emacs"))
+
+;; crispy-emacs: GLib/GObject C language support (port of crispy-nvim)
+(package! crispy-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/crispy-emacs"))
+
+;; bacon-emacs: Bacon .strip file major mode + LSP (port of bacon-nvim)
+(package! bacon-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/bacon-emacs"))
+
+;; podomation-emacs: Podomation .pod DSL major mode + LSP (port of podomation-nvim)
+(package! podomation-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/podomation-emacs"))
