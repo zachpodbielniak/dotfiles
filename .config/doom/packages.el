@@ -78,3 +78,12 @@
 
 ;; EPUB reader (replaces epub.nvim)
 (package! nov)
+
+
+;;; --- Phase 5: Email ---
+
+;; email-emacs: buffer-based email client using email.c backend (port of email-nvim)
+(package! email-emacs
+  :recipe (:type git
+           :host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/email-emacs"))

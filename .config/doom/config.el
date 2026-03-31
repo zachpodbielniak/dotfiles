@@ -245,3 +245,16 @@
 (load! "vimban")        ;; Ticket management (from lua/custom/vimban.lua)
 (load! "shell-runner")  ;; Shell command runner (from lua/custom/shell.lua)
 (load! "transclusion")  ;; Transclusion system (from core/mappings.lua)
+
+;;; Email client (port of email-nvim; backend: email.c)
+(use-package! email-emacs
+  :config
+  (setq email-cmd          "email.c"
+        email-from         nil     ;; set to your address for reply-all filtering
+        email-confirm-send   t
+        email-confirm-delete t)
+  (map! :leader
+        :desc "Email inbox"   "m m" #'email-open
+        :desc "Email compose" "m c" #'email-compose
+        :desc "Email folders" "m f" #'email-folders
+        :desc "Email search"  "m s" #'email-search))
