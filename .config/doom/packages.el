@@ -79,6 +79,21 @@
 ;; EPUB reader (replaces epub.nvim)
 (package! nov)
 
+;; Live markdown browser preview (replaces markdown-preview.nvim)
+(package! grip-mode)
+
+;; Table of contents generation for markdown
+(package! markdown-toc)
+
+;; Pixel-perfect table alignment in-buffer (renders tables cleanly)
+(package! valign)
+
+;; Claude Code CLI integration (runs `claude` as subprocess in Emacs)
+(package! claude-code)
+
+;; Code screenshots (replaces carbon-now.nvim)
+(package! carbon-now-sh)
+
 
 ;;; --- Phase 5: Email ---
 

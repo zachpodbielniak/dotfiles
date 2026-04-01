@@ -8,6 +8,14 @@
 ;;;; Phase 1: Foundation — Theme, UI, Core Editor
 ;;;; =========================================================================
 
+;;; Font: Hack Nerd Font Mono (matching gst terminal config)
+;;; Nerd Font covers modeline icons, Noto Color Emoji for emoji
+(setq doom-font (font-spec :family "Hack Nerd Font Mono" :size 18)
+      doom-variable-pitch-font (font-spec :family "Hack Nerd Font" :size 18)
+      doom-big-font (font-spec :family "Hack Nerd Font Mono" :size 24)
+      doom-symbol-font (font-spec :family "Symbols Nerd Font Mono" :size 18)
+      doom-emoji-font (font-spec :family "Noto Color Emoji" :size 18))
+
 ;;; Theme: Catppuccin Mocha (replaces doom-one, matches nvim catppuccin)
 (setq doom-theme 'catppuccin
       catppuccin-flavor 'mocha)
@@ -40,6 +48,104 @@
 ;; Apply alpha to new frames too
 (add-to-list 'default-frame-alist '(alpha-background . 85))
 
+;;; Modeline (tmux-style status bar with catppuccin colors and icons)
+(after! doom-modeline
+  ;; Enable battery and time display
+  (display-battery-mode 1)
+  (display-time-mode 1)
+
+  ;; General appearance
+  (setq doom-modeline-height 28
+        doom-modeline-bar-width 4
+        doom-modeline-icon t
+        doom-modeline-major-mode-icon t
+        doom-modeline-major-mode-color-icon t
+        doom-modeline-buffer-file-name-style 'truncate-upto-project
+        doom-modeline-buffer-encoding t
+        doom-modeline-vcs-max-length 25
+        doom-modeline-time-icon t
+        doom-modeline-time-live-icon t
+        doom-modeline-battery t
+        doom-modeline-env-version t
+        doom-modeline-modal-icon t
+        doom-modeline-modal-modern-icon t)
+
+  ;; Time format (matches tmux  %H:%M)
+  (setq display-time-format " %H:%M"
+        display-time-default-load-average nil)
+
+  ;; ---------------------------------------------------------------------------
+  ;; Custom segment: days-since trackers (cached, updates every 60s)
+  ;; Matches tmux right status: 🥩:days 🥤:days ☕:days
+  ;; ---------------------------------------------------------------------------
+  (defvar zach-modeline--days-cache ""
+    "Cached string for days-since trackers.")
+
+  (defvar zach-modeline--days-timer nil
+    "Timer for updating days-since cache.")
+
+  (defun zach-modeline--update-days ()
+    "Update the days-since cache by calling the days_since script."
+    (let ((carnivore (string-trim (shell-command-to-string "days_since 2024-11-24")))
+          (soda      (string-trim (shell-command-to-string "days_since 2025-07-14")))
+          (coffee    (string-trim (shell-command-to-string "days_since 2025-09-20"))))
+      (setq zach-modeline--days-cache
+            (concat
+             (propertize (format " 🥩:%s" carnivore) 'face '(:foreground "#f38ba8"))
+             (propertize (format " 🥤:%s" soda)      'face '(:foreground "#89b4fa"))
+             (propertize (format " ☕:%s" coffee)     'face '(:foreground "#a6e3a1"))
+             " "))))
+
+  ;; Update immediately at startup, then every 60 seconds
+  (zach-modeline--update-days)
+  (when zach-modeline--days-timer (cancel-timer zach-modeline--days-timer))
+  (setq zach-modeline--days-timer
+        (run-with-timer 60 60 #'zach-modeline--update-days))
+
+  (doom-modeline-def-segment days-since
+    "Days-since trackers: carnivore, soda, coffee."
+    zach-modeline--days-cache)
+
+  ;; ---------------------------------------------------------------------------
+  ;; Custom segment: pomodoro timer (cached, updates every 5s)
+  ;; ---------------------------------------------------------------------------
+  (defvar zach-modeline--pomo-cache ""
+    "Cached string for pomodoro status.")
+
+  (defvar zach-modeline--pomo-timer nil
+    "Timer for updating pomodoro cache.")
+
+  (defun zach-modeline--update-pomo ()
+    "Update the pomodoro cache by calling the pomo script."
+    (let ((pomo (string-trim (shell-command-to-string "pomo"))))
+      (setq zach-modeline--pomo-cache
+            (if (string-empty-p pomo) ""
+              (propertize (format " %s" pomo) 'face '(:foreground "#fab387"))))))
+
+  (zach-modeline--update-pomo)
+  (when zach-modeline--pomo-timer (cancel-timer zach-modeline--pomo-timer))
+  (setq zach-modeline--pomo-timer
+        (run-with-timer 5 5 #'zach-modeline--update-pomo))
+
+  (doom-modeline-def-segment pomodoro
+    "Pomodoro timer status."
+    zach-modeline--pomo-cache)
+
+  ;; ---------------------------------------------------------------------------
+  ;; Custom modeline layout
+  ;; Left:  evil-state | buffer | git-branch | major-mode | diagnostics |
+  ;;        encoding/line-endings | battery
+  ;; Right: line:col | time | pomodoro | days-since trackers
+  ;; ---------------------------------------------------------------------------
+  (doom-modeline-def-modeline 'zach-modeline
+    '(modals matches buffer-info remote-host vcs major-mode check
+      buffer-encoding battery)
+    '(misc-info buffer-position time pomodoro days-since))
+
+  ;; Apply to all buffers
+  (add-hook 'doom-modeline-mode-hook
+            (lambda () (doom-modeline-set-modeline 'zach-modeline 'default))))
+
 ;;; Color code highlighting (replaces nvim-colorizer.lua)
 (use-package! rainbow-mode
   :hook (prog-mode . rainbow-mode))
@@ -63,6 +169,16 @@
 (after! evil
   (setq evil-want-clipboard t))
 
+;;; Fix "wrong type argument: plistp, t" on SPC p p project switch
+;;; The workspace switch function hits a plistp error on first attempt when
+;;; persp-mode returns t instead of a perspective struct. Wrap with retry.
+(defadvice! +workspaces-switch-to-project-retry-a (fn &rest args)
+  "Catch plistp error on first project switch and retry."
+  :around #'+workspaces-switch-to-project-h
+  (condition-case _err
+      (apply fn args)
+    (wrong-type-argument (apply fn args))))
+
 
 ;;;; =========================================================================
 ;;;; Phase 2: LSP, Languages, Completion
@@ -83,12 +199,20 @@
 ;;; C mode: gnu style for gnu89 (matching nvim config)
 (after! cc-mode
   (setq c-default-style '((c-mode . "gnu")
-                           (other . "gnu"))))
+                           (other . "gnu")))
+  ;; Disable cc-mode electric reindentation on {, }, ;, :, #
+  (setq c-electric-flag nil)
+  (add-hook 'c-mode-hook (lambda () (electric-indent-local-mode -1)))
+  (add-hook 'c++-mode-hook (lambda () (electric-indent-local-mode -1))))
+
+;;; Disable electric-indent globally — manual format only (SPC f m)
+(electric-indent-mode -1)
 
 ;;; LSP keybindings (most already mapped by Doom Evil+eglot defaults)
 (map! :leader
       :desc "Signature help" "l s" #'eglot-signature-help
-      :desc "Buffer diagnostics" "l f" #'flymake-show-buffer-diagnostics)
+      :desc "Buffer diagnostics" "l f" #'flymake-show-buffer-diagnostics
+      :desc "Format buffer" "f m" #'+format/buffer)
 
 
 ;;;; =========================================================================
@@ -126,6 +250,15 @@
 (map! :leader
       :desc "Vterm popup" "o t" #'+vterm/toggle
       :desc "Vterm here" "o T" #'+vterm/here)
+
+;;; Make target runner keybindings
+(map! :leader
+      :desc "Run make target" "c m" #'+make/run
+      :desc "Run last target" "c M" #'+make/run-last)
+
+;;; Window selection (ace-window, complements tmux-navigator)
+(map! :leader
+      :desc "Select window" "w w" #'ace-window)
 
 ;;; Justfile syntax highlighting (replaces vim-just)
 (use-package! just-mode
@@ -184,6 +317,26 @@
     :models '(claude-sonnet-4-20250514)
     :stream t))
 
+;;; AI prefix (SPC a)
+(map! :leader :desc "AI" "a" nil)
+
+;;; Claude Code CLI (runs `claude` as subprocess via vterm)
+(use-package! claude-code
+  :config
+  (setq claude-code-terminal-backend 'vterm)
+  (map! :leader
+        :desc "Claude Code"        "a c" #'claude-code-start
+        :desc "Claude send region" "a s" #'claude-code-send-region
+        :desc "Claude send buffer" "a b" #'claude-code-send-buffer
+        :desc "Claude fix error"   "a f" #'claude-code-send-flymake-to-claude))
+
+;;; gptel rewrite & context (missing keybindings for existing features)
+(map! :leader
+      :desc "AI rewrite region" "a r" #'gptel-rewrite
+      :desc "AI add context"    "a a" #'gptel-add
+      :desc "AI menu"           "a m" #'gptel-menu
+      :desc "AI chat"           "a g" #'gptel)
+
 ;;; Calendar keybind (calfw, replaces calendar.vim)
 (map! :leader
       :desc "Calendar" "o c" #'+calendar/open-calendar)
@@ -194,6 +347,41 @@
   :config
   (setq nov-save-place-file
         (expand-file-name "nov-places" doom-profile-data-dir)))
+
+;;; Debugger: GDB via dape for C development
+(after! dape
+  (map! :leader
+        :desc "Debug"         "d d" #'dape
+        :desc "Breakpoint"    "d b" #'dape-breakpoint-toggle
+        :desc "Continue"      "d c" #'dape-continue
+        :desc "Step over"     "d n" #'dape-next
+        :desc "Step into"     "d i" #'dape-step-in
+        :desc "Step out"      "d o" #'dape-step-out
+        :desc "Quit debug"    "d q" #'dape-quit))
+
+;;; Live markdown browser preview (replaces markdown-preview.nvim)
+(use-package! grip-mode
+  :after markdown-mode
+  :config
+  (setq grip-preview-use-webkit nil)
+  (map! :map markdown-mode-map
+        :localleader
+        :desc "Live preview" "p" #'grip-mode))
+
+;;; Code screenshots (replaces carbon-now.nvim)
+(use-package! carbon-now-sh
+  :defer t
+  :config
+  (map! :leader
+        :desc "Carbon screenshot" "c s" #'carbon-now-sh))
+
+;;; Pixel-perfect table alignment (replaces render-markdown.nvim table rendering)
+;;; Aligns table columns visually using display properties — works even with
+;;; variable-width fonts or CJK characters.
+(use-package! valign
+  :hook (markdown-mode . valign-mode)
+  :config
+  (setq valign-fancy-bar t))  ;; render | as a continuous vertical bar
 
 ;;; Markdown rendering (replaces render-markdown.nvim + glow.nvim)
 (after! markdown-mode
@@ -217,14 +405,54 @@
         markdown-list-indent-width 4
         ;; Display images inline
         markdown-display-remote-images t
-        markdown-max-image-size '(800 . 600))
+        markdown-max-image-size '(800 . 600)
+        ;; Render horizontal rules as a line across the buffer
+        markdown-hr-display-char ?─)
 
   ;; Better header faces with catppuccin-friendly colors
   (custom-set-faces!
     '(markdown-header-face-1 :height 1.6 :weight bold)
     '(markdown-header-face-2 :height 1.4 :weight bold)
     '(markdown-header-face-3 :height 1.2 :weight bold)
-    '(markdown-header-face-4 :height 1.1 :weight bold)))
+    '(markdown-header-face-4 :height 1.1 :weight bold)
+    ;; Style table faces to match catppuccin
+    '(markdown-table-face :inherit fixed-pitch))
+
+  ;; Handle #anchor fragment links (markdown-toc TOC entries)
+  ;; markdown-mode silently drops fragment-only URLs, so intercept them
+  ;; via the markdown-follow-link-functions hook before that happens.
+  (defun zach-markdown-follow-anchor (url)
+    "Jump to the heading matching a #fragment anchor URL.
+Return t if handled, nil to fall through to default behaviour."
+    (when (and url (string-prefix-p "#" url))
+      (let* ((slug (substring url 1))
+             (found nil))
+        (save-excursion
+          (goto-char (point-min))
+          (while (and (not found)
+                      (re-search-forward markdown-regex-header nil t))
+            (let* ((heading (or (match-string-no-properties 1)
+                                (match-string-no-properties 5)))
+                   (heading-slug
+                    (when heading
+                      (thread-last heading
+                        (downcase)
+                        (replace-regexp-in-string "[^a-z0-9 -]" "")
+                        (string-trim)
+                        (replace-regexp-in-string " +" "-")))))
+              (when (string= heading-slug slug)
+                (setq found (point))))))
+        (when found
+          (goto-char found)
+          (beginning-of-line)
+          (recenter 4)
+          t))))
+
+  (add-hook 'markdown-follow-link-functions #'zach-markdown-follow-anchor)
+
+  ;; RET follows links (TOC anchors, file links, URLs) in normal mode
+  (map! :map markdown-mode-map
+        :n "RET" #'markdown-follow-thing-at-point))
 
 
 ;;;; =========================================================================
