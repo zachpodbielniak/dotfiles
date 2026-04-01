@@ -82,6 +82,7 @@ _path_append \
 _have vi && _set_editor "vi"
 _have vim && _set_editor "vim"
 _have nvim && _set_editor "nvim"
+_have emacs && _set_editor "emacs -nw"
 
 # source the files if we have them
 _source "${HOME}/.bashrc-functions"
