@@ -25,6 +25,11 @@ G_MODULE_EXPORT gboolean
 gst_config_init(void)
 {
 	GstConfig *config;
+    g_autoptr(GList) bacon_shell_hosts = NULL;
+    g_autofree gchar *shell = NULL;
+    g_autofree gchar *bacon_debug_path = NULL;
+    g_autofree gchar *bacon_debug_modules = NULL;
+    g_autofree gchar *bacon_args = NULL;
 
 	/* Catppuccin Mocha palette */
 	static const gchar *palette[] = {
@@ -54,8 +59,38 @@ gst_config_init(void)
 
 	config = gst_config_get_default();
 
+
 	/* --- Terminal --- */
-	gst_config_set_shell(config, "/bin/bash");
+    
+    /* build bacon path for debug build if it exists, if not, default to system bacon */
+    bacon_debug_path = g_build_filename(g_get_home_dir(), "source", "projects", "bacon", "build", "debug", "bacon", NULL);
+
+    if (g_file_test(bacon_debug_path, G_FILE_TEST_EXISTS))
+    { shell = g_strdup(bacon_debug_path); }
+    else
+    { shell = g_find_program_in_path("bacon"); }
+
+    /* Set up hosts that use bacon as default shell. This is "opt-in" */
+    bacon_shell_hosts = g_list_append(bacon_shell_hosts, "lt-zach");
+
+    /* iter all hosts and enable bacon on the ones that have it */
+    GList *iter;
+    for (iter = g_list_first(bacon_shell_hosts); iter != NULL; iter = iter->next)
+    {
+        if (0 == g_strcmp0(g_get_host_name(), iter->data))
+        { 
+            if (NULL != shell)
+            {
+                bacon_debug_modules = g_build_filename(g_get_home_dir(), "source", "projects", "bacon", "build", "debug", "modules", NULL);
+                bacon_args = g_strdup_printf("-M %s", bacon_debug_modules);
+                gst_config_set_shell(config, shell); 
+                g_setenv("SHELL", shell, TRUE);
+                g_setenv("BACON_ARGS", bacon_args, TRUE);
+            }
+        }
+        else
+        { gst_config_set_shell(config, "/bin/bash"); }
+    }
 	gst_config_set_term_name(config, "gst-256color");
 	gst_config_set_tabspaces(config, 8);
 

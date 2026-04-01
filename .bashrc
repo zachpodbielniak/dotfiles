@@ -56,7 +56,7 @@ _set_editor() {
 _path_prepend \
     "${HOME}/.local/bin" \
     "${HOME}/.cargo/bin" \
-    "/var/home/linuxbrew/.linuxbrew/bin" \
+    "${HOME}/../linuxbrew/.linuxbrew/bin" \
     "/nix/var/nix/profiles/default/bin" \
     "${HOME}/perl5/bin" \
     "${HOME}/bin" \
@@ -82,6 +82,7 @@ _path_append \
 _have vi && _set_editor "vi"
 _have vim && _set_editor "vim"
 _have nvim && _set_editor "nvim"
+_have emacs && _set_editor "emacs -nw"
 
 # source the files if we have them
 _source "${HOME}/.bashrc-functions"
@@ -135,6 +136,9 @@ _have bat && alias cat="bat --theme='Catppuccin Mocha' --paging=never"
 
 # mutt alias 
 _have neomutt && alias mutt="neomutt" && alias m="mutt" 
+
+# system command aliases 
+alias ls="ls --color=auto"
 
 # common things
 alias flatpak="flatpak --user"
