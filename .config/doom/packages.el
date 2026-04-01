@@ -91,6 +91,23 @@
 ;; Claude Code CLI integration (runs `claude` as subprocess in Emacs)
 (package! claude-code)
 
+;;; --- Phase 6: Org-mode ---
+
+;; Group agenda items into named sections
+(package! org-super-agenda)
+
+;; Structured query language for org headings
+(package! org-ql)
+
+;; Inline content from other org files (replaces transclusion.el)
+(package! org-transclusion)
+
+;; Interactive multi-day timeblock view for scheduled tasks
+(package! org-timeblock)
+
+;; Visual kanban board rendered as org table
+(package! org-kanban)
+
 ;; Code screenshots (replaces carbon-now.nvim)
 (package! carbon-now-sh)
 

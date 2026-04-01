@@ -23,8 +23,8 @@
 ;;; Line numbers
 (setq display-line-numbers-type t)
 
-;;; Org directory
-(setq org-directory "~/org/")
+;;; Org directory: point at PARA knowledge base root
+(setq org-directory "~/Documents/notes/")
 
 ;;; Dired: show dotfiles and parent directory (..)
 (setq dired-listing-switches "-ahl")
@@ -223,7 +223,13 @@
 ;;; Seamless Ctrl-h/j/k/l across Emacs windows and tmux panes
 (use-package! navigate
   :config
-  (require 'navigate))
+  (require 'navigate)
+  ;; Ensure C-l isn't swallowed by Doom's global recenter binding
+  ;; and that all four directions work in normal, motion, and visual states
+  (map! :nvm "C-h" (cmd! (tmux-navigate "left"))
+        :nvm "C-j" (cmd! (tmux-navigate "down"))
+        :nvm "C-k" (cmd! (tmux-navigate "up"))
+        :nvm "C-l" (cmd! (tmux-navigate "right"))))
 
 ;;; Git keybindings (extending magit + diff-hl from vc-gutter)
 (map! :leader
@@ -453,6 +459,172 @@ Return t if handled, nil to fall through to default behaviour."
   ;; RET follows links (TOC anchors, file links, URLs) in normal mode
   (map! :map markdown-mode-map
         :n "RET" #'markdown-follow-thing-at-point))
+
+
+;;;; =========================================================================
+;;;; Phase 6: Org-mode (full PARA knowledge base)
+;;;; =========================================================================
+
+;;; Doom capture file variables — org files live alongside PARA markdown
+(setq +org-capture-todo-file "02_areas/org/todo.org"
+      +org-capture-notes-file "02_areas/org/notes.org"
+      +org-capture-journal-file "02_areas/org/journal.org"
+      +org-capture-changelog-file "02_areas/org/changelog.org"
+      +org-capture-projects-file "02_areas/org/projects.org")
+
+(after! org
+  ;; Agenda: only scan inbox, projects, and org/ — NOT 03_resources (23k files)
+  ;; Recursively find all .org files in inbox, projects, and areas
+  ;; Re-scans before each agenda build so new files are picked up
+  (defun zach/refresh-org-agenda-files ()
+    "Recursively collect .org files from PARA agenda directories."
+    (setq org-agenda-files
+          (apply #'append
+                 (mapcar (lambda (d)
+                           (let ((dir (expand-file-name d org-directory)))
+                             (when (file-directory-p dir)
+                               (directory-files-recursively dir "\\.org$"))))
+                         '("00_inbox" "01_projects" "02_areas")))))
+  (add-hook 'org-agenda-mode-hook #'zach/refresh-org-agenda-files)
+
+  ;; Capture templates integrated with PARA
+  (setq org-capture-templates
+        '(("i" "Inbox" entry
+           (file+headline "02_areas/org/todo.org" "Inbox")
+           "* TODO %?\n:PROPERTIES:\n:CREATED: %U\n:END:\n%i\n%a"
+           :prepend t)
+
+          ("n" "Note" entry
+           (file+headline "02_areas/org/notes.org" "Inbox")
+           "* %U %?\n%i\n%a"
+           :prepend t)
+
+          ("m" "Meeting notes" entry
+           (file+headline "02_areas/org/notes.org" "Meetings")
+           "* %U Meeting: %?\n** Attendees\n- \n** Notes\n%i\n** Action Items\n- [ ] "
+           :prepend t)
+
+          ("c" "Code reference" entry
+           (file+headline "02_areas/org/notes.org" "Code References")
+           "* %?\n:PROPERTIES:\n:CREATED: %U\n:SOURCE: %a\n:END:\n#+begin_src %^{Language}\n%i\n#+end_src"
+           :prepend t)
+
+          ("p" "Project" entry
+           (file+headline "02_areas/org/projects.org" "Active")
+           "* PROJ %?\n:PROPERTIES:\n:CREATED: %U\n:END:"
+           :prepend t)))
+
+  ;; Appearance: header scaling to match markdown rendering
+  (custom-set-faces!
+    '(org-level-1 :height 1.6 :weight bold)
+    '(org-level-2 :height 1.4 :weight bold)
+    '(org-level-3 :height 1.2 :weight bold)
+    '(org-level-4 :height 1.1 :weight bold))
+
+  ;; Indent
+  (setq org-indent-indentation-per-level 4)
+
+  ;; Tempo: <s TAB expands to src block, <q TAB to quote, etc.
+  (require 'org-tempo)
+
+  ;; Babel: languages relevant to the user's stack
+  (org-babel-do-load-languages
+   'org-babel-load-languages
+   '((emacs-lisp . t)
+     (shell . t)
+     (python . t)
+     (C . t)
+     (sql . t))))
+
+;;; org-roam: bidirectional linking across entire PARA knowledge base
+(after! org-roam
+  (setq org-roam-directory (expand-file-name org-directory)
+        org-roam-dailies-directory "02_areas/personal/journal/"
+        org-roam-db-gc-threshold most-positive-fixnum
+        org-roam-completion-everywhere t))
+
+;;; org-journal: replaces markdown journal at 02_areas/personal/journal/
+(after! org-journal
+  (setq org-journal-dir (expand-file-name "02_areas/personal/journal/" org-directory)
+        org-journal-file-type 'daily
+        org-journal-date-format "%Y-%m-%d"
+        org-journal-file-format "%Y-%m-%d.org"
+        org-journal-time-format "%H:%M"
+        org-journal-carryover-items nil))
+
+;;; org-noter: annotate PDFs/EPUBs with org notes
+(after! org-noter
+  (setq org-noter-notes-search-path
+        (list (expand-file-name "02_areas/org/annotations/" org-directory))
+        org-noter-auto-save-last-location t
+        org-noter-separate-notes-from-heading t))
+
+;;; org-super-agenda: group agenda views into sections
+(use-package! org-super-agenda
+  :after org-agenda
+  :config
+  (org-super-agenda-mode)
+  (setq org-super-agenda-groups
+        '((:name "In Progress"
+           :todo "STRT"
+           :order 1)
+          (:name "Overdue"
+           :deadline past
+           :order 2)
+          (:name "Due Today"
+           :deadline today
+           :order 3)
+          (:name "Due Soon"
+           :deadline future
+           :order 4)
+          (:name "Waiting"
+           :todo "WAIT"
+           :order 5)
+          (:name "On Hold"
+           :todo "HOLD"
+           :order 6)
+          (:name "Projects"
+           :todo "PROJ"
+           :order 7)
+          (:name "Ideas"
+           :todo "IDEA"
+           :order 8)
+          (:name "Backlog"
+           :todo "TODO"
+           :order 9))))
+
+;;; org-ql: structured queries for org files
+(use-package! org-ql
+  :after org)
+
+;;; org-transclusion: inline content from other org files
+(use-package! org-transclusion
+  :after org)
+
+;;; org-timeblock: interactive multi-day timeblock view
+(use-package! org-timeblock
+  :after org)
+
+;;; org-kanban: visual kanban board as org table
+(use-package! org-kanban
+  :after org)
+
+;;; Org agenda: ensure hjkl work as pure Evil navigation
+;;; evil-org-agenda binds H/L to date shifting and J/K to priority — keep those,
+;;; but make sure lowercase hjkl are normal vim navigation
+(after! evil-org-agenda
+  (evil-define-key 'motion evil-org-agenda-mode-map
+    "j" 'org-agenda-next-line
+    "k" 'org-agenda-previous-line
+    "h" 'evil-backward-char
+    "l" 'evil-forward-char))
+
+;;; Org keybindings (extending Doom defaults)
+;;; NOTE: org-transclusion bindings live in transclusion.el alongside markdown ones
+(map! :leader
+      :desc "Org QL search"       "n q" #'org-ql-search
+      :desc "Org timeblock"       "n T" #'org-timeblock
+      :desc "Org kanban"          "n k" #'org-kanban/initialize)
 
 
 ;;;; =========================================================================

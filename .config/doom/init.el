@@ -85,7 +85,7 @@
 
        :checkers
        syntax              ; tasing you for every semicolon you forget
-       ;;(spell +flyspell) ; tasing you for misspelling mispelling
+       (spell +flyspell) ; on-the-fly spell checking
        ;;grammar           ; tasing grammar mistake every you make
 
        :tools
@@ -157,7 +157,7 @@
        nim               ; Nim language support
        ;;nix               ; I hereby declare "nix geht mehr!"
        ;;ocaml             ; an objective camel
-       org               ; organize your plain life in plain text
+       (org +pretty +dragndrop +noter +roam2 +journal) ; full org-mode with roam, journal, PDF annotation
        ;;php               ; perl's insecure younger brother
        ;;plantuml          ; diagrams for confusing people more
        ;;graphviz          ; diagrams for confusing yourself even more

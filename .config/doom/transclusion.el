@@ -372,13 +372,24 @@ relative to `transclusion-notes-dir'."
 ;; Keybindings (Evil leader, Doom map!)
 ;; ---------------------------------------------------------------------------
 
+;;; Transclusion bindings under SPC n x ("cross-inclusion")
+;;; SPC n t = org-todo-list, SPC n c = org-clock toggle (Doom defaults)
+;;; Org-transclusion (primary) + markdown transclusion (legacy, during migration)
 (map! :leader
-      :desc "notes" "n" nil
-      :desc "Insert PARA link"    "n i" #'transclusion-insert-para-link
-      :desc "Run/expand silently" "n r" #'transclusion-run-or-expand
-      :desc "Expand inline"       "n e" #'transclusion-expand-inline
-      :desc "Open in popup"       "n f" #'transclusion-open-float
-      :desc "Goto link"           "n g" #'transclusion-goto-link)
+      (:prefix ("n" . "notes")
+       (:prefix ("x" . "transclusion")
+        ;; org-transclusion (primary — for .org files)
+        :desc "Add at point"        "a" #'org-transclusion-add
+        :desc "Add all in buffer"   "A" #'org-transclusion-add-all
+        :desc "Remove at point"     "r" #'org-transclusion-remove
+        :desc "Remove all"          "R" #'org-transclusion-remove-all
+        :desc "Live edit"           "e" #'org-transclusion-live-sync-start
+        ;; markdown transclusion (legacy — for .md files during migration)
+        :desc "Insert PARA link"    "i" #'transclusion-insert-para-link
+        :desc "Run/expand silently" "x" #'transclusion-run-or-expand
+        :desc "Expand inline"       "E" #'transclusion-expand-inline
+        :desc "Open in popup"       "f" #'transclusion-open-float
+        :desc "Goto link"           "g" #'transclusion-goto-link)))
 
 (provide 'transclusion)
 ;;; transclusion.el ends here
