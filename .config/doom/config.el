@@ -18,6 +18,9 @@
 ;;; Org directory
 (setq org-directory "~/org/")
 
+;;; Dired: show dotfiles and parent directory (..)
+(setq dired-listing-switches "-ahl")
+
 
 ;;; Indentation: tabs, 4 spaces width (matching nvim config)
 (setq-default indent-tabs-mode t
