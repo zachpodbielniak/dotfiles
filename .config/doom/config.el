@@ -16,6 +16,40 @@
       doom-symbol-font (font-spec :family "Symbols Nerd Font Mono" :size 18)
       doom-emoji-font (font-spec :family "Noto Color Emoji" :size 18))
 
+;;; Fix font fallback height mismatches that cause vterm line-height bobbing.
+;;; PGTK Emacs (Wayland) computes line height per-glyph.  TUI spinner chars
+;;; (e.g. ✻ U+273B in Claude Code) fall back to system fonts with taller
+;;; metrics, making the spinner line expand and pushing everything below down.
+;;;
+;;; Diagnostic: eval in M-: with a *font-check* buffer visible to find bad fonts
+;;; Default font (Hack Nerd Font Mono) is 22px.  Measured fallback heights:
+;;;   Noto Sans Symbols: 38px  |  Noto Sans Symbols 2: 32px  |  Jomolhari: 29px
+;;;   Adwaita Mono: 24px  |  Adwaita Sans: 23px  |  FiraCode Nerd Font: 23px
+;;;   STIX: 19px
+;;;
+;;; Fix (two-pronged):
+;;; 1) Force Hack for ranges where it has correct-height glyphs (braille spinners)
+;;; 2) Rescale ALL remaining fallback fonts to match 22px
+;;;
+;;; Remaining slight bob: not font-height-related (confirmed zero mismatches in
+;;; vterm buffer).  Likely PGTK/Wayland compositor artifacts during rapid redraws.
+;;; vterm-timer-delay 0.02 reduces this further.  Tried and rejected:
+;;;   - line-height t via default-text-properties (breaks tmux status bar)
+;;;   - set-fontset-font for all of 'unicode (Hack Nerd Font patched glyphs
+;;;     have bad bounding boxes in PUA ranges, made bobbing worse)
+(dolist (range '((#x2600 . #x26FF)    ;; Misc Symbols (★⚡)
+                (#x2700 . #x27BF)    ;; Dingbats (✓✗)
+                (#x2800 . #x28FF)))  ;; Braille Patterns (⠋⠙⠹⠸ — TUI spinners)
+  (set-fontset-font t range "Hack Nerd Font Mono"))
+(setq face-font-rescale-alist
+      '(("-Noto Sans Symbols 2-" . 0.65)   ;; 32px → ≤22px
+        ("-Noto Sans Symbols-" . 0.55)     ;; 38px → ≤22px
+        ("-Jomolhari-" . 0.72)             ;; 29px → ≤22px
+        ("-Adwaita Mono-" . 0.88)          ;; 24px → ≤22px
+        ("-Adwaita Sans-" . 0.92)          ;; 23px → ≤22px
+        ("-FiraCode Nerd Font-" . 0.92)    ;; 23px → ≤22px
+        ("-STIX-" . 1.10)))
+
 ;;; Theme: Catppuccin Mocha (replaces doom-one, matches nvim catppuccin)
 (setq doom-theme 'catppuccin
       catppuccin-flavor 'mocha)
@@ -256,6 +290,13 @@
 (map! :leader
       :desc "Vterm popup" "o t" #'+vterm/toggle
       :desc "Vterm here" "o T" #'+vterm/here)
+
+;;; Vterm TUI stability
+(after! vterm
+  ;; Process output faster — fewer visible intermediate redraw states
+  (setq vterm-timer-delay 0.02))
+(add-hook! 'vterm-mode-hook
+  (display-line-numbers-mode -1))
 
 ;;; Make target runner keybindings
 (map! :leader
@@ -663,8 +704,9 @@ Return t if handled, nil to fall through to default behaviour."
 ;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
 (use-package! ement
   :config
-  (setq ement-save-sessions t
-        plz-curl-program "/usr/bin/curl")
+  ;; setopt (not setq) so the defcustom :set hook adds kill-emacs-hook
+  (setopt ement-save-sessions t)
+  (setq plz-curl-program "/usr/bin/curl")
   ;; Connect through pantalaimon for E2EE support
   (defun zach/ement-connect ()
     "Connect to Matrix via pantalaimon proxy.
