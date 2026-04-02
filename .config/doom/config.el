@@ -553,7 +553,8 @@ Return t if handled, nil to fall through to default behaviour."
   (setq org-roam-directory (expand-file-name org-directory)
         org-roam-dailies-directory "02_areas/personal/journal/"
         org-roam-db-gc-threshold most-positive-fixnum
-        org-roam-completion-everywhere t))
+        org-roam-completion-everywhere t
+        org-roam-file-exclude-regexp "03_resources/technical/docs/"))
 
 ;;; org-journal: replaces markdown journal at 02_areas/personal/journal/
 (after! org-journal
