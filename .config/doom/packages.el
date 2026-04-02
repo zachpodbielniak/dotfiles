@@ -108,6 +108,13 @@
 ;; Visual kanban board rendered as org table
 (package! org-kanban)
 
+;; Matrix chat client (native Emacs, E2EE via pantalaimon)
+(package! ement
+  :recipe (:host github :repo "alphapapa/ement.el"))
+
+;; MPD client (music player daemon)
+(package! emms)
+
 ;; Code screenshots (replaces carbon-now.nvim)
 (package! carbon-now-sh)
 
@@ -122,12 +129,6 @@
 
 
 ;;; --- Phase 6: Custom Emacs ports of nvim plugins ---
-
-;; matrix-emacs: Matrix chat client (port of matrix-nvim)
-(package! matrix-emacs
-  :recipe (:type git
-           :host nil
-           :repo "https://git.podbielniak.com/zachpodbielniak/matrix-emacs"))
 
 ;; gitctl-emacs: Git forge management UI (port of gitctl-nvim)
 (package! gitctl-emacs

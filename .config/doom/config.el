@@ -473,19 +473,31 @@ Return t if handled, nil to fall through to default behaviour."
       +org-capture-projects-file "02_areas/org/projects.org")
 
 (after! org
-  ;; Agenda: only scan inbox, projects, and org/ — NOT 03_resources (23k files)
-  ;; Recursively find all .org files in inbox, projects, and areas
-  ;; Re-scans before each agenda build so new files are picked up
+  ;; Agenda: recursively find .org files in inbox, projects, and areas
+  ;; Cached at startup — use zach/refresh-org-agenda-files to rescan manually
   (defun zach/refresh-org-agenda-files ()
     "Recursively collect .org files from PARA agenda directories."
+    (interactive)
     (setq org-agenda-files
           (apply #'append
                  (mapcar (lambda (d)
                            (let ((dir (expand-file-name d org-directory)))
                              (when (file-directory-p dir)
                                (directory-files-recursively dir "\\.org$"))))
-                         '("00_inbox" "01_projects" "02_areas")))))
-  (add-hook 'org-agenda-mode-hook #'zach/refresh-org-agenda-files)
+                         '("00_inbox" "01_projects" "02_areas"))))
+    (message "Agenda files: %d" (length org-agenda-files)))
+  ;; Build cache once at startup (deferred so it doesn't block init)
+  (run-with-idle-timer 2 nil #'zach/refresh-org-agenda-files)
+  ;; Also refresh when saving any org file in the agenda dirs
+  (add-hook 'after-save-hook
+            (lambda ()
+              (when (and (eq major-mode 'org-mode)
+                         buffer-file-name
+                         (string-prefix-p (expand-file-name org-directory)
+                                          buffer-file-name)
+                         (not (string-match-p "03_resources\\|04_archives"
+                                              buffer-file-name)))
+                (zach/refresh-org-agenda-files))))
 
   ;; Capture templates integrated with PARA
   (setq org-capture-templates
@@ -609,15 +621,14 @@ Return t if handled, nil to fall through to default behaviour."
 (use-package! org-kanban
   :after org)
 
-;;; Org agenda: ensure hjkl work as pure Evil navigation
-;;; evil-org-agenda binds H/L to date shifting and J/K to priority — keep those,
-;;; but make sure lowercase hjkl are normal vim navigation
-(after! evil-org-agenda
-  (evil-define-key 'motion evil-org-agenda-mode-map
-    "j" 'org-agenda-next-line
-    "k" 'org-agenda-previous-line
-    "h" 'evil-backward-char
-    "l" 'evil-forward-char))
+;;; Org agenda: fix navigation on org-super-agenda header lines
+;;; Super-agenda applies a text-property keymap on group headers that captures
+;;; keys before Evil sees them. Override that keymap to use vim navigation.
+(after! org-super-agenda
+  (define-key org-super-agenda-header-map (kbd "j") #'org-agenda-next-line)
+  (define-key org-super-agenda-header-map (kbd "k") #'org-agenda-previous-line)
+  (define-key org-super-agenda-header-map (kbd "h") #'evil-backward-char)
+  (define-key org-super-agenda-header-map (kbd "l") #'evil-forward-char))
 
 ;;; Org keybindings (extending Doom defaults)
 ;;; NOTE: org-transclusion bindings live in transclusion.el alongside markdown ones
@@ -648,14 +659,107 @@ Return t if handled, nil to fall through to default behaviour."
         :desc "Email folders" "m f" #'email-folders
         :desc "Email search"  "m s" #'email-search))
 
-;;; Matrix chat (port of matrix-nvim; backend: matrixctl)
-(use-package! matrix-emacs
+;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
+(use-package! ement
   :config
-  (setq matrix-cmd "matrixctl")
+  (setq ement-save-sessions t
+        plz-curl-program "/usr/bin/curl")
+  ;; Connect through pantalaimon for E2EE support
+  (defun zach/ement-connect ()
+    "Connect to Matrix via pantalaimon proxy.
+Restores saved session if available, otherwise prompts for login."
+    (interactive)
+    (if ement-sessions
+        ;; Already connected — just reconnect the first session
+        (ement-connect :session (cdar ement-sessions))
+      ;; Try to restore saved session from disk
+      (condition-case nil
+          (let ((saved (ement--read-sessions)))
+            (if saved
+                (ement-connect :session (cdar saved))
+              (error "No saved session")))
+        (error
+         ;; No saved session — fresh login through pantalaimon
+         (let ((user-id (read-string "User ID: " nil 'ement-connect-user-id-history))
+               (password (read-passwd "Password: ")))
+           (ement-connect :uri-prefix "http://localhost:8009"
+                          :user-id user-id
+                          :password password))))))
   (map! :leader
-        :desc "Matrix open"  "M M" #'matrix-open
-        :desc "Matrix rooms" "M r" #'matrix-rooms
-        :desc "Matrix tail"  "M t" #'matrix-tail))
+        :desc "Matrix connect" "M M" #'zach/ement-connect
+        :desc "Matrix rooms"   "M r" #'ement-room-list
+        :desc "Matrix view"    "M t" #'ement-view-room
+        :desc "Matrix disconnect" "M d" #'ement-disconnect))
+
+;;; EMMS: MPD client for music playback
+(use-package! emms
+  :config
+  (emms-all)
+  (emms-default-players)
+  ;; Disable modeline track display — causes UI lag with MPD polling
+  (emms-mode-line-mode -1)
+  (emms-playing-time-display-mode -1)
+  ;; EMMS uses non-derived modes so Evil doesn't auto-detect them.
+  ;; Bind directly on the mode keymaps with vim-style navigation.
+  (evil-set-initial-state 'emms-browser-mode 'normal)
+  (evil-set-initial-state 'emms-playlist-mode 'normal)
+
+  (evil-define-key* 'normal emms-browser-mode-map
+    "j"        #'next-line
+    "k"        #'previous-line
+    "h"        #'evil-backward-char
+    "l"        #'evil-forward-char
+    "q"        #'emms-browser-bury-buffer
+    (kbd "RET") #'emms-browser-add-tracks-and-play
+    (kbd "TAB") #'emms-browser-toggle-subitems
+    (kbd "SPC") #'emms-browser-toggle-subitems
+    "x"        #'emms-pause
+    "X"        #'emms-stop
+    "+"        #'emms-volume-raise
+    "-"        #'emms-volume-lower
+    "/"        #'emms-isearch-buffer
+    "d"        #'emms-browser-view-in-dired
+    "D"        #'emms-browser-delete-files
+    "C"        #'emms-browser-clear-playlist
+    "ga"       #'emms-browse-by-artist
+    "gA"       #'emms-browse-by-album
+    "gb"       #'emms-browse-by-genre
+    "gy"       #'emms-browse-by-year)
+
+  (evil-define-key* 'normal emms-playlist-mode-map
+    "j"        #'next-line
+    "k"        #'previous-line
+    "h"        #'evil-backward-char
+    "l"        #'evil-forward-char
+    "q"        #'quit-window
+    (kbd "RET") #'emms-playlist-mode-play-smart
+    "d"        #'emms-playlist-mode-kill-track
+    "x"        #'emms-pause
+    "X"        #'emms-stop
+    "+"        #'emms-volume-raise
+    "-"        #'emms-volume-lower
+    "r"        #'emms-random
+    "s"        #'emms-shuffle)
+  (setq emms-player-list '(emms-player-mpd)
+        emms-info-functions '(emms-info-mpd)
+        emms-player-mpd-server-name "localhost"
+        emms-player-mpd-server-port "6600"
+        emms-player-mpd-music-directory "~/Music")
+  ;; Connect to MPD lazily — only when first used
+  (add-hook 'emms-player-started-hook #'emms-player-mpd-connect)
+
+  (map! :leader
+        (:prefix ("z" . "music")
+         :desc "Play/pause"     "p" #'emms-pause
+         :desc "Stop"           "s" #'emms-stop
+         :desc "Next track"     "n" #'emms-next
+         :desc "Previous track" "N" #'emms-previous
+         :desc "Playlist"       "l" #'emms-playlist-mode-go
+         :desc "Browser"        "b" #'emms-browser
+         :desc "Volume up"      "+" #'emms-volume-raise
+         :desc "Volume down"    "-" #'emms-volume-lower
+         :desc "Shuffle"        "S" #'emms-shuffle
+         :desc "Now playing"    "i" #'emms-show)))
 
 ;;; Git forge management (port of gitctl-nvim; backend: gitctl)
 (use-package! gitctl-emacs
