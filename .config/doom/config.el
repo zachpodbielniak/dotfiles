@@ -652,7 +652,8 @@ Return t if handled, nil to fall through to default behaviour."
            :order 8)
           (:name "Backlog"
            :todo "TODO"
-           :order 9))))
+           :order 9)))
+)
 
 ;;; org-ql: structured queries for org files
 (use-package! org-ql
@@ -810,6 +811,87 @@ Restores saved session if available, otherwise prompts for login."
          :desc "Volume down"    "-" #'emms-volume-lower
          :desc "Shuffle"        "S" #'emms-shuffle
          :desc "Now playing"    "i" #'emms-show)))
+
+;;; Jira issue tracker (jira.el)
+;;; Auth: store credentials in ~/.authinfo.gpg:
+;;;   machine <instance>.atlassian.net login <email> port https password <api-token>
+(use-package! jira
+  :config
+  (setq jira-base-url "https://dt-rnd.atlassian.net"
+        jira-api-version 3
+        auth-sources '("~/.authinfo"))
+  (map! :leader
+        :desc "Jira issues" "J" #'jira-issues)
+  ;; Evil overrides in jira-issues-mode
+  (evil-define-key* 'normal jira-issues-mode-map
+    (kbd "RET") (lambda () (interactive)
+                  (jira-detail-show-issue (jira-utils-marked-item)))
+    "go"        (lambda () (interactive)
+                  (jira-actions-open-issue (jira-utils-marked-item)))
+    "gf"        (lambda () (interactive)
+                  (jira-detail-find-issue-by-key))
+    "gc"        (lambda () (interactive)
+                  (jira-actions-copy-issues-id-to-clipboard (jira-utils-marked-item)))
+    "gC"        #'jira-actions-change-issue-menu
+    "gw"        #'jira-actions-add-worklog-menu
+    "ge"        #'jira-export-menu
+    "gl"        #'jira-issues-menu
+    "gH"        #'jira-issues--switch-host-and-refresh
+    "?"         (lambda () (interactive)
+                  (with-current-buffer (get-buffer-create "*jira-keys*")
+                    (erase-buffer)
+                    (insert "Jira Issues Keybindings\n"
+                            "=======================\n\n"
+                            "RET  Open issue details\n"
+                            "gl   Filter/search menu\n"
+                            "gf   Find issue by key\n"
+                            "go   Open in browser\n"
+                            "gc   Copy issue ID\n"
+                            "gC   Change issue status\n"
+                            "gw   Add worklog\n"
+                            "ge   Export menu\n"
+                            "gH   Switch Jira host\n"
+                            "?    This help\n")
+                    (goto-char (point-min))
+                    (special-mode))
+                  (pop-to-buffer "*jira-keys*")))
+  ;; Evil overrides in jira-detail-mode
+  (evil-define-key* 'normal jira-detail-mode-map
+    "+"         (lambda () (interactive) (jira-detail--add-comment))
+    "-"         (lambda () (interactive) (jira-detail--remove-comment-at-point))
+    "ge"        (lambda () (interactive) (jira-detail--edit-comment-at-point))
+    "gC"        #'jira-actions-change-issue-menu
+    "go"        (lambda () (interactive)
+                  (jira-actions-open-issue jira-detail--current-key))
+    "gU"        (lambda () (interactive) (jira-detail--update-field))
+    "gf"        (lambda () (interactive) (jira-detail-find-issue-by-key))
+    "gw"        (lambda () (interactive) (jira-detail--watchers-menu))
+    "gP"        (lambda () (interactive) (jira-detail--show-parent-issue))
+    "gS"        (lambda () (interactive) (jira-detail--create-subtask))
+    "gc"        (lambda () (interactive)
+                  (jira-actions-copy-issues-id-to-clipboard jira-detail--current-key))
+    "gr"        (lambda () (interactive)
+                  (jira-detail-show-issue jira-detail--current-key))
+    "?"         (lambda () (interactive)
+                  (with-current-buffer (get-buffer-create "*jira-keys*")
+                    (erase-buffer)
+                    (insert "Jira Detail Keybindings\n"
+                            "=======================\n\n"
+                            "+    Add comment\n"
+                            "-    Remove comment\n"
+                            "ge   Edit comment\n"
+                            "gC   Change status\n"
+                            "gU   Update field\n"
+                            "gf   Find issue by key\n"
+                            "go   Open in browser\n"
+                            "gc   Copy issue ID\n"
+                            "gP   Show parent issue\n"
+                            "gS   Create subtask\n"
+                            "gr   Refresh\n"
+                            "?    This help\n")
+                    (goto-char (point-min))
+                    (special-mode))
+                  (pop-to-buffer "*jira-keys*"))))
 
 ;;; Git forge management (port of gitctl-nvim; backend: gitctl)
 (use-package! gitctl-emacs

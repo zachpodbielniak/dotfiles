@@ -119,6 +119,13 @@
 (package! carbon-now-sh)
 
 
+;;; --- Jira ---
+
+;; Jira issue tracker interface (list, view, edit, export issues)
+(package! jira
+  :recipe (:host github :repo "unmonoqueteclea/jira.el"))
+
+
 ;;; --- Phase 5: Email ---
 
 ;; email-emacs: buffer-based email client using email.c backend (port of email-nvim)
