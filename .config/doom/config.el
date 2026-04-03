@@ -67,7 +67,14 @@
 ;;; Indentation: tabs, 4 spaces width (matching nvim config)
 (setq-default indent-tabs-mode t
               tab-width 4
-              c-basic-offset 4)
+              c-basic-offset 4
+              evil-shift-width 4)
+;; Doom's CC module sets c-basic-offset from tab-width after config loads,
+;; so re-apply in the hook to ensure 4-wide tabs in C/C++ buffers.
+(after! cc-mode
+  (setq-default c-basic-offset 4)
+  (add-hook 'c-mode-common-hook
+            (lambda () (setq tab-width 4 c-basic-offset 4 evil-shift-width 4))))
 
 ;;; Transparent background (replaces transparent.nvim)
 ;;; GUI: set frame alpha; Terminal: clear face backgrounds
