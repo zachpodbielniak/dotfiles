@@ -970,10 +970,12 @@ Restores saved session if available, otherwise prompts for login."
 ;;; When Tailscale is available, start a TCP server bound to the Tailscale IP
 ;;; so emacsclient can connect from any machine on the tailnet.
 ;;; The server file (~/.emacs.d/server/server) contains host, port, and auth key.
-(after! server
-  (when (executable-find "tailscale")
-    (let ((ts-ip (string-trim
-                  (shell-command-to-string "tailscale ip -4 2>/dev/null"))))
-      (when (and ts-ip (not (string-empty-p ts-ip)))
-        (setq server-use-tcp t
-              server-host ts-ip)))))
+(when (executable-find "tailscale")
+  (let ((ts-ip (string-trim
+                (shell-command-to-string "tailscale ip -4 2>/dev/null"))))
+    (when (and ts-ip (not (string-empty-p ts-ip)))
+      (require 'server)
+      (setq server-use-tcp t
+            server-host ts-ip)
+      (unless (server-running-p)
+        (server-start)))))
