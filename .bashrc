@@ -230,7 +230,20 @@ export FZF_DEFAULT_OPTS=" \
 
 
 # Bash completion stuff
-_source "/usr/share/bash-completion/bash_completion"
+if [[ "$(uname)" == "Darwin" ]]; then
+    if _have brew; then
+        HOMEBREW_PREFIX="$(brew --prefix)"
+        if [[ -r "${HOMEBREW_PREFIX}/etc/profile.d/bash_completion.sh" ]]; then
+            source "${HOMEBREW_PREFIX}/etc/profile.d/bash_completion.sh"
+        else
+            for COMPLETION in "${HOMEBREW_PREFIX}/etc/bash_completion.d/"*; do
+                [[ -r "${COMPLETION}" ]] && source "${COMPLETION}"
+            done
+        fi
+    fi
+else
+    _source "/usr/share/bash-completion/bash_completion"
+fi
 
 # source programs we have
 _have kubectl && source <(kubectl completion bash)
