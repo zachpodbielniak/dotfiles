@@ -65,6 +65,14 @@
 ;;; Dired: show dotfiles and parent directory (..)
 (setq dired-listing-switches "-ahl")
 
+;;; wdired: bulk rename by editing filenames in dired
+(after! dired
+  (setq wdired-allow-to-change-permissions t
+        wdired-allow-to-redirect-links t)
+  (map! :map dired-mode-map
+        :localleader
+        "w" #'wdired-change-to-wdired-mode))
+
 
 ;;; Indentation: tabs, 4 spaces width (matching nvim config)
 (setq-default indent-tabs-mode t
@@ -718,6 +726,14 @@ Return t if handled, nil to fall through to default behaviour."
   ;; setopt (not setq) so the defcustom :set hook adds kill-emacs-hook
   (setopt ement-save-sessions t)
   (setq plz-curl-program "/usr/bin/curl")
+  ;; Guard against nil image metadata in encrypted rooms (pantalaimon
+  ;; sometimes returns incomplete info dicts for media events)
+  (defadvice! zach/ement--image-safe (fn event &rest args)
+    :around #'ement-room--format-message-body
+    (condition-case err
+        (apply fn event args)
+      (wrong-type-argument
+       (propertize "[image unavailable]" 'face 'font-lock-comment-face))))
   ;; Connect through pantalaimon for E2EE support
   (defun zach/ement-connect ()
     "Connect to Matrix via pantalaimon proxy.
