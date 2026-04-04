@@ -3,6 +3,23 @@
 ;; Identity
 (setq user-full-name "Zach Podbielniak")
 
+;;;; =========================================================================
+;;;; Tailscale: remote emacsclient via TCP server
+;;;; =========================================================================
+;;; When Tailscale is available, start a TCP server bound to the Tailscale IP
+;;; so emacsclient can connect from any machine on the tailnet.
+;;; The server file (~/.config/emacs/server/server) contains host, port, and auth key.
+;;; This must run early — errors in later config blocks must not prevent the server.
+(when (executable-find "tailscale")
+  (let ((ts-ip (string-trim
+                (shell-command-to-string "tailscale ip -4 2>/dev/null"))))
+    (when (and ts-ip (not (string-empty-p ts-ip)))
+      (require 'server)
+      (setq server-use-tcp t
+            server-host ts-ip)
+      (unless (server-running-p)
+        (server-start)))))
+
 
 ;;;; =========================================================================
 ;;;; Phase 1: Foundation — Theme, UI, Core Editor
@@ -964,18 +981,3 @@ Restores saved session if available, otherwise prompts for login."
                          "/var/home/zach/source/projects/podomation/build/debug/modules")))
 
 
-;;;; =========================================================================
-;;;; Tailscale: remote emacsclient via TCP server
-;;;; =========================================================================
-;;; When Tailscale is available, start a TCP server bound to the Tailscale IP
-;;; so emacsclient can connect from any machine on the tailnet.
-;;; The server file (~/.emacs.d/server/server) contains host, port, and auth key.
-(when (executable-find "tailscale")
-  (let ((ts-ip (string-trim
-                (shell-command-to-string "tailscale ip -4 2>/dev/null"))))
-    (when (and ts-ip (not (string-empty-p ts-ip)))
-      (require 'server)
-      (setq server-use-tcp t
-            server-host ts-ip)
-      (unless (server-running-p)
-        (server-start)))))
