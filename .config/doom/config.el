@@ -14,11 +14,12 @@
   (let ((ts-ip (string-trim
                 (shell-command-to-string "tailscale ip -4 2>/dev/null"))))
     (when (and ts-ip (not (string-empty-p ts-ip)))
-      (require 'server)
       (setq server-use-tcp t
             server-host ts-ip)
-      (unless (server-running-p)
-        (server-start)))))
+      (add-hook! 'emacs-startup-hook
+        (require 'server)
+        (unless (server-running-p)
+          (server-start))))))
 
 
 ;;;; =========================================================================
