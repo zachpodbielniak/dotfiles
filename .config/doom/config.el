@@ -10,11 +10,13 @@
 
 ;;; Font: Hack Nerd Font Mono (matching gst terminal config)
 ;;; Nerd Font covers modeline icons, Noto Color Emoji for emoji
-(setq doom-font (font-spec :family "Hack Nerd Font Mono" :size 18)
-      doom-variable-pitch-font (font-spec :family "Hack Nerd Font" :size 18)
-      doom-big-font (font-spec :family "Hack Nerd Font Mono" :size 24)
-      doom-symbol-font (font-spec :family "Symbols Nerd Font Mono" :size 18)
-      doom-emoji-font (font-spec :family "Noto Color Emoji" :size 18))
+(let ((sz (if IS-MAC 14 18))
+      (big (if IS-MAC 20 24)))
+  (setq doom-font (font-spec :family "Hack Nerd Font Mono" :size sz)
+        doom-variable-pitch-font (font-spec :family "Hack Nerd Font" :size sz)
+        doom-big-font (font-spec :family "Hack Nerd Font Mono" :size big)
+        doom-symbol-font (font-spec :family "Symbols Nerd Font Mono" :size sz)
+        doom-emoji-font (font-spec :family "Noto Color Emoji" :size sz)))
 
 ;;; Fix font fallback height mismatches that cause vterm line-height bobbing.
 ;;; PGTK Emacs (Wayland) computes line height per-glyph.  TUI spinner chars
@@ -299,6 +301,7 @@
       :desc "Vterm here" "o T" #'+vterm/here)
 
 ;;; Vterm TUI stability
+(setq vterm-always-compile-module t)
 (after! vterm
   ;; Process output faster — fewer visible intermediate redraw states
   (setq vterm-timer-delay 0.02))
