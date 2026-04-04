@@ -129,8 +129,10 @@
 ;;; --- Jira ---
 
 ;; Jira issue tracker interface (list, view, edit, export issues)
-(package! jira
-  :recipe (:host github :repo "unmonoqueteclea/jira.el"))
+;; jira.el uses rx syntax that requires Emacs 30+
+(when (>= emacs-major-version 30)
+  (package! jira
+    :recipe (:host github :repo "unmonoqueteclea/jira.el")))
 
 
 ;;; --- Phase 5: Email ---

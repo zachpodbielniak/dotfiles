@@ -833,10 +833,11 @@ Restores saved session if available, otherwise prompts for login."
          :desc "Shuffle"        "S" #'emms-shuffle
          :desc "Now playing"    "i" #'emms-show)))
 
-;;; Jira issue tracker (jira.el)
+;;; Jira issue tracker (jira.el) — requires Emacs 30+ (rx compat)
 ;;; Auth: store credentials in ~/.authinfo.gpg:
 ;;;   machine <instance>.atlassian.net login <email> port https password <api-token>
 (use-package! jira
+  :when (>= emacs-major-version 30)
   :config
   (setq jira-base-url "https://dt-rnd.atlassian.net"
         jira-api-version 3
