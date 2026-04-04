@@ -120,8 +120,10 @@
 
 ;;; Modeline (tmux-style status bar with catppuccin colors and icons)
 (after! doom-modeline
-  ;; Enable battery and time display
-  (display-battery-mode 1)
+  ;; Enable battery and time display (skip battery on headless/servers)
+  (when (and (display-graphic-p)
+             (not (string-empty-p (string-trim (shell-command-to-string "upower -e 2>/dev/null")))))
+    (display-battery-mode 1))
   (display-time-mode 1)
 
   ;; General appearance
@@ -135,7 +137,7 @@
         doom-modeline-vcs-max-length 25
         doom-modeline-time-icon t
         doom-modeline-time-live-icon t
-        doom-modeline-battery t
+        doom-modeline-battery (display-graphic-p)
         doom-modeline-env-version t
         doom-modeline-modal-icon t
         doom-modeline-modal-modern-icon t)
