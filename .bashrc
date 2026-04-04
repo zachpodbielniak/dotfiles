@@ -42,13 +42,22 @@ _path_prepend() {
 
 # helper function for setting the editor correctly
 _set_editor() {
-    export EDITOR="${1}"
-    export VISUAL="${1}"
-    export GIT_EDITOR="${1}"
-    alias vim="${EDITOR}"
-    alias vi="${EDITOR}"
-    alias v="${EDITOR}"
-    alias nano="${EDITOR}"
+	# only allow vi/vim/nvim for this, not emacs for quick things
+	# since loading `emacs -nw` takes a good amount of time
+	#if [[ "${1}" == "vi" ]] || [[ "${1}" == "vim" ]] || [[ "${1}" == "nvim" ]]
+	if [[ ! "${1}" =~ emacs ]]
+	then
+		export EDITOR="${1}"
+		export VISUAL="${1}"
+		export GIT_EDITOR="${1}"
+		alias vim="${EDITOR}"
+		alias vi="${EDITOR}"
+		alias v="${EDITOR}"
+		alias nano="${EDITOR}"
+    else
+		alias e="${1}"
+	fi
+
 }
 
 
@@ -221,7 +230,20 @@ export FZF_DEFAULT_OPTS=" \
 
 
 # Bash completion stuff
-_source "/usr/share/bash-completion/bash_completion"
+if [[ "$(uname)" == "Darwin" ]]; then
+    if _have brew; then
+        HOMEBREW_PREFIX="$(brew --prefix)"
+        if [[ -r "${HOMEBREW_PREFIX}/etc/profile.d/bash_completion.sh" ]]; then
+            source "${HOMEBREW_PREFIX}/etc/profile.d/bash_completion.sh"
+        else
+            for COMPLETION in "${HOMEBREW_PREFIX}/etc/bash_completion.d/"*; do
+                [[ -r "${COMPLETION}" ]] && source "${COMPLETION}"
+            done
+        fi
+    fi
+else
+    _source "/usr/share/bash-completion/bash_completion"
+fi
 
 # source programs we have
 _have kubectl && source <(kubectl completion bash)

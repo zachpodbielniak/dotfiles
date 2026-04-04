@@ -71,7 +71,7 @@ gst_config_init(void)
     { shell = g_find_program_in_path("bacon"); }
 
     /* Set up hosts that use bacon as default shell. This is "opt-in" */
-    bacon_shell_hosts = g_list_append(bacon_shell_hosts, "lt-zach");
+    /* bacon_shell_hosts = g_list_append(bacon_shell_hosts, "lt-zach"); */
 
     /* iter all hosts and enable bacon on the ones that have it */
     GList *iter;

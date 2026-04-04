@@ -79,6 +79,52 @@
 ;; EPUB reader (replaces epub.nvim)
 (package! nov)
 
+;; Live markdown browser preview (replaces markdown-preview.nvim)
+(package! grip-mode)
+
+;; Table of contents generation for markdown
+(package! markdown-toc)
+
+;; Pixel-perfect table alignment in-buffer (renders tables cleanly)
+(package! valign)
+
+;; Claude Code CLI integration (runs `claude` as subprocess in Emacs)
+(package! claude-code)
+
+;;; --- Phase 6: Org-mode ---
+
+;; Group agenda items into named sections
+(package! org-super-agenda)
+
+;; Structured query language for org headings
+(package! org-ql)
+
+;; Inline content from other org files (replaces transclusion.el)
+(package! org-transclusion)
+
+;; Interactive multi-day timeblock view for scheduled tasks
+(package! org-timeblock)
+
+;; Visual kanban board rendered as org table
+(package! org-kanban)
+
+;; Matrix chat client (native Emacs, E2EE via pantalaimon)
+(package! ement
+  :recipe (:host github :repo "alphapapa/ement.el"))
+
+;; MPD client (music player daemon)
+(package! emms)
+
+;; Code screenshots (replaces carbon-now.nvim)
+(package! carbon-now-sh)
+
+
+;;; --- Jira ---
+
+;; Jira issue tracker interface (list, view, edit, export issues)
+(package! jira
+  :recipe (:host github :repo "unmonoqueteclea/jira.el"))
+
 
 ;;; --- Phase 5: Email ---
 
@@ -90,12 +136,6 @@
 
 
 ;;; --- Phase 6: Custom Emacs ports of nvim plugins ---
-
-;; matrix-emacs: Matrix chat client (port of matrix-nvim)
-(package! matrix-emacs
-  :recipe (:type git
-           :host nil
-           :repo "https://git.podbielniak.com/zachpodbielniak/matrix-emacs"))
 
 ;; gitctl-emacs: Git forge management UI (port of gitctl-nvim)
 (package! gitctl-emacs
