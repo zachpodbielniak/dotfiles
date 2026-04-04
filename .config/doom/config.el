@@ -16,10 +16,11 @@
     (when (and ts-ip (not (string-empty-p ts-ip)))
       (setq server-use-tcp t
             server-host ts-ip)
-      (add-hook! 'emacs-startup-hook
-        (require 'server)
-        (unless (server-running-p)
-          (server-start))))))
+      (run-with-timer 3 nil
+                      (lambda ()
+                        (require 'server)
+                        (unless (server-running-p)
+                          (server-start)))))))
 
 
 ;;;; =========================================================================
