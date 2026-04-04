@@ -54,6 +54,13 @@
 ;; (unpin! t)
 
 
+;;; --- Dependencies ---
+
+;; Emacs 29.x ships an older transient that lacks transient--set-layout.
+;; Packages like claude-code and jira.el need the MELPA version.
+(package! transient)
+
+
 ;;; --- Phase 1: Theme & UI ---
 
 ;; Catppuccin theme (standalone MELPA package, not in doom-themes)
