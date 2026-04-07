@@ -678,7 +678,107 @@ Return t if handled, nil to fall through to default behaviour."
 
 ;;; org-timeblock: interactive multi-day timeblock view
 (use-package! org-timeblock
-  :after org)
+  :after org
+  :config
+  (setq org-timeblock-scale-options nil)
+  ;; Show DONE/KILL items so timeblock works like a full calendar.
+  ;; The package hardcodes `org-entry-is-done-p' to skip done entries,
+  ;; so we advise it to always return nil while gathering entries.
+  (defadvice! +org-timeblock--show-done-a (orig-fn &rest args)
+    :around #'org-timeblock-get-buffer-entries-all
+    (cl-letf (((symbol-function 'org-entry-is-done-p) #'ignore))
+      (apply orig-fn args)))
+  ;; Help command: show keybinding cheatsheet in minibuffer
+  (defun org-timeblock-help ()
+    "Display org-timeblock Evil keybindings."
+    (interactive)
+    (let ((help-text
+           (concat
+            "org-timeblock keybindings:\n"
+            "─── Navigation ───────────────────────────\n"
+            "  j/k      block down/up    h/l    column left/right\n"
+            "  H/L      prev/next day    J      jump to day\n"
+            "─── Actions ──────────────────────────────\n"
+            "  RET      go to task       go     go to (other window)\n"
+            "  s        schedule         d      set duration\n"
+            "  t        toggle TODO      a      new task\n"
+            "  ci/co    clock in/out\n"
+            "─── Marks ────────────────────────────────\n"
+            "  m        mark block       u      unmark block\n"
+            "  %        mark by regexp   U      unmark all\n"
+            "─── View ─────────────────────────────────\n"
+            "  v        switch scaling   V      change span\n"
+            "  T        toggle list      gr     refresh\n"
+            "  W        write/export     q      quit\n"
+            "  C-s      save org files   ?      this help")))
+      (with-current-buffer (get-buffer-create "*org-timeblock-help*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert help-text)
+          (goto-char (point-min))
+          (special-mode))
+        (display-buffer (current-buffer)
+                        '(display-buffer-at-bottom . ((window-height . fit-window-to-buffer)))))))
+  ;; Evil-friendly keybindings for the timeblock SVG view
+  (evil-define-key* 'normal org-timeblock-mode-map
+    ;; navigation: vim-style hjkl
+    "j" #'org-timeblock-forward-block
+    "k" #'org-timeblock-backward-block
+    "h" #'org-timeblock-backward-column
+    "l" #'org-timeblock-forward-column
+    ;; day navigation
+    "H" #'org-timeblock-day-earlier
+    "L" #'org-timeblock-day-later
+    ;; jump / goto
+    "J" #'org-timeblock-jump-to-day
+    (kbd "RET") #'org-timeblock-goto
+    (kbd "TAB") #'org-timeblock-goto-other-window
+    "go" #'org-timeblock-goto-other-window
+    ;; actions
+    "s" #'org-timeblock-schedule
+    "d" #'org-timeblock-set-duration
+    "t" #'org-timeblock-todo
+    "a" #'org-timeblock-new-task
+    ;; clock
+    "ci" #'org-timeblock-clock-in
+    "co" #'org-clock-out
+    ;; marks
+    "m" #'org-timeblock-mark-block
+    "%" #'org-timeblock-mark-by-regexp
+    "u" #'org-timeblock-unmark-block
+    "U" #'org-timeblock-unmark-all-blocks
+    ;; view
+    "v" #'org-timeblock-switch-scaling
+    "V" #'org-timeblock-change-span
+    "T" #'org-timeblock-toggle-timeblock-list
+    "gr" #'org-timeblock-redraw-buffers
+    "W" #'org-timeblock-write
+    "q" #'org-timeblock-quit
+    "?" #'org-timeblock-help
+    (kbd "C-s") #'org-save-all-org-buffers)
+  ;; Evil-friendly keybindings for the timeblock list sidebar
+  (evil-define-key* 'normal org-timeblock-list-mode-map
+    "j" #'org-timeblock-list-next-line
+    "k" #'org-timeblock-list-previous-line
+    "H" #'org-timeblock-day-earlier
+    "L" #'org-timeblock-day-later
+    "J" #'org-timeblock-jump-to-day
+    (kbd "RET") #'org-timeblock-list-goto
+    (kbd "TAB") #'org-timeblock-list-goto-other-window
+    "go" #'org-timeblock-list-goto-other-window
+    "s" #'org-timeblock-list-schedule
+    "d" #'org-timeblock-list-set-duration
+    "t" #'org-timeblock-todo
+    "a" #'org-timeblock-new-task
+    "ci" #'org-timeblock-list-clock-in
+    "co" #'org-clock-out
+    "v" #'org-timeblock-switch-scaling
+    "V" #'org-timeblock-change-span
+    "T" #'org-timeblock-list-toggle-timeblock
+    "gr" #'org-timeblock-redraw-buffers
+    "q" #'org-timeblock-quit
+    "?" #'org-timeblock-help
+    (kbd "C-s") #'org-save-all-org-buffers))
 
 ;;; org-kanban: visual kanban board as org table
 (use-package! org-kanban
