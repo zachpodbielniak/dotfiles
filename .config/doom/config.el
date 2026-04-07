@@ -793,12 +793,59 @@ Return t if handled, nil to fall through to default behaviour."
   (define-key org-super-agenda-header-map (kbd "h") #'evil-backward-char)
   (define-key org-super-agenda-header-map (kbd "l") #'evil-forward-char))
 
+;;; +org/insert-linked-note: Anytype-style create-and-link in PARA structure
+(defun +org--create-and-link-note (dir)
+  "Create a new org note in DIR and insert a link at point.
+Auto-prefixes the filename with today's date when DIR contains
+\"meeting\", \"journal\", or \"1on1\"."
+  (let* ((title (read-string "Title: "))
+         (slug (thread-last title
+                 (downcase)
+                 (replace-regexp-in-string "[^a-z0-9]+" "_")
+                 (replace-regexp-in-string "\\`_\\|_\\'" "")))
+         (date-prefix (format-time-string "%Y%m%d"))
+         (auto-date-p (string-match-p "meeting\\|journal\\|1on1" (downcase dir)))
+         (filename (concat (if auto-date-p (concat date-prefix "_") "") slug ".org"))
+         (filepath (expand-file-name filename dir))
+         (link-path (abbreviate-file-name filepath)))
+    (when (file-exists-p filepath)
+      (unless (y-or-n-p (format "%s already exists.  Link to it anyway?" filename))
+        (user-error "Aborted")))
+    (unless (file-exists-p dir)
+      (make-directory dir t))
+    (unless (file-exists-p filepath)
+      (with-temp-file filepath
+        (insert (format "#+title: %s\n#+author: %s\n#+startup: overview indent\n\n"
+                        title user-full-name))))
+    (insert (org-link-make-string (concat "file:" link-path) title))))
+
+(defun +org/insert-linked-note ()
+  "Create and link a note — browse PARA directories step by step."
+  (interactive)
+  (+org--create-and-link-note
+   (read-directory-name "Location: " org-directory nil t)))
+
+(defun +org/insert-linked-note-fuzzy ()
+  "Create and link a note — fuzzy-search all PARA directories."
+  (interactive)
+  (let* ((root (expand-file-name org-directory))
+         (dirs (mapcar
+                (lambda (d) (file-relative-name d root))
+                (seq-filter (lambda (d)
+                              (and (file-directory-p d)
+                                   (not (string-match-p "/\\.git\\(/\\|$\\)" d))))
+                            (directory-files-recursively root "" t))))
+         (pick (completing-read "Location (fuzzy): " (cons "./" dirs) nil nil)))
+    (+org--create-and-link-note (expand-file-name pick root))))
+
 ;;; Org keybindings (extending Doom defaults)
 ;;; NOTE: org-transclusion bindings live in transclusion.el alongside markdown ones
 (map! :leader
       :desc "Org QL search"       "n q" #'org-ql-search
       :desc "Org timeblock"       "n T" #'org-timeblock
-      :desc "Org kanban"          "n k" #'org-kanban/initialize)
+      :desc "Org kanban"          "n k" #'org-kanban/initialize
+      :desc "Insert linked note"  "n i" #'+org/insert-linked-note
+      :desc "Insert linked (fuzzy)" "n I" #'+org/insert-linked-note-fuzzy)
 
 
 ;;;; =========================================================================
