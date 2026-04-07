@@ -220,7 +220,22 @@
 
 ;;; Sync all Evil yank/delete operations to system clipboard
 (after! evil
-  (setq evil-want-clipboard t))
+  (setq evil-want-clipboard t)
+
+  ;; Visual line motion: gj/gk move by display lines in word-wrapped buffers
+  ;; Global binding for non-org modes
+  (evil-define-key 'normal 'global
+    "gj" #'evil-next-visual-line
+    "gk" #'evil-previous-visual-line)
+  (evil-define-key 'visual 'global
+    "gj" #'evil-next-visual-line
+    "gk" #'evil-previous-visual-line))
+
+;; Override evil-org's gj/gk (org-forward/backward-element) with visual line motion
+(after! evil-org
+  (evil-define-key '(normal visual) evil-org-mode-map
+    "gj" #'evil-next-visual-line
+    "gk" #'evil-previous-visual-line))
 
 ;;; Fix "wrong type argument: plistp, t" on SPC p p project switch
 ;;; The workspace switch function hits a plistp error on first attempt when
