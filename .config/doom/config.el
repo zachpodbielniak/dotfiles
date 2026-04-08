@@ -218,6 +218,10 @@
 ;;; Clipboard paste (GTK GUI)
 (map! "C-S-v" #'clipboard-yank)
 
+;;; Scratch buffers in emacs-lisp-mode (for SPC m e e eval, etc.)
+(setq initial-major-mode 'lisp-interaction-mode          ; *scratch* buffer
+      doom-scratch-buffer-major-mode 'lisp-interaction-mode) ; SPC x scratch
+
 ;;; Sync all Evil yank/delete operations to system clipboard
 (after! evil
   (setq evil-want-clipboard t)
@@ -879,10 +883,10 @@ Auto-prefixes the filename with today's date when DIR contains
         email-confirm-send   t
         email-confirm-delete t)
   (map! :leader
-        :desc "Email inbox"   "m m" #'email-open
-        :desc "Email compose" "m c" #'email-compose
-        :desc "Email folders" "m f" #'email-folders
-        :desc "Email search"  "m s" #'email-search))
+        :desc "Email inbox"   "e m" #'email-open
+        :desc "Email compose" "e c" #'email-compose
+        :desc "Email folders" "e f" #'email-folders
+        :desc "Email search"  "e s" #'email-search))
 
 ;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
 (use-package! ement
