@@ -86,6 +86,9 @@
 ;; EPUB reader (replaces epub.nvim)
 (package! nov)
 
+;; Calibre library browser
+(package! calibredb)
+
 ;; Live markdown browser preview (replaces markdown-preview.nvim)
 (package! grip-mode)
 

@@ -8,6 +8,9 @@
 ;;;; Phase 1: Foundation — Theme, UI, Core Editor
 ;;;; =========================================================================
 
+;;; Custom splash screen
+(setq fancy-splash-image "~/Pictures/Immutablue/immutablue-logo.jpg")
+
 ;;; Font: Hack Nerd Font Mono (matching gst terminal config)
 ;;; Nerd Font covers modeline icons, Noto Color Emoji for emoji
 (let ((sz (if IS-MAC 14 18))
@@ -241,15 +244,22 @@
     "gj" #'evil-next-visual-line
     "gk" #'evil-previous-visual-line))
 
-;;; Fix "wrong type argument: plistp, t" on SPC p p project switch
-;;; The workspace switch function hits a plistp error on first attempt when
-;;; persp-mode returns t instead of a perspective struct. Wrap with retry.
+;;; Fix "wrong type argument: plistp, t" when persp-mode isn't initialized yet.
+;;; persp-mode returns t instead of a perspective struct on first use after
+;;; launch.  Wrap affected functions so they fall back gracefully.
 (defadvice! +workspaces-switch-to-project-retry-a (fn &rest args)
   "Catch plistp error on first project switch and retry."
   :around #'+workspaces-switch-to-project-h
   (condition-case _err
       (apply fn args)
     (wrong-type-argument (apply fn args))))
+
+(defadvice! +workspace-buffer-list-safe-a (fn &rest args)
+  "Fall back to global buffer list when persp-mode isn't ready."
+  :around #'+workspace-buffer-list
+  (condition-case _err
+      (apply fn args)
+    (wrong-type-argument (buffer-list))))
 
 
 ;;;; =========================================================================
@@ -539,6 +549,34 @@ Return t if handled, nil to fall through to default behaviour."
   ;; RET follows links (TOC anchors, file links, URLs) in normal mode
   (map! :map markdown-mode-map
         :n "RET" #'markdown-follow-thing-at-point))
+
+
+;;; EPUB reader (nov.el)
+(use-package! nov
+  :mode ("\\.epub\\'" . nov-mode)
+  :config
+  (setq nov-text-width 80))
+
+;;; Calibre library browser
+(use-package! calibredb
+  :commands (calibredb)
+  :config
+  (setq calibredb-program "flatpak run --command=calibredb com.calibre_ebook.calibre"
+        calibredb-root-dir "~/Documents/E-Books"
+        calibredb-db-dir (expand-file-name "metadata.db" calibredb-root-dir)
+        calibredb-library-alist '(("~/Documents/E-Books")))
+  (map! :leader
+        :desc "Calibre library" "o b" #'calibredb)
+  (map! :map calibredb-search-mode-map
+        :n "RET" #'calibredb-find-file
+        :n "V"   #'calibredb-open-file-with-default-tool
+        :n "v"   #'calibredb-view
+        :n "?"   #'calibredb-dispatch
+        :n "/"   #'calibredb-search-live-filter
+        :n "r"   #'calibredb-search-refresh-and-clear-filter
+        :n "m"   #'calibredb-mark-and-forward
+        :n "u"   #'calibredb-unmark-and-forward
+        :n "q"   #'calibredb-search-quit))
 
 
 ;;;; =========================================================================
