@@ -576,6 +576,9 @@ Return t if handled, nil to fall through to default behaviour."
         :n "r"   #'calibredb-search-refresh-and-clear-filter
         :n "m"   #'calibredb-mark-and-forward
         :n "u"   #'calibredb-unmark-and-forward
+        :n "q"   #'calibredb-search-quit)
+  (map! :map calibredb-show-mode-map
+        :n "?"   #'calibredb-entry-dispatch
         :n "q"   #'calibredb-search-quit))
 
 
@@ -1169,5 +1172,12 @@ Restores saved session if available, otherwise prompts for login."
         podomation-cmd '("podomation-language-server"
                          "--modules-path"
                          "/var/home/zach/source/projects/podomation/build/debug/modules")))
+
+;;; monday.com client (GraphQL API)
+(use-package! monday
+  :commands (monday monday-boards)
+  :config
+  (map! :leader
+        :desc "monday.com" "M" #'monday))
 
 

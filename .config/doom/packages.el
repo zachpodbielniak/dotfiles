@@ -184,3 +184,8 @@
   :recipe (:type git
            :host nil
            :repo "https://git.podbielniak.com/zachpodbielniak/podomation-emacs"))
+
+;; monday: monday.com client (GraphQL API)
+(package! monday
+  :recipe (:host nil
+           :repo "https://git.podbielniak.com/zachpodbielniak/monday-emacs"))
