@@ -92,7 +92,10 @@
 ;;; Transparent background (replaces transparent.nvim)
 ;;; GUI: set frame alpha; Terminal: clear face backgrounds
 (if (display-graphic-p)
-    (set-frame-parameter nil 'alpha-background 95)
+    (if (eq system-type 'darwin)
+        ;; macOS NS port: alpha-background is not supported, use alpha instead
+        (set-frame-parameter nil 'alpha '(95 . 85))
+      (set-frame-parameter nil 'alpha-background 95))
   (add-hook 'doom-load-theme-hook
             (lambda ()
               (set-face-background 'default nil)
@@ -100,7 +103,15 @@
               (when (facep 'solaire-default-face)
                 (set-face-background 'solaire-default-face nil)))))
 ;; Apply alpha to new frames too
-(add-to-list 'default-frame-alist '(alpha-background . 85))
+(if (eq system-type 'darwin)
+    (add-to-list 'default-frame-alist '(alpha . (85 . 75)))
+  (add-to-list 'default-frame-alist '(alpha-background . 85)))
+
+;; macOS native fullscreen creates a separate Space and drops transparency.
+;; Use non-native fullscreen (maximized within current Space) instead.
+(when (eq system-type 'darwin)
+  (setq ns-use-native-fullscreen nil)
+  (add-to-list 'default-frame-alist '(fullscreen . maximized)))
 
 ;;; Modeline (tmux-style status bar with catppuccin colors and icons)
 (after! doom-modeline
