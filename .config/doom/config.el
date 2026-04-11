@@ -142,13 +142,27 @@
         (assq-delete-all 'alpha-background default-frame-alist))
   (add-to-list 'default-frame-alist '(alpha-background . 85))
 
-  ;; After Doom finishes frame setup: un-fullscreen and set alpha-background.
-  ;; The alpha module (0.9) is already < 1.0, so wlroots composites the
-  ;; wallpaper behind the frame — no separate gowl-set-all-alpha needed.
+  ;; Status bar — title + system info + clock
+  (gowl-bar-enable)
+
+  ;; After Doom finishes frame setup: un-fullscreen, set alpha-background,
+  ;; and sync bar title with buffer/window changes.
   (add-hook 'doom-after-init-hook
             (lambda ()
               (set-frame-parameter nil 'fullscreen nil)
-              (set-frame-parameter nil 'alpha-background 85))))
+              (set-frame-parameter nil 'alpha-background 85)
+              ;; Keep bar title in sync with active buffer.
+              ;; Poll every 200ms — hooks all fire before window state
+              ;; is finalized; a timer reads the settled state reliably.
+              (defvar gowl--bar-last-title nil)
+              (run-with-timer 0.2 0.2
+                (lambda ()
+                  (ignore-errors
+                    (let ((title (buffer-name
+                                  (window-buffer (selected-window)))))
+                      (unless (equal title gowl--bar-last-title)
+                        (setq gowl--bar-last-title title)
+                        (gowl-bar-set-title title)))))))))
 
 ;;; Modeline (tmux-style status bar with catppuccin colors and icons)
 (after! doom-modeline
