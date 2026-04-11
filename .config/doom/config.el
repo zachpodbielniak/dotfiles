@@ -145,6 +145,12 @@
   ;; Status bar — title + system info + clock
   (gowl-bar-enable)
 
+  (defun gowl-bar-restart ()
+    "Kill and re-enable the gowl bar (fixes sizing after resize)."
+    (interactive)
+    (gowl-bar-disable)
+    (gowl-bar-enable))
+
   ;; After Doom finishes frame setup: un-fullscreen, set alpha-background,
   ;; and sync bar title with buffer/window changes.
   (add-hook 'doom-after-init-hook
