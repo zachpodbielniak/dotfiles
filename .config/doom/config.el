@@ -142,13 +142,13 @@
         (assq-delete-all 'alpha-background default-frame-alist))
   (add-to-list 'default-frame-alist '(alpha-background . 85))
 
-  ;; After Doom finishes frame setup: un-fullscreen, set alpha-background,
-  ;; and force compositor to composite behind the Emacs frame.
+  ;; After Doom finishes frame setup: un-fullscreen and set alpha-background.
+  ;; The alpha module (0.9) is already < 1.0, so wlroots composites the
+  ;; wallpaper behind the frame — no separate gowl-set-all-alpha needed.
   (add-hook 'doom-after-init-hook
             (lambda ()
               (set-frame-parameter nil 'fullscreen nil)
-              (set-frame-parameter nil 'alpha-background 85)
-              (gowl-set-all-alpha 0.99))))
+              (set-frame-parameter nil 'alpha-background 85))))
 
 ;;; Modeline (tmux-style status bar with catppuccin colors and icons)
 (after! doom-modeline
