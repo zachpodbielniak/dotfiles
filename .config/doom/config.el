@@ -3,6 +3,24 @@
 ;; Identity
 (setq user-full-name "Zach Podbielniak")
 
+;;; exec-path: ensure Emacs can find tools regardless of how it was launched.
+;;; When started from a desktop file or systemd, PATH is minimal and misses
+;;; linuxbrew, ~/bin/scripts, cargo, etc.  Add them here once rather than
+;;; patching each package individually.
+(dolist (dir '("/home/linuxbrew/.linuxbrew/bin"
+              "/home/linuxbrew/.linuxbrew/sbin"
+              "~/bin/scripts"
+              "~/bin"
+              "~/.local/bin"
+              "~/.cargo/bin"))
+  (let ((expanded (expand-file-name dir)))
+    (when (file-directory-p expanded)
+      (add-to-list 'exec-path expanded)
+      (setenv "PATH" (concat expanded ":" (getenv "PATH"))))))
+(let ((perl5lib (expand-file-name "~/perl5/lib/perl5")))
+  (when (file-directory-p perl5lib)
+    (setenv "PERL5LIB" (concat perl5lib ":" (or (getenv "PERL5LIB") "")))))
+
 
 ;;;; =========================================================================
 ;;;; Phase 1: Foundation — Theme, UI, Core Editor
@@ -76,6 +94,26 @@
         :localleader
         "w" #'wdired-change-to-wdired-mode))
 
+;;; Dirvish: enhanced dired with preview and multi-column layout
+;; Preview deps: brew install libvips mediainfo
+(use-package! dirvish
+  :after dired
+  :config
+  (dirvish-override-dired-mode)
+  (dirvish-peek-mode)
+  (setq dirvish-attributes '(hl-line subtree-state nerd-icons collapse git-msg file-time file-size)
+        dirvish-mode-line-format '(:left (sort symlink) :right (omit yank index))
+        dirvish-preview-dispatchers '(image gif video audio epub pdf archive))
+  (map! :leader
+        :desc "Dirvish"      "d d" #'dirvish
+        :desc "Dirvish dwim" "d s" #'dirvish-side)
+  (map! :map dirvish-mode-map
+        :n "q"   #'dirvish-quit
+        :n "TAB" #'dirvish-subtree-toggle
+        :n "a"   #'dirvish-quick-access
+        :n "s"   #'dirvish-quicksort
+        :n "y"   #'dirvish-yank-menu
+        :n "f"   #'dirvish-fd))
 
 ;;; Indentation: tabs, 4 spaces width (matching nvim config)
 (setq-default indent-tabs-mode t
@@ -142,8 +180,19 @@
         (assq-delete-all 'alpha-background default-frame-alist))
   (add-to-list 'default-frame-alist '(alpha-background . 85))
 
-  ;; Status bar — title + system info + clock
+  ;; Status bar — title + system widgets + clock
   (gowl-bar-enable)
+  (gowl-bar-configure
+    '(("widgets" . "cpu memory disk:/var battery clock")
+      ("cpu-color" . "#a6e3a1")
+      ("memory-color" . "#89b4fa")
+      ("disk-color" . "#f9e2af")
+      ("battery-color" . "#94e2d5")
+      ("clock-color" . "#cdd6f4")
+      ;; Colorize title text — split on delimiters, cycle Catppuccin palette
+      ("title-delimiters" . "-._/: *")
+      ("title-delimiter-color" . "#585b70")
+      ("title-palette" . "#89b4fa #a6e3a1 #f9e2af #f5c2e7 #94e2d5 #cba6f7 #fab387 #89dceb")))
 
   (defun gowl-bar-restart ()
     "Kill and re-enable the gowl bar (fixes sizing after resize)."
@@ -202,12 +251,6 @@
   ;; Custom segment: days-since trackers (cached, updates every 60s)
   ;; Matches tmux right status: 🥩:days 🥤:days ☕:days
   ;; ---------------------------------------------------------------------------
-  (defvar zach-modeline--perl-cmd
-    (if (file-executable-p "/home/linuxbrew/.linuxbrew/bin/perl")
-        "PERL5LIB=~/perl5/lib/perl5 /home/linuxbrew/.linuxbrew/bin/perl "
-      "")
-    "Perl invocation prefix: uses linuxbrew perl if available, otherwise relies on PATH.")
-
   (defvar zach-modeline--days-cache ""
     "Cached string for days-since trackers.")
 
@@ -216,9 +259,9 @@
 
   (defun zach-modeline--update-days ()
     "Update the days-since cache by calling the days_since script."
-    (let ((carnivore (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/days_since 2024-11-24"))))
-          (soda      (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/days_since 2025-07-14"))))
-          (coffee    (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/days_since 2025-09-20")))))
+    (let ((carnivore (string-trim (shell-command-to-string "days_since 2024-11-24")))
+          (soda      (string-trim (shell-command-to-string "days_since 2025-07-14")))
+          (coffee    (string-trim (shell-command-to-string "days_since 2025-09-20"))))
       (setq zach-modeline--days-cache
             (concat
              (propertize (format " 🥩:%s" carnivore) 'face '(:foreground "#f38ba8"))
@@ -247,7 +290,7 @@
 
   (defun zach-modeline--update-pomo ()
     "Update the pomodoro cache by calling the pomo script."
-    (let ((pomo (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/pomo")))))
+    (let ((pomo (string-trim (shell-command-to-string "pomo"))))
       (setq zach-modeline--pomo-cache
             (if (string-empty-p pomo) ""
               (propertize (format " %s" pomo) 'face '(:foreground "#fab387"))))))
