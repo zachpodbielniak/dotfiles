@@ -113,6 +113,43 @@
   (setq ns-use-native-fullscreen nil)
   (add-to-list 'default-frame-alist '(fullscreen . maximized)))
 
+;;; Gowl compositor modules (only when running as Wayland compositor)
+(defconst IS-GOWL (and (fboundp 'gowl-running-p) (gowl-running-p)))
+
+(when IS-GOWL
+  ;; Initialize gowl Elisp integration (loads bundled modules)
+  (gowl-start)
+
+  ;; Window opacity — dim unfocused clients
+  (gowl-enable-module "alpha")
+  (gowl-set-focused-alpha 0.9)
+  (gowl-set-unfocused-alpha 0.9)
+
+  ;; Wallpaper
+  (gowl-set-wallpaper "~/Pictures/wallpaper.png")
+
+  ;; Tiling gaps — outer gaps give the frame breathing room from edges
+  (gowl-enable-module "vanitygaps")
+  (gowl-set-gaps '(("inner-gap" . "0") ("outer-gap" . "32")))
+
+  ;; Prevent Doom from fullscreening the frame (gaps need tiled mode)
+  (setq default-frame-alist
+        (assq-delete-all 'fullscreen default-frame-alist))
+
+  ;; PGTK frame transparency — render background with alpha so the
+  ;; wallpaper shows through.  Text and UI elements stay fully opaque.
+  (setq default-frame-alist
+        (assq-delete-all 'alpha-background default-frame-alist))
+  (add-to-list 'default-frame-alist '(alpha-background . 85))
+
+  ;; After Doom finishes frame setup: un-fullscreen, set alpha-background,
+  ;; and force compositor to composite behind the Emacs frame.
+  (add-hook 'doom-after-init-hook
+            (lambda ()
+              (set-frame-parameter nil 'fullscreen nil)
+              (set-frame-parameter nil 'alpha-background 85)
+              (gowl-set-all-alpha 0.99))))
+
 ;;; Modeline (tmux-style status bar with catppuccin colors and icons)
 (after! doom-modeline
   ;; Enable battery and time display (skip battery on headless/servers)
@@ -271,6 +308,24 @@
   (condition-case _err
       (apply fn args)
     (wrong-type-argument (buffer-list))))
+
+
+;;; Toggle-maximize: SPC w m m zooms current window, repeat to restore.
+(defvar +my/window-maximize-register nil
+  "Register used to store window config before maximizing.")
+
+(defun +my/toggle-maximize-window ()
+  "Toggle maximizing the current window."
+  (interactive)
+  (if (and +my/window-maximize-register (= 1 (length (window-list))))
+      (progn
+        (jump-to-register +my/window-maximize-register)
+        (setq +my/window-maximize-register nil))
+    (setq +my/window-maximize-register (gensym))
+    (window-configuration-to-register +my/window-maximize-register)
+    (delete-other-windows)))
+
+(map! :leader "w m m" #'+my/toggle-maximize-window)
 
 
 ;;;; =========================================================================
