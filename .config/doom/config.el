@@ -182,6 +182,12 @@
   ;; Custom segment: days-since trackers (cached, updates every 60s)
   ;; Matches tmux right status: 🥩:days 🥤:days ☕:days
   ;; ---------------------------------------------------------------------------
+  (defvar zach-modeline--perl-cmd
+    (if (file-executable-p "/home/linuxbrew/.linuxbrew/bin/perl")
+        "PERL5LIB=~/perl5/lib/perl5 /home/linuxbrew/.linuxbrew/bin/perl "
+      "")
+    "Perl invocation prefix: uses linuxbrew perl if available, otherwise relies on PATH.")
+
   (defvar zach-modeline--days-cache ""
     "Cached string for days-since trackers.")
 
@@ -190,9 +196,9 @@
 
   (defun zach-modeline--update-days ()
     "Update the days-since cache by calling the days_since script."
-    (let ((carnivore (string-trim (shell-command-to-string "days_since 2024-11-24")))
-          (soda      (string-trim (shell-command-to-string "days_since 2025-07-14")))
-          (coffee    (string-trim (shell-command-to-string "days_since 2025-09-20"))))
+    (let ((carnivore (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/days_since 2024-11-24"))))
+          (soda      (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/days_since 2025-07-14"))))
+          (coffee    (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/days_since 2025-09-20")))))
       (setq zach-modeline--days-cache
             (concat
              (propertize (format " 🥩:%s" carnivore) 'face '(:foreground "#f38ba8"))
@@ -221,7 +227,7 @@
 
   (defun zach-modeline--update-pomo ()
     "Update the pomodoro cache by calling the pomo script."
-    (let ((pomo (string-trim (shell-command-to-string "pomo"))))
+    (let ((pomo (string-trim (shell-command-to-string (concat zach-modeline--perl-cmd "~/bin/scripts/pomo")))))
       (setq zach-modeline--pomo-cache
             (if (string-empty-p pomo) ""
               (propertize (format " %s" pomo) 'face '(:foreground "#fab387"))))))
