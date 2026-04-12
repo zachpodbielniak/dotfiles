@@ -69,6 +69,9 @@
 ;; Color code highlighting (replaces nvim-colorizer.lua)
 (package! rainbow-mode)
 
+;; Browse kill-ring in a dedicated buffer
+(package! browse-kill-ring)
+
 
 ;;; --- Phase 3: Navigation & Tools ---
 

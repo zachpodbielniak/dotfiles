@@ -374,6 +374,28 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 ;;; Clipboard paste (GTK GUI)
 (map! "C-S-v" #'clipboard-yank)
 
+;;; browse-kill-ring: evil keybinds (defaults are Emacs-style)
+(after! browse-kill-ring
+  (set-evil-initial-state! 'browse-kill-ring-mode 'normal)
+  (evil-define-key 'normal browse-kill-ring-mode-map
+    "j"   #'browse-kill-ring-forward
+    "k"   #'browse-kill-ring-previous
+    "n"   #'browse-kill-ring-search-forward
+    "N"   #'browse-kill-ring-search-backward
+    "/"   #'browse-kill-ring-search-forward
+    "?"   #'browse-kill-ring-search-backward
+    "d"   #'browse-kill-ring-delete
+    "y"   #'browse-kill-ring-insert-and-quit
+    "p"   #'browse-kill-ring-insert-and-quit
+    "i"   #'browse-kill-ring-insert
+    "a"   #'browse-kill-ring-append-insert
+    "u"   #'browse-kill-ring-undo-other-window
+    "r"   #'browse-kill-ring-update
+    "gr"  #'browse-kill-ring-update
+    "q"   #'browse-kill-ring-quit
+    (kbd "RET") #'browse-kill-ring-insert-and-quit
+    (kbd "ESC") #'browse-kill-ring-quit))
+
 ;;; Scratch buffers in emacs-lisp-mode (for SPC m e e eval, etc.)
 (setq initial-major-mode 'lisp-interaction-mode          ; *scratch* buffer
       doom-scratch-buffer-major-mode 'lisp-interaction-mode) ; SPC x scratch
