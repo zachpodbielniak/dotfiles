@@ -144,15 +144,6 @@
     :recipe (:host github :repo "unmonoqueteclea/jira.el")))
 
 
-;;; --- Phase 5: Email ---
-
-;; email-emacs: buffer-based email client using email.c backend (port of email-nvim)
-(package! email-emacs
-  :recipe (:type git
-           :host nil
-           :repo "https://git.podbielniak.com/zachpodbielniak/email-emacs"))
-
-
 ;;; --- Phase 6: Custom Emacs ports of nvim plugins ---
 
 ;; gitctl-emacs: Git forge management UI (port of gitctl-nvim)

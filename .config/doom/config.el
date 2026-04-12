@@ -170,6 +170,10 @@
   (gowl-enable-module "vanitygaps")
   (gowl-set-gaps '(("inner-gap" . "0") ("outer-gap" . "32")))
 
+  ;; Rounded corners -- because it looks cool
+  (gowl-enable-module "roundcorners")
+  (gowl-set-corner-radius 12)
+
   ;; Prevent Doom from fullscreening the frame (gaps need tiled mode)
   (setq default-frame-alist
         (assq-delete-all 'fullscreen default-frame-alist))
@@ -1109,18 +1113,43 @@ Auto-prefixes the filename with today's date when DIR contains
 (load! "shell-runner")  ;; Shell command runner (from lua/custom/shell.lua)
 (load! "transclusion")  ;; Transclusion system (from core/mappings.lua)
 
-;;; Email client (port of email-nvim; backend: email.c)
-(use-package! email-emacs
-  :config
-  (setq email-cmd          "email.c"
-        email-from         nil     ;; set to your address for reply-all filtering
-        email-confirm-send   t
-        email-confirm-delete t)
-  (map! :leader
-        :desc "Email inbox"   "e m" #'email-open
-        :desc "Email compose" "e c" #'email-compose
-        :desc "Email folders" "e f" #'email-folders
-        :desc "Email search"  "e s" #'email-search))
+;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
+;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
+;;; Sending: msmtp  (config at ~/.config/msmtp/config)
+(after! mu4e
+  (setq mu4e-maildir (expand-file-name "~/.local/share/mail/proton")
+        mu4e-get-mail-command "mbsync -c ~/.config/isync/mbsyncrc proton"
+        mu4e-update-interval (* 5 60)
+        mu4e-change-filenames-when-moving t  ;; required for mbsync
+        mu4e-use-fancy-chars t
+        mu4e-view-show-images t
+        mu4e-view-show-addresses t
+        mu4e-compose-format-flowed t
+        mu4e-confirm-quit nil
+        mu4e-attachment-dir "~/Downloads"
+        ;; Identity
+        user-mail-address "zach@podbielniak.com"
+        user-full-name "Zach Podbielniak"
+        ;; Folder mapping — Proton Bridge exposes standard IMAP folders
+        mu4e-drafts-folder "/Drafts"
+        mu4e-sent-folder   "/Sent"
+        mu4e-refile-folder "/Archive"
+        mu4e-trash-folder  "/Trash"
+        ;; Proton keeps a copy in Sent automatically — don't double-save
+        mu4e-sent-messages-behavior 'delete
+        ;; Sending via msmtp
+        sendmail-program "/usr/bin/msmtp"
+        send-mail-function #'smtpmail-send-it
+        message-sendmail-f-is-evil t
+        message-sendmail-extra-arguments '("--read-envelope-from")
+        message-send-mail-function #'message-send-mail-with-sendmail)
+
+  ;; Quick bookmarks for mu4e main view
+  (setq mu4e-bookmarks
+        '((:name "Unread"    :query "flag:unread AND NOT flag:trashed" :key ?u)
+          (:name "Today"     :query "date:today..now"                  :key ?t)
+          (:name "This week" :query "date:7d..now"                     :key ?w)
+          (:name "Flagged"   :query "flag:flagged"                     :key ?f))))
 
 ;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
 (use-package! ement
