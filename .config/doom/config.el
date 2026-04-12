@@ -183,10 +183,13 @@
   ;; Status bar — title + system widgets + clock
   (gowl-bar-enable)
   (gowl-bar-configure
-    '(("widgets" . "cpu memory disk:/var battery clock")
+    '(("widgets" . "cmd:~/bin/scripts/pomo@1 cpu memory disk:/var ip podman battery clock")
       ("cpu-color" . "#a6e3a1")
       ("memory-color" . "#89b4fa")
       ("disk-color" . "#f9e2af")
+      ("ip-color" . "#cba6f7")
+      ("podman-color" . "#fab387")
+      ("cmd-color" . "#f5c2e7")
       ("battery-color" . "#94e2d5")
       ("clock-color" . "#cdd6f4")
       ;; Colorize title text — split on delimiters, cycle Catppuccin palette
@@ -217,7 +220,40 @@
                                   (window-buffer (selected-window)))))
                       (unless (equal title gowl--bar-last-title)
                         (setq gowl--bar-last-title title)
-                        (gowl-bar-set-title title)))))))))
+                        (gowl-bar-set-title title))))))
+              ;; Multi-monitor: position monitors then create per-monitor frames.
+              ;; Only runs when more than one monitor is connected.
+              (when (> (gowl-monitor-count) 1)
+                (cmacs-gowl-setup-monitors)))))
+
+(defun cmacs-gowl-setup-monitors ()
+  "Position monitors to match physical layout and create one frame per monitor.
+Monitors are identified by name.  The layout below matches the GNOME
+config: two LG SDQHD side-by-side on top, laptop centered below."
+  (interactive)
+  (let ((monitors (gowl-list-monitors))
+        (layout nil))
+    ;; Build name→monitor lookup
+    (dolist (m monitors)
+      (push (cons (cdr (assq 'name (gowl-monitor-info m))) m) layout))
+    ;; Position monitors (adjust for your physical layout)
+    (let ((dp1 (or (cdr (assoc "DP-11" layout))
+                   (cdr (assoc "DP-9" layout))
+                   (cdr (assoc "DP-13" layout))))
+          (dp2 (or (cdr (assoc "DP-12" layout))
+                   (cdr (assoc "DP-10" layout))
+                   (cdr (assoc "DP-14" layout))))
+          (edp (cdr (assoc "eDP-1" layout))))
+      (when dp1 (gowl-set-monitor-position 0 0 dp1))
+      (when dp2 (gowl-set-monitor-position 2560 0 dp2))
+      (when edp (gowl-set-monitor-position 1501 2880 edp)))
+    ;; Wait for layout to settle, then create one frame per extra monitor
+    (run-with-timer 0.5 nil
+      (lambda ()
+        (let ((n-extra (1- (gowl-monitor-count))))
+          (dotimes (_ n-extra)
+            (make-frame '((fullscreen . nil)
+                          (alpha-background . 85)))))))))
 
 ;;; Modeline (tmux-style status bar with catppuccin colors and icons)
 (after! doom-modeline

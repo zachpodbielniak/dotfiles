@@ -72,6 +72,9 @@
 
 ;;; --- Phase 3: Navigation & Tools ---
 
+;; Enhanced dired file manager with preview and multi-column layout
+(package! dirvish)
+
 ;; Seamless Ctrl-h/j/k/l navigation between Emacs and tmux panes
 ;; (replaces christoomey/vim-tmux-navigator)
 (package! navigate
