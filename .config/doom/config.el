@@ -430,7 +430,10 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 (use-package! rainbow-mode
   :hook (prog-mode . rainbow-mode))
 
-;;; Per-column coloring for CSV/TSV buffers
+;;; CSV/TSV: align columns visually + per-column coloring
+(add-hook 'csv-mode-hook #'csv-align-mode)
+(add-hook 'tsv-mode-hook #'csv-align-mode)
+
 (use-package! rainbow-csv
   :hook ((csv-mode . rainbow-csv-mode)
          (tsv-mode . rainbow-csv-mode)))
