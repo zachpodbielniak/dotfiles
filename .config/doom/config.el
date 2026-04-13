@@ -184,19 +184,31 @@
         (assq-delete-all 'alpha-background default-frame-alist))
   (add-to-list 'default-frame-alist '(alpha-background . 85))
 
-  ;; Status bar — title + system widgets + clock
+  ;; Status bar — top: title + system widgets + clock
   (gowl-bar-enable)
   (gowl-bar-configure
-    '(("widgets" . "cmd:~/bin/scripts/pomo@1 cpu memory disk:/var ip podman battery clock")
+    '(("position" . "top")
+      ("widgets" . "cpu memory disk:/var battery clock")
       ("cpu-color" . "#a6e3a1")
       ("memory-color" . "#89b4fa")
       ("disk-color" . "#f9e2af")
-      ("ip-color" . "#cba6f7")
-      ("podman-color" . "#fab387")
-      ("cmd-color" . "#f5c2e7")
       ("battery-color" . "#94e2d5")
       ("clock-color" . "#cdd6f4")
       ;; Colorize title text — split on delimiters, cycle Catppuccin palette
+      ("title-delimiters" . "-._/: *")
+      ("title-delimiter-color" . "#585b70")
+      ("title-palette" . "#89b4fa #a6e3a1 #f9e2af #f5c2e7 #94e2d5 #cba6f7 #fab387 #89dceb")))
+
+  ;; Bottom bar — networking + container + pomodoro (left → right).
+  ;; Same Catppuccin style as the top bar; per-widget colors picked
+  ;; from the same palette so it visually feels like a sibling.
+  (gowl-bar-configure
+    '(("position" . "bottom")
+      ("widgets" . "ip podman cmd:~/bin/scripts/pomo@1")
+      ("ip-color" . "#cba6f7")
+      ("podman-color" . "#fab387")
+      ("cmd-color" . "#f5c2e7")
+      ;; Colorize the title (if any) the same way the top bar does
       ("title-delimiters" . "-._/: *")
       ("title-delimiter-color" . "#585b70")
       ("title-palette" . "#89b4fa #a6e3a1 #f9e2af #f5c2e7 #94e2d5 #cba6f7 #fab387 #89dceb")))
@@ -543,6 +555,48 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
   (setq vterm-timer-delay 0.02))
 (add-hook! 'vterm-mode-hook
   (display-line-numbers-mode -1))
+
+;;; C-Escape: send a literal Escape to the active buffer's underlying
+;;; program.  Useful inside vterm running nvim or a nested `emacs -nw`,
+;;; or — when running under gowl — inside a gowl-embedded Wayland app.
+;;; Plain Escape is intercepted by evil-mode (and, in the gowl embed
+;;; case, by the embed itself, which uses Escape to return focus to
+;;; Emacs).
+(if IS-GOWL
+    (defun +zach/send-escape ()
+      "Send a literal Escape to the program backing the current buffer.
+Gowl-aware variant: handles embedded Wayland clients via the
+compositor seat."
+      (interactive)
+      (cond
+       ;; gowl-embedded Wayland client: focus it, then inject KEY_ESC
+       ;; (evdev keycode 1) press+release through the compositor seat.
+       ((and (boundp 'gowl-embedded-client) gowl-embedded-client)
+        (when (fboundp 'gowl-embed-focus)
+          (gowl-embed-focus gowl-embedded-client))
+        (gowl-send-key 1 t)
+        (gowl-send-key 1 nil))
+       ((derived-mode-p 'vterm-mode)
+        (vterm-send-escape))
+       ((derived-mode-p 'term-mode)
+        (term-send-raw-string "\e"))
+       ((derived-mode-p 'eat-mode)
+        (eat-self-input 1 ?\e))
+       (t
+        (execute-kbd-macro (kbd "<escape>")))))
+  (defun +zach/send-escape ()
+    "Send a literal Escape to the program backing the current buffer."
+    (interactive)
+    (cond
+     ((derived-mode-p 'vterm-mode)
+      (vterm-send-escape))
+     ((derived-mode-p 'term-mode)
+      (term-send-raw-string "\e"))
+     ((derived-mode-p 'eat-mode)
+      (eat-self-input 1 ?\e))
+     (t
+      (execute-kbd-macro (kbd "<escape>"))))))
+(map! :gnvime "C-<escape>" #'+zach/send-escape)
 
 ;;; Make target runner keybindings
 (map! :leader
