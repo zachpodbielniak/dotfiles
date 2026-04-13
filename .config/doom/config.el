@@ -80,6 +80,14 @@
 ;;; Line numbers
 (setq display-line-numbers-type t)
 
+;;; Steady cursor — no blink.
+;;; Each blink invalidates the cursor region, which runs through PGTK's
+;;; redisplay → cairo → wl_surface attach+commit, damaging the gowl
+;;; scene at 0.5 Hz for zero informational value.  With this off, the
+;;; emacs PGTK frame truly goes silent between user input and timer
+;;; firings.
+(blink-cursor-mode -1)
+
 ;;; Org directory: point at PARA knowledge base root
 (setq org-directory "~/Documents/notes/")
 
@@ -114,6 +122,25 @@
         :n "s"   #'dirvish-quicksort
         :n "y"   #'dirvish-yank-menu
         :n "f"   #'dirvish-fd))
+
+;;; Treemacs: quiet down the file watcher.
+;;;
+;;; Perf of `cmacs --gowl` at idle showed `treemacs--filewatch-callback`
+;;; consuming ~8% CPU (inclusive) and driving a cascade of buffer
+;;; switches → redisplay → pgtk pixman redraws.  Causes: build artifacts
+;;; (native-lisp/, *.eln, *.o, build/) churning inside watched
+;;; directories, and a 2 s default coalescing delay that's still too
+;;; short once inotify is firing in bursts.
+;;;
+;;; Fixes:
+;;;   1. Coalesce events over 10 s so bursts collapse into one update.
+;;;   2. Hide git-ignored files so treemacs never displays (and thus
+;;;      never watches) build dirs — our .gitignore already excludes
+;;;      native-lisp/, *.eln, *.o, build/.
+(after! treemacs
+  (setq treemacs-file-event-delay 10000)
+  (when (fboundp 'treemacs-hide-gitignored-files-mode)
+    (treemacs-hide-gitignored-files-mode 1)))
 
 ;;; Indentation: tabs, 4 spaces width (matching nvim config)
 (setq-default indent-tabs-mode t
@@ -202,9 +229,14 @@
   ;; Bottom bar — networking + container + pomodoro (left → right).
   ;; Same Catppuccin style as the top bar; per-widget colors picked
   ;; from the same palette so it visually feels like a sibling.
+  ;;
+  ;; pomo widget uses the default 10 s cmd interval (no @N override).
+  ;; At @1 the bar ticker pulled the whole compositor refresh to 1 Hz
+  ;; and spawned a subprocess every second even at idle — the pomodoro
+  ;; display doesn't need sub-10s granularity.
   (gowl-bar-configure
     '(("position" . "bottom")
-      ("widgets" . "ip podman cmd:~/bin/scripts/pomo@1")
+      ("widgets" . "ip podman cmd:~/bin/scripts/pomo")
       ("ip-color" . "#cba6f7")
       ("podman-color" . "#fab387")
       ("cmd-color" . "#f5c2e7")
@@ -219,24 +251,41 @@
     (gowl-bar-disable)
     (gowl-bar-enable))
 
+  ;; Bar title sync: push the current buffer name to the top bar
+  ;; whenever the visible buffer changes.  Previously polled at 5 Hz
+  ;; from a repeating timer which kept the whole redisplay / GC /
+  ;; pgtk draw cascade alive at idle (perf showed ~29% pixman, driven
+  ;; by redisplay invalidations on every timer tick).  Hook-driven now.
+  (defvar gowl--bar-last-title nil
+    "Last title pushed to the gowl top bar via `gowl-bar-set-title'.")
+
+  (defun gowl--sync-bar-title (&rest _)
+    "Push the current buffer name to the gowl top bar if it changed.
+Attached to `window-buffer-change-functions' and
+`window-selection-change-functions' so it only runs on actual
+window-state transitions."
+    (ignore-errors
+      (let ((title (buffer-name (window-buffer (selected-window)))))
+        (unless (equal title gowl--bar-last-title)
+          (setq gowl--bar-last-title title)
+          (gowl-bar-set-title title)))))
+
   ;; After Doom finishes frame setup: un-fullscreen, set alpha-background,
-  ;; and sync bar title with buffer/window changes.
+  ;; and wire up the bar title sync.
   (add-hook 'doom-after-init-hook
             (lambda ()
               (set-frame-parameter nil 'fullscreen nil)
               (set-frame-parameter nil 'alpha-background 85)
-              ;; Keep bar title in sync with active buffer.
-              ;; Poll every 200ms — hooks all fire before window state
-              ;; is finalized; a timer reads the settled state reliably.
-              (defvar gowl--bar-last-title nil)
-              (run-with-timer 0.2 0.2
-                (lambda ()
-                  (ignore-errors
-                    (let ((title (buffer-name
-                                  (window-buffer (selected-window)))))
-                      (unless (equal title gowl--bar-last-title)
-                        (setq gowl--bar-last-title title)
-                        (gowl-bar-set-title title))))))
+              ;; Event-driven title sync. `window-buffer-change-functions'
+              ;; fires once per command loop after a window's displayed
+              ;; buffer changes — exactly when we need to update the bar.
+              ;; A tiny idle timer handles the case where the first frame
+              ;; is still settling when the hooks are installed.
+              (add-hook 'window-buffer-change-functions
+                        #'gowl--sync-bar-title)
+              (add-hook 'window-selection-change-functions
+                        #'gowl--sync-bar-title)
+              (run-with-idle-timer 0.5 nil #'gowl--sync-bar-title)
               ;; Multi-monitor: position monitors then create per-monitor frames.
               ;; Only runs when more than one monitor is connected.
               (when (> (gowl-monitor-count) 1)
@@ -289,7 +338,10 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
         doom-modeline-buffer-encoding t
         doom-modeline-vcs-max-length 25
         doom-modeline-time-icon t
-        doom-modeline-time-live-icon t
+        ;; No "live" animated clock glyph — it ticks at 1 Hz, invalidates
+        ;; the modeline, triggers redisplay + a wl_surface commit on every
+        ;; tick, and you can't actually tell the difference at a glance.
+        doom-modeline-time-live-icon nil
         doom-modeline-battery (display-graphic-p)
         doom-modeline-env-version t
         doom-modeline-modal-icon t
@@ -349,8 +401,11 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 
   (zach-modeline--update-pomo)
   (when zach-modeline--pomo-timer (cancel-timer zach-modeline--pomo-timer))
+  ;; 15 s is plenty for a pomodoro display — every 5 s was spawning
+  ;; a subprocess 12×/minute at idle (which also hit the redisplay +
+  ;; GC path each time).
   (setq zach-modeline--pomo-timer
-        (run-with-timer 5 5 #'zach-modeline--update-pomo))
+        (run-with-timer 15 15 #'zach-modeline--update-pomo))
 
   (doom-modeline-def-segment pomodoro
     "Pomodoro timer status."
