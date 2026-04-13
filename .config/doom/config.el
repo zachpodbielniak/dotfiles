@@ -430,6 +430,11 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 (use-package! rainbow-mode
   :hook (prog-mode . rainbow-mode))
 
+;;; Per-column coloring for CSV/TSV buffers
+(use-package! rainbow-csv
+  :hook ((csv-mode . rainbow-csv-mode)
+         (tsv-mode . rainbow-csv-mode)))
+
 ;;; Indent guides: highlight current depth (replaces snacks.nvim indent)
 (after! indent-bars
   (setq indent-bars-highlight-current-depth t))

@@ -69,6 +69,10 @@
 ;; Color code highlighting (replaces nvim-colorizer.lua)
 (package! rainbow-mode)
 
+;; Per-column coloring for csv-mode buffers
+(package! rainbow-csv
+  :recipe (:host github :repo "emacs-vs/rainbow-csv"))
+
 ;; Browse kill-ring in a dedicated buffer
 (package! browse-kill-ring)
 
