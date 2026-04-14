@@ -1258,7 +1258,7 @@ Auto-prefixes the filename with today's date when DIR contains
         ;; Proton keeps a copy in Sent automatically — don't double-save
         mu4e-sent-messages-behavior 'delete
         ;; Sending via msmtp
-        sendmail-program "/usr/bin/msmtp"
+        sendmail-program (executable-find "msmtp")
         send-mail-function #'smtpmail-send-it
         message-sendmail-f-is-evil t
         message-sendmail-extra-arguments '("--read-envelope-from")
