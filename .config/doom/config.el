@@ -1240,6 +1240,9 @@ Auto-prefixes the filename with today's date when DIR contains
         mu4e-change-filenames-when-moving t  ;; required for mbsync
         mu4e-use-fancy-chars t
         mu4e-view-show-images t
+        mu4e-view-use-gnus t            ;; richer HTML rendering via gnus/shr
+        shr-inhibit-images nil          ;; let shr fetch images
+        gnus-blocked-images nil         ;; don't block remote images
         mu4e-view-show-addresses t
         mu4e-compose-format-flowed t
         mu4e-confirm-quit nil
@@ -1266,7 +1269,29 @@ Auto-prefixes the filename with today's date when DIR contains
         '((:name "Unread"    :query "flag:unread AND NOT flag:trashed" :key ?u)
           (:name "Today"     :query "date:today..now"                  :key ?t)
           (:name "This week" :query "date:7d..now"                     :key ?w)
-          (:name "Flagged"   :query "flag:flagged"                     :key ?f))))
+          (:name "Flagged"   :query "flag:flagged"                     :key ?f)))
+
+  ;; Redefine the `trash` mark: move into the Trash maildir WITHOUT setting
+  ;; the \Deleted (T) flag. mbsync's `Expunge Both` sees a new local file with
+  ;; T set and no remote UID as "marked for deletion, never uploaded" and
+  ;; silently expunges it locally — so the delete never reaches Proton. Moving
+  ;; into /Trash is already the delete action on Proton; the T flag is
+  ;; redundant and destructive here.
+  (setf (alist-get 'trash mu4e-marks)
+        '(:char ("d" . "▼")
+          :prompt "dtrash"
+          :dyn-target (lambda (target msg) (mu4e-get-trash-folder msg))
+          :action (lambda (docid msg target)
+                    (mu4e--server-move docid
+                                       (mu4e--mark-check-target target)
+                                       "-N"))))
+
+  ;; After executing marks (x), push the local changes back to the IMAP server
+  ;; by running mbsync again. mbsync is bidirectional, so deletions/moves/flag
+  ;; changes made locally propagate up to Proton.
+  (advice-add 'mu4e-mark-execute-all :after
+              (lambda (&rest _)
+                (mu4e-update-mail-and-index t))))
 
 ;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
 (use-package! ement
