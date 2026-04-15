@@ -112,6 +112,29 @@
   ;; Tell eshell to use TRAMP for remote paths (cd /ssh:host:/)
   (add-to-list 'tramp-remote-path 'tramp-own-remote-path))
 
+;; text-mode (and markdown-mode, which inherits) adds `ispell-completion-at-point'
+;; to `completion-at-point-functions'. It shells out to `look' via `process-file'
+;; on every completion attempt — over TRAMP that's a full SSH round-trip per
+;; keystroke and freezes Emacs. Kill it globally.
+(setq text-mode-ispell-word-completion nil)
+
+;; Keep auto-save files local instead of writing them through SSH each cycle
+(setq auto-save-file-name-transforms
+      `((".*" ,(expand-file-name "auto-save/" doom-cache-dir) t)))
+
+(after! recentf
+  (setq recentf-auto-cleanup 'never)
+  (add-to-list 'recentf-exclude tramp-file-name-regexp))
+
+;; Belt and suspenders: if anything re-adds `ispell-completion-at-point' in a
+;; remote buffer, strip it on find-file.
+(add-hook 'find-file-hook
+          (lambda ()
+            (when (file-remote-p default-directory)
+              (setq-local completion-at-point-functions
+                          (remq 'ispell-completion-at-point
+                                completion-at-point-functions)))))
+
 ;; Disable projectile on remote files — walking the tree over SSH is brutal
 (after! projectile
   (defadvice! zach--projectile-skip-remote-a (fn &rest args)
