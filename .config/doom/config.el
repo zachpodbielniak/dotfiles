@@ -272,6 +272,18 @@
   (gowl-enable-module "roundcorners")
   (gowl-set-corner-radius 12)
 
+  ;; Window rules: auto-float popups/dialogs/modals (Zoom, pavucontrol,
+  ;; pinentry, KeePassXC unlock, file choosers, ...).  Rules come from
+  ;; `cmacs-gowl-float-rules' and are pushed by `cmacs-gowl-mode' below.
+  (gowl-enable-module "windowrules")
+
+  ;; Dropdown terminals: guake-style drop-from-top windows toggled by
+  ;; Super+grave.  Entries come from `cmacs-gowl-dropdowns' and are
+  ;; pushed + adopted by `cmacs-gowl-mode' below.  Must be enabled
+  ;; before `cmacs-gowl-mode' so its --apply-dropdowns + refresh see
+  ;; a loaded provider.
+  (gowl-enable-module "dropdown")
+
   ;; Prevent Doom from fullscreening the frame (gaps need tiled mode)
   (setq default-frame-alist
         (assq-delete-all 'fullscreen default-frame-alist))
@@ -357,6 +369,15 @@ window-state transitions."
               (add-hook 'window-selection-change-functions
                         #'gowl--sync-bar-title)
               (run-with-idle-timer 0.5 nil #'gowl--sync-bar-title)
+              ;; Enable cmacs-gowl-mode so its --start arm pushes
+              ;; `cmacs-gowl-float-rules' and `cmacs-gowl-dropdowns'
+              ;; into the running gowl config and calls
+              ;; `gowl-dropdown-refresh' so Super+grave binds to the
+              ;; first entry's :keybind immediately.  Runs after the
+              ;; windowrules + dropdown modules are loaded above so
+              ;; there's a provider to receive the data.
+              (when (fboundp 'cmacs-gowl-mode)
+                (cmacs-gowl-mode 1))
               ;; Multi-monitor: position monitors then create per-monitor frames.
               ;; Only runs when more than one monitor is connected.
               (when (> (gowl-monitor-count) 1)
@@ -1366,6 +1387,12 @@ Auto-prefixes the filename with today's date when DIR contains
   (advice-add 'mu4e-mark-execute-all :after
               (lambda (&rest _)
                 (mu4e-update-mail-and-index t))))
+
+;;; org-download: paste images from the Wayland clipboard.
+;;; Default uses xclip which doesn't read Wayland clipboards — writes
+;;; 0-byte files and you see a white box in place of the image.
+(after! org-download
+  (setq org-download-screenshot-method "wl-paste -t image/png > %s"))
 
 ;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
 (use-package! ement
