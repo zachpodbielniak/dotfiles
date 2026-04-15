@@ -91,6 +91,77 @@
 ;;; Org directory: point at PARA knowledge base root
 (setq org-directory "~/Documents/notes/")
 
+;;;; -------------------------------------------------------------------------
+;;;; TRAMP: make remote file access usable
+;;;; -------------------------------------------------------------------------
+;;; Without these guards, opening /ssh:host:/path hangs Emacs because
+;;; dirvish, vc, projectile, LSP, and syntax checkers all fire synchronous
+;;; subprocess calls over the SSH connection.
+
+;; Use ssh directly (not scp) and keep connections alive
+(after! tramp
+  (setq tramp-default-method "ssh"
+        tramp-verbose 1                         ;; minimal logging (raise to 6 to debug)
+        tramp-auto-save-directory (expand-file-name "tramp-autosave" doom-cache-dir)
+        remote-file-name-inhibit-cache nil       ;; cache remote stat results
+        tramp-completion-reread-directory-timeout nil  ;; don't re-stat for completion
+        vc-ignore-dir-regexp (format "%s\\|%s"
+                                     vc-ignore-dir-regexp
+                                     tramp-file-name-regexp))  ;; disable VC over TRAMP
+
+  ;; Tell eshell to use TRAMP for remote paths (cd /ssh:host:/)
+  (add-to-list 'tramp-remote-path 'tramp-own-remote-path))
+
+;; Disable projectile on remote files — walking the tree over SSH is brutal
+(after! projectile
+  (defadvice! zach--projectile-skip-remote-a (fn &rest args)
+    :around #'projectile-project-root
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
+
+;; Disable LSP/eglot on remote buffers
+(after! eglot
+  (defadvice! zach--eglot-skip-remote-a (fn &rest args)
+    :around #'eglot-ensure
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
+
+;; Disable syntax checking on remote files
+(after! flycheck
+  (defadvice! zach--flycheck-skip-remote-a (fn &rest args)
+    :around #'flycheck-mode
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
+(after! flymake
+  (add-hook 'flymake-mode-hook
+            (lambda ()
+              (when (file-remote-p default-directory)
+                (flymake-mode -1)))))
+
+;; Dirvish: disable expensive attributes on remote directories
+(after! dirvish
+  (defadvice! zach--dirvish-simple-remote-a (fn &rest args)
+    :around #'dirvish
+    (if (file-remote-p default-directory)
+        (let ((dirvish-attributes '(hl-line))
+              (dirvish-preview-dispatchers nil))
+          (apply fn args))
+      (apply fn args)))
+  ;; Also guard the dired override so plain dired on remote paths stays plain
+  (defadvice! zach--dired-skip-dirvish-remote-a (fn &rest args)
+    :around #'dired
+    (if (and (car args) (file-remote-p (car args)))
+        (let ((dirvish-override-dired-mode nil))
+          (apply fn args))
+        (apply fn args))))
+
+;; Treemacs: don't set up file watchers on remote paths
+(after! treemacs
+  (defadvice! zach--treemacs-skip-remote-watch-a (fn &rest args)
+    :around #'treemacs--start-watching
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
+
 ;;; Dired: show dotfiles and parent directory (..)
 (setq dired-listing-switches "-ahl")
 
@@ -1233,6 +1304,9 @@ Auto-prefixes the filename with today's date when DIR contains
 ;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
 ;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
 ;;; Sending: msmtp  (config at ~/.config/msmtp/config)
+(when IS-MAC
+  (when-let ((mu4e-dir (car (file-expand-wildcards "/opt/homebrew/share/emacs/site-lisp/mu/mu4e"))))
+    (add-to-list 'load-path mu4e-dir)))
 (after! mu4e
   (setq mu4e-maildir (expand-file-name "~/.local/share/mail/proton")
         mu4e-get-mail-command "mbsync -c ~/.config/isync/mbsyncrc proton"
