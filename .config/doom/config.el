@@ -112,6 +112,9 @@
   ;; Tell eshell to use TRAMP for remote paths (cd /ssh:host:/)
   (add-to-list 'tramp-remote-path 'tramp-own-remote-path))
 
+;;; Eshell performance tuning & TRAMP integration (see eshell.el)
+(load! "eshell")
+
 ;; Disable projectile on remote files — walking the tree over SSH is brutal
 (after! projectile
   (defadvice! zach--projectile-skip-remote-a (fn &rest args)
@@ -517,9 +520,10 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 (map! :leader
       :desc "Insert emoji" "i e" #'emoji-search)
 
-;;; Tab/Shift-Tab to cycle buffers (matching nvim tabufline)
-(map! :n "TAB" #'next-buffer
-      :n [backtab] #'previous-buffer)
+;;; Buffer cycling: ]b / [b (vim-unimpaired style)
+;;; NOTE: do NOT bind TAB in normal mode — it shadows SPC TAB (workspace prefix)
+(map! :n "]b" #'next-buffer
+      :n "[b" #'previous-buffer)
 
 ;;; Clipboard paste (GTK GUI)
 (map! "C-S-v" #'clipboard-yank)
