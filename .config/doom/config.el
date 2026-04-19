@@ -80,8 +80,113 @@
 ;;; Line numbers
 (setq display-line-numbers-type t)
 
+;;; Steady cursor — no blink.
+;;; Each blink invalidates the cursor region, which runs through PGTK's
+;;; redisplay → cairo → wl_surface attach+commit, damaging the gowl
+;;; scene at 0.5 Hz for zero informational value.  With this off, the
+;;; emacs PGTK frame truly goes silent between user input and timer
+;;; firings.
+(blink-cursor-mode -1)
+
 ;;; Org directory: point at PARA knowledge base root
 (setq org-directory "~/Documents/notes/")
+
+;;;; -------------------------------------------------------------------------
+;;;; TRAMP: make remote file access usable
+;;;; -------------------------------------------------------------------------
+;;; Without these guards, opening /ssh:host:/path hangs Emacs because
+;;; dirvish, vc, projectile, LSP, and syntax checkers all fire synchronous
+;;; subprocess calls over the SSH connection.
+
+;; Use ssh directly (not scp) and keep connections alive
+(after! tramp
+  (setq tramp-default-method "ssh"
+        tramp-verbose 1                         ;; minimal logging (raise to 6 to debug)
+        tramp-auto-save-directory (expand-file-name "tramp-autosave" doom-cache-dir)
+        remote-file-name-inhibit-cache nil       ;; cache remote stat results
+        tramp-completion-reread-directory-timeout nil  ;; don't re-stat for completion
+        vc-ignore-dir-regexp (format "%s\\|%s"
+                                     vc-ignore-dir-regexp
+                                     tramp-file-name-regexp))  ;; disable VC over TRAMP
+
+  ;; Tell eshell to use TRAMP for remote paths (cd /ssh:host:/)
+  (add-to-list 'tramp-remote-path 'tramp-own-remote-path))
+
+;;; Eshell performance tuning & TRAMP integration (see eshell.el)
+(load! "eshell")
+
+;; text-mode (and markdown-mode, which inherits) adds `ispell-completion-at-point'
+;; to `completion-at-point-functions'. It shells out to `look' via `process-file'
+;; on every completion attempt — over TRAMP that's a full SSH round-trip per
+;; keystroke and freezes Emacs. Kill it globally.
+(setq text-mode-ispell-word-completion nil)
+
+;; Keep auto-save files local instead of writing them through SSH each cycle
+(setq auto-save-file-name-transforms
+      `((".*" ,(expand-file-name "auto-save/" doom-cache-dir) t)))
+
+(after! recentf
+  (setq recentf-auto-cleanup 'never)
+  (add-to-list 'recentf-exclude tramp-file-name-regexp))
+
+;; Belt and suspenders: if anything re-adds `ispell-completion-at-point' in a
+;; remote buffer, strip it on find-file.
+(add-hook 'find-file-hook
+          (lambda ()
+            (when (file-remote-p default-directory)
+              (setq-local completion-at-point-functions
+                          (remq 'ispell-completion-at-point
+                                completion-at-point-functions)))))
+
+;; Disable projectile on remote files — walking the tree over SSH is brutal
+(after! projectile
+  (defadvice! zach--projectile-skip-remote-a (fn &rest args)
+    :around #'projectile-project-root
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
+
+;; Disable LSP/eglot on remote buffers
+(after! eglot
+  (defadvice! zach--eglot-skip-remote-a (fn &rest args)
+    :around #'eglot-ensure
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
+
+;; Disable syntax checking on remote files
+(after! flycheck
+  (defadvice! zach--flycheck-skip-remote-a (fn &rest args)
+    :around #'flycheck-mode
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
+(after! flymake
+  (add-hook 'flymake-mode-hook
+            (lambda ()
+              (when (file-remote-p default-directory)
+                (flymake-mode -1)))))
+
+;; Dirvish: disable expensive attributes on remote directories
+(after! dirvish
+  (defadvice! zach--dirvish-simple-remote-a (fn &rest args)
+    :around #'dirvish
+    (if (file-remote-p default-directory)
+        (let ((dirvish-attributes '(hl-line))
+              (dirvish-preview-dispatchers nil))
+          (apply fn args))
+      (apply fn args)))
+  ;; Also guard the dired override so plain dired on remote paths stays plain
+  (defadvice! zach--dired-skip-dirvish-remote-a (fn &rest args)
+    :around #'dired
+    (if (and (car args) (file-remote-p (car args)))
+        (let ((dirvish-override-dired-mode nil))
+          (apply fn args))
+        (apply fn args))))
+
+;; Treemacs: don't set up file watchers on remote paths
+(after! treemacs
+  (defadvice! zach--treemacs-skip-remote-watch-a (fn &rest args)
+    :around #'treemacs--start-watching
+    (unless (file-remote-p default-directory)
+      (apply fn args))))
 
 ;;; Dired: show dotfiles and parent directory (..)
 (setq dired-listing-switches "-ahl")
@@ -114,6 +219,25 @@
         :n "s"   #'dirvish-quicksort
         :n "y"   #'dirvish-yank-menu
         :n "f"   #'dirvish-fd))
+
+;;; Treemacs: quiet down the file watcher.
+;;;
+;;; Perf of `cmacs --gowl` at idle showed `treemacs--filewatch-callback`
+;;; consuming ~8% CPU (inclusive) and driving a cascade of buffer
+;;; switches → redisplay → pgtk pixman redraws.  Causes: build artifacts
+;;; (native-lisp/, *.eln, *.o, build/) churning inside watched
+;;; directories, and a 2 s default coalescing delay that's still too
+;;; short once inotify is firing in bursts.
+;;;
+;;; Fixes:
+;;;   1. Coalesce events over 10 s so bursts collapse into one update.
+;;;   2. Hide git-ignored files so treemacs never displays (and thus
+;;;      never watches) build dirs — our .gitignore already excludes
+;;;      native-lisp/, *.eln, *.o, build/.
+(after! treemacs
+  (setq treemacs-file-event-delay 10000)
+  (when (fboundp 'treemacs-hide-gitignored-files-mode)
+    (treemacs-hide-gitignored-files-mode 1)))
 
 ;;; Indentation: tabs, 4 spaces width (matching nvim config)
 (setq-default indent-tabs-mode t
@@ -170,6 +294,22 @@
   (gowl-enable-module "vanitygaps")
   (gowl-set-gaps '(("inner-gap" . "0") ("outer-gap" . "32")))
 
+  ;; Rounded corners -- because it looks cool
+  (gowl-enable-module "roundcorners")
+  (gowl-set-corner-radius 12)
+
+  ;; Window rules: auto-float popups/dialogs/modals (Zoom, pavucontrol,
+  ;; pinentry, KeePassXC unlock, file choosers, ...).  Rules come from
+  ;; `cmacs-gowl-float-rules' and are pushed by `cmacs-gowl-mode' below.
+  (gowl-enable-module "windowrules")
+
+  ;; Dropdown terminals: guake-style drop-from-top windows toggled by
+  ;; Super+grave.  Entries come from `cmacs-gowl-dropdowns' and are
+  ;; pushed + adopted by `cmacs-gowl-mode' below.  Must be enabled
+  ;; before `cmacs-gowl-mode' so its --apply-dropdowns + refresh see
+  ;; a loaded provider.
+  (gowl-enable-module "dropdown")
+
   ;; Prevent Doom from fullscreening the frame (gaps need tiled mode)
   (setq default-frame-alist
         (assq-delete-all 'fullscreen default-frame-alist))
@@ -180,19 +320,36 @@
         (assq-delete-all 'alpha-background default-frame-alist))
   (add-to-list 'default-frame-alist '(alpha-background . 85))
 
-  ;; Status bar — title + system widgets + clock
+  ;; Status bar — top: title + system widgets + clock
   (gowl-bar-enable)
   (gowl-bar-configure
-    '(("widgets" . "cmd:~/bin/scripts/pomo@1 cpu memory disk:/var ip podman battery clock")
+    '(("position" . "top")
+      ("widgets" . "cpu memory disk:/var battery clock")
       ("cpu-color" . "#a6e3a1")
       ("memory-color" . "#89b4fa")
       ("disk-color" . "#f9e2af")
-      ("ip-color" . "#cba6f7")
-      ("podman-color" . "#fab387")
-      ("cmd-color" . "#f5c2e7")
       ("battery-color" . "#94e2d5")
       ("clock-color" . "#cdd6f4")
       ;; Colorize title text — split on delimiters, cycle Catppuccin palette
+      ("title-delimiters" . "-._/: *")
+      ("title-delimiter-color" . "#585b70")
+      ("title-palette" . "#89b4fa #a6e3a1 #f9e2af #f5c2e7 #94e2d5 #cba6f7 #fab387 #89dceb")))
+
+  ;; Bottom bar — networking + container + pomodoro (left → right).
+  ;; Same Catppuccin style as the top bar; per-widget colors picked
+  ;; from the same palette so it visually feels like a sibling.
+  ;;
+  ;; pomo widget uses the default 10 s cmd interval (no @N override).
+  ;; At @1 the bar ticker pulled the whole compositor refresh to 1 Hz
+  ;; and spawned a subprocess every second even at idle — the pomodoro
+  ;; display doesn't need sub-10s granularity.
+  (gowl-bar-configure
+    '(("position" . "bottom")
+      ("widgets" . "ip podman cmd:~/bin/scripts/pomo")
+      ("ip-color" . "#cba6f7")
+      ("podman-color" . "#fab387")
+      ("cmd-color" . "#f5c2e7")
+      ;; Colorize the title (if any) the same way the top bar does
       ("title-delimiters" . "-._/: *")
       ("title-delimiter-color" . "#585b70")
       ("title-palette" . "#89b4fa #a6e3a1 #f9e2af #f5c2e7 #94e2d5 #cba6f7 #fab387 #89dceb")))
@@ -203,24 +360,50 @@
     (gowl-bar-disable)
     (gowl-bar-enable))
 
+  ;; Bar title sync: push the current buffer name to the top bar
+  ;; whenever the visible buffer changes.  Previously polled at 5 Hz
+  ;; from a repeating timer which kept the whole redisplay / GC /
+  ;; pgtk draw cascade alive at idle (perf showed ~29% pixman, driven
+  ;; by redisplay invalidations on every timer tick).  Hook-driven now.
+  (defvar gowl--bar-last-title nil
+    "Last title pushed to the gowl top bar via `gowl-bar-set-title'.")
+
+  (defun gowl--sync-bar-title (&rest _)
+    "Push the current buffer name to the gowl top bar if it changed.
+Attached to `window-buffer-change-functions' and
+`window-selection-change-functions' so it only runs on actual
+window-state transitions."
+    (ignore-errors
+      (let ((title (buffer-name (window-buffer (selected-window)))))
+        (unless (equal title gowl--bar-last-title)
+          (setq gowl--bar-last-title title)
+          (gowl-bar-set-title title)))))
+
   ;; After Doom finishes frame setup: un-fullscreen, set alpha-background,
-  ;; and sync bar title with buffer/window changes.
+  ;; and wire up the bar title sync.
   (add-hook 'doom-after-init-hook
             (lambda ()
               (set-frame-parameter nil 'fullscreen nil)
               (set-frame-parameter nil 'alpha-background 85)
-              ;; Keep bar title in sync with active buffer.
-              ;; Poll every 200ms — hooks all fire before window state
-              ;; is finalized; a timer reads the settled state reliably.
-              (defvar gowl--bar-last-title nil)
-              (run-with-timer 0.2 0.2
-                (lambda ()
-                  (ignore-errors
-                    (let ((title (buffer-name
-                                  (window-buffer (selected-window)))))
-                      (unless (equal title gowl--bar-last-title)
-                        (setq gowl--bar-last-title title)
-                        (gowl-bar-set-title title))))))
+              ;; Event-driven title sync. `window-buffer-change-functions'
+              ;; fires once per command loop after a window's displayed
+              ;; buffer changes — exactly when we need to update the bar.
+              ;; A tiny idle timer handles the case where the first frame
+              ;; is still settling when the hooks are installed.
+              (add-hook 'window-buffer-change-functions
+                        #'gowl--sync-bar-title)
+              (add-hook 'window-selection-change-functions
+                        #'gowl--sync-bar-title)
+              (run-with-idle-timer 0.5 nil #'gowl--sync-bar-title)
+              ;; Enable cmacs-gowl-mode so its --start arm pushes
+              ;; `cmacs-gowl-float-rules' and `cmacs-gowl-dropdowns'
+              ;; into the running gowl config and calls
+              ;; `gowl-dropdown-refresh' so Super+grave binds to the
+              ;; first entry's :keybind immediately.  Runs after the
+              ;; windowrules + dropdown modules are loaded above so
+              ;; there's a provider to receive the data.
+              (when (fboundp 'cmacs-gowl-mode)
+                (cmacs-gowl-mode 1))
               ;; Multi-monitor: position monitors then create per-monitor frames.
               ;; Only runs when more than one monitor is connected.
               (when (> (gowl-monitor-count) 1)
@@ -273,7 +456,10 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
         doom-modeline-buffer-encoding t
         doom-modeline-vcs-max-length 25
         doom-modeline-time-icon t
-        doom-modeline-time-live-icon t
+        ;; No "live" animated clock glyph — it ticks at 1 Hz, invalidates
+        ;; the modeline, triggers redisplay + a wl_surface commit on every
+        ;; tick, and you can't actually tell the difference at a glance.
+        doom-modeline-time-live-icon nil
         doom-modeline-battery (display-graphic-p)
         doom-modeline-env-version t
         doom-modeline-modal-icon t
@@ -333,8 +519,11 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 
   (zach-modeline--update-pomo)
   (when zach-modeline--pomo-timer (cancel-timer zach-modeline--pomo-timer))
+  ;; 15 s is plenty for a pomodoro display — every 5 s was spawning
+  ;; a subprocess 12×/minute at idle (which also hit the redisplay +
+  ;; GC path each time).
   (setq zach-modeline--pomo-timer
-        (run-with-timer 5 5 #'zach-modeline--update-pomo))
+        (run-with-timer 15 15 #'zach-modeline--update-pomo))
 
   (doom-modeline-def-segment pomodoro
     "Pomodoro timer status."
@@ -359,6 +548,14 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 (use-package! rainbow-mode
   :hook (prog-mode . rainbow-mode))
 
+;;; CSV/TSV: align columns visually + per-column coloring
+(add-hook 'csv-mode-hook #'csv-align-mode)
+(add-hook 'tsv-mode-hook #'csv-align-mode)
+
+(use-package! rainbow-csv
+  :hook ((csv-mode . rainbow-csv-mode)
+         (tsv-mode . rainbow-csv-mode)))
+
 ;;; Indent guides: highlight current depth (replaces snacks.nvim indent)
 (after! indent-bars
   (setq indent-bars-highlight-current-depth t))
@@ -367,9 +564,10 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 (map! :leader
       :desc "Insert emoji" "i e" #'emoji-search)
 
-;;; Tab/Shift-Tab to cycle buffers (matching nvim tabufline)
-(map! :n "TAB" #'next-buffer
-      :n [backtab] #'previous-buffer)
+;;; Buffer cycling: ]b / [b (vim-unimpaired style)
+;;; NOTE: do NOT bind TAB in normal mode — it shadows SPC TAB (workspace prefix)
+(map! :n "]b" #'next-buffer
+      :n "[b" #'previous-buffer)
 
 ;;; Clipboard paste (GTK GUI)
 (map! "C-S-v" #'clipboard-yank)
@@ -539,6 +737,48 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
   (setq vterm-timer-delay 0.02))
 (add-hook! 'vterm-mode-hook
   (display-line-numbers-mode -1))
+
+;;; C-Escape: send a literal Escape to the active buffer's underlying
+;;; program.  Useful inside vterm running nvim or a nested `emacs -nw`,
+;;; or — when running under gowl — inside a gowl-embedded Wayland app.
+;;; Plain Escape is intercepted by evil-mode (and, in the gowl embed
+;;; case, by the embed itself, which uses Escape to return focus to
+;;; Emacs).
+(if IS-GOWL
+    (defun +zach/send-escape ()
+      "Send a literal Escape to the program backing the current buffer.
+Gowl-aware variant: handles embedded Wayland clients via the
+compositor seat."
+      (interactive)
+      (cond
+       ;; gowl-embedded Wayland client: focus it, then inject KEY_ESC
+       ;; (evdev keycode 1) press+release through the compositor seat.
+       ((and (boundp 'gowl-embedded-client) gowl-embedded-client)
+        (when (fboundp 'gowl-embed-focus)
+          (gowl-embed-focus gowl-embedded-client))
+        (gowl-send-key 1 t)
+        (gowl-send-key 1 nil))
+       ((derived-mode-p 'vterm-mode)
+        (vterm-send-escape))
+       ((derived-mode-p 'term-mode)
+        (term-send-raw-string "\e"))
+       ((derived-mode-p 'eat-mode)
+        (eat-self-input 1 ?\e))
+       (t
+        (execute-kbd-macro (kbd "<escape>")))))
+  (defun +zach/send-escape ()
+    "Send a literal Escape to the program backing the current buffer."
+    (interactive)
+    (cond
+     ((derived-mode-p 'vterm-mode)
+      (vterm-send-escape))
+     ((derived-mode-p 'term-mode)
+      (term-send-raw-string "\e"))
+     ((derived-mode-p 'eat-mode)
+      (eat-self-input 1 ?\e))
+     (t
+      (execute-kbd-macro (kbd "<escape>"))))))
+(map! :gnvime "C-<escape>" #'+zach/send-escape)
 
 ;;; Make target runner keybindings
 (map! :leader
@@ -1109,18 +1349,77 @@ Auto-prefixes the filename with today's date when DIR contains
 (load! "shell-runner")  ;; Shell command runner (from lua/custom/shell.lua)
 (load! "transclusion")  ;; Transclusion system (from core/mappings.lua)
 
-;;; Email client (port of email-nvim; backend: email.c)
-(use-package! email-emacs
-  :config
-  (setq email-cmd          "email.c"
-        email-from         nil     ;; set to your address for reply-all filtering
-        email-confirm-send   t
-        email-confirm-delete t)
-  (map! :leader
-        :desc "Email inbox"   "e m" #'email-open
-        :desc "Email compose" "e c" #'email-compose
-        :desc "Email folders" "e f" #'email-folders
-        :desc "Email search"  "e s" #'email-search))
+;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
+;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
+;;; Sending: msmtp  (config at ~/.config/msmtp/config)
+(when IS-MAC
+  (when-let ((mu4e-dir (car (file-expand-wildcards "/opt/homebrew/share/emacs/site-lisp/mu/mu4e"))))
+    (add-to-list 'load-path mu4e-dir)))
+(after! mu4e
+  (setq mu4e-maildir (expand-file-name "~/.local/share/mail/proton")
+        mu4e-get-mail-command "mbsync -c ~/.config/isync/mbsyncrc proton"
+        mu4e-update-interval (* 5 60)
+        mu4e-change-filenames-when-moving t  ;; required for mbsync
+        mu4e-use-fancy-chars t
+        mu4e-view-show-images t
+        mu4e-view-use-gnus t            ;; richer HTML rendering via gnus/shr
+        shr-inhibit-images nil          ;; let shr fetch images
+        gnus-blocked-images nil         ;; don't block remote images
+        mu4e-view-show-addresses t
+        mu4e-compose-format-flowed t
+        mu4e-confirm-quit nil
+        mu4e-attachment-dir "~/Downloads"
+        ;; Identity
+        user-mail-address "zach@podbielniak.com"
+        user-full-name "Zach Podbielniak"
+        ;; Folder mapping — Proton Bridge exposes standard IMAP folders
+        mu4e-drafts-folder "/Drafts"
+        mu4e-sent-folder   "/Sent"
+        mu4e-refile-folder "/Archive"
+        mu4e-trash-folder  "/Trash"
+        ;; Proton keeps a copy in Sent automatically — don't double-save
+        mu4e-sent-messages-behavior 'delete
+        ;; Sending via msmtp
+        sendmail-program (executable-find "msmtp")
+        send-mail-function #'smtpmail-send-it
+        message-sendmail-f-is-evil t
+        message-sendmail-extra-arguments '("--read-envelope-from")
+        message-send-mail-function #'message-send-mail-with-sendmail)
+
+  ;; Quick bookmarks for mu4e main view
+  (setq mu4e-bookmarks
+        '((:name "Unread"    :query "flag:unread AND NOT flag:trashed" :key ?u)
+          (:name "Today"     :query "date:today..now"                  :key ?t)
+          (:name "This week" :query "date:7d..now"                     :key ?w)
+          (:name "Flagged"   :query "flag:flagged"                     :key ?f)))
+
+  ;; Redefine the `trash` mark: move into the Trash maildir WITHOUT setting
+  ;; the \Deleted (T) flag. mbsync's `Expunge Both` sees a new local file with
+  ;; T set and no remote UID as "marked for deletion, never uploaded" and
+  ;; silently expunges it locally — so the delete never reaches Proton. Moving
+  ;; into /Trash is already the delete action on Proton; the T flag is
+  ;; redundant and destructive here.
+  (setf (alist-get 'trash mu4e-marks)
+        '(:char ("d" . "▼")
+          :prompt "dtrash"
+          :dyn-target (lambda (target msg) (mu4e-get-trash-folder msg))
+          :action (lambda (docid msg target)
+                    (mu4e--server-move docid
+                                       (mu4e--mark-check-target target)
+                                       "-N"))))
+
+  ;; After executing marks (x), push the local changes back to the IMAP server
+  ;; by running mbsync again. mbsync is bidirectional, so deletions/moves/flag
+  ;; changes made locally propagate up to Proton.
+  (advice-add 'mu4e-mark-execute-all :after
+              (lambda (&rest _)
+                (mu4e-update-mail-and-index t))))
+
+;;; org-download: paste images from the Wayland clipboard.
+;;; Default uses xclip which doesn't read Wayland clipboards — writes
+;;; 0-byte files and you see a white box in place of the image.
+(after! org-download
+  (setq org-download-screenshot-method "wl-paste -t image/png > %s"))
 
 ;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
 (use-package! ement

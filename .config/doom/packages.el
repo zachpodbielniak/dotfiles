@@ -69,6 +69,10 @@
 ;; Color code highlighting (replaces nvim-colorizer.lua)
 (package! rainbow-mode)
 
+;; Per-column coloring for csv-mode buffers
+(package! rainbow-csv
+  :recipe (:host github :repo "emacs-vs/rainbow-csv"))
+
 ;; Browse kill-ring in a dedicated buffer
 (package! browse-kill-ring)
 
@@ -142,15 +146,6 @@
 (when (>= emacs-major-version 30)
   (package! jira
     :recipe (:host github :repo "unmonoqueteclea/jira.el")))
-
-
-;;; --- Phase 5: Email ---
-
-;; email-emacs: buffer-based email client using email.c backend (port of email-nvim)
-(package! email-emacs
-  :recipe (:type git
-           :host nil
-           :repo "https://git.podbielniak.com/zachpodbielniak/email-emacs"))
 
 
 ;;; --- Phase 6: Custom Emacs ports of nvim plugins ---
