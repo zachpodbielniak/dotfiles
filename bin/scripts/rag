@@ -1,0 +1,3682 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+"""
+rag - Local-first multi-corpus Retrieval-Augmented Generation knowledge base.
+
+Features:
+    - Multiple named corpora in a single local PostgreSQL + pgvector database.
+    - Heading-aware parsing for .org, .md, .norg; paragraph chunking for text;
+      regex boundary splitting for source code; Docling for PDFs/DOCX/PPTX/images
+      (optional); structured splitting for YAML/JSON/CSV.
+    - Incremental indexing with mtime+size fast path, SHA-256 on mismatch.
+    - Hybrid search: pgvector cosine + PostgreSQL tsvector, combined via
+      Reciprocal Rank Fusion.
+    - stdio MCP server mode exposing retrieval + metadata tools.
+
+Administration happens on the CLI (add/remove/update corpora, index, sync,
+reindex). The MCP server only exposes read tools so clients cannot mutate
+the index by accident.
+"""
+
+
+# ===== Distrobox container check =====================================
+# Must execute BEFORE any heavy imports that are only available inside
+# the `dev` distrobox. Pattern mirrors aipy, codepy, semantic_search.
+import os
+import sys
+from subprocess import run
+
+_ctr_id: str = os.environ.get("CONTAINER_ID", "")
+_no_dbox_check: bool = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+if not _no_dbox_check and _ctr_id != "dev":
+    _cmd: list[str] = ["distrobox", "enter", "dev", "--", *sys.argv]
+    run(_cmd)
+    sys.exit(0)
+
+
+# ===== Standard library imports =======================================
+import argparse
+import fnmatch
+import hashlib
+import json
+import re
+import shlex
+import stat as stat_mod
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from subprocess import PIPE
+from typing import Any, Callable, Iterator, Optional, Sequence
+
+
+# ===== Third-party imports (guarded) ==================================
+# Hard requirements: psycopg, requests. Soft: yaml, mcp, docling, numpy.
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    # psycopg_binary bundles the native driver; importing it forces psycopg
+    # to pick it up instead of building from source.
+    import psycopg_binary  # noqa: F401
+except ImportError as _e:
+    print(f"Error: psycopg required but missing: {_e}", file=sys.stderr)
+    print("Install in dev container: pip install psycopg[binary]", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("Error: requests required. Install: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import yaml
+    _YAML_AVAILABLE: bool = True
+except ImportError:
+    yaml = None
+    _YAML_AVAILABLE = False
+
+try:
+    from docling.document_converter import DocumentConverter as _DoclingConverter
+    _DOCLING_AVAILABLE: bool = True
+except ImportError:
+    _DoclingConverter = None
+    _DOCLING_AVAILABLE = False
+
+try:
+    from mcp.server.fastmcp import FastMCP as _FastMCP
+    _MCP_AVAILABLE: bool = True
+except ImportError:
+    _FastMCP = None
+    _MCP_AVAILABLE = False
+
+
+# ===== Constants ======================================================
+DEFAULT_CONFIG_PATH: str = os.path.expanduser("~/.config/rag/config.yaml")
+
+# Connection and embedding defaults — can be overridden via config file
+# or environment variables. Env vars take the highest precedence.
+DEFAULT_DB_HOST: str = "127.0.0.1"
+DEFAULT_DB_PORT: int = 5432
+DEFAULT_DB_NAME: str = "rag"
+DEFAULT_DB_USER: str = "postgres"
+DEFAULT_DB_PASSWORD: str = ""
+
+DEFAULT_OLLAMA_ENDPOINT: str = "http://localhost:11434"
+DEFAULT_EMBEDDING_MODEL: str = "nomic-embed-text:v1.5"
+DEFAULT_EMBEDDING_DIMENSION: int = 768
+DEFAULT_EMBED_TIMEOUT: int = 30
+DEFAULT_EMBED_RETRIES: int = 3
+DEFAULT_EMBED_BATCH_SIZE: int = 32
+
+DEFAULT_CHUNK_SIZE: int = 512        # tokens  (notes / mixed)
+DEFAULT_CHUNK_OVERLAP: int = 128     # tokens
+
+# Per-corpus-type chunk size overrides. Docs corpora tend to contain
+# enormous reference files (emacs.org is 4 MB, elisp.org is 7 MB) where
+# 512-token chunks produce thousands of tiny slices that each need a
+# sequential embedding call. Bigger chunks trade some retrieval precision
+# for a 3-4x speedup on ingestion.
+TYPE_CHUNK_DEFAULTS: dict[str, tuple[int, int]] = {
+    "notes": (512, 128),
+    "mixed": (512, 128),
+    "code":  (768, 128),
+    "docs":  (2048, 256),
+}
+DEFAULT_SEARCH_LIMIT: int = 10
+DEFAULT_SEARCH_THRESHOLD: float = 0.45
+DEFAULT_RRF_K: int = 60
+DEFAULT_KEYWORD_BOOST: float = 1.5
+
+# Token-count is estimated as characters / CHARS_PER_TOKEN to avoid a
+# tokenizer dependency for every file we read. Good enough for chunk sizing.
+CHARS_PER_TOKEN: float = 4.0
+
+# Default file-type classification by extension. A corpus can further
+# restrict this with include/exclude glob patterns.
+EXT_TEXT: set[str] = {".txt", ".rst", ".tex", ".log"}
+EXT_MARKDOWN: set[str] = {".md", ".mdx", ".markdown", ".norg"}
+EXT_ORG: set[str] = {".org"}
+EXT_CODE: set[str] = {
+    ".py", ".c", ".h", ".cpp", ".hpp", ".cc", ".hh",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".hs", ".lhs",
+    ".pl", ".pm",
+    ".go", ".rs", ".rb", ".lua",
+    ".js", ".jsx", ".ts", ".tsx",
+    ".java", ".kt", ".scala",
+    ".nim", ".zig", ".d",
+    ".sql",
+}
+EXT_STRUCTURED: set[str] = {".yaml", ".yml", ".json", ".toml", ".csv", ".tsv", ".ini"}
+EXT_DOCLING: set[str] = {
+    ".pdf", ".docx", ".pptx", ".xlsx",
+    ".html", ".htm", ".xhtml",
+    ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp",
+}
+
+# Binary / noisy extensions we always skip even if pattern matches.
+EXT_ALWAYS_SKIP: set[str] = {
+    ".bin", ".exe", ".dll", ".so", ".dylib", ".a", ".o", ".obj",
+    ".class", ".jar", ".war", ".pyc", ".pyo",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".mp3", ".mp4", ".mkv", ".avi", ".mov", ".wav", ".flac", ".ogg", ".m4a",
+    ".ttf", ".otf", ".woff", ".woff2",
+    ".pack", ".idx",
+    ".lock",
+}
+
+# Used by supports_ext() when no corpus-specific include patterns are set.
+EXT_SUPPORTED: set[str] = (
+    EXT_TEXT | EXT_MARKDOWN | EXT_ORG | EXT_CODE | EXT_STRUCTURED | EXT_DOCLING
+)
+
+
+# ===== Colors / output helpers ========================================
+# Respect NO_COLOR env var (https://no-color.org). Printing to non-TTY
+# stderr also suppresses colors to keep logs clean when piped.
+_NO_COLOR: bool = os.environ.get("NO_COLOR", "") != ""
+_IS_TTY: bool = sys.stderr.isatty()
+
+
+def _c(code: str, text: str) -> str:
+    """Wrap text in an ANSI SGR escape unless NO_COLOR or not a TTY."""
+    if _NO_COLOR or not _IS_TTY:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _red(text: str) -> str:    return _c("31", text)
+def _green(text: str) -> str:  return _c("32", text)
+def _yellow(text: str) -> str: return _c("33", text)
+def _blue(text: str) -> str:   return _c("34", text)
+def _magenta(text: str) -> str:return _c("35", text)
+def _cyan(text: str) -> str:   return _c("36", text)
+def _bold(text: str) -> str:   return _c("1", text)
+def _dim(text: str) -> str:    return _c("2", text)
+
+
+class Out:
+    """Centralized output helper that honors --silent and --format flags.
+
+    `verbose` level controls which informational messages are emitted.
+    Structured output (yaml/json) always goes through the normal stdout
+    channels; human-readable status goes to stderr so it never pollutes
+    machine-readable output piped to stdout.
+    """
+    def __init__(self, silent: bool = False, verbose: bool = False, debug: bool = False):
+        self.silent: bool = silent
+        self.verbose: bool = verbose
+        self.debug: bool = debug
+
+    def info(self, msg: str) -> None:
+        if not self.silent:
+            print(msg, file=sys.stderr)
+
+    def warn(self, msg: str) -> None:
+        print(_yellow(f"warning: {msg}"), file=sys.stderr)
+
+    def error(self, msg: str) -> None:
+        print(_red(f"error: {msg}"), file=sys.stderr)
+
+    def ok(self, msg: str) -> None:
+        if not self.silent:
+            print(_green(f"✓ {msg}"), file=sys.stderr)
+
+    def fail(self, msg: str) -> None:
+        print(_red(f"✗ {msg}"), file=sys.stderr)
+
+    def verb(self, msg: str) -> None:
+        if self.verbose and not self.silent:
+            print(_dim(msg), file=sys.stderr)
+
+    def dbg(self, msg: str) -> None:
+        if self.debug:
+            print(_magenta(f"debug: {msg}"), file=sys.stderr)
+
+
+# Global singleton populated from argparse in main(). Subcommand handlers
+# read from this rather than threading an Out object through every call.
+OUT: Out = Out()
+
+
+class ProgressReporter:
+    """Throttled single-line progress for long-running loops.
+
+    Two display modes picked automatically:
+      * TTY:     overwrite one line with `\\r`; refresh at most ~5 Hz.
+      * non-TTY: emit a new line every `nontty_interval_s` seconds.
+
+    Silent mode disables all output. Verbose mode also disables the bar on
+    the assumption that the caller is emitting per-item lines of its own
+    (which would otherwise be clobbered by `\\r`).
+    """
+    def __init__(
+        self,
+        total: int,
+        label: str,
+        silent: bool = False,
+        verbose: bool = False,
+        min_interval_s: float = 0.2,
+        nontty_interval_s: float = 5.0,
+    ):
+        self.total = max(total, 1)
+        self.label = label
+        self.done = 0
+        self.start_time = time.time()
+        self.last_print = 0.0
+        self.silent = silent
+        self.verbose = verbose
+        self.tty = sys.stderr.isatty() and not _NO_COLOR
+        self.min_interval = min_interval_s
+        self.nontty_interval = nontty_interval_s
+        self.last_line_len = 0
+        self.counters: dict[str, int] = {}
+        self.current: str = ""
+        self._finished: bool = False
+
+    def _active(self) -> bool:
+        return not (self.silent or self.verbose)
+
+    def update(self, current: str = "", **counter_deltas: int) -> None:
+        """Advance by 1 and optionally set the current label + counters."""
+        self.done += 1
+        if current:
+            self.current = current
+        for k, v in counter_deltas.items():
+            self.counters[k] = self.counters.get(k, 0) + v
+        if self._active():
+            self._maybe_render(force=False)
+
+    def heartbeat(self, detail: str = "") -> None:
+        """Refresh the display without advancing the counter.
+
+        Call this from inside long per-item operations (e.g. embedding a
+        file with dozens of chunks) so the user doesn't see the progress
+        line freeze. `detail` temporarily replaces the current-file label
+        — the next `update()` call resets it.
+        """
+        if not self._active():
+            return
+        if detail:
+            self.current = detail
+        self._maybe_render(force=False)
+
+    def _maybe_render(self, force: bool) -> None:
+        now = time.time()
+        interval = self.min_interval if self.tty else self.nontty_interval
+        if not force and now - self.last_print < interval and self.done < self.total:
+            return
+        self.last_print = now
+        self._render()
+
+    def _render(self) -> None:
+        elapsed = max(time.time() - self.start_time, 0.001)
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        pct = self.done / self.total * 100.0
+        remaining = (self.total - self.done) / rate if rate > 0 else 0
+        counters = "  ".join(f"{k}:{v}" for k, v in self.counters.items() if v)
+        cur_disp = f"  ← {_truncate(self.current, 42)}" if self.current else ""
+
+        line = (
+            f"  {self.label}  "
+            f"{self.done:>{len(str(self.total))}}/{self.total}  "
+            f"{pct:5.1f}%  "
+            f"{rate:5.1f} f/s  "
+            f"ETA {_format_duration(remaining)}"
+        )
+        if counters:
+            line += f"  {counters}"
+        if cur_disp:
+            line += cur_disp
+
+        if self.tty:
+            # Pad/overwrite trailing characters from a previously longer line
+            pad = " " * max(0, self.last_line_len - len(line))
+            sys.stderr.write("\r" + line + pad)
+            sys.stderr.flush()
+            self.last_line_len = len(line)
+        else:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+
+    def finish(self, summary: str = "") -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if self._active():
+            # Force one last render so the final state is visible
+            self._maybe_render(force=True)
+            if self.tty:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+        if summary and not self.silent:
+            sys.stderr.write(summary + "\n")
+            sys.stderr.flush()
+
+
+def _truncate(s: str, max_len: int) -> str:
+    """Truncate a string to max_len chars with an ellipsis marker."""
+    if len(s) <= max_len:
+        return s
+    if max_len <= 1:
+        return s[:max_len]
+    return "…" + s[-(max_len - 1):]
+
+
+def _format_duration(seconds: float) -> str:
+    """Compact human-readable duration ('1h23m', '4m12s', '45s')."""
+    if not seconds or seconds != seconds or seconds > 24 * 3600:  # NaN or absurd
+        return "  --  "
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds:4d}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m:2d}m{s:02d}s"
+    h, rem = divmod(seconds, 3600)
+    m, _ = divmod(rem, 60)
+    return f"{h:2d}h{m:02d}m"
+
+
+# ===== Config loading =================================================
+def load_config(path: Optional[str] = None) -> dict:
+    """Load YAML config from disk, layer env-var overrides on top.
+
+    The returned dict is a merged view with the hardcoded defaults at
+    the bottom, then the YAML file, then env vars. Missing file is not
+    an error — we just fall back to defaults + env.
+    """
+    config: dict = _default_config()
+
+    config_path: str = path or os.environ.get("RAG_CONFIG", DEFAULT_CONFIG_PATH)
+
+    # Layer 2: YAML file (optional). If YAML parser is missing, skip.
+    if os.path.isfile(config_path) and _YAML_AVAILABLE:
+        try:
+            with open(config_path, "r") as f:
+                loaded = yaml.safe_load(f) or {}
+                _deep_merge(config, loaded)
+        except Exception as e:
+            OUT.warn(f"Failed to parse config at {config_path}: {e}")
+
+    # Layer 3: environment variables
+    env_map: dict[str, tuple[list[str], Callable[[str], Any]]] = {
+        "RAG_DB_HOST":            (["database", "host"], str),
+        "RAG_DB_PORT":            (["database", "port"], int),
+        "RAG_DB_NAME":            (["database", "name"], str),
+        "RAG_DB_USER":            (["database", "user"], str),
+        "RAG_DB_PASSWORD":        (["database", "password"], str),
+        "RAG_OLLAMA_ENDPOINT":    (["embedding", "endpoint"], str),
+        "RAG_EMBEDDING_MODEL":    (["embedding", "model"], str),
+        "RAG_EMBEDDING_DIMENSION":(["embedding", "dimension"], int),
+    }
+    for var, (key_path, caster) in env_map.items():
+        if var in os.environ and os.environ[var] != "":
+            try:
+                _deep_set(config, key_path, caster(os.environ[var]))
+            except ValueError as e:
+                OUT.warn(f"Invalid env var {var}={os.environ[var]!r}: {e}")
+
+    config["_source_path"] = config_path
+    return config
+
+
+def _default_config() -> dict:
+    """The baseline config used when no file / env vars present."""
+    return {
+        "database": {
+            "host":     DEFAULT_DB_HOST,
+            "port":     DEFAULT_DB_PORT,
+            "name":     DEFAULT_DB_NAME,
+            "user":     DEFAULT_DB_USER,
+            "password": DEFAULT_DB_PASSWORD,
+        },
+        "embedding": {
+            "endpoint":        DEFAULT_OLLAMA_ENDPOINT,
+            "model":           DEFAULT_EMBEDDING_MODEL,
+            "dimension":       DEFAULT_EMBEDDING_DIMENSION,
+            "timeout_seconds": DEFAULT_EMBED_TIMEOUT,
+            "max_retries":     DEFAULT_EMBED_RETRIES,
+            "batch_size":      DEFAULT_EMBED_BATCH_SIZE,
+        },
+        "defaults": {
+            "chunk_size":     DEFAULT_CHUNK_SIZE,
+            "chunk_overlap":  DEFAULT_CHUNK_OVERLAP,
+            "search_limit":   DEFAULT_SEARCH_LIMIT,
+            "threshold":      DEFAULT_SEARCH_THRESHOLD,
+            "rrf_k":          DEFAULT_RRF_K,
+            "keyword_boost":  DEFAULT_KEYWORD_BOOST,
+        },
+        "parsers": {
+            "docling_enabled":          True,
+            "docling_ocr":              True,
+            "docling_artifacts_path":   DEFAULT_DOCLING_ARTIFACTS_PATH,
+            "code_languages":           sorted(EXT_CODE),
+            "skip_hidden":              True,
+            "skip_binary":              True,
+            "max_file_size_mb":         25,
+        },
+        "mcp": {
+            "enabled":           True,
+            "default_limit":     8,
+            "default_threshold": 0.4,
+        },
+    }
+
+
+def _deep_merge(dst: dict, src: dict) -> None:
+    """Recursively overlay `src` onto `dst` in place."""
+    for k, v in src.items():
+        if k in dst and isinstance(dst[k], dict) and isinstance(v, dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
+def _deep_set(dst: dict, keys: Sequence[str], value: Any) -> None:
+    """Write `value` at the nested path `keys` inside `dst`, creating dicts."""
+    cur = dst
+    for k in keys[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[keys[-1]] = value
+
+
+# ===== Data classes ===================================================
+@dataclass
+class CorpusRecord:
+    """In-memory mirror of a row from rag_corpora."""
+    id: str
+    name: str
+    root_path: str
+    corpus_type: str
+    description: Optional[str]
+    include_patterns: list[str]
+    exclude_patterns: list[str]
+    chunk_size: int
+    chunk_overlap: int
+    file_count: int
+    chunk_count: int
+    last_indexed_at: Optional[datetime]
+    metadata: dict
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class FileRecord:
+    """In-memory mirror of a row from rag_files."""
+    id: str
+    corpus_id: str
+    relative_path: str
+    absolute_path: str
+    file_hash: str
+    file_size: int
+    file_type: Optional[str]
+    mtime: datetime
+    chunk_count: int
+
+
+@dataclass
+class Chunk:
+    """One parsed chunk, ready to be embedded and stored.
+
+    Produced by the parser layer, consumed by the ingestion layer.
+    `embedding` is filled in by the embedding step, not the parser.
+    """
+    content: str
+    chunk_index: int
+    heading_path: list[str] = field(default_factory=list)
+    chunk_type: Optional[str] = None
+    token_count: Optional[int] = None
+    start_char: int = 0
+    end_char: int = 0
+    metadata: dict = field(default_factory=dict)
+    embedding: Optional[list[float]] = None
+
+
+# ===== Database helpers ===============================================
+def get_connection(config: dict) -> psycopg.Connection:
+    """Connect to the rag database using the config.
+
+    Exits the process on connection failure — there is no graceful degrade
+    path for a tool whose entire purpose is talking to postgres.
+    """
+    db = config["database"]
+    try:
+        return psycopg.connect(
+            host=db["host"],
+            port=db["port"],
+            dbname=db["name"],
+            user=db["user"],
+            password=db.get("password") or "",
+            row_factory=dict_row,
+            connect_timeout=5,
+        )
+    except psycopg.OperationalError as e:
+        OUT.error(f"Cannot connect to rag database at {db['host']}:{db['port']}/{db['name']}: {e}")
+        OUT.info("  Is PostgreSQL running? Run: local_postgres init-rag")
+        sys.exit(2)
+
+
+def ensure_rag_meta(conn: psycopg.Connection, config: dict) -> dict:
+    """Verify the rag_meta singleton exists and matches config.
+
+    Returns the rag_meta row as a dict. If the database is present but
+    rag_meta is missing (schema partially created), emits an error.
+    If the meta model/dimension differs from config, warn loudly —
+    mismatches silently produce broken embeddings.
+    """
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SELECT embedding_model, embedding_dimension, schema_version FROM rag_meta WHERE singleton = TRUE LIMIT 1")
+        except psycopg.errors.UndefinedTable:
+            conn.rollback()
+            OUT.error("rag_meta table missing. Run: local_postgres init-rag")
+            sys.exit(2)
+        row = cur.fetchone()
+
+    if row is None:
+        OUT.error("rag_meta is empty. Run: local_postgres init-rag")
+        sys.exit(2)
+
+    cfg_model = config["embedding"]["model"]
+    cfg_dim = config["embedding"]["dimension"]
+    if row["embedding_model"] != cfg_model or row["embedding_dimension"] != cfg_dim:
+        OUT.warn(
+            f"config has {cfg_model}/{cfg_dim}, but rag_meta says {row['embedding_model']}/{row['embedding_dimension']}"
+        )
+        OUT.warn("  Using rag_meta values (DB is the source of truth).")
+        config["embedding"]["model"] = row["embedding_model"]
+        config["embedding"]["dimension"] = row["embedding_dimension"]
+    return row
+
+
+# ===== Ollama client ==================================================
+def ollama_is_reachable(config: dict) -> tuple[bool, str]:
+    """Quick health check — HEAD/GET on the tags endpoint."""
+    endpoint = config["embedding"]["endpoint"].rstrip("/")
+    try:
+        r = requests.get(f"{endpoint}/api/tags", timeout=3)
+        if r.status_code == 200:
+            return True, "reachable"
+        return False, f"HTTP {r.status_code}"
+    except requests.RequestException as e:
+        return False, str(e)
+
+
+def ollama_model_present(config: dict, model: str) -> tuple[bool, str]:
+    """Check whether `model` is available in the local Ollama.
+
+    Returns (present, resolved_name). Side effect: stores the resolved
+    name into config['embedding']['_resolved_model'] so subsequent calls
+    to generate_embedding hit the tag the user actually has pulled.
+    Ollama treats `foo` and `foo:latest` as the same tag, but a literal
+    `foo:v1.5` 404s if only `:latest` is pulled — so we match on base
+    name when the exact tag is absent.
+    """
+    endpoint = config["embedding"]["endpoint"].rstrip("/")
+    try:
+        r = requests.get(f"{endpoint}/api/tags", timeout=5)
+        if r.status_code != 200:
+            return False, f"/api/tags returned HTTP {r.status_code}"
+        data = r.json()
+        names = [m.get("name", "") for m in data.get("models", [])]
+        if model in names:
+            config["embedding"]["_resolved_model"] = model
+            return True, model
+        bare = model.split(":", 1)[0]
+        # Prefer bare match (no tag), then :latest, then any tag of the same base
+        for candidate in (bare, f"{bare}:latest"):
+            if candidate in names:
+                config["embedding"]["_resolved_model"] = candidate
+                return True, candidate
+        for n in names:
+            if n == bare or n.startswith(bare + ":"):
+                config["embedding"]["_resolved_model"] = n
+                return True, n
+        return False, f"not pulled (have: {', '.join(names) if names else 'none'})"
+    except requests.RequestException as e:
+        return False, str(e)
+
+
+def ensure_resolved_model(config: dict) -> Optional[str]:
+    """Lazily populate config['embedding']['_resolved_model'].
+
+    This lets commands that need embeddings (index, sync, search, mcp)
+    call Ollama's /api/tags once at startup to figure out what name the
+    pulled model actually has — e.g. when config says `nomic-embed-text:v1.5`
+    but the user pulled `nomic-embed-text:latest`. Returns the resolved
+    name, or None if the model isn't pulled at all.
+    """
+    if config["embedding"].get("_resolved_model"):
+        return config["embedding"]["_resolved_model"]
+    ok, resolved = ollama_model_present(config, config["embedding"]["model"])
+    return resolved if ok else None
+
+
+def generate_embedding(
+    config: dict,
+    text: str,
+    max_retries: Optional[int] = None,
+) -> Optional[list[float]]:
+    """Call Ollama /api/embed with a single input, return vector or None.
+
+    Thin wrapper over generate_embeddings_batch for callers that only
+    need one vector at a time (search queries).
+    """
+    result = generate_embeddings_batch(config, [text], max_retries=max_retries)
+    return result[0] if result else None
+
+
+def generate_embeddings_batch(
+    config: dict,
+    texts: list[str],
+    max_retries: Optional[int] = None,
+) -> list[Optional[list[float]]]:
+    """Embed a batch of texts in a single Ollama /api/embed request.
+
+    Returns a list the same length as `texts`. Items are None for texts
+    that were empty or for which the request failed. Uses the modern
+    /api/embed endpoint (input=array) rather than /api/embeddings so
+    Ollama can serve them in one roundtrip — a big win for large files
+    that produce many chunks (an 80-chunk file drops from ~80s to ~3s).
+    """
+    endpoint = config["embedding"]["endpoint"].rstrip("/")
+    # Prefer the resolved model name from ollama_model_present() if we
+    # already discovered that the literal config model isn't pulled but
+    # a compatible base-name tag is.
+    model = config["embedding"].get("_resolved_model") or config["embedding"]["model"]
+    dimension = config["embedding"]["dimension"]
+    timeout = config["embedding"].get("timeout_seconds", DEFAULT_EMBED_TIMEOUT)
+    retries = max_retries if max_retries is not None else config["embedding"].get("max_retries", DEFAULT_EMBED_RETRIES)
+
+    # Pre-clean: strip NUL bytes; mark empty inputs so we preserve
+    # ordering of results when we re-insert them.
+    cleaned: list[str] = []
+    preserve_index: list[int] = []  # positions in `cleaned` that correspond to real (non-empty) inputs
+    result: list[Optional[list[float]]] = [None] * len(texts)
+
+    for i, t in enumerate(texts):
+        c = (t or "").replace("\x00", "")
+        if not c.strip():
+            continue
+        preserve_index.append(i)
+        cleaned.append(c)
+
+    if not cleaned:
+        return result
+
+    url = f"{endpoint}/api/embed"
+    payload = {"model": model, "input": cleaned}
+
+    last_err: Optional[str] = None
+    for attempt in range(retries):
+        try:
+            # Scale timeout with batch size — a 64-chunk batch legitimately
+            # takes longer than a 1-chunk call.
+            r = requests.post(url, json=payload, timeout=max(timeout, timeout * len(cleaned) / 16))
+            if r.status_code == 200:
+                data = r.json()
+                embs = data.get("embeddings")
+                if not isinstance(embs, list) or len(embs) != len(cleaned):
+                    last_err = f"/api/embed returned {len(embs) if isinstance(embs, list) else 'non-list'} embeddings for {len(cleaned)} inputs"
+                else:
+                    for src_idx, emb in zip(preserve_index, embs):
+                        if not isinstance(emb, list):
+                            continue
+                        if len(emb) != dimension:
+                            OUT.warn(f"embedding dimension mismatch: got {len(emb)}, expected {dimension}")
+                            continue
+                        result[src_idx] = emb
+                    return result
+            else:
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+        except requests.RequestException as e:
+            last_err = str(e)
+        if attempt < retries - 1:
+            time.sleep(0.5 * (attempt + 1))
+
+    OUT.dbg(f"batch embedding failed after {retries} retries: {last_err}")
+    return result
+
+
+# ===== Config / status / check commands ===============================
+def cmd_config(args: argparse.Namespace, config: dict) -> int:
+    """Show, print path, or edit the config file."""
+    action = args.config_action or "show"
+
+    if action == "path":
+        print(config.get("_source_path", DEFAULT_CONFIG_PATH))
+        return 0
+
+    if action == "show":
+        # Strip internal fields before dumping.
+        clean = {k: v for k, v in config.items() if not k.startswith("_")}
+        if _YAML_AVAILABLE:
+            print(yaml.safe_dump(clean, sort_keys=False))
+        else:
+            print(json.dumps(clean, indent=2, default=str))
+        return 0
+
+    if action == "edit":
+        editor = os.environ.get("EDITOR") or "vi"
+        path = config.get("_source_path", DEFAULT_CONFIG_PATH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(yaml.safe_dump(_default_config(), sort_keys=False) if _YAML_AVAILABLE else "")
+        os.execvp(editor.split()[0], [*editor.split(), path])
+        return 0  # unreachable
+
+    OUT.error(f"unknown config action: {action}")
+    return 1
+
+
+def cmd_status(args: argparse.Namespace, config: dict) -> int:
+    """Compact one-line-per-component health report."""
+    # DB
+    try:
+        conn = psycopg.connect(
+            host=config["database"]["host"],
+            port=config["database"]["port"],
+            dbname=config["database"]["name"],
+            user=config["database"]["user"],
+            password=config["database"].get("password") or "",
+            connect_timeout=3,
+        )
+        conn.close()
+        db_ok = True
+        db_msg = f"{config['database']['host']}:{config['database']['port']}/{config['database']['name']}"
+    except Exception as e:
+        db_ok = False
+        db_msg = str(e)
+
+    # Ollama endpoint
+    ollama_ok, ollama_msg = ollama_is_reachable(config)
+
+    # Model availability (only if ollama reachable)
+    if ollama_ok:
+        model_ok, model_msg = ollama_model_present(config, config["embedding"]["model"])
+    else:
+        model_ok, model_msg = False, "(skipped — ollama unreachable)"
+
+    # Optional dependencies
+    mcp_ok = _MCP_AVAILABLE
+    docling_ok = _DOCLING_AVAILABLE
+    yaml_ok = _YAML_AVAILABLE
+
+    def _line(label: str, ok: bool, detail: str) -> str:
+        mark = _green("✓") if ok else _red("✗")
+        return f"  {mark} {label:<20} {_dim(detail)}"
+
+    print(_bold("rag status"))
+    print(_line("database",     db_ok,     db_msg))
+    print(_line("ollama",       ollama_ok, ollama_msg))
+    print(_line("embed model",  model_ok,  f"{config['embedding']['model']} — {model_msg}"))
+    print(_line("mcp package",  mcp_ok,    "installed" if mcp_ok else "pip install 'mcp[cli]'"))
+    print(_line("docling",      docling_ok, "installed (rich formats enabled)" if docling_ok else "optional — pip install docling"))
+    print(_line("yaml",         yaml_ok,   "installed" if yaml_ok else "pip install PyYAML"))
+
+    return 0 if (db_ok and ollama_ok and model_ok) else 1
+
+
+def cmd_check(args: argparse.Namespace, config: dict) -> int:
+    """Preflight verification — more rigorous than status.
+
+    Also verifies that rag_meta exists and matches config, that the
+    required tables exist, and that we can execute a trivial embedding.
+    Exit non-zero on any failure so this is useful in shell conditionals.
+    """
+    failures: list[str] = []
+
+    # 1. DB connection + schema
+    try:
+        conn = get_connection(config)
+        OUT.ok("database reachable")
+    except SystemExit:
+        return 1
+
+    with conn.cursor() as cur:
+        for table in ("rag_meta", "rag_corpora", "rag_files", "rag_chunks", "rag_ingestion_log"):
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = %s", (table,))
+            if cur.fetchone() is None:
+                failures.append(f"missing table: {table}")
+                OUT.fail(f"table missing: {table}")
+            else:
+                OUT.ok(f"table exists: {table}")
+
+    # 2. rag_meta integrity
+    meta = ensure_rag_meta(conn, config)
+    OUT.ok(f"rag_meta: model={meta['embedding_model']} dim={meta['embedding_dimension']} v={meta['schema_version']}")
+
+    # 3. pgvector extension
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+        if cur.fetchone() is None:
+            failures.append("pgvector extension not enabled")
+            OUT.fail("pgvector extension missing")
+        else:
+            OUT.ok("pgvector extension loaded")
+
+    # 4. Ollama
+    ollama_ok, msg = ollama_is_reachable(config)
+    if ollama_ok:
+        OUT.ok(f"ollama endpoint: {config['embedding']['endpoint']}")
+    else:
+        failures.append(f"ollama unreachable: {msg}")
+        OUT.fail(f"ollama unreachable: {msg}")
+
+    # 5. Model availability
+    if ollama_ok:
+        model_ok, msg = ollama_model_present(config, config["embedding"]["model"])
+        if model_ok:
+            OUT.ok(f"embedding model: {config['embedding']['model']}")
+        else:
+            failures.append(f"embedding model: {msg}")
+            OUT.fail(f"embedding model: {msg}")
+            OUT.info(f"  fix: ollama pull {config['embedding']['model']}")
+
+    # 6. Trivial embedding roundtrip (uses resolved model name if the
+    # literal tag isn't pulled but a compatible base-name is).
+    if ollama_ok:
+        emb = generate_embedding(config, "hello world", max_retries=1)
+        effective = config["embedding"].get("_resolved_model") or config["embedding"]["model"]
+        if emb and len(emb) == config["embedding"]["dimension"]:
+            OUT.ok(f"embedding roundtrip produced {len(emb)}-dim vector via {effective}")
+        else:
+            failures.append("embedding roundtrip failed")
+            OUT.fail(f"embedding roundtrip failed (tried {effective})")
+
+    conn.close()
+
+    if failures:
+        OUT.error(f"{len(failures)} check(s) failed")
+        return 1
+    OUT.ok("all checks passed")
+    return 0
+
+
+def cmd_license(args: argparse.Namespace, config: dict) -> int:
+    """Print the program's license."""
+    print("rag — part of Zach Podbielniak's dotfiles")
+    print("Copyright (C) 2026  Zach Podbielniak")
+    print("Licensed under the GNU Affero General Public License v3.0")
+    print("https://www.gnu.org/licenses/agpl-3.0.html")
+    return 0
+
+
+# ===== File utilities =================================================
+_BINARY_PROBE_BYTES: int = 4096
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count (chars / CHARS_PER_TOKEN). Avoids a tokenizer dep."""
+    return int(len(text) / CHARS_PER_TOKEN)
+
+
+def tokens_to_chars(tokens: int) -> int:
+    """Inverse of estimate_tokens. Used to size chunks in character units."""
+    return int(tokens * CHARS_PER_TOKEN)
+
+
+def stat_file(path: Path) -> tuple[Optional[int], Optional[datetime]]:
+    """Return (size_bytes, mtime_utc) for a path, or (None, None) on error."""
+    try:
+        st = path.stat()
+        return st.st_size, datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    except OSError:
+        return None, None
+
+
+def sha256_of_file(path: Path, chunk_bytes: int = 65536) -> Optional[str]:
+    """Stream-hash a file into a hex digest. None on IO error."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                buf = f.read(chunk_bytes)
+                if not buf:
+                    break
+                h.update(buf)
+    except OSError as e:
+        OUT.dbg(f"hash failed for {path}: {e}")
+        return None
+    return h.hexdigest()
+
+
+def is_probably_binary(path: Path) -> bool:
+    """Cheap heuristic: NUL bytes in the first few KB => binary."""
+    try:
+        with open(path, "rb") as f:
+            sample = f.read(_BINARY_PROBE_BYTES)
+    except OSError:
+        return True
+    if b"\x00" in sample:
+        return True
+    # Tolerate UTF-8 BOMs and high-ASCII in prose; reject if >30% are control
+    # characters (excluding common whitespace).
+    if not sample:
+        return False
+    allowed = {0x09, 0x0a, 0x0d, 0x0c}  # tab, LF, CR, FF
+    ctrl = sum(1 for b in sample if b < 0x20 and b not in allowed)
+    return ctrl / len(sample) > 0.30
+
+
+def read_file_content(path: Path) -> Optional[str]:
+    """Read a text file using encoding fallback (utf-8, latin-1, cp1252).
+
+    Strips NUL bytes (Ollama rejects them). Returns None on unrecoverable
+    decode errors or IO failure.
+    """
+    for encoding in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                data = f.read()
+                return data.replace("\x00", "")
+        except (UnicodeDecodeError, OSError):
+            continue
+    return None
+
+
+def classify_file(path: Path) -> str:
+    """Return a short label for parser dispatch.
+
+    Returns one of: 'org', 'markdown', 'text', 'code', 'structured',
+    'docling', 'skip'.
+    """
+    suffix = path.suffix.lower()
+    if suffix in EXT_ALWAYS_SKIP:
+        return "skip"
+    if suffix in EXT_ORG:
+        return "org"
+    if suffix in EXT_MARKDOWN:
+        return "markdown"
+    if suffix in EXT_TEXT:
+        return "text"
+    if suffix in EXT_CODE:
+        return "code"
+    if suffix in EXT_STRUCTURED:
+        return "structured"
+    if suffix in EXT_DOCLING:
+        return "docling"
+    return "skip"
+
+
+def should_skip_path(
+    rel_parts: tuple[str, ...],
+    suffix: str,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    skip_hidden: bool,
+) -> bool:
+    """Centralized include/exclude / hidden / unsupported gate.
+
+    - `rel_parts` is pathlib.Path.parts for the path relative to corpus root.
+    - Include patterns: if present, the path must match at least one.
+    - Exclude patterns: if matched, always skipped.
+    - Hidden: leading-dot components drop the path unless explicitly included.
+    """
+    if skip_hidden and any(p.startswith(".") and p not in (".", "..") for p in rel_parts):
+        # Allow explicit includes to override (e.g. "--include .config/**")
+        rel_path = "/".join(rel_parts)
+        if not any(fnmatch.fnmatch(rel_path, pat) for pat in include_patterns):
+            return True
+
+    rel_path = "/".join(rel_parts)
+    for pat in exclude_patterns:
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+        # Also match directory prefixes: "node_modules/**" style
+        for i in range(1, len(rel_parts)):
+            if fnmatch.fnmatch("/".join(rel_parts[:i]), pat):
+                return True
+
+    if include_patterns:
+        if not any(fnmatch.fnmatch(rel_path, pat) for pat in include_patterns):
+            return True
+
+    return False
+
+
+# ===== Parsers ========================================================
+# All parsers return list[Chunk] with content, heading_path, chunk_type,
+# start_char, end_char, token_count filled in. chunk_index is assigned
+# by the caller so it's stable across the document.
+#
+# Chunking strategy is uniform across heading-aware parsers:
+#   1. Walk natural boundaries (headings, paragraph breaks, fence ends).
+#   2. Slide a start pointer forward; pick the end so the chunk is near
+#      target size, preferring a boundary within ±25% of target.
+#   3. Advance start to end-overlap, clamped to avoid infinite loops.
+#
+# The plain text parser is simpler — just paragraph boundaries.
+
+
+def _split_at_boundaries(
+    content: str,
+    boundaries: list[int],
+    chunk_size_tokens: int,
+    overlap_tokens: int,
+) -> list[tuple[int, int]]:
+    """Return a list of (start_char, end_char) pairs for the document.
+
+    Identical logic to semantic_search's chunker; factored out so both
+    heading-aware and plain-text parsers can reuse it.
+    """
+    if not content.strip():
+        return []
+
+    chunk_chars = tokens_to_chars(chunk_size_tokens)
+    overlap_chars = tokens_to_chars(overlap_tokens)
+    slack = chunk_chars // 4  # snap-to-boundary window = ±25% of target
+
+    chunks: list[tuple[int, int]] = []
+    start = 0
+    n = len(content)
+    last_start = -1
+
+    while start < n:
+        end = start + chunk_chars
+        if end >= n:
+            end = n
+        else:
+            # Find a boundary within [start+1, end+slack] nearest to `end`.
+            best: Optional[int] = None
+            best_dist: int = slack
+            for b in boundaries:
+                if b <= start:
+                    continue
+                if b > end + slack:
+                    break
+                d = abs(b - end)
+                if d < best_dist:
+                    best_dist = d
+                    best = b
+            if best is not None:
+                end = best
+
+        if end > start:
+            chunks.append((start, end))
+
+        if end >= n:
+            break
+
+        new_start = end - overlap_chars
+        # Prevent repeated identical chunks from the overlap window.
+        if new_start <= last_start:
+            new_start = end
+        last_start = start
+        start = new_start
+
+    return chunks
+
+
+def _heading_path_at(content: str, pos: int, heading_re: re.Pattern, strip_fn: Callable[[str], str]) -> list[str]:
+    """Return the nested heading breadcrumb for the chunk starting at `pos`.
+
+    Scans the document from the start up to `pos`, tracking the current
+    heading stack by depth. heading_re must produce groups:
+      group(1) = level markers (e.g. '**')
+      group(2) = heading title
+    strip_fn cleans the title (strips TODO keywords, property markers, etc).
+    """
+    stack: list[str] = []
+    for m in heading_re.finditer(content):
+        if m.start() >= pos:
+            break
+        level = len(m.group(1))
+        title = strip_fn(m.group(2).strip())
+        # Pop deeper-or-equal levels, then push this one
+        while len(stack) >= level:
+            stack.pop()
+        stack.append(title)
+    return stack
+
+
+def _protect_blocks(content: str, block_res: list[re.Pattern]) -> list[tuple[int, int]]:
+    """Return spans [start, end) of regions that must not be split.
+
+    Used by chunkers to reject boundaries that fall inside fenced code
+    blocks, org SRC blocks, org drawer blocks, etc.
+    """
+    spans: list[tuple[int, int]] = []
+    for rx in block_res:
+        for m in rx.finditer(content):
+            spans.append((m.start(), m.end()))
+    spans.sort()
+    # Merge overlapping spans
+    merged: list[tuple[int, int]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _filter_boundaries_outside_spans(
+    boundaries: list[int], spans: list[tuple[int, int]]
+) -> list[int]:
+    """Drop any boundary position that falls inside a protected span."""
+    if not spans:
+        return boundaries
+    out: list[int] = []
+    spans_iter = iter(spans)
+    try:
+        cs, ce = next(spans_iter)
+    except StopIteration:
+        return boundaries
+    for b in boundaries:
+        while b >= ce:
+            try:
+                cs, ce = next(spans_iter)
+            except StopIteration:
+                out.append(b)
+                out.extend([x for x in boundaries if x > b])
+                return sorted(set(out))
+        if b < cs or b >= ce:
+            out.append(b)
+    return out
+
+
+# --- org ---------------------------------------------------------------
+_ORG_HEADING_RE = re.compile(r"^(\*{1,6})\s+(.+)$", re.MULTILINE)
+_ORG_SRC_BLOCK_RE = re.compile(
+    r"^#\+begin_src\b.*?^#\+end_src\s*$", re.MULTILINE | re.DOTALL | re.IGNORECASE
+)
+_ORG_EXAMPLE_BLOCK_RE = re.compile(
+    r"^#\+begin_example\b.*?^#\+end_example\s*$", re.MULTILINE | re.DOTALL | re.IGNORECASE
+)
+_ORG_QUOTE_BLOCK_RE = re.compile(
+    r"^#\+begin_quote\b.*?^#\+end_quote\s*$", re.MULTILINE | re.DOTALL | re.IGNORECASE
+)
+_ORG_DRAWER_RE = re.compile(
+    r"^\s*:[A-Z]+:\s*$.*?^\s*:END:\s*$", re.MULTILINE | re.DOTALL
+)
+_ORG_TODO_KEYWORD_RE = re.compile(r"^(TODO|DONE|NEXT|CANCELLED|WAITING|HOLD|IN-PROGRESS)\s+")
+_ORG_TAGS_RE = re.compile(r"\s+:[^\s]+:\s*$")
+
+
+def _org_strip_heading(title: str) -> str:
+    """Normalize an org heading for the breadcrumb: drop TODO keyword + tags."""
+    t = _ORG_TODO_KEYWORD_RE.sub("", title)
+    t = _ORG_TAGS_RE.sub("", t)
+    return t.strip()
+
+
+def parse_org(content: str, chunk_size: int, chunk_overlap: int) -> list[Chunk]:
+    """Chunk an org-mode document.
+
+    Splits primarily on heading boundaries (*, **, ***). Keeps SRC/EXAMPLE/
+    QUOTE blocks and PROPERTIES/LOGBOOK drawers intact by forbidding
+    boundaries inside them.
+    """
+    if not content.strip():
+        return []
+
+    # Boundaries: every heading start + every blank-line paragraph break
+    boundaries: list[int] = [0]
+    for m in _ORG_HEADING_RE.finditer(content):
+        boundaries.append(m.start())
+    for m in re.finditer(r"\n{2,}", content):
+        boundaries.append(m.end())
+
+    protected = _protect_blocks(content, [
+        _ORG_SRC_BLOCK_RE,
+        _ORG_EXAMPLE_BLOCK_RE,
+        _ORG_QUOTE_BLOCK_RE,
+        _ORG_DRAWER_RE,
+    ])
+    boundaries = sorted(set(boundaries))
+    boundaries = _filter_boundaries_outside_spans(boundaries, protected)
+
+    spans = _split_at_boundaries(content, boundaries, chunk_size, chunk_overlap)
+    chunks: list[Chunk] = []
+    for idx, (s, e) in enumerate(spans):
+        piece = content[s:e].strip()
+        if not piece:
+            continue
+        heading_path = _heading_path_at(content, s, _ORG_HEADING_RE, _org_strip_heading)
+        chunk_type = "heading_section" if piece.lstrip().startswith("*") else "paragraph"
+        chunks.append(Chunk(
+            content=piece,
+            chunk_index=idx,
+            heading_path=heading_path,
+            chunk_type=chunk_type,
+            token_count=estimate_tokens(piece),
+            start_char=s,
+            end_char=e,
+            metadata={"format": "org"},
+        ))
+    return chunks
+
+
+# --- markdown / norg ---------------------------------------------------
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+_NORG_HEADING_RE = re.compile(r"^(\*{1,6})\s+(.+)$", re.MULTILINE)
+_MD_FENCE_RE = re.compile(r"^```[^\n]*\n.*?^```\s*$", re.MULTILINE | re.DOTALL)
+_MD_TILDE_FENCE_RE = re.compile(r"^~~~[^\n]*\n.*?^~~~\s*$", re.MULTILINE | re.DOTALL)
+
+
+def _md_strip_heading(title: str) -> str:
+    return title.strip().lstrip("#").strip()
+
+
+def parse_markdown(content: str, chunk_size: int, chunk_overlap: int, is_norg: bool = False) -> list[Chunk]:
+    """Chunk a markdown (or neorg) document by heading boundaries.
+
+    Keeps fenced code blocks intact by forbidding boundaries inside them.
+    Norg uses the org-style `*` heading syntax; markdown uses `#`.
+    """
+    if not content.strip():
+        return []
+    heading_re = _NORG_HEADING_RE if is_norg else _MD_HEADING_RE
+
+    boundaries: list[int] = [0]
+    for m in heading_re.finditer(content):
+        boundaries.append(m.start())
+    for m in re.finditer(r"\n{2,}", content):
+        boundaries.append(m.end())
+
+    protected = _protect_blocks(content, [_MD_FENCE_RE, _MD_TILDE_FENCE_RE])
+    boundaries = sorted(set(boundaries))
+    boundaries = _filter_boundaries_outside_spans(boundaries, protected)
+
+    spans = _split_at_boundaries(content, boundaries, chunk_size, chunk_overlap)
+    fmt_label = "norg" if is_norg else "markdown"
+    chunks: list[Chunk] = []
+    for idx, (s, e) in enumerate(spans):
+        piece = content[s:e].strip()
+        if not piece:
+            continue
+        heading_path = _heading_path_at(content, s, heading_re, _md_strip_heading)
+        first = piece.lstrip()
+        if is_norg:
+            chunk_type = "heading_section" if first.startswith("*") else "paragraph"
+        else:
+            chunk_type = "heading_section" if first.startswith("#") else "paragraph"
+        chunks.append(Chunk(
+            content=piece,
+            chunk_index=idx,
+            heading_path=heading_path,
+            chunk_type=chunk_type,
+            token_count=estimate_tokens(piece),
+            start_char=s,
+            end_char=e,
+            metadata={"format": fmt_label},
+        ))
+    return chunks
+
+
+# --- plain text / rst / tex -------------------------------------------
+def parse_text(content: str, chunk_size: int, chunk_overlap: int, fmt: str = "text") -> list[Chunk]:
+    """Fallback parser: paragraph boundaries (blank lines) + fixed size."""
+    if not content.strip():
+        return []
+
+    boundaries: list[int] = [0]
+    for m in re.finditer(r"\n{2,}", content):
+        boundaries.append(m.end())
+
+    # RST has its own heading convention (underlined), pick it up cheaply:
+    if fmt == "rst":
+        for m in re.finditer(r"^([=\-~`+*#^\"']{3,})\s*$", content, re.MULTILINE):
+            # Heading is the line ABOVE the underline. Boundary at line start.
+            line_start = content.rfind("\n", 0, m.start()) + 1
+            boundaries.append(line_start)
+
+    boundaries = sorted(set(boundaries))
+    spans = _split_at_boundaries(content, boundaries, chunk_size, chunk_overlap)
+    chunks: list[Chunk] = []
+    for idx, (s, e) in enumerate(spans):
+        piece = content[s:e].strip()
+        if not piece:
+            continue
+        chunks.append(Chunk(
+            content=piece,
+            chunk_index=idx,
+            heading_path=[],
+            chunk_type="paragraph",
+            token_count=estimate_tokens(piece),
+            start_char=s,
+            end_char=e,
+            metadata={"format": fmt},
+        ))
+    return chunks
+
+
+# --- source code ------------------------------------------------------
+# Regex catalogs for "top-level declaration" boundaries. Language is
+# detected from the file suffix — we can't use tree-sitter for a tool
+# meant to be deps-light, so we use heuristic regexes and fall back to
+# blank-line boundaries when no declaration lines are found.
+_CODE_BOUNDARIES: dict[str, re.Pattern] = {
+    ".py":  re.compile(r"^(async\s+def|def|class)\s+\w+", re.MULTILINE),
+    ".sh":  re.compile(r"^(function\s+\w+|\w+\s*\(\)\s*\{)", re.MULTILINE),
+    ".bash":re.compile(r"^(function\s+\w+|\w+\s*\(\)\s*\{)", re.MULTILINE),
+    ".zsh": re.compile(r"^(function\s+\w+|\w+\s*\(\)\s*\{)", re.MULTILINE),
+    ".fish":re.compile(r"^function\s+\w+", re.MULTILINE),
+    ".c":   re.compile(r"^([A-Za-z_][\w\s\*]*\w+\s*\([^;\{]*\)\s*\{|struct\s+\w+|enum\s+\w+|typedef\b)", re.MULTILINE),
+    ".h":   re.compile(r"^([A-Za-z_][\w\s\*]*\w+\s*\([^;\{]*\)\s*[;\{]|struct\s+\w+|enum\s+\w+|typedef\b|#define\s+)", re.MULTILINE),
+    ".cpp": re.compile(r"^([A-Za-z_][\w:\s\*]*\w+\s*\([^;\{]*\)\s*\{|class\s+\w+|struct\s+\w+|namespace\s+\w+)", re.MULTILINE),
+    ".hpp": re.compile(r"^([A-Za-z_][\w:\s\*]*\w+\s*\([^;\{]*\)\s*[;\{]|class\s+\w+|struct\s+\w+|namespace\s+\w+)", re.MULTILINE),
+    ".cc":  re.compile(r"^([A-Za-z_][\w:\s\*]*\w+\s*\([^;\{]*\)\s*\{|class\s+\w+|struct\s+\w+|namespace\s+\w+)", re.MULTILINE),
+    ".hh":  re.compile(r"^([A-Za-z_][\w:\s\*]*\w+\s*\([^;\{]*\)\s*[;\{]|class\s+\w+|struct\s+\w+|namespace\s+\w+)", re.MULTILINE),
+    ".hs":  re.compile(r"^([A-Za-z_]\w*\s*::|data\s+\w+|newtype\s+\w+|class\s+\w+|instance\b)", re.MULTILINE),
+    ".lhs": re.compile(r"^>?\s*([A-Za-z_]\w*\s*::|data\s+\w+|newtype\s+\w+|class\s+\w+|instance\b)", re.MULTILINE),
+    ".pl":  re.compile(r"^(sub\s+\w+|package\s+\w+)", re.MULTILINE),
+    ".pm":  re.compile(r"^(sub\s+\w+|package\s+\w+)", re.MULTILINE),
+    ".go":  re.compile(r"^(func\s+\w+|type\s+\w+|var\s+\w+|const\s+\()", re.MULTILINE),
+    ".rs":  re.compile(r"^(pub\s+)?(async\s+)?(fn|struct|enum|impl|trait|mod|type)\s+\w+", re.MULTILINE),
+    ".rb":  re.compile(r"^(def|class|module)\s+\w+", re.MULTILINE),
+    ".lua": re.compile(r"^(local\s+)?function\s+[\w\.]+", re.MULTILINE),
+    ".js":  re.compile(r"^(export\s+)?(async\s+)?(function|class|const|let|var)\s+\w+", re.MULTILINE),
+    ".jsx": re.compile(r"^(export\s+)?(async\s+)?(function|class|const|let|var)\s+\w+", re.MULTILINE),
+    ".ts":  re.compile(r"^(export\s+)?(async\s+)?(function|class|interface|type|const|let|enum)\s+\w+", re.MULTILINE),
+    ".tsx": re.compile(r"^(export\s+)?(async\s+)?(function|class|interface|type|const|let|enum)\s+\w+", re.MULTILINE),
+    ".java":re.compile(r"^(public|private|protected)\s+(static\s+)?(class|interface|enum|\S+\s+\w+\s*\()", re.MULTILINE),
+    ".kt":  re.compile(r"^(fun|class|object|interface)\s+\w+", re.MULTILINE),
+    ".scala":re.compile(r"^(def|class|object|trait|case\s+class)\s+\w+", re.MULTILINE),
+    ".nim": re.compile(r"^(proc|func|method|template|macro|type)\s+\w+", re.MULTILINE),
+    ".zig": re.compile(r"^(pub\s+)?(fn|const|var)\s+\w+", re.MULTILINE),
+    ".d":   re.compile(r"^(void|int|string|auto|struct|class|module)\s+\w+", re.MULTILINE),
+    ".sql": re.compile(r"^(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|SELECT|WITH|GRANT|REVOKE)\b", re.MULTILINE | re.IGNORECASE),
+}
+
+
+def parse_code(content: str, chunk_size: int, chunk_overlap: int, suffix: str) -> list[Chunk]:
+    """Chunk source code at top-level declaration boundaries.
+
+    If no boundaries are found we fall back to blank-line paragraphs.
+    Either way, the token sizing rules from _split_at_boundaries apply.
+    """
+    if not content.strip():
+        return []
+
+    boundary_re = _CODE_BOUNDARIES.get(suffix)
+    boundaries: list[int] = [0]
+    # Always add the shebang line boundary so shebang + imports aren't split
+    if content.startswith("#!"):
+        shebang_end = content.find("\n")
+        if shebang_end >= 0:
+            boundaries.append(shebang_end + 1)
+
+    if boundary_re:
+        for m in boundary_re.finditer(content):
+            boundaries.append(m.start())
+
+    # Fall back if we got zero declaration boundaries — just use paragraphs
+    if len(boundaries) <= 2:
+        for m in re.finditer(r"\n{2,}", content):
+            boundaries.append(m.end())
+
+    boundaries = sorted(set(boundaries))
+
+    spans = _split_at_boundaries(content, boundaries, chunk_size, chunk_overlap)
+    lang = suffix.lstrip(".")
+    chunks: list[Chunk] = []
+    for idx, (s, e) in enumerate(spans):
+        piece = content[s:e].strip()
+        if not piece:
+            continue
+        chunks.append(Chunk(
+            content=piece,
+            chunk_index=idx,
+            heading_path=[],  # code doesn't have meaningful breadcrumbs here
+            chunk_type="code_block",
+            token_count=estimate_tokens(piece),
+            start_char=s,
+            end_char=e,
+            metadata={"format": "code", "language": lang},
+        ))
+    return chunks
+
+
+# --- structured (yaml/json/toml/csv/tsv/ini) --------------------------
+def parse_structured(
+    content: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    suffix: str,
+) -> list[Chunk]:
+    """Chunk structured data: top-level keys (yaml/json) or record groups (csv).
+
+    For YAML/JSON/TOML: each top-level key becomes its own chunk whose
+    content is `key:\\n<yaml dump of the subtree>`. Very small subtrees
+    may be grouped to keep chunks above some minimum size.
+
+    For CSV/TSV: every N rows become a chunk, with the header prepended.
+    """
+    if not content.strip():
+        return []
+
+    if suffix in (".yaml", ".yml"):
+        if not _YAML_AVAILABLE:
+            return parse_text(content, chunk_size, chunk_overlap, fmt="yaml")
+        try:
+            data = yaml.safe_load(content)
+        except yaml.YAMLError:
+            return parse_text(content, chunk_size, chunk_overlap, fmt="yaml")
+        return _chunks_from_mapping(data, chunk_size, fmt="yaml", dump=lambda v: yaml.safe_dump(v, sort_keys=False))
+
+    if suffix == ".json":
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return parse_text(content, chunk_size, chunk_overlap, fmt="json")
+        return _chunks_from_mapping(data, chunk_size, fmt="json", dump=lambda v: json.dumps(v, indent=2, default=str))
+
+    if suffix == ".toml":
+        # Section boundaries are the simplest and most universal chunk break.
+        boundaries: list[int] = [0]
+        for m in re.finditer(r"^\[[^\]]+\]\s*$", content, re.MULTILINE):
+            boundaries.append(m.start())
+        spans = _split_at_boundaries(content, sorted(set(boundaries)), chunk_size, chunk_overlap)
+        chunks: list[Chunk] = []
+        for idx, (s, e) in enumerate(spans):
+            piece = content[s:e].strip()
+            if not piece:
+                continue
+            chunks.append(Chunk(
+                content=piece, chunk_index=idx, heading_path=[],
+                chunk_type="config_section",
+                token_count=estimate_tokens(piece),
+                start_char=s, end_char=e,
+                metadata={"format": "toml"},
+            ))
+        return chunks
+
+    if suffix in (".csv", ".tsv"):
+        return _parse_delimited(content, chunk_size, suffix)
+
+    if suffix == ".ini":
+        boundaries = [0]
+        for m in re.finditer(r"^\[[^\]]+\]\s*$", content, re.MULTILINE):
+            boundaries.append(m.start())
+        spans = _split_at_boundaries(content, sorted(set(boundaries)), chunk_size, chunk_overlap)
+        chunks: list[Chunk] = []
+        for idx, (s, e) in enumerate(spans):
+            piece = content[s:e].strip()
+            if not piece:
+                continue
+            chunks.append(Chunk(
+                content=piece, chunk_index=idx, heading_path=[],
+                chunk_type="config_section",
+                token_count=estimate_tokens(piece),
+                start_char=s, end_char=e,
+                metadata={"format": "ini"},
+            ))
+        return chunks
+
+    return parse_text(content, chunk_size, chunk_overlap, fmt=suffix.lstrip("."))
+
+
+def _chunks_from_mapping(data: Any, chunk_size: int, fmt: str, dump: Callable[[Any], str]) -> list[Chunk]:
+    """Split a parsed YAML/JSON structure into chunks at top-level keys.
+
+    Groups adjacent tiny subtrees into one chunk (≥ chunk_size/4 chars each)
+    to avoid a torrent of single-line chunks. Non-mapping roots become a
+    single chunk containing the whole dumped value.
+    """
+    chunks: list[Chunk] = []
+    if not isinstance(data, dict):
+        text = dump(data)
+        if text.strip():
+            chunks.append(Chunk(
+                content=text, chunk_index=0, heading_path=[],
+                chunk_type="structured_record",
+                token_count=estimate_tokens(text),
+                start_char=0, end_char=len(text),
+                metadata={"format": fmt},
+            ))
+        return chunks
+
+    target_chars = tokens_to_chars(chunk_size)
+    min_chars = max(100, target_chars // 4)
+
+    pending_text = ""
+    pending_keys: list[str] = []
+    idx = 0
+    for key, value in data.items():
+        segment = f"{key}:\n{dump(value)}".rstrip()
+        if not segment:
+            continue
+        if len(pending_text) + len(segment) < target_chars and len(pending_text) < min_chars:
+            if pending_text:
+                pending_text += "\n\n"
+            pending_text += segment
+            pending_keys.append(str(key))
+            continue
+
+        if pending_text:
+            chunks.append(Chunk(
+                content=pending_text, chunk_index=idx,
+                heading_path=pending_keys[:],
+                chunk_type="structured_record",
+                token_count=estimate_tokens(pending_text),
+                start_char=0, end_char=len(pending_text),
+                metadata={"format": fmt, "keys": pending_keys[:]},
+            ))
+            idx += 1
+
+        pending_text = segment
+        pending_keys = [str(key)]
+
+    if pending_text:
+        chunks.append(Chunk(
+            content=pending_text, chunk_index=idx,
+            heading_path=pending_keys[:],
+            chunk_type="structured_record",
+            token_count=estimate_tokens(pending_text),
+            start_char=0, end_char=len(pending_text),
+            metadata={"format": fmt, "keys": pending_keys[:]},
+        ))
+    return chunks
+
+
+def _parse_delimited(content: str, chunk_size: int, suffix: str) -> list[Chunk]:
+    """Chunk CSV/TSV: header + N rows per chunk, sized to chunk_size."""
+    import csv
+    dialect = csv.excel_tab if suffix == ".tsv" else csv.excel
+    try:
+        lines = content.splitlines()
+        reader = csv.reader(lines, dialect=dialect)
+        rows = list(reader)
+    except Exception:
+        return parse_text(content, chunk_size, DEFAULT_CHUNK_OVERLAP, fmt=suffix.lstrip("."))
+
+    if not rows:
+        return []
+
+    header = rows[0]
+    body = rows[1:]
+    target_chars = tokens_to_chars(chunk_size)
+
+    chunks: list[Chunk] = []
+    buf: list[list[str]] = []
+    buf_len = 0
+    idx = 0
+    sep = "\t" if suffix == ".tsv" else ","
+    header_line = sep.join(header)
+
+    for row in body:
+        line = sep.join(row)
+        if buf and buf_len + len(line) > target_chars:
+            body_text = "\n".join(sep.join(r) for r in buf)
+            content_text = f"{header_line}\n{body_text}"
+            chunks.append(Chunk(
+                content=content_text, chunk_index=idx, heading_path=[],
+                chunk_type="structured_record",
+                token_count=estimate_tokens(content_text),
+                start_char=0, end_char=len(content_text),
+                metadata={"format": suffix.lstrip("."), "columns": header, "rows": len(buf)},
+            ))
+            idx += 1
+            buf = []
+            buf_len = 0
+        buf.append(row)
+        buf_len += len(line) + 1
+
+    if buf:
+        body_text = "\n".join(sep.join(r) for r in buf)
+        content_text = f"{header_line}\n{body_text}"
+        chunks.append(Chunk(
+            content=content_text, chunk_index=idx, heading_path=[],
+            chunk_type="structured_record",
+            token_count=estimate_tokens(content_text),
+            start_char=0, end_char=len(content_text),
+            metadata={"format": suffix.lstrip("."), "columns": header, "rows": len(buf)},
+        ))
+    return chunks
+
+
+# --- docling (optional) -----------------------------------------------
+# Lazy singleton so we don't pay Docling's model-loading cost unless
+# the user actually has rich-format files to ingest. Instantiating the
+# converter loads torch, transformers, and (if OCR is enabled) downloads
+# ~14 MB of RapidOCR models on first use.
+_DOCLING_CONVERTER = None
+
+
+DEFAULT_DOCLING_ARTIFACTS_PATH: str = os.path.expanduser("~/.cache/docling/models")
+
+
+def _artifacts_has_rapidocr(artifacts_path: str) -> bool:
+    """Check whether `docling-tools models download rapidocr` was run.
+
+    Docling auto-derives all five RapidOCR paths (det/cls/rec model, rec_keys,
+    font) from `artifacts_path / RapidOcr / ...` — but only if ALL five exist.
+    If the directory is missing any of them docling silently falls through to
+    downloading into RapidOCR's site-packages. We check for the English-onnx
+    detection model as the sentinel since it's the first file docling expects.
+    """
+    base = Path(artifacts_path) / "RapidOcr"
+    sentinel = base / "onnx" / "PP-OCRv4" / "det" / "en_PP-OCRv3_det_mobile.onnx"
+    return sentinel.is_file()
+
+
+def _get_docling_converter(enable_ocr: bool, artifacts_path: Optional[str]):
+    """Return the lazy DocumentConverter singleton.
+
+    Pointing docling at a user-writable `artifacts_path` is the key to
+    making OCR "just work" — without it, RapidOCR tries to write its ~25 MB
+    of model files into its own site-packages directory, which is root-owned
+    after `sudo pip3 install`. `docling-tools models download rapidocr`
+    populates this path once per user.
+    """
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is not None or not _DOCLING_AVAILABLE:
+        return _DOCLING_CONVERTER
+
+    try:
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
+        from docling.document_converter import PdfFormatOption
+
+        pdf_opts = PdfPipelineOptions()
+        pdf_opts.do_ocr = enable_ocr
+        pdf_opts.do_table_structure = True
+        if artifacts_path and os.path.isdir(artifacts_path):
+            pdf_opts.artifacts_path = artifacts_path
+        if enable_ocr:
+            # Docling's RapidOcrModel auto-derives all five model paths
+            # (det/cls/rec + rec_keys + font) from artifacts_path. We pass
+            # backend="onnxruntime" + lang=["english"] and leave the
+            # per-file paths as None so docling fills them in. If artifacts
+            # are missing, RapidOCR will try to download into site-packages
+            # and fail with a permission error — the caller should have run
+            # `docling-tools models download rapidocr` first (or
+            # `just rag-models`).
+            if artifacts_path and not _artifacts_has_rapidocr(artifacts_path):
+                OUT.warn(
+                    f"docling OCR enabled but RapidOCR models missing from {artifacts_path}"
+                )
+                OUT.info("  fix: distrobox enter dev -- docling-tools models download rapidocr")
+            pdf_opts.ocr_options = RapidOcrOptions(
+                backend="onnxruntime",
+                lang=["english"],
+            )
+        _DOCLING_CONVERTER = _DoclingConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts),
+            }
+        )
+    except Exception:
+        # Fall back to the plain default converter if docling's pipeline-
+        # options API shape has changed. The plain default works for
+        # PDFs with a text layer; OCR may fail with a permission error
+        # if artifacts aren't pre-downloaded.
+        _DOCLING_CONVERTER = _DoclingConverter()
+    return _DOCLING_CONVERTER
+
+
+def parse_docling(
+    path: Path,
+    chunk_size: int,
+    chunk_overlap: int,
+    enable_ocr: bool,
+    artifacts_path: Optional[str],
+) -> list[Chunk]:
+    """Convert a rich-format file to markdown via Docling, then chunk it."""
+    conv = _get_docling_converter(enable_ocr, artifacts_path)
+    if conv is None:
+        return []
+    try:
+        result = conv.convert(str(path))
+    except Exception as e:
+        OUT.warn(f"docling failed on {path.name}: {e}")
+        return []
+    try:
+        md = result.document.export_to_markdown()
+    except Exception as e:
+        OUT.warn(f"docling export failed on {path.name}: {e}")
+        return []
+    chunks = parse_markdown(md, chunk_size, chunk_overlap, is_norg=False)
+    for c in chunks:
+        c.metadata = {**(c.metadata or {}), "format": "docling", "source_type": path.suffix.lstrip(".")}
+    return chunks
+
+
+# ===== Parser dispatch ================================================
+def parse_file(
+    path: Path,
+    corpus_type: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    config: dict,
+) -> tuple[list[Chunk], Optional[str]]:
+    """Dispatch a file to the right parser.
+
+    Returns (chunks, error) — error is None on success, else a short
+    human-readable reason the file was skipped (so callers can log it).
+
+    Binary detection runs first so we never hand a binary blob to a
+    text parser. Large files are clamped by parsers/max_file_size_mb.
+    """
+    parsers_cfg = config.get("parsers", {})
+    max_mb = parsers_cfg.get("max_file_size_mb", 25)
+
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        return [], f"stat failed: {e}"
+    if size > max_mb * 1024 * 1024:
+        return [], f"too large ({size // (1024*1024)} MB > {max_mb} MB)"
+
+    category = classify_file(path)
+    if category == "skip":
+        return [], f"unsupported extension: {path.suffix}"
+
+    if parsers_cfg.get("skip_binary", True) and category in ("org", "markdown", "text", "code", "structured"):
+        if is_probably_binary(path):
+            return [], "binary content detected"
+
+    # Text-based parsers
+    if category in ("org", "markdown", "text"):
+        content = read_file_content(path)
+        if content is None:
+            return [], "unable to decode"
+        if category == "org":
+            return parse_org(content, chunk_size, chunk_overlap), None
+        if category == "markdown":
+            return parse_markdown(content, chunk_size, chunk_overlap, is_norg=(path.suffix.lower() == ".norg")), None
+        fmt = "rst" if path.suffix.lower() == ".rst" else "text"
+        return parse_text(content, chunk_size, chunk_overlap, fmt=fmt), None
+
+    if category == "code":
+        content = read_file_content(path)
+        if content is None:
+            return [], "unable to decode"
+        return parse_code(content, chunk_size, chunk_overlap, path.suffix.lower()), None
+
+    if category == "structured":
+        content = read_file_content(path)
+        if content is None:
+            return [], "unable to decode"
+        return parse_structured(content, chunk_size, chunk_overlap, path.suffix.lower()), None
+
+    if category == "docling":
+        if not parsers_cfg.get("docling_enabled", True):
+            return [], "docling disabled in config"
+        if not _DOCLING_AVAILABLE:
+            return [], "docling not installed (pip install docling)"
+        ocr = parsers_cfg.get("docling_ocr", True)
+        raw_artifacts = parsers_cfg.get("docling_artifacts_path") or DEFAULT_DOCLING_ARTIFACTS_PATH
+        artifacts_path = os.path.expanduser(raw_artifacts)
+        chunks = parse_docling(
+            path, chunk_size, chunk_overlap,
+            enable_ocr=ocr,
+            artifacts_path=artifacts_path,
+        )
+        return chunks, None if chunks else "docling returned no chunks"
+
+    return [], f"unclassified file type: {path.suffix}"
+
+
+# ===== Corpus registry operations =====================================
+# Thin layer over rag_corpora. Returns dict rows because the rest of
+# the file consumes dict-shaped data; callers don't need dataclasses.
+
+def _corpus_row_by_name(conn: psycopg.Connection, name: str) -> Optional[dict]:
+    """Look up a corpus by name, or None if it doesn't exist."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM rag_corpora WHERE name = %s", (name,))
+        return cur.fetchone()
+
+
+def _all_corpora(conn: psycopg.Connection) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM rag_corpora ORDER BY name")
+        return cur.fetchall() or []
+
+
+def _resolve_corpora(conn: psycopg.Connection, names: list[str], all_flag: bool) -> list[dict]:
+    """Translate --corpus / --all into a list of corpus rows.
+
+    - If --corpus was given: look up each by name, error on any missing.
+    - Otherwise if --all: every registered corpus.
+    - Otherwise: empty list (caller decides whether to error or default).
+    """
+    if names:
+        rows: list[dict] = []
+        for n in names:
+            r = _corpus_row_by_name(conn, n)
+            if r is None:
+                OUT.error(f"unknown corpus: {n}")
+                return []
+            rows.append(r)
+        return rows
+    if all_flag:
+        return _all_corpora(conn)
+    return []
+
+
+def _check_path_usable(path: str) -> Optional[str]:
+    """Return an error message if the path isn't a sane corpus root, else None."""
+    if not os.path.exists(path):
+        return f"path does not exist: {path}"
+    if not os.path.isdir(path):
+        return f"path is not a directory: {path}"
+    if not os.access(path, os.R_OK):
+        return f"path is not readable: {path}"
+    return None
+
+
+def corpus_add(
+    conn: psycopg.Connection,
+    name: str,
+    root_path: str,
+    corpus_type: str = "mixed",
+    description: Optional[str] = None,
+    include_patterns: Optional[list[str]] = None,
+    exclude_patterns: Optional[list[str]] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> Optional[dict]:
+    """Insert a new corpus row, return the created row (or None on error).
+
+    Name must be unique. Path is canonicalized (absolute, symlinks resolved).
+    Warns (but does not refuse) if root_path is nested inside or overlaps
+    an existing corpus — it's valid but usually unintentional.
+    """
+    abs_path = os.path.realpath(os.path.expanduser(root_path))
+    err = _check_path_usable(abs_path)
+    if err:
+        OUT.error(err)
+        return None
+
+    if _corpus_row_by_name(conn, name) is not None:
+        OUT.error(f"corpus already exists: {name}")
+        return None
+
+    # Soft warning on overlap. os.path.commonpath is picky about input so
+    # we just do prefix matching with a trailing separator for correctness.
+    existing = _all_corpora(conn)
+    for other in existing:
+        other_path = other["root_path"].rstrip(os.sep)
+        check = abs_path.rstrip(os.sep)
+        if check == other_path:
+            OUT.warn(f"another corpus ({other['name']}) already uses this path; both will index it")
+        elif check.startswith(other_path + os.sep) or other_path.startswith(check + os.sep):
+            OUT.warn(f"path overlaps with corpus {other['name']} at {other['root_path']}")
+
+    include = include_patterns or []
+    exclude = exclude_patterns or []
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rag_corpora
+                (name, root_path, corpus_type, description, include_patterns,
+                 exclude_patterns, chunk_size, chunk_overlap)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (name, abs_path, corpus_type, description, include, exclude, chunk_size, chunk_overlap))
+        row = cur.fetchone()
+        conn.commit()
+    return row
+
+
+def corpus_remove(conn: psycopg.Connection, name: str, keep_chunks: bool = False) -> bool:
+    """Delete a corpus (and cascade to files/chunks unless keep_chunks)."""
+    row = _corpus_row_by_name(conn, name)
+    if row is None:
+        OUT.error(f"unknown corpus: {name}")
+        return False
+
+    with conn.cursor() as cur:
+        if keep_chunks:
+            # Detach files+chunks from the corpus by renaming the corpus
+            # to a tombstone and clearing its root_path. This is mostly
+            # useful for forensics — rare flag.
+            tombstone = f"__detached_{name}_{int(time.time())}"
+            cur.execute(
+                "UPDATE rag_corpora SET name = %s, root_path = %s, updated_at = NOW() WHERE id = %s",
+                (tombstone, "", row["id"])
+            )
+            OUT.warn(f"corpus renamed to {tombstone}; chunks retained")
+        else:
+            cur.execute("DELETE FROM rag_corpora WHERE id = %s", (row["id"],))
+        conn.commit()
+    return True
+
+
+def corpus_update(
+    conn: psycopg.Connection,
+    name: str,
+    description: Optional[str] = None,
+    corpus_type: Optional[str] = None,
+    include_patterns: Optional[list[str]] = None,
+    exclude_patterns: Optional[list[str]] = None,
+    add_include: Optional[list[str]] = None,
+    add_exclude: Optional[list[str]] = None,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+) -> Optional[dict]:
+    """Update selected fields. Fields left as None are preserved."""
+    row = _corpus_row_by_name(conn, name)
+    if row is None:
+        OUT.error(f"unknown corpus: {name}")
+        return None
+
+    updates: list[str] = []
+    params: list[Any] = []
+    if description is not None:
+        updates.append("description = %s"); params.append(description)
+    if corpus_type is not None:
+        updates.append("corpus_type = %s"); params.append(corpus_type)
+    if include_patterns is not None:
+        updates.append("include_patterns = %s"); params.append(include_patterns)
+    if exclude_patterns is not None:
+        updates.append("exclude_patterns = %s"); params.append(exclude_patterns)
+    if add_include:
+        merged = list(dict.fromkeys(list(row["include_patterns"]) + add_include))
+        updates.append("include_patterns = %s"); params.append(merged)
+    if add_exclude:
+        merged = list(dict.fromkeys(list(row["exclude_patterns"]) + add_exclude))
+        updates.append("exclude_patterns = %s"); params.append(merged)
+    if chunk_size is not None:
+        updates.append("chunk_size = %s"); params.append(chunk_size)
+    if chunk_overlap is not None:
+        updates.append("chunk_overlap = %s"); params.append(chunk_overlap)
+
+    if not updates:
+        OUT.warn("no fields to update")
+        return row
+
+    updates.append("updated_at = NOW()")
+    sql = f"UPDATE rag_corpora SET {', '.join(updates)} WHERE id = %s RETURNING *"
+    params.append(row["id"])
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        updated = cur.fetchone()
+        conn.commit()
+    return updated
+
+
+def corpus_rename(conn: psycopg.Connection, old: str, new: str) -> bool:
+    row = _corpus_row_by_name(conn, old)
+    if row is None:
+        OUT.error(f"unknown corpus: {old}")
+        return False
+    if _corpus_row_by_name(conn, new) is not None:
+        OUT.error(f"corpus already exists: {new}")
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE rag_corpora SET name = %s, updated_at = NOW() WHERE id = %s",
+            (new, row["id"])
+        )
+        conn.commit()
+    return True
+
+
+# ===== Corpus CLI command handlers ====================================
+def _format_corpus_summary(row: dict) -> dict:
+    """Normalize a rag_corpora row into a JSON/YAML-friendly dict."""
+    return {
+        "name": row["name"],
+        "type": row["corpus_type"],
+        "root_path": row["root_path"],
+        "description": row.get("description"),
+        "include_patterns": list(row.get("include_patterns") or []),
+        "exclude_patterns": list(row.get("exclude_patterns") or []),
+        "chunk_size": row["chunk_size"],
+        "chunk_overlap": row["chunk_overlap"],
+        "file_count": row.get("file_count", 0),
+        "chunk_count": row.get("chunk_count", 0),
+        "last_indexed_at": row.get("last_indexed_at").isoformat() if row.get("last_indexed_at") else None,
+        "created_at": row["created_at"].isoformat(),
+        "updated_at": row["updated_at"].isoformat(),
+    }
+
+
+def cmd_corpus_add(args: argparse.Namespace, config: dict) -> int:
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+
+    # If the user didn't pass --chunk-size / --chunk-overlap, pick sensible
+    # per-type defaults (docs gets bigger chunks because its files are huge).
+    type_cs, type_co = TYPE_CHUNK_DEFAULTS.get(
+        args.corpus_type, (DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP)
+    )
+    chunk_size = args.chunk_size if args.chunk_size != DEFAULT_CHUNK_SIZE else type_cs
+    chunk_overlap = args.chunk_overlap if args.chunk_overlap != DEFAULT_CHUNK_OVERLAP else type_co
+
+    try:
+        row = corpus_add(
+            conn,
+            name=args.name,
+            root_path=args.path,
+            corpus_type=args.corpus_type,
+            description=args.description,
+            include_patterns=args.include or [],
+            exclude_patterns=args.exclude or [],
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+    finally:
+        conn.close()
+
+    if row is None:
+        return 1
+    OUT.ok(f"corpus added: {row['name']}  ({row['root_path']}, type={row['corpus_type']})")
+    OUT.info(f"  chunk size: {row['chunk_size']} tokens  overlap: {row['chunk_overlap']} tokens")
+    OUT.info(f"  next: rag index --corpus {row['name']}")
+    return 0
+
+
+def cmd_corpus_remove(args: argparse.Namespace, config: dict) -> int:
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    row = _corpus_row_by_name(conn, args.name)
+    if row is None:
+        OUT.error(f"unknown corpus: {args.name}")
+        conn.close()
+        return 1
+
+    if not args.force and sys.stdin.isatty():
+        msg = f"Remove corpus '{args.name}' "
+        msg += "(detach chunks)" if args.keep_chunks else f"and all {row['chunk_count']} chunks"
+        msg += "? Type the corpus name to confirm: "
+        reply = input(msg).strip()
+        if reply != args.name:
+            OUT.info("aborted")
+            conn.close()
+            return 1
+
+    try:
+        ok = corpus_remove(conn, args.name, keep_chunks=args.keep_chunks)
+    finally:
+        conn.close()
+
+    if ok:
+        OUT.ok(f"corpus removed: {args.name}")
+        return 0
+    return 1
+
+
+def cmd_corpus_list(args: argparse.Namespace, config: dict) -> int:
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    try:
+        rows = _all_corpora(conn)
+    finally:
+        conn.close()
+
+    if args.format in ("yaml", "json"):
+        payload = {"corpora": [_format_corpus_summary(r) for r in rows]}
+        if args.format == "yaml" and _YAML_AVAILABLE:
+            print(yaml.safe_dump(payload, sort_keys=False))
+        else:
+            print(json.dumps(payload, indent=2, default=str))
+        return 0
+
+    if args.format == "simple":
+        for r in rows:
+            print(r["name"])
+        return 0
+
+    # Default: table
+    if not rows:
+        OUT.info("no corpora registered. run: rag corpus add <name> <path>")
+        return 0
+    # Compute widths
+    w_name = max(len("NAME"), max((len(r["name"]) for r in rows), default=0))
+    w_type = max(len("TYPE"), max((len(r["corpus_type"]) for r in rows), default=0))
+    header = f"  {_bold('NAME'.ljust(w_name))}  {_bold('TYPE'.ljust(w_type))}  {_bold('FILES'):>8}  {_bold('CHUNKS'):>8}  {_bold('LAST INDEXED')}  {_bold('ROOT')}"
+    print(header)
+    for r in rows:
+        last = r.get("last_indexed_at")
+        last_str = last.strftime("%Y-%m-%d %H:%M") if last else _dim("never")
+        print(
+            f"  {r['name'].ljust(w_name)}  "
+            f"{r['corpus_type'].ljust(w_type)}  "
+            f"{r['file_count']:>8}  {r['chunk_count']:>8}  "
+            f"{last_str:<16}  {_dim(r['root_path'])}"
+        )
+    return 0
+
+
+def cmd_corpus_show(args: argparse.Namespace, config: dict) -> int:
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    try:
+        row = _corpus_row_by_name(conn, args.name)
+    finally:
+        conn.close()
+
+    if row is None:
+        OUT.error(f"unknown corpus: {args.name}")
+        return 1
+
+    info = _format_corpus_summary(row)
+    if args.format == "yaml" and _YAML_AVAILABLE:
+        print(yaml.safe_dump(info, sort_keys=False))
+        return 0
+    if args.format == "json":
+        print(json.dumps(info, indent=2, default=str))
+        return 0
+
+    # Default: text
+    print(f"{_bold(info['name'])}  [{info['type']}]")
+    print(f"  root:           {info['root_path']}")
+    if info["description"]:
+        print(f"  description:    {info['description']}")
+    print(f"  files:          {info['file_count']}")
+    print(f"  chunks:         {info['chunk_count']}")
+    print(f"  chunk size:     {info['chunk_size']} tokens  (overlap {info['chunk_overlap']})")
+    print(f"  include:        {info['include_patterns'] or '(all supported)'}")
+    print(f"  exclude:        {info['exclude_patterns'] or '(none)'}")
+    print(f"  last indexed:   {info['last_indexed_at'] or 'never'}")
+    print(f"  created:        {info['created_at']}")
+    print(f"  updated:        {info['updated_at']}")
+    return 0
+
+
+def cmd_corpus_update(args: argparse.Namespace, config: dict) -> int:
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    try:
+        row = corpus_update(
+            conn,
+            name=args.name,
+            description=args.description,
+            corpus_type=args.corpus_type,
+            include_patterns=args.include,
+            exclude_patterns=args.exclude,
+            add_include=args.add_include,
+            add_exclude=args.add_exclude,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+        )
+    finally:
+        conn.close()
+    if row is None:
+        return 1
+    OUT.ok(f"corpus updated: {row['name']}")
+    return 0
+
+
+def cmd_corpus_rename(args: argparse.Namespace, config: dict) -> int:
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    try:
+        ok = corpus_rename(conn, args.old, args.new)
+    finally:
+        conn.close()
+    if ok:
+        OUT.ok(f"renamed: {args.old} → {args.new}")
+        return 0
+    return 1
+
+
+def cmd_corpus(args: argparse.Namespace, config: dict) -> int:
+    """Dispatch `rag corpus <action>` to the per-action handler."""
+    actions: dict[str, Callable[[argparse.Namespace, dict], int]] = {
+        "add":    cmd_corpus_add,
+        "remove": cmd_corpus_remove,
+        "list":   cmd_corpus_list,
+        "show":   cmd_corpus_show,
+        "update": cmd_corpus_update,
+        "rename": cmd_corpus_rename,
+    }
+    if args.corpus_action is None:
+        # No sub-action -> default to list
+        args.format = getattr(args, "format", "table")
+        return cmd_corpus_list(args, config)
+    handler = actions.get(args.corpus_action)
+    if handler is None:
+        OUT.error(f"unknown corpus action: {args.corpus_action}")
+        return 64
+    return handler(args, config)
+
+
+# ===== File discovery =================================================
+def discover_corpus_files(corpus: dict, config: dict) -> Iterator[Path]:
+    """Yield every path under `corpus['root_path']` that passes corpus filters.
+
+    Filters applied (in order, cheapest first):
+      - suffix in EXT_ALWAYS_SKIP → skip
+      - skip_hidden + leading-dot component (unless explicitly included)
+      - exclude_patterns
+      - include_patterns (if set, path must match at least one)
+
+    Binary detection is done lazily inside parse_file() so we don't
+    probe files we're going to reject on name alone.
+    """
+    root = Path(corpus["root_path"])
+    if not root.is_dir():
+        return
+
+    include = list(corpus.get("include_patterns") or [])
+    exclude = list(corpus.get("exclude_patterns") or [])
+    skip_hidden = config.get("parsers", {}).get("skip_hidden", True)
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix in EXT_ALWAYS_SKIP:
+            continue
+        if classify_file(path) == "skip":
+            continue
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        rel_parts = rel.parts
+        if should_skip_path(rel_parts, suffix, include, exclude, skip_hidden):
+            continue
+        yield path
+
+
+# ===== File / chunk DB ops ============================================
+def _embedding_to_pg(vec: list[float]) -> str:
+    """Serialize a vector for pgvector's literal syntax: '[0.1,0.2,...]'."""
+    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+
+
+def _get_file_row(conn: psycopg.Connection, corpus_id: str, relative_path: str) -> Optional[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM rag_files WHERE corpus_id = %s AND relative_path = %s",
+            (corpus_id, relative_path)
+        )
+        return cur.fetchone()
+
+
+def _upsert_file_row(
+    conn: psycopg.Connection,
+    corpus_id: str,
+    relative_path: str,
+    absolute_path: str,
+    file_hash: str,
+    file_size: int,
+    file_type: str,
+    mtime: datetime,
+    chunk_count: int,
+) -> dict:
+    """Insert or update the rag_files row; return the row."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rag_files
+                (corpus_id, relative_path, absolute_path, file_hash, file_size,
+                 file_type, mtime, indexed_at, chunk_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+            ON CONFLICT (corpus_id, relative_path) DO UPDATE SET
+                absolute_path = EXCLUDED.absolute_path,
+                file_hash     = EXCLUDED.file_hash,
+                file_size     = EXCLUDED.file_size,
+                file_type     = EXCLUDED.file_type,
+                mtime         = EXCLUDED.mtime,
+                indexed_at    = NOW(),
+                updated_at    = NOW(),
+                chunk_count   = EXCLUDED.chunk_count
+            RETURNING *
+        """, (corpus_id, relative_path, absolute_path, file_hash, file_size,
+              file_type, mtime, chunk_count))
+        return cur.fetchone()
+
+
+def _update_file_mtime_only(conn: psycopg.Connection, file_id: str, new_mtime: datetime) -> None:
+    """For the 'touched-but-identical' case — avoid re-embedding."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE rag_files SET mtime = %s, updated_at = NOW() WHERE id = %s",
+            (new_mtime, file_id)
+        )
+
+
+def _delete_file_chunks(conn: psycopg.Connection, file_id: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM rag_chunks WHERE file_id = %s", (file_id,))
+        return cur.rowcount or 0
+
+
+def _insert_chunks(
+    conn: psycopg.Connection,
+    corpus_id: str,
+    file_id: str,
+    chunks: list[Chunk],
+) -> int:
+    """Bulk-insert chunks for a file. Returns number written."""
+    if not chunks:
+        return 0
+    with conn.cursor() as cur:
+        inserted = 0
+        for c in chunks:
+            emb_str = _embedding_to_pg(c.embedding) if c.embedding else None
+            cur.execute("""
+                INSERT INTO rag_chunks
+                    (corpus_id, file_id, chunk_index, content, embedding,
+                     heading_path, chunk_type, token_count, start_char, end_char, metadata)
+                VALUES
+                    (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+                    content      = EXCLUDED.content,
+                    embedding    = EXCLUDED.embedding,
+                    heading_path = EXCLUDED.heading_path,
+                    chunk_type   = EXCLUDED.chunk_type,
+                    token_count  = EXCLUDED.token_count,
+                    start_char   = EXCLUDED.start_char,
+                    end_char     = EXCLUDED.end_char,
+                    metadata     = EXCLUDED.metadata,
+                    updated_at   = NOW()
+            """, (
+                corpus_id, file_id, c.chunk_index, c.content, emb_str,
+                list(c.heading_path or []), c.chunk_type, c.token_count,
+                c.start_char, c.end_char, json.dumps(c.metadata or {}),
+            ))
+            inserted += 1
+        return inserted
+
+
+def _refresh_corpus_stats(conn: psycopg.Connection, corpus_id: str) -> None:
+    """Recompute file_count + chunk_count on rag_corpora. Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE rag_corpora c SET
+                file_count = COALESCE((
+                    SELECT COUNT(*) FROM rag_files WHERE corpus_id = c.id
+                ), 0),
+                chunk_count = COALESCE((
+                    SELECT COUNT(*) FROM rag_chunks WHERE corpus_id = c.id
+                ), 0),
+                last_indexed_at = NOW(),
+                updated_at = NOW()
+            WHERE c.id = %s
+        """, (corpus_id,))
+
+
+def _log_ingestion(
+    conn: psycopg.Connection,
+    corpus_id: str,
+    operation: str,
+    status: str,
+    stats: dict,
+    duration_ms: int,
+    error: Optional[str] = None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rag_ingestion_log
+                (corpus_id, operation, status, files_scanned, files_added,
+                 files_updated, files_removed, files_skipped, chunks_written,
+                 duration_ms, error_message, completed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """, (
+            corpus_id, operation, status,
+            stats.get("files_scanned", 0),
+            stats.get("files_added", 0),
+            stats.get("files_updated", 0),
+            stats.get("files_removed", 0),
+            stats.get("files_skipped", 0),
+            stats.get("chunks_written", 0),
+            duration_ms, error,
+        ))
+
+
+# ===== Ingestion engine ===============================================
+def _change_decision(
+    path: Path, stored: Optional[dict]
+) -> tuple[str, Optional[int], Optional[datetime], Optional[str]]:
+    """Decide how to treat a file during an incremental pass.
+
+    Returns (decision, size, mtime, hash) where decision is:
+      'new'        — no prior row
+      'unchanged'  — stat matches; skip entirely (size+mtime)
+      'touched'    — stat differs but hash matches; update mtime only
+      'changed'    — stat differs AND hash differs; reindex
+      'missing'    — stat failed; skip (handled by clean sweep)
+
+    `hash` is only computed on the mtime/size mismatch branch.
+    """
+    size, mtime = stat_file(path)
+    if size is None or mtime is None:
+        return "missing", None, None, None
+
+    if stored is None:
+        digest = sha256_of_file(path)
+        if digest is None:
+            return "missing", size, mtime, None
+        return "new", size, mtime, digest
+
+    stored_size = stored["file_size"]
+    stored_mtime = stored["mtime"]
+    # Postgres returns datetime with tz; ensure our mtime is tz-aware too.
+    if stored_mtime.tzinfo is None:
+        stored_mtime = stored_mtime.replace(tzinfo=timezone.utc)
+
+    # Fast path: size + mtime unchanged → skip
+    if stored_size == size and abs((stored_mtime - mtime).total_seconds()) < 1:
+        return "unchanged", size, mtime, stored["file_hash"]
+
+    # Slow path: read bytes and hash
+    digest = sha256_of_file(path)
+    if digest is None:
+        return "missing", size, mtime, None
+    if digest == stored["file_hash"]:
+        return "touched", size, mtime, digest
+    return "changed", size, mtime, digest
+
+
+def _ingest_file(
+    conn: psycopg.Connection,
+    config: dict,
+    corpus: dict,
+    path: Path,
+    force: bool,
+    progress: Optional["ProgressReporter"] = None,
+) -> tuple[str, int]:
+    """Process a single file. Returns (decision_label, chunks_written).
+
+    decision_label is one of the values from _change_decision, plus:
+      'parse-skip'  — parser declined the file (logged)
+      'embed-fail'  — at least one chunk embedding failed; file partially written
+
+    The optional `progress` reporter is heartbeat-pinged during the expensive
+    stages (hashing, parsing, per-chunk embedding) so the caller's status line
+    doesn't freeze on files that produce many chunks.
+    """
+    root = Path(corpus["root_path"])
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return "skipped", 0
+    rel_str = str(rel)
+
+    stored = _get_file_row(conn, corpus["id"], rel_str)
+
+    if force:
+        # Force reindex: treat like 'changed' but compute hash fresh.
+        size, mtime = stat_file(path)
+        if progress and size and size > 1024 * 1024:
+            progress.heartbeat(f"{rel_str}  [hashing]")
+        digest = sha256_of_file(path) if size is not None else None
+        if size is None or mtime is None or digest is None:
+            return "missing", 0
+        decision = "changed"
+    else:
+        decision, size, mtime, digest = _change_decision(path, stored)
+
+    if decision == "missing":
+        return "missing", 0
+    if decision == "unchanged":
+        return "unchanged", 0
+    if decision == "touched":
+        _update_file_mtime_only(conn, stored["id"], mtime)
+        conn.commit()
+        return "touched", 0
+
+    # 'new' or 'changed' — parse + embed + write
+    assert size is not None and mtime is not None and digest is not None
+
+    if progress:
+        progress.heartbeat(f"{rel_str}  [parsing]")
+
+    chunks, err = parse_file(
+        path, corpus["corpus_type"],
+        corpus["chunk_size"], corpus["chunk_overlap"],
+        config,
+    )
+    if err:
+        OUT.verb(f"  skip: {rel_str} — {err}")
+        conn.rollback()
+        return "parse-skip", 0
+
+    # Embed chunks in batches. A large file (thousands of chunks) gets
+    # cut from ~1 hour of serial requests down to minutes. Failures for
+    # individual chunks are non-fatal — they stay searchable by keyword.
+    embed_failures = 0
+    total = len(chunks)
+    batch_size = max(1, int(config["embedding"].get("batch_size", DEFAULT_EMBED_BATCH_SIZE)))
+    for batch_start in range(0, total, batch_size):
+        batch = chunks[batch_start:batch_start + batch_size]
+        if progress:
+            progress.heartbeat(
+                f"{rel_str}  [embed {batch_start + len(batch)}/{total}]"
+            )
+        vectors = generate_embeddings_batch(config, [c.content for c in batch])
+        for c, v in zip(batch, vectors):
+            c.embedding = v
+            if v is None:
+                embed_failures += 1
+
+    if progress:
+        progress.heartbeat(f"{rel_str}  [writing]")
+
+    # Upsert file row, then replace chunks.
+    file_row = _upsert_file_row(
+        conn, corpus["id"], rel_str, str(path.resolve()),
+        digest, size, path.suffix.lower(), mtime, len(chunks),
+    )
+    _delete_file_chunks(conn, file_row["id"])
+    written = _insert_chunks(conn, corpus["id"], file_row["id"], chunks)
+    conn.commit()
+
+    if embed_failures > 0:
+        OUT.warn(f"  {rel_str}: {embed_failures}/{len(chunks)} chunks missing embedding")
+        return "embed-fail", written
+    return decision, written
+
+
+def run_index(
+    conn: psycopg.Connection,
+    config: dict,
+    corpus: dict,
+    force: bool,
+    dry_run: bool,
+    include_delete_sweep: bool,
+) -> dict:
+    """Run a full index/sync pass over one corpus. Returns a stats dict."""
+    t0 = time.time()
+    op = "sync" if include_delete_sweep else ("reindex" if force else "index")
+
+    stats = {
+        "files_scanned": 0,
+        "files_added": 0,
+        "files_updated": 0,
+        "files_removed": 0,
+        "files_skipped": 0,
+        "chunks_written": 0,
+    }
+
+    OUT.info(_bold(f"{op}: corpus={corpus['name']}  root={corpus['root_path']}"))
+    if force:
+        OUT.info("  (force — every file will be reindexed)")
+
+    files = list(discover_corpus_files(corpus, config))
+    stats["files_scanned"] = len(files)
+    OUT.info(f"  scanned {len(files)} candidate file(s)")
+
+    if dry_run:
+        for p in files[:20]:
+            try:
+                rel = p.relative_to(corpus["root_path"])
+            except ValueError:
+                rel = p
+            OUT.info(f"    would process: {rel}")
+        if len(files) > 20:
+            OUT.info(f"    … and {len(files) - 20} more")
+        return stats
+
+    # Progress line shown in non-verbose mode; verbose mode keeps per-file
+    # lines (which would otherwise get clobbered by the \r overwrite).
+    progress = ProgressReporter(
+        total=len(files),
+        label=corpus["name"],
+        silent=OUT.silent,
+        verbose=OUT.verbose,
+    )
+
+    # Per-file commits so an interrupted run preserves progress.
+    for i, path in enumerate(files, 1):
+        try:
+            rel = path.relative_to(corpus["root_path"])
+        except ValueError:
+            rel = path
+        rel_str = str(rel)
+
+        try:
+            decision, written = _ingest_file(conn, config, corpus, path, force, progress=progress)
+        except Exception as e:
+            OUT.warn(f"  error on {rel}: {e}")
+            conn.rollback()
+            stats["files_skipped"] += 1
+            progress.update(current=rel_str, skip=1)
+            continue
+
+        if decision == "new":
+            stats["files_added"] += 1
+            stats["chunks_written"] += written
+            OUT.verb(f"  [{i}/{len(files)}] +new    {rel}  ({written} chunks)")
+            progress.update(current=rel_str, **{"+new": 1})
+        elif decision == "changed":
+            stats["files_updated"] += 1
+            stats["chunks_written"] += written
+            OUT.verb(f"  [{i}/{len(files)}] ~chg    {rel}  ({written} chunks)")
+            progress.update(current=rel_str, **{"~chg": 1})
+        elif decision == "embed-fail":
+            stats["files_updated"] += 1
+            stats["chunks_written"] += written
+            OUT.verb(f"  [{i}/{len(files)}] !embfail {rel}")
+            progress.update(current=rel_str, **{"!embfail": 1})
+        elif decision == "touched":
+            stats["files_skipped"] += 1
+            OUT.verb(f"  [{i}/{len(files)}]  touched {rel}")
+            progress.update(current=rel_str, touched=1)
+        elif decision == "unchanged":
+            stats["files_skipped"] += 1
+            progress.update(current=rel_str, unchanged=1)
+        elif decision in ("missing", "parse-skip", "skipped"):
+            stats["files_skipped"] += 1
+            progress.update(current=rel_str, skip=1)
+
+    progress.finish()
+
+    if include_delete_sweep:
+        removed = _sweep_deleted_files(conn, corpus)
+        stats["files_removed"] = removed
+        if removed:
+            OUT.info(f"  removed {removed} deleted file(s) from index")
+
+    _refresh_corpus_stats(conn, corpus["id"])
+    conn.commit()
+
+    duration_ms = int((time.time() - t0) * 1000)
+    _log_ingestion(conn, corpus["id"], op, "success", stats, duration_ms)
+    conn.commit()
+
+    OUT.ok(
+        f"{op} complete: +{stats['files_added']} ~{stats['files_updated']} "
+        f"-{stats['files_removed']} skip {stats['files_skipped']}  "
+        f"({stats['chunks_written']} chunks, {duration_ms} ms)"
+    )
+    return stats
+
+
+def _sweep_deleted_files(conn: psycopg.Connection, corpus: dict) -> int:
+    """Remove rag_files rows (and their chunks) whose files are gone from disk."""
+    removed = 0
+    root = Path(corpus["root_path"])
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, relative_path FROM rag_files WHERE corpus_id = %s",
+            (corpus["id"],)
+        )
+        rows = cur.fetchall() or []
+
+    for row in rows:
+        abs_path = root / row["relative_path"]
+        if not abs_path.is_file():
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM rag_files WHERE id = %s", (row["id"],))
+                removed += cur.rowcount or 0
+            conn.commit()
+    return removed
+
+
+# ===== index / sync / clean / reindex command handlers ================
+def _corpora_for_action(conn: psycopg.Connection, args: argparse.Namespace) -> list[dict]:
+    rows = _resolve_corpora(conn, args.corpus, getattr(args, "all", False))
+    if not rows:
+        if args.corpus:
+            return []  # error already printed
+        if not getattr(args, "all", False):
+            OUT.error("specify --corpus <name> (repeatable) or --all")
+            return []
+    return rows
+
+
+def _preflight_embeddings(config: dict, dry_run: bool = False) -> bool:
+    """Verify the embedding model is available. Called by commands
+    that will actually embed text. Not needed in --dry-run."""
+    if dry_run:
+        return True
+    resolved = ensure_resolved_model(config)
+    if resolved is None:
+        OUT.error(
+            f"embedding model {config['embedding']['model']!r} not available in ollama"
+        )
+        OUT.info(f"  fix: ollama pull {config['embedding']['model']}")
+        return False
+    OUT.dbg(f"resolved embedding model: {resolved}")
+    return True
+
+
+def cmd_index(args: argparse.Namespace, config: dict) -> int:
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    if not _preflight_embeddings(config, dry_run=args.dry_run):
+        conn.close()
+        return 1
+    try:
+        corpora = _corpora_for_action(conn, args)
+        if not corpora:
+            return 1 if args.corpus or not args.all else 0
+        failures = 0
+        for corpus in corpora:
+            try:
+                run_index(conn, config, corpus, force=args.force, dry_run=args.dry_run, include_delete_sweep=False)
+            except Exception as e:
+                OUT.error(f"index failed for {corpus['name']}: {e}")
+                conn.rollback()
+                failures += 1
+        return 1 if failures else 0
+    finally:
+        conn.close()
+
+
+def cmd_sync(args: argparse.Namespace, config: dict) -> int:
+    """Incremental index + clean sweep."""
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    if not _preflight_embeddings(config, dry_run=args.dry_run):
+        conn.close()
+        return 1
+    try:
+        corpora = _corpora_for_action(conn, args)
+        if not corpora:
+            return 1 if args.corpus or not args.all else 0
+        failures = 0
+        for corpus in corpora:
+            try:
+                run_index(conn, config, corpus, force=False, dry_run=args.dry_run, include_delete_sweep=True)
+            except Exception as e:
+                OUT.error(f"sync failed for {corpus['name']}: {e}")
+                conn.rollback()
+                failures += 1
+        return 1 if failures else 0
+    finally:
+        conn.close()
+
+
+def cmd_clean(args: argparse.Namespace, config: dict) -> int:
+    """Remove chunks for files that no longer exist on disk."""
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    try:
+        corpora = _corpora_for_action(conn, args)
+        if not corpora:
+            return 1 if args.corpus or not args.all else 0
+        total = 0
+        for corpus in corpora:
+            OUT.info(f"clean: {corpus['name']}")
+            if args.dry_run:
+                root = Path(corpus["root_path"])
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT relative_path FROM rag_files WHERE corpus_id = %s",
+                        (corpus["id"],)
+                    )
+                    rows = cur.fetchall() or []
+                gone = [r["relative_path"] for r in rows if not (root / r["relative_path"]).is_file()]
+                for g in gone[:20]:
+                    OUT.info(f"    would remove: {g}")
+                if len(gone) > 20:
+                    OUT.info(f"    … and {len(gone) - 20} more")
+                continue
+            removed = _sweep_deleted_files(conn, corpus)
+            _refresh_corpus_stats(conn, corpus["id"])
+            conn.commit()
+            OUT.ok(f"  removed {removed} file(s) from {corpus['name']}")
+            total += removed
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_reindex(args: argparse.Namespace, config: dict) -> int:
+    """Alias for `index --force`."""
+    args.force = True
+    args.dry_run = False
+    return cmd_index(args, config)
+
+
+# ===== Hybrid search ==================================================
+# Vector (cosine distance) + tsvector (ts_rank_cd) combined via
+# Reciprocal Rank Fusion, same scoring as semantic_search.
+
+def _vector_search(
+    conn: psycopg.Connection,
+    query_embedding: list[float],
+    corpus_ids: Optional[list[str]],
+    limit: int,
+    threshold: float,
+) -> list[dict]:
+    emb_str = _embedding_to_pg(query_embedding)
+    # 1 - cosine_distance = similarity in [0,1]
+    sql = """
+        SELECT
+            ch.id,
+            ch.file_id,
+            ch.corpus_id,
+            ch.chunk_index,
+            ch.content,
+            ch.heading_path,
+            ch.chunk_type,
+            ch.metadata,
+            c.name  AS corpus_name,
+            c.corpus_type,
+            f.relative_path,
+            f.absolute_path,
+            f.file_type,
+            1 - (ch.embedding <=> %s::vector) AS similarity
+        FROM rag_chunks ch
+        JOIN rag_corpora c ON c.id = ch.corpus_id
+        JOIN rag_files   f ON f.id = ch.file_id
+        WHERE ch.embedding IS NOT NULL
+          AND (1 - (ch.embedding <=> %s::vector)) >= %s
+    """
+    params: list[Any] = [emb_str, emb_str, threshold]
+    if corpus_ids:
+        sql += " AND ch.corpus_id = ANY(%s)"
+        params.append(corpus_ids)
+    sql += " ORDER BY ch.embedding <=> %s::vector LIMIT %s"
+    params.extend([emb_str, limit * 2])
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall() or []
+
+
+def _keyword_search(
+    conn: psycopg.Connection,
+    query: str,
+    corpus_ids: Optional[list[str]],
+    limit: int,
+) -> list[dict]:
+    # Sanitize the query for tsquery: drop non-word chars then AND-join words
+    cleaned = re.sub(r"[^\w\s]", " ", query).strip()
+    if not cleaned:
+        return []
+    sql = """
+        SELECT
+            ch.id,
+            ch.file_id,
+            ch.corpus_id,
+            ch.chunk_index,
+            ch.content,
+            ch.heading_path,
+            ch.chunk_type,
+            ch.metadata,
+            c.name AS corpus_name,
+            c.corpus_type,
+            f.relative_path,
+            f.absolute_path,
+            f.file_type,
+            ts_rank_cd(ch.content_tsv, plainto_tsquery('english', %s)) AS rank
+        FROM rag_chunks ch
+        JOIN rag_corpora c ON c.id = ch.corpus_id
+        JOIN rag_files   f ON f.id = ch.file_id
+        WHERE ch.content_tsv @@ plainto_tsquery('english', %s)
+    """
+    params: list[Any] = [cleaned, cleaned]
+    if corpus_ids:
+        sql += " AND ch.corpus_id = ANY(%s)"
+        params.append(corpus_ids)
+    sql += " ORDER BY rank DESC LIMIT %s"
+    params.append(limit * 2)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall() or []
+
+
+def _rrf_combine(
+    vec_rows: list[dict],
+    kw_rows: list[dict],
+    k: int,
+    keyword_boost: float,
+) -> list[dict]:
+    """Reciprocal Rank Fusion: merge two ranked lists into a single score.
+
+    RRF score for a row = sum over the lists it appears in of
+    weight / (k + rank+1). Keyword hits get a boost since exact matches
+    are a strong signal.
+    """
+    scores: dict[str, float] = {}
+    rows_by_id: dict[str, dict] = {}
+
+    for rank, r in enumerate(vec_rows):
+        rid = str(r["id"])
+        scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
+        rows_by_id.setdefault(rid, dict(r))
+        rows_by_id[rid].setdefault("vector_similarity", r.get("similarity"))
+
+    for rank, r in enumerate(kw_rows):
+        rid = str(r["id"])
+        scores[rid] = scores.get(rid, 0.0) + keyword_boost / (k + rank + 1)
+        rows_by_id.setdefault(rid, dict(r))
+        rows_by_id[rid]["bm25_rank"] = r.get("rank")
+
+    ordered_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    out: list[dict] = []
+    for rid in ordered_ids:
+        row = rows_by_id[rid]
+        row["rrf_score"] = scores[rid]
+        out.append(row)
+    return out
+
+
+def _dedup_by_file(rows: list[dict]) -> list[dict]:
+    """Collapse chunks to one result per file, preserving best score."""
+    best: dict[str, dict] = {}
+    counts: dict[str, int] = {}
+    for r in rows:
+        key = f"{r['corpus_id']}:{r['file_id']}"
+        counts[key] = counts.get(key, 0) + 1
+        prev = best.get(key)
+        if prev is None:
+            best[key] = r
+        else:
+            prev_score = prev.get("rrf_score") or prev.get("similarity") or 0
+            new_score = r.get("rrf_score") or r.get("similarity") or 0
+            if new_score > prev_score:
+                best[key] = r
+
+    out: list[dict] = []
+    for key, row in best.items():
+        row = dict(row)
+        row["matched_chunks"] = counts[key]
+        out.append(row)
+    out.sort(key=lambda x: x.get("rrf_score") or x.get("similarity") or 0, reverse=True)
+    return out
+
+
+def run_search(
+    conn: psycopg.Connection,
+    config: dict,
+    query: str,
+    corpus_ids: Optional[list[str]],
+    limit: int,
+    threshold: float,
+    keyword_only: bool,
+    vector_only: bool,
+    dedup: bool,
+) -> list[dict]:
+    """Execute a hybrid search and return ranked result rows."""
+    cfg = config.get("defaults", {})
+    rrf_k = cfg.get("rrf_k", DEFAULT_RRF_K)
+    kw_boost = cfg.get("keyword_boost", DEFAULT_KEYWORD_BOOST)
+
+    vec_rows: list[dict] = []
+    kw_rows: list[dict] = []
+
+    if not keyword_only:
+        emb = generate_embedding(config, query)
+        if emb is None:
+            OUT.warn("embedding failed; falling back to keyword-only search")
+            keyword_only = True
+        else:
+            vec_rows = _vector_search(conn, emb, corpus_ids, limit, threshold)
+
+    if not vector_only:
+        kw_rows = _keyword_search(conn, query, corpus_ids, limit)
+
+    if keyword_only:
+        rows = [dict(r) for r in kw_rows]
+        for r in rows:
+            r["similarity"] = r.get("rank")
+    elif vector_only:
+        rows = [dict(r) for r in vec_rows]
+    else:
+        rows = _rrf_combine(vec_rows, kw_rows, rrf_k, kw_boost)
+
+    if dedup:
+        rows = _dedup_by_file(rows)
+    return rows[:limit]
+
+
+def _format_result_row(row: dict, show_chunks: bool) -> dict:
+    """Normalize a result row for yaml/json output."""
+    out = {
+        "corpus":        row["corpus_name"],
+        "corpus_type":   row.get("corpus_type"),
+        "file_path":     row["relative_path"],
+        "absolute_path": row.get("absolute_path"),
+        "heading_path":  list(row.get("heading_path") or []),
+        "chunk_type":    row.get("chunk_type"),
+        "chunk_index":   row.get("chunk_index"),
+        "matched_chunks": row.get("matched_chunks", 1),
+    }
+    if row.get("vector_similarity") is not None:
+        out["vector_similarity"] = round(float(row["vector_similarity"]), 4)
+    if row.get("bm25_rank") is not None:
+        out["bm25_rank"] = round(float(row["bm25_rank"]), 4)
+    if row.get("rrf_score") is not None:
+        out["rrf_score"] = round(float(row["rrf_score"]), 4)
+    if show_chunks:
+        content = row.get("content") or ""
+        out["content"] = (content[:500] + "…") if len(content) > 500 else content
+    meta = row.get("metadata")
+    if meta:
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except json.JSONDecodeError:
+                pass
+        out["metadata"] = meta
+    return out
+
+
+def cmd_search(args: argparse.Namespace, config: dict) -> int:
+    if not args.query:
+        OUT.error("search requires a query string")
+        return 64
+    if args.keyword_only and args.vector_only:
+        OUT.error("--keyword-only and --vector-only are mutually exclusive")
+        return 64
+
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+
+    # Resolve the corpus filter. If both lists empty, search everything.
+    selected: Optional[list[str]]
+    if args.corpus:
+        rows = _resolve_corpora(conn, args.corpus, False)
+        if not rows:
+            conn.close()
+            return 1
+        selected = [r["id"] for r in rows]
+    else:
+        selected = None
+
+    if not args.keyword_only:
+        if not _preflight_embeddings(config):
+            conn.close()
+            return 1
+
+    try:
+        rows = run_search(
+            conn, config, args.query,
+            corpus_ids=selected,
+            limit=args.limit,
+            threshold=args.threshold,
+            keyword_only=args.keyword_only,
+            vector_only=args.vector_only,
+            dedup=not args.no_dedup,
+        )
+    finally:
+        conn.close()
+
+    if not rows:
+        if args.format in ("yaml", "json"):
+            payload = {"query": args.query, "results": []}
+            print(yaml.safe_dump(payload, sort_keys=False) if args.format == "yaml" and _YAML_AVAILABLE else json.dumps(payload, indent=2))
+        else:
+            OUT.info("no matches")
+        return 0
+
+    if args.format == "simple":
+        for r in rows:
+            print(r["relative_path"])
+        return 0
+
+    if args.format in ("yaml", "json"):
+        payload = {
+            "query": args.query,
+            "results": [_format_result_row(r, args.show_chunks) for r in rows],
+        }
+        if args.format == "yaml" and _YAML_AVAILABLE:
+            print(yaml.safe_dump(payload, sort_keys=False))
+        else:
+            print(json.dumps(payload, indent=2, default=str))
+        return 0
+
+    # Default: text, human-readable
+    print(_bold(f"{len(rows)} result(s) for: {args.query}"))
+    print(_dim("-" * 80))
+    for i, r in enumerate(rows, 1):
+        scores: list[str] = []
+        if r.get("vector_similarity") is not None:
+            scores.append(f"sim {float(r['vector_similarity']):.2%}")
+        if r.get("bm25_rank") is not None:
+            scores.append(f"bm25 {float(r['bm25_rank']):.2f}")
+        if r.get("rrf_score") is not None and not scores:
+            scores.append(f"rrf {float(r['rrf_score']):.4f}")
+        score_str = " | ".join(scores) if scores else "matched"
+        heading = " › ".join(r.get("heading_path") or []) or _dim("(top)")
+        print(f"{i}. {_bold(r['relative_path'])}  {_dim('[' + r['corpus_name'] + ']')}")
+        print(f"   {_dim(score_str)}  chunks: {r.get('matched_chunks', 1)}")
+        print(f"   {_dim('path:')} {heading}")
+        if args.show_chunks:
+            preview = (r.get("content") or "").replace("\n", " ").strip()
+            preview = preview[:240] + ("…" if len(preview) > 240 else "")
+            print(f"   {_dim('preview:')} {preview}")
+        print(_dim("-" * 80))
+
+    if args.open and rows:
+        top = rows[0]
+        target = top.get("absolute_path") or top["relative_path"]
+        editor = args.editor or os.environ.get("EDITOR") or "vi"
+        OUT.info(f"opening {target} with {editor}")
+        os.execvp(editor.split()[0], [*editor.split(), target])
+
+    return 0
+
+
+# ===== MCP server =====================================================
+# Retrieval-only surface for Claude Code / OpenCode. No admin tools:
+# ingest/sync/reindex must go through the CLI so an LLM can't mutate
+# the index from chat context.
+
+def cmd_mcp(args: argparse.Namespace, config: dict) -> int:
+    """Run rag as a stdio MCP server.
+
+    The tools exposed:
+      - search(query, corpus?, limit?, threshold?, keyword_only?, vector_only?)
+      - list_corpora()
+      - get_corpus(name)
+      - get_file_chunks(corpus, relative_path)
+
+    All output must go to stdout via MCP; anything we'd normally log
+    to stderr should be suppressed (or go to stderr if debugging).
+    """
+    if not _MCP_AVAILABLE:
+        OUT.error("mcp package not installed. run: pip install 'mcp[cli]'")
+        return 1
+
+    # Connection is opened per-request so long-running servers don't hold
+    # an idle connection across hours of inactivity.
+    def _with_conn(fn: Callable[[psycopg.Connection], Any]) -> Any:
+        conn = get_connection(config)
+        try:
+            ensure_rag_meta(conn, config)
+            return fn(conn)
+        finally:
+            conn.close()
+
+    mcp = _FastMCP(
+        name="rag",
+        instructions=(
+            "Retrieval tools for Zach's local multi-corpus RAG knowledge base. "
+            "Use `search` to find relevant passages across corpora; use "
+            "`list_corpora` to see what's available. "
+            "Administration (adding corpora, indexing, reindexing) is CLI-only."
+        ),
+    )
+
+    mcp_defaults = config.get("mcp", {})
+    default_limit = mcp_defaults.get("default_limit", 8)
+    default_threshold = mcp_defaults.get("default_threshold", 0.4)
+
+    @mcp.tool()
+    def search(
+        query: str,
+        corpus: Optional[list[str]] = None,
+        limit: int = default_limit,
+        threshold: float = default_threshold,
+        keyword_only: bool = False,
+        vector_only: bool = False,
+    ) -> dict:
+        """Hybrid (vector + keyword) search across one or more corpora.
+
+        Returns the top `limit` results by RRF score, deduplicated to
+        one result per file.
+        """
+        if not query or not query.strip():
+            return {"error": "query is required", "results": []}
+        if keyword_only and vector_only:
+            return {"error": "keyword_only and vector_only are exclusive", "results": []}
+
+        def _run(conn: psycopg.Connection) -> dict:
+            corpus_ids: Optional[list[str]] = None
+            if corpus:
+                rows = _resolve_corpora(conn, list(corpus), False)
+                if not rows:
+                    return {"error": f"unknown corpus in {corpus}", "results": []}
+                corpus_ids = [r["id"] for r in rows]
+
+            if not keyword_only:
+                if ensure_resolved_model(config) is None:
+                    return {"error": f"embedding model {config['embedding']['model']} not available in ollama", "results": []}
+
+            rows = run_search(
+                conn, config, query,
+                corpus_ids=corpus_ids,
+                limit=limit,
+                threshold=threshold,
+                keyword_only=keyword_only,
+                vector_only=vector_only,
+                dedup=True,
+            )
+            return {
+                "query": query,
+                "count": len(rows),
+                "results": [_format_result_row(r, show_chunks=True) for r in rows],
+            }
+
+        return _with_conn(_run)
+
+    @mcp.tool()
+    def list_corpora() -> dict:
+        """List all registered corpora with summary statistics."""
+        def _run(conn: psycopg.Connection) -> dict:
+            rows = _all_corpora(conn)
+            return {
+                "count": len(rows),
+                "corpora": [_format_corpus_summary(r) for r in rows],
+            }
+        return _with_conn(_run)
+
+    @mcp.tool()
+    def get_corpus(name: str) -> dict:
+        """Return full details for the corpus named `name`."""
+        def _run(conn: psycopg.Connection) -> dict:
+            row = _corpus_row_by_name(conn, name)
+            if row is None:
+                return {"error": f"unknown corpus: {name}"}
+            return _format_corpus_summary(row)
+        return _with_conn(_run)
+
+    @mcp.tool()
+    def get_file_chunks(corpus: str, relative_path: str) -> dict:
+        """Return every chunk (in order) stored for a specific file."""
+        def _run(conn: psycopg.Connection) -> dict:
+            crow = _corpus_row_by_name(conn, corpus)
+            if crow is None:
+                return {"error": f"unknown corpus: {corpus}", "chunks": []}
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ch.chunk_index, ch.content, ch.heading_path,
+                           ch.chunk_type, ch.token_count, ch.metadata
+                    FROM rag_chunks ch
+                    JOIN rag_files f ON f.id = ch.file_id
+                    WHERE ch.corpus_id = %s AND f.relative_path = %s
+                    ORDER BY ch.chunk_index
+                """, (crow["id"], relative_path))
+                rows = cur.fetchall() or []
+            return {
+                "corpus": corpus,
+                "file_path": relative_path,
+                "count": len(rows),
+                "chunks": [
+                    {
+                        "chunk_index": r["chunk_index"],
+                        "heading_path": list(r.get("heading_path") or []),
+                        "chunk_type": r.get("chunk_type"),
+                        "token_count": r.get("token_count"),
+                        "content": r["content"],
+                        "metadata": r.get("metadata"),
+                    } for r in rows
+                ],
+            }
+        return _with_conn(_run)
+
+    # Run on stdio. This call blocks until the client disconnects.
+    # We silence the greeting to keep the MCP framing pristine.
+    try:
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+# ===== Stats ==========================================================
+def cmd_stats(args: argparse.Namespace, config: dict) -> int:
+    """Show statistics for one or all corpora plus DB totals."""
+    conn = get_connection(config)
+    ensure_rag_meta(conn, config)
+    try:
+        corpora = _all_corpora(conn)
+        if args.corpus:
+            wanted = set(args.corpus)
+            corpora = [c for c in corpora if c["name"] in wanted]
+            missing = wanted - {c["name"] for c in corpora}
+            for n in missing:
+                OUT.warn(f"unknown corpus: {n}")
+
+        # Fetch meta for header
+        with conn.cursor() as cur:
+            cur.execute("SELECT embedding_model, embedding_dimension, schema_version FROM rag_meta WHERE singleton = TRUE LIMIT 1")
+            meta = cur.fetchone() or {}
+
+        # Overall totals
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM rag_corpora"); total_corpora = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM rag_files"); total_files = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM rag_chunks"); total_chunks = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM rag_chunks WHERE embedding IS NOT NULL"); total_embedded = cur.fetchone()["c"]
+            cur.execute("SELECT pg_size_pretty(pg_database_size('rag')) AS s")
+            db_size = cur.fetchone()["s"]
+
+        per_corpus: list[dict] = []
+        with conn.cursor() as cur:
+            for c in corpora:
+                # Aggregate files and chunks separately — joining them in
+                # a single query creates a cartesian product that inflates
+                # both counts proportionally.
+                cur.execute("""
+                    SELECT COUNT(*) AS files, COALESCE(SUM(file_size), 0) AS bytes
+                    FROM rag_files WHERE corpus_id = %s
+                """, (c["id"],))
+                frow = cur.fetchone() or {"files": 0, "bytes": 0}
+                cur.execute("""
+                    SELECT
+                        COUNT(*) AS chunks,
+                        COUNT(*) FILTER (WHERE embedding IS NOT NULL) AS embedded
+                    FROM rag_chunks WHERE corpus_id = %s
+                """, (c["id"],))
+                crow = cur.fetchone() or {"chunks": 0, "embedded": 0}
+                row = {
+                    "files":    int(frow["files"]),
+                    "chunks":   int(crow["chunks"]),
+                    "embedded": int(crow["embedded"]),
+                    "bytes":    int(frow["bytes"]),
+                }
+
+                cur.execute("""
+                    SELECT file_type, COUNT(*) AS n
+                    FROM rag_files WHERE corpus_id = %s AND file_type IS NOT NULL
+                    GROUP BY file_type ORDER BY n DESC LIMIT 10
+                """, (c["id"],))
+                type_rows = cur.fetchall() or []
+
+                cur.execute("""
+                    SELECT operation, status, started_at, duration_ms,
+                           files_added, files_updated, files_removed, files_skipped, chunks_written
+                    FROM rag_ingestion_log
+                    WHERE corpus_id = %s
+                    ORDER BY started_at DESC LIMIT 5
+                """, (c["id"],))
+                log_rows = cur.fetchall() or []
+
+                per_corpus.append({
+                    "name": c["name"],
+                    "type": c["corpus_type"],
+                    "root_path": c["root_path"],
+                    "files":    row.get("files", 0),
+                    "chunks":   row.get("chunks", 0),
+                    "embedded": row.get("embedded", 0),
+                    "bytes":    row.get("bytes", 0),
+                    "file_types": [(r["file_type"], r["n"]) for r in type_rows],
+                    "last_indexed_at": c.get("last_indexed_at").isoformat() if c.get("last_indexed_at") else None,
+                    "recent_ops": [
+                        {
+                            "op": r["operation"], "status": r["status"],
+                            "started_at": r["started_at"].isoformat(),
+                            "duration_ms": r["duration_ms"],
+                            "added": r["files_added"], "updated": r["files_updated"],
+                            "removed": r["files_removed"], "skipped": r["files_skipped"],
+                            "chunks": r["chunks_written"],
+                        } for r in log_rows
+                    ],
+                })
+    finally:
+        conn.close()
+
+    payload = {
+        "database": {
+            "name": config["database"]["name"],
+            "size": db_size,
+            "embedding_model":      meta.get("embedding_model"),
+            "embedding_dimension":  meta.get("embedding_dimension"),
+            "schema_version":       meta.get("schema_version"),
+        },
+        "totals": {
+            "corpora": total_corpora,
+            "files":   total_files,
+            "chunks":  total_chunks,
+            "embedded_chunks": total_embedded,
+        },
+        "corpora": per_corpus,
+    }
+
+    if args.format == "yaml" and _YAML_AVAILABLE:
+        # PyYAML can't serialize psycopg's Decimal/datetime out of the box;
+        # coerce via the json roundtrip which uses `default=str`.
+        print(yaml.safe_dump(json.loads(json.dumps(payload, default=str)), sort_keys=False))
+        return 0
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+
+    # Default: text
+    db = payload["database"]; t = payload["totals"]
+    print(_bold("rag database"))
+    print(f"  size:           {db['size']}")
+    print(f"  embedding:      {db['embedding_model']}  ({db['embedding_dimension']} dim)")
+    print(f"  schema version: {db['schema_version']}")
+    print(_bold("\ntotals"))
+    print(f"  corpora: {t['corpora']}  files: {t['files']}  chunks: {t['chunks']}  embedded: {t['embedded_chunks']}")
+    for c in payload["corpora"]:
+        print(_bold(f"\n{c['name']}  [{c['type']}]"))
+        print(f"  path:     {c['root_path']}")
+        print(f"  files:    {c['files']}   chunks: {c['chunks']}   embedded: {c['embedded']}")
+        print(f"  size:     {_format_bytes(c['bytes'])}")
+        print(f"  last:     {c['last_indexed_at'] or 'never'}")
+        if c["file_types"]:
+            types = "  ".join(f"{ft}:{n}" for ft, n in c["file_types"])
+            print(f"  types:    {types}")
+        if c["recent_ops"]:
+            print("  recent ops:")
+            for op in c["recent_ops"]:
+                print(f"    {op['started_at'][:19]}  {op['op']:>7} {op['status']:>7}  "
+                      f"+{op['added']} ~{op['updated']} -{op['removed']} skip {op['skipped']}  "
+                      f"{op['chunks']} chunks  {op['duration_ms']}ms")
+    return 0
+
+
+def _format_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        n /= 1024
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PiB"
+
+
+# ===== Argparse construction ==========================================
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="rag",
+        description=(
+            "Local-first multi-corpus RAG knowledge base. "
+            "Manages named corpora (indexed folders) in a single PostgreSQL + "
+            "pgvector database and exposes hybrid search via CLI or MCP."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # One-time setup (creates database + schema):
+  local_postgres init-rag
+  rag check
+
+  # Register a corpus and index it:
+  rag corpus add notes ~/Documents/notes --type notes
+  rag index --corpus notes
+
+  # Incremental update (most common):
+  rag sync --corpus notes           # detect new/changed/deleted files
+  rag sync --all                    # same for every registered corpus
+
+  # Search across all corpora (hybrid vector + keyword, RRF combined):
+  rag search "carnivore diet"
+  rag search "python async" --corpus dotfiles_code --limit 5
+  rag search "readme" --format yaml
+
+  # Run as MCP server over stdio (for Claude Code / OpenCode):
+  rag mcp
+
+Environment variables:
+  RAG_CONFIG                 Override config file path
+  RAG_DB_HOST RAG_DB_PORT RAG_DB_NAME RAG_DB_USER RAG_DB_PASSWORD
+  RAG_OLLAMA_ENDPOINT        Ollama base URL (default http://localhost:11434)
+  RAG_EMBEDDING_MODEL        Embedding model (default nomic-embed-text:v1.5)
+  NO_COLOR                   Disable ANSI colors
+  NO_DBOX_CHECK              Skip the auto-reexec into the 'dev' distrobox
+""",
+    )
+    parser.add_argument("--config", help="Path to config YAML (default: ~/.config/rag/config.yaml)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--debug", action="store_true", help="Debug output")
+    parser.add_argument("--silent", action="store_true", help="Suppress progress output")
+    parser.add_argument("--license", action="store_true", help="Show license and exit")
+
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    # ----- corpus ------------------------------------------------------
+    p_corpus = sub.add_parser("corpus", help="Manage corpora (named indexed folders)")
+    corpus_sub = p_corpus.add_subparsers(dest="corpus_action", metavar="ACTION", required=False)
+
+    p_add = corpus_sub.add_parser("add", help="Register a new corpus")
+    p_add.add_argument("name", help="Corpus name (must be unique)")
+    p_add.add_argument("path", help="Root directory to index")
+    p_add.add_argument("--type", dest="corpus_type", default="mixed",
+                       choices=["notes", "docs", "code", "mixed"],
+                       help="Corpus type hint (default: mixed)")
+    p_add.add_argument("--description", default=None, help="Human-readable description")
+    p_add.add_argument("--include", action="append", default=[], metavar="GLOB",
+                       help="Include only files matching glob (repeatable). If empty, includes all supported extensions.")
+    p_add.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                       help="Exclude files matching glob (repeatable). Always applied in addition to defaults.")
+    p_add.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, metavar="N",
+                       help=f"Chunk size in tokens (default: {DEFAULT_CHUNK_SIZE})")
+    p_add.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP, metavar="N",
+                       help=f"Chunk overlap in tokens (default: {DEFAULT_CHUNK_OVERLAP})")
+
+    p_rm = corpus_sub.add_parser("remove", help="Unregister a corpus")
+    p_rm.add_argument("name")
+    p_rm.add_argument("--keep-chunks", action="store_true",
+                      help="Keep chunks in DB (detached from corpus) instead of cascading delete")
+    p_rm.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+
+    p_ls = corpus_sub.add_parser("list", help="List registered corpora")
+    p_ls.add_argument("--format", choices=["simple", "table", "yaml", "json"], default="table")
+
+    p_show = corpus_sub.add_parser("show", help="Show details for a corpus")
+    p_show.add_argument("name")
+    p_show.add_argument("--format", choices=["text", "yaml", "json"], default="text")
+
+    p_up = corpus_sub.add_parser("update", help="Update a corpus's settings")
+    p_up.add_argument("name")
+    p_up.add_argument("--description", default=None)
+    p_up.add_argument("--type", dest="corpus_type", default=None,
+                      choices=["notes", "docs", "code", "mixed"])
+    p_up.add_argument("--include", action="append", default=None, metavar="GLOB",
+                      help="Replace include patterns (use empty --include to clear)")
+    p_up.add_argument("--exclude", action="append", default=None, metavar="GLOB",
+                      help="Replace exclude patterns")
+    p_up.add_argument("--add-include", action="append", default=[], metavar="GLOB")
+    p_up.add_argument("--add-exclude", action="append", default=[], metavar="GLOB")
+    p_up.add_argument("--chunk-size", type=int, default=None, metavar="N")
+    p_up.add_argument("--chunk-overlap", type=int, default=None, metavar="N")
+
+    p_mv = corpus_sub.add_parser("rename", help="Rename a corpus")
+    p_mv.add_argument("old")
+    p_mv.add_argument("new")
+
+    # ----- index / sync / clean / reindex ------------------------------
+    p_idx = sub.add_parser("index", help="Index (incremental by default) one or more corpora")
+    _add_corpus_selector(p_idx)
+    p_idx.add_argument("--force", action="store_true", help="Reindex every file, ignore hashes")
+    p_idx.add_argument("--dry-run", action="store_true", help="Report what would change without writing")
+
+    p_syn = sub.add_parser("sync", help="Incremental index + clean deleted files")
+    _add_corpus_selector(p_syn)
+    p_syn.add_argument("--dry-run", action="store_true")
+
+    p_cln = sub.add_parser("clean", help="Remove chunks for files that no longer exist on disk")
+    _add_corpus_selector(p_cln)
+    p_cln.add_argument("--dry-run", action="store_true")
+
+    p_re = sub.add_parser("reindex", help="Alias for 'index --force'")
+    _add_corpus_selector(p_re)
+
+    # ----- search ------------------------------------------------------
+    p_sr = sub.add_parser("search", help="Hybrid search across one or more corpora")
+    p_sr.add_argument("query", nargs="?", help="Natural language query")
+    _add_corpus_selector(p_sr, allow_all_default=True)
+    p_sr.add_argument("--limit", type=int, default=DEFAULT_SEARCH_LIMIT, metavar="N")
+    p_sr.add_argument("--threshold", type=float, default=DEFAULT_SEARCH_THRESHOLD, metavar="FLOAT")
+    p_sr.add_argument("--keyword-only", action="store_true")
+    p_sr.add_argument("--vector-only", action="store_true")
+    p_sr.add_argument("--no-dedup", action="store_true", help="Return all matching chunks, not just one per file")
+    p_sr.add_argument("--show-chunks", action="store_true", help="Include chunk content in output")
+    p_sr.add_argument("--format", choices=["simple", "text", "yaml", "json"], default="text")
+    p_sr.add_argument("--open", action="store_true", help="Open the top match in $EDITOR")
+    p_sr.add_argument("--editor", default=None, help="Editor command (default: $EDITOR)")
+
+    # ----- stats / status / check / config / mcp -----------------------
+    p_st = sub.add_parser("stats", help="Show corpus/DB stats")
+    p_st.add_argument("--corpus", action="append", default=[])
+    p_st.add_argument("--format", choices=["text", "yaml", "json"], default="text")
+
+    sub.add_parser("status", help="Quick one-line-per-component health check")
+    sub.add_parser("check", help="Preflight verification (exits non-zero on failure)")
+
+    p_cfg = sub.add_parser("config", help="Show/print-path/edit config")
+    p_cfg.add_argument("config_action", nargs="?", default="show",
+                       choices=["show", "path", "edit"])
+
+    sub.add_parser("mcp", help="Run as MCP server over stdio")
+
+    return parser
+
+
+def _add_corpus_selector(p: argparse.ArgumentParser, allow_all_default: bool = False) -> None:
+    """Shared helper: add --corpus and --all to a subparser."""
+    p.add_argument("--corpus", action="append", default=[], metavar="NAME",
+                   help="Act on this corpus (repeatable).")
+    if allow_all_default:
+        p.add_argument("--all", action="store_true",
+                       help="Act on all corpora (also the default if neither --corpus nor --all is given).")
+    else:
+        p.add_argument("--all", action="store_true", help="Act on all registered corpora.")
+
+
+# ===== Dispatch =======================================================
+# Maps the argparse `command` to its handler. Handlers are uniform:
+# they take (args, config) and return an int exit code.
+DISPATCH: dict[str, Callable[[argparse.Namespace, dict], int]] = {
+    "corpus":   cmd_corpus,
+    "index":    cmd_index,
+    "sync":     cmd_sync,
+    "clean":    cmd_clean,
+    "reindex":  cmd_reindex,
+    "search":   cmd_search,
+    "stats":    cmd_stats,
+    "status":   cmd_status,
+    "check":    cmd_check,
+    "config":   cmd_config,
+    "mcp":      cmd_mcp,
+}
+
+
+def main() -> int:
+    global OUT
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.license:
+        return cmd_license(args, {})
+
+    OUT = Out(silent=args.silent, verbose=args.verbose, debug=args.debug)
+    config = load_config(args.config)
+
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    handler = DISPATCH.get(args.command)
+    if handler is None:
+        OUT.error(f"unknown command: {args.command}")
+        return 64
+
+    try:
+        return handler(args, config)
+    except KeyboardInterrupt:
+        OUT.warn("interrupted")
+        return 130
+    except Exception as e:
+        if args.debug:
+            raise
+        OUT.error(f"{type(e).__name__}: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

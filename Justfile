@@ -164,14 +164,16 @@ dep_dirs:
 
     mkdir -p $HOME/.librewolf/native-messaging-hosts
 
+    mkdir -p $HOME/.cache/docling/models
+
 
 # install deps
 bootstrap:
     #!/usr/bin/env bash
-    set -euxo pipefail 
-    
+    set -euxo pipefail
+
     if [[ -f "${HOME}/.config/.dotfiles_init" ]]
-    then 
+    then
         echo "dotfiles_init file already exists...exiting"
         exit 0
     fi
@@ -180,6 +182,25 @@ bootstrap:
     cpan install YAML::XS < <(yes)
     # init pomo so it has a state file
     bash -c "source ${HOME}/.bashrc && pomo -s && pomo -S"
+
+    # Pre-fetch docling models into the user cache so the `rag` tool's
+    # Docling parser can OCR on first use without trying to write into
+    # root-owned site-packages. Idempotent (safe to run again). Downloads
+    # the default set (layout, tableformer, etc.) plus rapidocr. Total
+    # ~200-400 MB. If docling isn't installed yet this fails silently —
+    # the models can be fetched later via `just rag-models`.
+    if distrobox enter dev -- command -v docling-tools >/dev/null 2>&1; then
+        distrobox enter dev -- docling-tools models download || true
+        distrobox enter dev -- docling-tools models download rapidocr || true
+    fi
+
+
+# fetch docling models into the user cache (idempotent)
+rag-models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    distrobox enter dev -- docling-tools models download
+    distrobox enter dev -- docling-tools models download rapidocr
 
 
 # create git-worktree

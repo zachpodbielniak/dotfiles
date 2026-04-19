@@ -32,6 +32,7 @@ SYNC_DATABASES=(
     "flashcards"
     "possessions"
     "agent_memories"
+    "rag"       # Multi-corpus RAG knowledge base (pgvector + tsvector chunks)
     "postgres"  # For pgvector/second_brain_vectors table
 )
 
@@ -590,6 +591,213 @@ init_agent_memories_schema() {
     echo "Agent memories schema initialized successfully"
 }
 
+# Initialize rag (multi-corpus knowledge base) schema
+# Creates a dedicated `rag` database with pgvector + tsvector tables that support
+# multiple named corpora (one row per folder/source), per-file state for incremental
+# indexing, and chunks with embeddings + full-text vectors for hybrid search.
+# The embedding model is locked at init time via rag_meta singleton; switching
+# models later requires a full reindex (drop the database and re-init).
+init_rag_schema() {
+    echo "Initializing rag (multi-corpus knowledge base) schema..."
+
+    # Embedding model / dimension locked in via env vars (override defaults)
+    # These must match whatever `rag` CLI uses at query time. Changing them
+    # after ingestion requires reindexing.
+    local rag_model="${RAG_EMBEDDING_MODEL:-nomic-embed-text:v1.5}"
+    local rag_dim="${RAG_EMBEDDING_DIMENSION:-768}"
+
+    # Create rag database if it doesn't exist
+    if ! database_exists "rag"; then
+        echo "Creating rag database..."
+        execute_sql "CREATE DATABASE rag" "postgres" || return 1
+    fi
+
+    # Create the shared update_updated_at trigger function in the rag database
+    execute_sql "
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS \$\$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    \$\$ language 'plpgsql';" "rag" || return 1
+
+    # Enable required extensions: vector (pgvector), pg_trgm (fuzzy text),
+    # btree_gin (composite GIN indexes). pg_trgm and btree_gin are non-fatal.
+    execute_sql "CREATE EXTENSION IF NOT EXISTS vector;" "rag" || {
+        echo "Error: Failed to create vector extension (is pgvector available?)" >&2
+        return 1
+    }
+    execute_sql "CREATE EXTENSION IF NOT EXISTS pg_trgm;" "rag" 2>/dev/null || true
+    execute_sql "CREATE EXTENSION IF NOT EXISTS btree_gin;" "rag" 2>/dev/null || true
+
+    # Singleton config table: enforces one-model-per-database. The CHECK
+    # on singleton BOOLEAN PRIMARY KEY means only one row can ever exist.
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS rag_meta (
+        singleton           BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+        embedding_model     TEXT NOT NULL,
+        embedding_dimension INTEGER NOT NULL,
+        schema_version      INTEGER NOT NULL DEFAULT 1,
+        created_at          TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at          TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );" "rag" || return 1
+
+    # Seed rag_meta with the chosen model/dimension. If a row already exists,
+    # we refuse to change it silently — warn if mismatch and continue with the
+    # existing value (reindex via `rag reindex --all` after drop-reinit).
+    local existing_model=$(psql -d "$(get_connection_string "" "" "rag")" -tAc \
+        "SELECT embedding_model FROM rag_meta WHERE singleton = TRUE LIMIT 1" 2>/dev/null || echo "")
+    local existing_dim=$(psql -d "$(get_connection_string "" "" "rag")" -tAc \
+        "SELECT embedding_dimension FROM rag_meta WHERE singleton = TRUE LIMIT 1" 2>/dev/null || echo "")
+
+    if [[ -z "$existing_model" ]]; then
+        execute_sql "
+        INSERT INTO rag_meta (singleton, embedding_model, embedding_dimension, schema_version)
+        VALUES (TRUE, '$rag_model', $rag_dim, 1);" "rag" || return 1
+        echo "Seeded rag_meta: model=$rag_model dimension=$rag_dim"
+    else
+        if [[ "$existing_model" != "$rag_model" ]] || [[ "$existing_dim" != "$rag_dim" ]]; then
+            echo "Warning: rag_meta already seeded with model=$existing_model dim=$existing_dim" >&2
+            echo "         Requested model=$rag_model dim=$rag_dim will be ignored." >&2
+            echo "         To change, drop the rag database and re-init, then reindex." >&2
+            rag_model="$existing_model"
+            rag_dim="$existing_dim"
+        else
+            echo "rag_meta already seeded (model=$rag_model dim=$rag_dim)"
+        fi
+    fi
+
+    # Corpora registry: one row per indexed folder. Each corpus has its own
+    # root path, file-type scope (include/exclude patterns), and chunking params.
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS rag_corpora (
+        id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name              TEXT UNIQUE NOT NULL,
+        root_path         TEXT NOT NULL,
+        corpus_type       TEXT NOT NULL DEFAULT 'mixed',
+        description       TEXT,
+        include_patterns  TEXT[] DEFAULT '{}',
+        exclude_patterns  TEXT[] DEFAULT '{}',
+        chunk_size        INTEGER NOT NULL DEFAULT 512,
+        chunk_overlap     INTEGER NOT NULL DEFAULT 128,
+        file_count        INTEGER DEFAULT 0,
+        chunk_count       INTEGER DEFAULT 0,
+        last_indexed_at   TIMESTAMPTZ,
+        metadata          JSONB DEFAULT '{}',
+        created_at        TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at        TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );" "rag" || return 1
+
+    # Per-file state: tracks hash + mtime + size for the two-stage change
+    # detection (mtime+size fast path, SHA-256 on mismatch).
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS rag_files (
+        id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        corpus_id      UUID NOT NULL REFERENCES rag_corpora(id) ON DELETE CASCADE,
+        relative_path  TEXT NOT NULL,
+        absolute_path  TEXT NOT NULL,
+        file_hash      TEXT NOT NULL,
+        file_size      BIGINT NOT NULL,
+        file_type      TEXT,
+        mtime          TIMESTAMPTZ NOT NULL,
+        indexed_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        chunk_count    INTEGER DEFAULT 0,
+        metadata       JSONB DEFAULT '{}',
+        UNIQUE (corpus_id, relative_path)
+    );" "rag" || return 1
+
+    # Chunks: holds the actual text + embedding + generated tsvector.
+    # embedding dimension is templated from rag_meta at init time.
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS rag_chunks (
+        id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        corpus_id      UUID NOT NULL REFERENCES rag_corpora(id) ON DELETE CASCADE,
+        file_id        UUID NOT NULL REFERENCES rag_files(id)   ON DELETE CASCADE,
+        chunk_index    INTEGER NOT NULL,
+        content        TEXT NOT NULL,
+        embedding      vector($rag_dim),
+        content_tsv    TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+        heading_path   TEXT[] DEFAULT '{}',
+        chunk_type     TEXT,
+        token_count    INTEGER,
+        start_char     INTEGER,
+        end_char       INTEGER,
+        metadata       JSONB DEFAULT '{}',
+        created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (file_id, chunk_index)
+    );" "rag" || return 1
+
+    # Ingestion operations history (append-only log for debugging / auditing).
+    execute_sql "
+    CREATE TABLE IF NOT EXISTS rag_ingestion_log (
+        id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        corpus_id        UUID REFERENCES rag_corpora(id) ON DELETE CASCADE,
+        operation        TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        files_scanned    INTEGER DEFAULT 0,
+        files_added      INTEGER DEFAULT 0,
+        files_updated    INTEGER DEFAULT 0,
+        files_removed    INTEGER DEFAULT 0,
+        files_skipped    INTEGER DEFAULT 0,
+        chunks_written   INTEGER DEFAULT 0,
+        duration_ms      INTEGER,
+        error_message    TEXT,
+        metadata         JSONB DEFAULT '{}',
+        started_at       TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        completed_at     TIMESTAMPTZ
+    );" "rag" || return 1
+
+    # Indexes for hybrid search + incremental indexing workloads.
+    # HNSW chosen over ivfflat because it has good recall at any scale
+    # (ivfflat needs ≫ lists entries to train partitions well).
+    echo "Creating indexes for rag..."
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_chunks_embedding ON rag_chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_chunks_tsv ON rag_chunks USING GIN (content_tsv);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_chunks_corpus ON rag_chunks (corpus_id);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_chunks_file ON rag_chunks (file_id);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_chunks_heading_path ON rag_chunks USING GIN (heading_path);" "rag" 2>/dev/null || true
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_files_corpus ON rag_files (corpus_id);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_files_hash ON rag_files (file_hash);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_files_mtime ON rag_files (mtime);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_files_type ON rag_files (file_type);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_corpora_name ON rag_corpora (name);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_corpora_type ON rag_corpora (corpus_type);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_ingestion_log_corpus ON rag_ingestion_log (corpus_id);" "rag" || return 1
+    execute_sql "CREATE INDEX IF NOT EXISTS idx_rag_ingestion_log_started ON rag_ingestion_log (started_at);" "rag" || return 1
+
+    # updated_at triggers for tables that carry this column
+    execute_sql "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_rag_corpora_updated_at') THEN
+            CREATE TRIGGER update_rag_corpora_updated_at
+            BEFORE UPDATE ON rag_corpora
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_rag_files_updated_at') THEN
+            CREATE TRIGGER update_rag_files_updated_at
+            BEFORE UPDATE ON rag_files
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_rag_chunks_updated_at') THEN
+            CREATE TRIGGER update_rag_chunks_updated_at
+            BEFORE UPDATE ON rag_chunks
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_rag_meta_updated_at') THEN
+            CREATE TRIGGER update_rag_meta_updated_at
+            BEFORE UPDATE ON rag_meta
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        END IF;
+    END
+    \$\$;" "rag" || return 1
+
+    echo "Rag schema initialized successfully (model=$rag_model dimension=$rag_dim)"
+}
+
 # Initialize ai_chats schema
 init_ai_chats_schema() {
     echo "Initializing ai_chats schema..."
@@ -1124,6 +1332,7 @@ init_all_schemas() {
     init_flashcards_schema || return 1
     init_possessions_schema || return 1
     init_agent_memories_schema || return 1
+    init_rag_schema || return 1
     echo "All schemas initialized successfully"
 }
 
@@ -1360,11 +1569,50 @@ show_stats() {
         "postgres")
             echo -e "\nVector Database Statistics:"
             execute_sql "
-            SELECT 
+            SELECT
                 COUNT(*) as total_vectors,
                 COUNT(DISTINCT provider) as unique_providers,
                 COUNT(DISTINCT model) as unique_models
             FROM second_brain_vectors;" "$db" 2>/dev/null || echo "No second_brain_vectors table found"
+            ;;
+        "rag")
+            echo -e "\nRag Meta:"
+            execute_sql "
+            SELECT embedding_model, embedding_dimension, schema_version,
+                   created_at, updated_at
+            FROM rag_meta;" "$db" 2>/dev/null || echo "No rag_meta found"
+
+            echo -e "\nRag Totals:"
+            execute_sql "
+            SELECT
+                (SELECT COUNT(*) FROM rag_corpora)  AS corpora,
+                (SELECT COUNT(*) FROM rag_files)    AS files,
+                (SELECT COUNT(*) FROM rag_chunks)   AS chunks,
+                (SELECT COUNT(*) FROM rag_chunks WHERE embedding IS NOT NULL) AS embedded_chunks;" "$db" || return 1
+
+            echo -e "\nCorpora:"
+            execute_sql "
+            SELECT name, corpus_type AS type, file_count, chunk_count,
+                   last_indexed_at, root_path
+            FROM rag_corpora ORDER BY name;" "$db" || return 1
+
+            echo -e "\nFile Types:"
+            execute_sql "
+            SELECT c.name AS corpus, f.file_type, COUNT(*) AS n
+            FROM rag_files f JOIN rag_corpora c ON f.corpus_id = c.id
+            WHERE f.file_type IS NOT NULL
+            GROUP BY c.name, f.file_type
+            ORDER BY c.name, n DESC;" "$db" || return 1
+
+            echo -e "\nRecent Ingestion Operations (last 10):"
+            execute_sql "
+            SELECT c.name AS corpus, l.operation, l.status,
+                   l.files_added AS added, l.files_updated AS updated,
+                   l.files_removed AS removed, l.chunks_written AS chunks,
+                   l.duration_ms, l.started_at
+            FROM rag_ingestion_log l
+            LEFT JOIN rag_corpora c ON l.corpus_id = c.id
+            ORDER BY l.started_at DESC LIMIT 10;" "$db" || return 1
             ;;
         *)
             echo -e "\nGeneric table count:"
@@ -1408,7 +1656,27 @@ show_all_stats() {
     if database_exists "cold_storage"; then
         available_dbs+=("cold_storage")
     fi
-    
+
+    # Check for flashcards database
+    if database_exists "flashcards"; then
+        available_dbs+=("flashcards")
+    fi
+
+    # Check for possessions database
+    if database_exists "possessions"; then
+        available_dbs+=("possessions")
+    fi
+
+    # Check for agent_memories database
+    if database_exists "agent_memories"; then
+        available_dbs+=("agent_memories")
+    fi
+
+    # Check for rag (multi-corpus knowledge base) database
+    if database_exists "rag"; then
+        available_dbs+=("rag")
+    fi
+
     # Check for postgres database (always exists)
     available_dbs+=("postgres")
     
@@ -1429,20 +1697,20 @@ show_all_stats() {
     
     # Total size across all databases
     execute_sql "
-    SELECT 
+    SELECT
         COUNT(*) as total_databases,
         pg_size_pretty(SUM(pg_database_size(datname))) as total_size
-    FROM pg_database 
-    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'media', 'cold_storage', 'postgres');" "postgres" || return 1
-    
+    FROM pg_database
+    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'media', 'cold_storage', 'flashcards', 'possessions', 'agent_memories', 'rag', 'postgres');" "postgres" || return 1
+
     echo ""
     echo "Individual database sizes:"
     execute_sql "
-    SELECT 
+    SELECT
         datname as database,
         pg_size_pretty(pg_database_size(datname)) as size
-    FROM pg_database 
-    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'media', 'cold_storage', 'postgres')
+    FROM pg_database
+    WHERE datname IN ('transcriptions', 'ai_chats', 'notes', 'media', 'cold_storage', 'flashcards', 'possessions', 'agent_memories', 'rag', 'postgres')
     ORDER BY pg_database_size(datname) DESC;" "postgres" || return 1
 }
 
@@ -1624,7 +1892,23 @@ backup_all_databases() {
     if database_exists "cold_storage"; then
         databases+=("cold_storage")
     fi
-    
+
+    if database_exists "flashcards"; then
+        databases+=("flashcards")
+    fi
+
+    if database_exists "possessions"; then
+        databases+=("possessions")
+    fi
+
+    if database_exists "agent_memories"; then
+        databases+=("agent_memories")
+    fi
+
+    if database_exists "rag"; then
+        databases+=("rag")
+    fi
+
     # Always include postgres database (for second_brain_vectors)
     databases+=("postgres")
     
@@ -1917,7 +2201,7 @@ merge_sync_table() {
     
     # Get non-generated columns for tables that have generated columns
     local column_list=""
-    if [[ "$table" == "notes" ]] || [[ "$table" == "transcription_chunks" ]]; then
+    if [[ "$table" == "notes" ]] || [[ "$table" == "transcription_chunks" ]] || [[ "$table" == "rag_chunks" ]]; then
         column_list=$(get_non_generated_columns "$db" "$table")
         if [[ -n "$column_list" ]]; then
             [[ "$DEBUG" == true ]] && echo "        Debug: Using column list for $table: $column_list"
@@ -2113,23 +2397,118 @@ merge_sync_table() {
             "file_entries")
                 # Merge file entries - only insert if not exists (they shouldn't change)
                 execute_sql "
-                INSERT INTO $table 
+                INSERT INTO $table
                 SELECT * FROM $temp_table
                 ON CONFLICT (snapshot_id, path) DO NOTHING;" "$db" >/dev/null 2>&1
                 ;;
-            
+
+            "rag_meta")
+                # rag_meta is a one-row singleton: skip merge if any value differs
+                # (operators should reconcile manually rather than silently
+                # overwrite a model/dimension mismatch across hosts).
+                execute_sql "
+                INSERT INTO $table (singleton, embedding_model, embedding_dimension, schema_version, created_at, updated_at)
+                SELECT singleton, embedding_model, embedding_dimension, schema_version, created_at, updated_at
+                FROM $temp_table
+                ON CONFLICT (singleton) DO NOTHING;" "$db" >/dev/null 2>&1
+                ;;
+
+            "rag_corpora")
+                # Merge corpora by id, keep newer updated_at side.
+                execute_sql "
+                INSERT INTO $table
+                SELECT * FROM $temp_table
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    root_path = EXCLUDED.root_path,
+                    corpus_type = EXCLUDED.corpus_type,
+                    description = EXCLUDED.description,
+                    include_patterns = EXCLUDED.include_patterns,
+                    exclude_patterns = EXCLUDED.exclude_patterns,
+                    chunk_size = EXCLUDED.chunk_size,
+                    chunk_overlap = EXCLUDED.chunk_overlap,
+                    file_count = EXCLUDED.file_count,
+                    chunk_count = EXCLUDED.chunk_count,
+                    last_indexed_at = EXCLUDED.last_indexed_at,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                ;;
+
+            "rag_files")
+                # Merge files by id, keep newer updated_at side.
+                execute_sql "
+                INSERT INTO $table
+                SELECT * FROM $temp_table
+                ON CONFLICT (id) DO UPDATE SET
+                    corpus_id = EXCLUDED.corpus_id,
+                    relative_path = EXCLUDED.relative_path,
+                    absolute_path = EXCLUDED.absolute_path,
+                    file_hash = EXCLUDED.file_hash,
+                    file_size = EXCLUDED.file_size,
+                    file_type = EXCLUDED.file_type,
+                    mtime = EXCLUDED.mtime,
+                    indexed_at = EXCLUDED.indexed_at,
+                    chunk_count = EXCLUDED.chunk_count,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                ;;
+
+            "rag_chunks")
+                # Chunks have a generated tsvector column, so use column list.
+                # Merge by id, keep newer side. Chunks are expensive to recompute
+                # (re-embedding is required), so we don't drop existing chunks.
+                if [[ -n "$column_list" ]]; then
+                    execute_sql "
+                    INSERT INTO $table ($column_list)
+                    SELECT $column_list FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        corpus_id = EXCLUDED.corpus_id,
+                        file_id = EXCLUDED.file_id,
+                        chunk_index = EXCLUDED.chunk_index,
+                        content = EXCLUDED.content,
+                        embedding = EXCLUDED.embedding,
+                        heading_path = EXCLUDED.heading_path,
+                        chunk_type = EXCLUDED.chunk_type,
+                        token_count = EXCLUDED.token_count,
+                        start_char = EXCLUDED.start_char,
+                        end_char = EXCLUDED.end_char,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                else
+                    execute_sql "
+                    INSERT INTO $table
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        embedding = EXCLUDED.embedding,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" "$db" >/dev/null 2>&1
+                fi
+                ;;
+
+            "rag_ingestion_log")
+                # Append-only audit log — never update, just keep every row.
+                execute_sql "
+                INSERT INTO $table
+                SELECT * FROM $temp_table
+                ON CONFLICT (id) DO NOTHING;" "$db" >/dev/null 2>&1
+                ;;
+
             *)
                 # Generic merge - insert only if not exists
                 execute_sql "
-                INSERT INTO $table 
+                INSERT INTO $table
                 SELECT * FROM $temp_table
                 ON CONFLICT DO NOTHING;" "$db" >/dev/null 2>&1
                 ;;
         esac
-        
+
         # Drop staging table
         execute_sql "DROP TABLE IF EXISTS $temp_table;" "$db" >/dev/null 2>&1
-        
+
         # Clean up error files
         rm -f "${error_file}_remote" "${error_file}_local"
         echo "        ✓ Merged successfully"
@@ -2186,7 +2565,7 @@ push_sync_table() {
     
     # Get non-generated columns for tables that have generated columns
     local column_list=""
-    if [[ "$table" == "notes" ]] || [[ "$table" == "transcription_chunks" ]]; then
+    if [[ "$table" == "notes" ]] || [[ "$table" == "transcription_chunks" ]] || [[ "$table" == "rag_chunks" ]]; then
         column_list=$(get_non_generated_columns "$db" "$table")
         if [[ -n "$column_list" ]]; then
             [[ "$DEBUG" == true ]] && echo "        Debug: Using column list for $table: $column_list"
@@ -2426,11 +2805,127 @@ push_sync_table() {
                     -U "$DEFAULT_DB_USER" \
                     -d "$db" \
                     -c "
-                    INSERT INTO $table 
+                    INSERT INTO $table
                     SELECT * FROM $temp_table
                     ON CONFLICT (snapshot_id, path) DO NOTHING;" >/dev/null 2>&1
                 ;;
-            
+
+            "rag_meta")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table (singleton, embedding_model, embedding_dimension, schema_version, created_at, updated_at)
+                    SELECT singleton, embedding_model, embedding_dimension, schema_version, created_at, updated_at
+                    FROM $temp_table
+                    ON CONFLICT (singleton) DO NOTHING;" >/dev/null 2>&1
+                ;;
+
+            "rag_corpora")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        root_path = EXCLUDED.root_path,
+                        corpus_type = EXCLUDED.corpus_type,
+                        description = EXCLUDED.description,
+                        include_patterns = EXCLUDED.include_patterns,
+                        exclude_patterns = EXCLUDED.exclude_patterns,
+                        chunk_size = EXCLUDED.chunk_size,
+                        chunk_overlap = EXCLUDED.chunk_overlap,
+                        file_count = EXCLUDED.file_count,
+                        chunk_count = EXCLUDED.chunk_count,
+                        last_indexed_at = EXCLUDED.last_indexed_at,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                ;;
+
+            "rag_files")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO UPDATE SET
+                        corpus_id = EXCLUDED.corpus_id,
+                        relative_path = EXCLUDED.relative_path,
+                        absolute_path = EXCLUDED.absolute_path,
+                        file_hash = EXCLUDED.file_hash,
+                        file_size = EXCLUDED.file_size,
+                        file_type = EXCLUDED.file_type,
+                        mtime = EXCLUDED.mtime,
+                        indexed_at = EXCLUDED.indexed_at,
+                        chunk_count = EXCLUDED.chunk_count,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                    WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                ;;
+
+            "rag_chunks")
+                if [[ -n "$column_list" ]]; then
+                    PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                        -h "$target_host" \
+                        -p "$DEFAULT_DB_PORT" \
+                        -U "$DEFAULT_DB_USER" \
+                        -d "$db" \
+                        -c "
+                        INSERT INTO $table ($column_list)
+                        SELECT $column_list FROM $temp_table
+                        ON CONFLICT (id) DO UPDATE SET
+                            corpus_id = EXCLUDED.corpus_id,
+                            file_id = EXCLUDED.file_id,
+                            chunk_index = EXCLUDED.chunk_index,
+                            content = EXCLUDED.content,
+                            embedding = EXCLUDED.embedding,
+                            heading_path = EXCLUDED.heading_path,
+                            chunk_type = EXCLUDED.chunk_type,
+                            token_count = EXCLUDED.token_count,
+                            start_char = EXCLUDED.start_char,
+                            end_char = EXCLUDED.end_char,
+                            metadata = EXCLUDED.metadata,
+                            updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                        WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                else
+                    PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                        -h "$target_host" \
+                        -p "$DEFAULT_DB_PORT" \
+                        -U "$DEFAULT_DB_USER" \
+                        -d "$db" \
+                        -c "
+                        INSERT INTO $table
+                        SELECT * FROM $temp_table
+                        ON CONFLICT (id) DO UPDATE SET
+                            content = EXCLUDED.content,
+                            embedding = EXCLUDED.embedding,
+                            updated_at = GREATEST($table.updated_at, EXCLUDED.updated_at)
+                        WHERE $table.updated_at < EXCLUDED.updated_at;" >/dev/null 2>&1
+                fi
+                ;;
+
+            "rag_ingestion_log")
+                PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
+                    -h "$target_host" \
+                    -p "$DEFAULT_DB_PORT" \
+                    -U "$DEFAULT_DB_USER" \
+                    -d "$db" \
+                    -c "
+                    INSERT INTO $table
+                    SELECT * FROM $temp_table
+                    ON CONFLICT (id) DO NOTHING;" >/dev/null 2>&1
+                ;;
+
             *)
                 PGPASSWORD="$DEFAULT_DB_PASSWORD" psql \
                     -h "$target_host" \
@@ -2438,7 +2933,7 @@ push_sync_table() {
                     -U "$DEFAULT_DB_USER" \
                     -d "$db" \
                     -c "
-                    INSERT INTO $table 
+                    INSERT INTO $table
                     SELECT * FROM $temp_table
                     ON CONFLICT DO NOTHING;" >/dev/null 2>&1
                 ;;
@@ -2543,6 +3038,8 @@ sync_databases() {
                     init_possessions_schema
                 elif [[ "$db" == "agent_memories" ]]; then
                     init_agent_memories_schema
+                elif [[ "$db" == "rag" ]]; then
+                    init_rag_schema
                 else
                     execute_sql "CREATE DATABASE $db" "postgres" >/dev/null 2>&1
                 fi
@@ -2574,6 +3071,12 @@ sync_databases() {
                     ;;
                 "agent_memories")
                     tables_to_sync=("memories")
+                    ;;
+                "rag")
+                    # rag_meta must sync first (defines the embedding model both sides
+                    # must agree on), then registry (corpora), then files, then chunks.
+                    # ingestion_log is append-only and syncs last for correct ordering.
+                    tables_to_sync=("rag_meta" "rag_corpora" "rag_files" "rag_chunks" "rag_ingestion_log")
                     ;;
                 "postgres")
                     # For postgres db, sync the vector table if it exists
@@ -2713,7 +3216,7 @@ Supports multiple databases: transcriptions, ai_chats, notes, postgres.
 
 COMMANDS:
     setup               Setup database and all schemas (alias for init)
-    init                Initialize all schemas (transcriptions + ai_chats + notes + media + cold_storage + second_brain)
+    init                Initialize all schemas (transcriptions + ai_chats + notes + media + cold_storage + second_brain + flashcards + possessions + agent_memories + rag)
     init-transcripts    Initialize transcriptions schema only
     init-ai             Initialize ai_chats schema only
     init-notes          Initialize notes schema only
@@ -2723,6 +3226,7 @@ COMMANDS:
     init-flashcards     Initialize flashcards schema only (spaced repetition learning)
     init-possessions    Initialize possessions schema only (minimalism tracking)
     init-agent-memories Initialize agent memories schema only (AI agent memory store)
+    init-rag            Initialize rag multi-corpus knowledge base schema (pgvector + tsvector chunks)
     maintain            Perform maintenance operations (vacuum, reindex, cleanup)
     stats               Show database statistics
     export [FILE]       Export data to JSON file
@@ -2746,7 +3250,9 @@ ENVIRONMENT VARIABLES:
     LOCAL_DB_NAME             Database name (default: transcriptions)
     LOCAL_DB_USER             Database user (default: postgres)
     LOCAL_DB_PASSWORD         Database password (default: none)
-    
+    RAG_EMBEDDING_MODEL       Embedding model for init-rag (default: nomic-embed-text:v1.5)
+    RAG_EMBEDDING_DIMENSION   Embedding dimension for init-rag (default: 768)
+
     Backward compatibility (deprecated):
     TRANSCRIPTION_DB_*        Legacy environment variables (still supported)
 
@@ -2787,7 +3293,11 @@ EXAMPLES:
     
     # Bidirectional sync with remote hosts
     $SCRIPT_NAME sync
-    
+
+    # Initialize the rag knowledge base schema (multi-corpus)
+    $SCRIPT_NAME init-rag
+    RAG_EMBEDDING_MODEL=mxbai-embed-large RAG_EMBEDDING_DIMENSION=1024 $SCRIPT_NAME init-rag
+
     # Drop database (DANGEROUS!)
     $SCRIPT_NAME --database ai_chats drop
     $SCRIPT_NAME --database notes drop
@@ -2831,7 +3341,7 @@ parse_args() {
                 BACKUP_ALL=true
                 shift
                 ;;
-            setup|init|init-transcripts|init-ai|init-notes|init-media|init-cold-storage|init-second-brain|init-flashcards|init-possessions|init-agent-memories|maintain|stats|export|archive|backup|sync|drop)
+            setup|init|init-transcripts|init-ai|init-notes|init-media|init-cold-storage|init-second-brain|init-flashcards|init-possessions|init-agent-memories|init-rag|maintain|stats|export|archive|backup|sync|drop)
                 ACTION="$1"
                 shift
                 break
@@ -2908,6 +3418,9 @@ main() {
             ;;
         init-agent-memories)
             init_agent_memories_schema
+            ;;
+        init-rag)
+            init_rag_schema
             ;;
         maintain)
             perform_maintenance "$TARGET_DATABASE"
