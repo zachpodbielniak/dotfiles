@@ -1346,8 +1346,11 @@ Auto-prefixes the filename with today's date when DIR contains
 ;;;; =========================================================================
 
 ;;; Load custom elisp modules (ported from nvim lua)
-(load! "shell-runner")  ;; Shell command runner (from lua/custom/shell.lua)
-(load! "transclusion")  ;; Transclusion system (from core/mappings.lua)
+(load! "shell-runner")        ;; Shell command runner (from lua/custom/shell.lua)
+(load! "transclusion")        ;; Transclusion system (from core/mappings.lua)
+(load! "qbittorrent-webui")   ;; qBittorrent WebUI API client
+(load! "qbittorrent-torrents");; qBittorrent torrents-list UI
+(load! "jackett")             ;; Jackett torrent search client
 
 ;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
 ;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
@@ -1613,6 +1616,70 @@ Restores saved session if available, otherwise prompts for login."
                     (goto-char (point-min))
                     (special-mode))
                   (pop-to-buffer "*jira-keys*"))))
+
+;;; Torrenting — qbittorrent-transient + Jackett search
+;;; Auth: store Jackett API key in ~/.authinfo (plain, not gpg):
+;;;   machine nas-main_jackett login jackett password <api-key>
+(use-package! qbittorrent-transient
+  :commands (qbittorrent-transient
+             qbittorrent-transient-url
+             qbittorrent-transient-filepath
+             qbittorrent-transient-dired)
+  :init
+  (map! :leader :desc "Torrents" "T" nil)
+  (map! :leader
+        :desc "qBittorrent menu"   "T t" #'qbittorrent-transient
+        :desc "Add from Dired"     "T m" #'qbittorrent-transient-dired
+        :desc "Open qBittorrent"   "T o" #'qbittorrent-transient-open))
+
+;; Jackett search — defined in jackett.el, loaded above via (load! "jackett").
+;; Configure host/port here (credentials stay in authinfo).
+(with-eval-after-load 'jackett
+  (setq jackett-host "nas-main"
+        jackett-auth-host "nas-main_jackett"
+        jackett-port 9117
+        jackett-scheme "http"
+        jackett-add-backend 'webui)
+  (map! :leader
+        :desc "Search Jackett"     "T s" #'jackett-search)
+  ;; Evil normal-state overrides — otherwise RET/a/d/w just move the cursor.
+  (evil-define-key* 'normal jackett-results-mode-map
+    (kbd "RET") #'jackett-add-to-qbittorrent
+    "a"         #'jackett-add-to-qbittorrent
+    "d"         #'jackett-download-torrent-file
+    "w"         #'jackett-copy-magnet
+    "g"         #'jackett-refresh
+    "q"         #'quit-window))
+
+;; qBittorrent WebUI — points at the container on nas-main.
+;; Authinfo: machine nas-main_qbittorrent login <user> password <pw>
+(with-eval-after-load 'qbittorrent-webui
+  (setq qbittorrent-webui-host "nas-main"
+        qbittorrent-webui-auth-host "nas-main_qbittorrent"
+        qbittorrent-webui-port 8580
+        qbittorrent-webui-scheme "http"
+        qbittorrent-webui-user "admin")
+  (map! :leader
+        :desc "qBittorrent login"  "T l" #'qbittorrent-webui-login
+        :desc "Add magnet/URL"     "T u" #'qbittorrent-webui-add-url
+        :desc "Add .torrent file"  "T f" #'qbittorrent-webui-add-file))
+
+;; Torrents list UI — live-updating table of torrents with actions.
+(with-eval-after-load 'qbittorrent-torrents
+  (map! :leader
+        :desc "List torrents"      "T L" #'qbittorrent-torrents)
+  ;; Evil normal-state overrides — otherwise letter keys just move the cursor.
+  (evil-define-key* 'normal qbittorrent-torrents-mode-map
+    "p" #'qbittorrent-torrents-pause-at-point
+    "r" #'qbittorrent-torrents-resume-at-point
+    "d" #'qbittorrent-torrents-delete-at-point
+    "D" #'qbittorrent-torrents-delete-with-files-at-point
+    "c" #'qbittorrent-torrents-recheck-at-point
+    "w" #'qbittorrent-torrents-copy-hash
+    "o" #'qbittorrent-torrents-open-webui
+    "g" #'qbittorrent-torrents-refresh
+    "q" #'quit-window
+    "?" #'qbittorrent-torrents-show-keys))
 
 ;;; Git forge management (port of gitctl-nvim; backend: gitctl)
 (use-package! gitctl-emacs

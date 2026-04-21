@@ -190,3 +190,9 @@
 (package! monday
   :recipe (:host nil
            :repo "https://git.podbielniak.com/zachpodbielniak/monday-emacs"))
+
+;;; --- Torrenting ---
+
+;; Transient menu wrapper around the qbittorrent CLI. Not on MELPA.
+(package! qbittorrent-transient
+  :recipe (:host github :repo "theobori/qbittorrent-transient"))
