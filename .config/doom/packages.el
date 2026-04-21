@@ -196,3 +196,8 @@
 ;; Transient menu wrapper around the qbittorrent CLI. Not on MELPA.
 (package! qbittorrent-transient
   :recipe (:host github :repo "theobori/qbittorrent-transient"))
+
+;;; --- Home Assistant ---
+
+;; REST + WebSocket client for Home Assistant. On MELPA.
+(package! hass)
