@@ -1351,6 +1351,9 @@ Auto-prefixes the filename with today's date when DIR contains
 (load! "qbittorrent-webui")   ;; qBittorrent WebUI API client
 (load! "qbittorrent-torrents");; qBittorrent torrents-list UI
 (load! "jackett")             ;; Jackett torrent search client
+(load! "arr")                 ;; Generic *arr REST client (Sonarr/Radarr/Lidarr/Readarr)
+(load! "arr-queue")           ;; Unified *arr queue viewer
+(load! "arr-search")          ;; Search-and-add across *arr services
 
 ;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
 ;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
@@ -1663,6 +1666,57 @@ Restores saved session if available, otherwise prompts for login."
         :desc "qBittorrent login"  "T l" #'qbittorrent-webui-login
         :desc "Add magnet/URL"     "T u" #'qbittorrent-webui-add-url
         :desc "Add .torrent file"  "T f" #'qbittorrent-webui-add-file))
+
+;;; *arr services (Sonarr/Radarr/Lidarr/Readarr) — see arr.el + arr-queue.el
+;;; Auth: store each service's API key in ~/.authinfo:
+;;;   machine <auth-host> login arr password <api-key>
+;;; Add Readarr by appending another plist once configured.
+(with-eval-after-load 'arr
+  (setq arr-services
+        '((:name sonarr :label "TV"
+           :host "nas-main" :port 8989
+           :auth-host "nas-main_sonarr"
+           :api-path "/api/v3" :resource series)
+          (:name radarr :label "Mov"
+           :host "nas-main" :port 7878
+           :auth-host "nas-main_radarr"
+           :api-path "/api/v3" :resource movie)
+          (:name lidarr :label "Msc"
+           :host "nas-main" :port 8686
+           :auth-host "nas-main_lidarr"
+           :api-path "/api/v1" :resource artist)
+          ;; Readarr — uncomment when configured:
+          ;; (:name readarr :label "Bk"
+          ;;  :host "nas-main" :port 8787
+          ;;  :auth-host "nas-main_readarr"
+          ;;  :api-path "/api/v1" :resource book)
+          )))
+
+;; SPC A prefix for *arr commands.
+(map! :leader :desc "*arr" "A" nil)
+
+(with-eval-after-load 'arr-queue
+  (map! :leader
+        :desc "Queue (all *arr)"   "A q" #'arr-queue
+        :desc "Ping *arr"          "A p" #'arr-ping)
+  ;; Evil normal-state overrides — otherwise letter keys just move the cursor.
+  (evil-define-key* 'normal arr-queue-mode-map
+    "g" #'arr-queue-refresh
+    "d" #'arr-queue-remove-at-point
+    "D" #'arr-queue-remove-and-blocklist-at-point
+    "o" #'arr-queue-open-webui-at-point
+    "w" #'arr-queue-copy-title
+    "q" #'quit-window
+    "?" #'arr-queue-show-keys))
+
+(with-eval-after-load 'arr-search
+  (map! :leader
+        :desc "Search *arr"        "A s" #'arr-search)
+  (evil-define-key* 'normal arr-search-mode-map
+    "a" #'arr-search-add-at-point
+    "g" #'arr-search-refresh
+    "q" #'quit-window
+    "?" #'arr-search-show-keys))
 
 ;; Torrents list UI — live-updating table of torrents with actions.
 (with-eval-after-load 'qbittorrent-torrents
