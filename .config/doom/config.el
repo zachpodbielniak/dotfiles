@@ -1837,6 +1837,108 @@ for https and 8123 for http (HA's native port)."
         :desc "HA service+payload"   "H p" #'hass-call-service-with-payload
         :desc "HA ensure connection" "H e" #'hass-ensure))
 
+;;; YouTube front-end (yeetube): search + play via mpv, download via yt-dlp.
+(defun zach/yeetube-show-keys ()
+  "Display a help buffer listing `yeetube-mode' keybindings."
+  (interactive)
+  (with-current-buffer (get-buffer-create "*yeetube-keys*")
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert "yeetube Keybindings\n"
+              "===================\n\n"
+              "Playback:\n"
+              "  RET    Play video at point (mpv)\n"
+              "  r      Replay last video\n"
+              "  p      Toggle mpv pause\n"
+              "  v      Toggle video display in mpv\n"
+              "  V      Toggle --no-video flag\n"
+              "  C-q    Change mpv video quality\n\n"
+              "Navigation / search:\n"
+              "  M-RET  New search\n"
+              "  C-RET  Open video/playlist page\n"
+              "  b      Browse URL in external browser\n"
+              "  c      Channel videos (for channel at point)\n"
+              "  L      Channel live streams\n\n"
+              "Saved / clipboard:\n"
+              "  s      Save video to persistent list\n"
+              "  P      Play a saved video\n"
+              "  C      Copy URL to kill ring\n\n"
+              "Download:\n"
+              "  d      Download video (yt-dlp)\n"
+              "  D      Change download directory\n"
+              "  a      Change audio format\n\n"
+              "Misc:\n"
+              "  T      Toggle torsocks routing\n"
+              "  S      Sort by column at point (tabulated-list)\n"
+              "  q      Quit window\n"
+              "  ?      This help\n"))
+    (goto-char (point-min))
+    (special-mode))
+  (pop-to-buffer "*yeetube-keys*"))
+
+(use-package! yeetube
+  :defer t
+  :init
+  (setq yeetube-results-limit        20
+        yeetube-enable-emojis        nil
+        yeetube-display-thumbnails-p t)
+  (map! :leader :desc "YouTube" "Y" nil)
+  (map! :leader
+        :desc "Search YouTube"  "Y s" #'yeetube-search
+        :desc "Saved videos"    "Y l" #'yeetube-play-saved-video
+        :desc "Download dir"    "Y d" #'yeetube-download-change-directory)
+  :config
+  (keymap-set yeetube-mode-map "?" #'zach/yeetube-show-keys)
+  ;; Evil normal-state overrides — otherwise RET / letter keys just move point.
+  (evil-define-key* 'normal yeetube-mode-map
+    (kbd "RET")   #'yeetube-play
+    (kbd "M-RET") #'yeetube-search
+    (kbd "C-<return>") #'yeetube-video-or-playlist-page
+    (kbd "C-q")   #'yeetube-mpv-change-video-quality
+    "b"  #'yeetube-browse-url
+    "c"  #'yeetube-channel-videos
+    "C"  #'yeetube-copy-url
+    "d"  #'yeetube-download-video
+    "D"  #'yeetube-download-change-directory
+    "a"  #'yeetube-download-change-audio-format
+    "p"  #'yeetube-mpv-toggle-pause
+    "v"  #'yeetube-mpv-toggle-video
+    "V"  #'yeetube-mpv-toggle-no-video-flag
+    "s"  #'yeetube-save-video
+    "L"  #'yeetube-channel-streams
+    "P"  #'yeetube-play-saved-video
+    "r"  #'yeetube-replay
+    "T"  #'yeetube-mpv-toggle-torsocks
+    "q"  #'quit-window
+    "?"  #'zach/yeetube-show-keys))
+
+;;; Jellyfin (emacs-os/jellyfin-emms-mpv.el): browse + play through EMMS/mpv.
+;;; Server URL comes from $JELLYFIN_URL.
+;;; Auth lives in ~/.authinfo keyed by the hostname inside $JELLYFIN_URL:
+;;;   machine <host> login <user> password <pw>
+;;; (If you use a non-443/80 port, add `port NNNN' to the machine line.)
+(use-package! jellyfin-emms-mpv
+  :defer t
+  :init
+  (setq jellyfin-server-url
+          (let ((u (getenv "JELLYFIN_URL")))
+            (and u (string-trim-right u "/")))
+        jellyfin-completing-read-preview   t
+        jellyfin-preferred-language        "eng"
+        jellyfin-subtitles                 nil
+        jellyfin-emms-cover-art            t
+        jellyfin-elcava-emms-experimental  nil)
+  (map! :leader :desc "Video (Jellyfin)" "V" nil)
+  (map! :leader
+        :desc "Movies"              "V m" #'jellyfin-browse-movies
+        :desc "Movies gallery"      "V M" #'jellyfin-browse-movies-gallery
+        :desc "TV shows"            "V t" #'jellyfin-browse-shows
+        :desc "TV shows gallery"    "V T" #'jellyfin-browse-shows-gallery
+        :desc "Continue watching"   "V c" #'jellyfin-browse-continue-watching
+        :desc "Albums"              "V a" #'jellyfin-browse-albums
+        :desc "Playlists"           "V p" #'jellyfin-browse-playlists
+        :desc "Songs"               "V s" #'jellyfin-browse-songs))
+
 ;; Torrents list UI — live-updating table of torrents with actions.
 (with-eval-after-load 'qbittorrent-torrents
   (map! :leader

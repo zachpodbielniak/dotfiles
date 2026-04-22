@@ -201,3 +201,13 @@
 
 ;; REST + WebSocket client for Home Assistant. On MELPA.
 (package! hass)
+
+;;; --- Media ---
+
+;; YouTube front-end: search, play via mpv, download via yt-dlp. On MELPA.
+(package! yeetube)
+
+;; Jellyfin client via EMMS + mpv: browse movies, shows, music, playlists.
+;; Not on MELPA — install direct from GitHub.
+(package! jellyfin-emms-mpv
+  :recipe (:host github :repo "emacs-os/jellyfin-emms-mpv.el"))
