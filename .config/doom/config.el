@@ -727,8 +727,9 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 ;; Alt-v: vertical terminal (right split)
 (map! :ni "M-v" (cmd! (split-window-right) (other-window 1) (+vterm/here nil)))
 (map! :leader
-      :desc "Vterm popup" "o t" #'+vterm/toggle
-      :desc "Vterm here" "o T" #'+vterm/here)
+      :desc "Vterm popup"        "o t" #'+vterm/toggle
+      :desc "Vterm here"         "o T" #'+vterm/here
+      :desc "Browser (eww) here" "o B" #'zach/eww-here)
 
 ;;; Vterm TUI stability
 (setq vterm-always-compile-module t)
@@ -1551,6 +1552,7 @@ Auto-prefixes the filename with today's date when DIR contains
 (load! "arr")                 ;; Generic *arr REST client (Sonarr/Radarr/Lidarr/Readarr)
 (load! "arr-queue")           ;; Unified *arr queue viewer
 (load! "arr-search")          ;; Search-and-add across *arr services
+(load! "eww")                 ;; Emacs-as-browser (eww + shr + URL routing)
 
 ;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
 ;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
