@@ -128,6 +128,11 @@
 ;; Visual kanban board rendered as org table
 (package! org-kanban)
 
+;; Universal annotation layer: highlight regions in any buffer (text,
+;; code, org, eww, nov, Info) and persist notes into aggregating .org
+;; files under the PARA tree.
+(package! org-remark)
+
 ;; Matrix chat client (native Emacs, E2EE via pantalaimon)
 (package! ement
   :recipe (:host github :repo "alphapapa/ement.el"))

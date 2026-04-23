@@ -1538,6 +1538,29 @@ Auto-prefixes the filename with today's date when DIR contains
       :desc "Insert linked note"  "n i" #'+org/insert-linked-note
       :desc "Insert linked (fuzzy)" "n I" #'+org/insert-linked-note-fuzzy)
 
+;;; org-remark: universal annotation layer. `SPC n r' family covers
+;;; every verb — mark (default + semantic pens), navigate, manage,
+;;; open notes.  `g/R/b' are green/red/blue pens (confirmed / refute
+;;; / question); uppercase R keeps lowercase `r' on "remove" which
+;;; gets hit most often.  Module body lives in `org-remark.el'.
+(map! :leader
+      (:prefix ("n r" . "remark")
+       :desc "Mark region (yellow)"   "m" #'org-remark-mark
+       :desc "Mark whole line"        "l" #'org-remark-mark-line
+       :desc "Mark green (confirmed)" "g" #'org-remark-mark-green
+       :desc "Mark red (refute)"      "R" #'org-remark-mark-red
+       :desc "Mark blue (question)"   "b" #'org-remark-mark-blue
+       :desc "Mark important"         "!" #'org-remark-mark-important
+       :desc "Open notes"             "o" #'org-remark-open
+       :desc "View in sidebar"        "v" #'org-remark-view
+       :desc "Next highlight"         "n" #'org-remark-view-next
+       :desc "Prev highlight"         "p" #'org-remark-view-prev
+       :desc "Remove (keep note)"     "r" #'org-remark-remove
+       :desc "Delete (with note)"     "d" #'org-remark-delete
+       :desc "Change pen"             "c" #'org-remark-change
+       :desc "Toggle visibility"      "t" #'org-remark-toggle
+       :desc "List all highlights"    "L" #'org-remark-list-highlights))
+
 
 ;;;; =========================================================================
 ;;;; Phase 5: Custom Modules
@@ -1553,6 +1576,7 @@ Auto-prefixes the filename with today's date when DIR contains
 (load! "arr-queue")           ;; Unified *arr queue viewer
 (load! "arr-search")          ;; Search-and-add across *arr services
 (load! "eww")                 ;; Emacs-as-browser (eww + shr + URL routing)
+(load! "org-remark")          ;; Universal annotation layer (all buffer types)
 
 ;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
 ;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
