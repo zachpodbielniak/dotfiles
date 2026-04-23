@@ -80,6 +80,12 @@
 ;;; Line numbers
 (setq display-line-numbers-type t)
 
+;;; GTK-style right-click context menu (Emacs 28+).  Without this,
+;;; mouse-3 is `mouse-save-then-kill'; with it, mouse-3 opens an
+;;; extensible menu that packages like org-remark inject entries
+;;; into (mark / open / change pen) automatically.
+(context-menu-mode 1)
+
 ;;; Steady cursor — no blink.
 ;;; Each blink invalidates the cursor region, which runs through PGTK's
 ;;; redisplay → cairo → wl_surface attach+commit, damaging the gowl
