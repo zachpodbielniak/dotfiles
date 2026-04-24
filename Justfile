@@ -1,5 +1,6 @@
 # normal stow operation
-stow: dep_dirs
+# Pass quadlets=false to skip Podman quadlet units (.config/containers/systemd/*.container)
+stow quadlets="true": dep_dirs
     #!/usr/bin/env bash
     set -euxo pipefail
 
@@ -16,6 +17,11 @@ stow: dep_dirs
             fi
         fi
     done
+
+    # optionally skip Podman quadlet units on hosts that don't run containers
+    if [ "{{quadlets}}" != "true" ]; then
+        IGNORE_FLAGS+=("--ignore=\\.container$")
+    fi
 
     stow \
         --ignore=LICENSE \
@@ -47,7 +53,8 @@ stow: dep_dirs
 
 
 # modified stow operation for other devices
-stow_alt: dep_dirs
+# Pass quadlets=false to skip Podman quadlet units (.config/containers/systemd/*.container)
+stow_alt quadlets="true": dep_dirs
     #!/usr/bin/env bash
     set -euxo pipefail
 
@@ -64,6 +71,11 @@ stow_alt: dep_dirs
             fi
         fi
     done
+
+    # optionally skip Podman quadlet units on hosts that don't run containers
+    if [ "{{quadlets}}" != "true" ]; then
+        IGNORE_FLAGS+=("--ignore=\\.container$")
+    fi
 
     stow \
         --ignore=LICENSE \
@@ -104,7 +116,8 @@ unstow:
 
 
 # dry-run
-dry: dep_dirs
+# Pass quadlets=false to skip Podman quadlet units (.config/containers/systemd/*.container)
+dry quadlets="true": dep_dirs
     #!/usr/bin/env bash
     set -euxo pipefail
 
@@ -120,6 +133,11 @@ dry: dep_dirs
             fi
         fi
     done
+
+    # optionally skip Podman quadlet units on hosts that don't run containers
+    if [ "{{quadlets}}" != "true" ]; then
+        IGNORE_FLAGS+=("--ignore=\\.container$")
+    fi
 
     stow --ignore=Justfile --simulate -v "${IGNORE_FLAGS[@]}" .
 

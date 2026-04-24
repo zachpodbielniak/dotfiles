@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Test Qtile configuration: `just test`
 - Install dotfiles: `just stow`
 - Install dotfiles (alternative): `just stow_alt`
+- Install without Podman quadlets: `just stow quadlets=false` (also works for `stow_alt` / `dry`)
 - Uninstall dotfiles: `just unstow`
 - Dry run installation: `just dry`
 - Bootstrap dependencies: `just bootstrap`
