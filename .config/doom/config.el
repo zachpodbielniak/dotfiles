@@ -1112,7 +1112,7 @@ Return t if handled, nil to fall through to default behaviour."
 ;;; org-roam: bidirectional linking across entire PARA knowledge base
 (after! org-roam
   (setq org-roam-directory (expand-file-name org-directory)
-        org-roam-dailies-directory "02_areas/personal/journal/"
+        org-roam-dailies-directory "02_areas/dailies/"
         org-roam-db-gc-threshold most-positive-fixnum
         org-roam-completion-everywhere t
         org-roam-file-exclude-regexp "03_resources/technical/docs/"))
