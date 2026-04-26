@@ -827,9 +827,43 @@ compositor seat."
           ;; DailyWire
           ("https://www.dailywire.com/feeds/rss.xml" news))))
 
+;; `o R' was previously bound to `elfeed-update' directly; clear it
+;; with an explicit nil so Doom can rebuild it as a prefix.  Mirrors
+;; the AI prefix pattern below (`SPC a' nil + flat "a c" sub-keys).
+(map! :leader :desc "reddit/rss" "o R" nil)
+
 (map! :leader
-      :desc "Open RSS" "o r" #'elfeed
-      :desc "Update RSS" "o R" #'elfeed-update)
+      :desc "Open RSS"         "o r"   #'elfeed
+      :desc "Reddit main"      "o R r" #'reddigg-view-main
+      :desc "Reddit subreddit" "o R s" #'reddigg-view-sub
+      :desc "Reddit comments"  "o R c" #'reddigg-view-comments
+      :desc "Update RSS"       "o R u" #'elfeed-update)
+
+;;; Reddit (reddigg) -- org-mode-native browser
+(use-package! reddigg
+  :defer t
+  :config
+  (setq reddigg-subs
+        '(bash C_Programming Fedora Fire dividends emacs))
+
+  ;; Route reddit.com URLs from eww / elfeed / org links into reddigg
+  ;; instead of rendering as a generic web page. Matches the existing
+  ;; YouTube->mpv / PDF->pdf-tools pattern in eww.el.
+  (defun zach/browse-url-reddit (url &rest _args)
+    "Open reddit URL in reddigg.
+Comment threads -> `reddigg-view-comments'; subreddit pages ->
+`reddigg-view-sub'; anything else -> eww."
+    (cond
+     ((string-match "/r/[^/]+/comments/" url)
+      (reddigg-view-comments url))
+     ((string-match "/r/\\([^/?#]+\\)" url)
+      (reddigg-view-sub (match-string 1 url)))
+     (t (eww-browse-url url))))
+  (function-put 'zach/browse-url-reddit 'browse-url-browser-kind 'internal)
+
+  (add-to-list 'browse-url-handlers
+               '("\\(www\\.\\|old\\.\\)?reddit\\.com"
+                 . zach/browse-url-reddit)))
 
 ;;; AI/LLM (gptel, replaces avante.nvim)
 ;;; Three backends matching nvim config: ollama (default), openai, anthropic

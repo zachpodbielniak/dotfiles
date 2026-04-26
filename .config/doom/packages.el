@@ -196,6 +196,12 @@
   :recipe (:host nil
            :repo "https://git.podbielniak.com/zachpodbielniak/monday-emacs"))
 
+;;; --- Reddit ---
+
+;; Org-mode-native Reddit reader: renders subreddits and threads as
+;; .org buffers. Read-only; no auth.
+(package! reddigg)
+
 ;;; --- Torrenting ---
 
 ;; Transient menu wrapper around the qbittorrent CLI. Not on MELPA.
