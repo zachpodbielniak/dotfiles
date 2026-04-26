@@ -116,7 +116,13 @@
                                      tramp-file-name-regexp))  ;; disable VC over TRAMP
 
   ;; Tell eshell to use TRAMP for remote paths (cd /ssh:host:/)
-  (add-to-list 'tramp-remote-path 'tramp-own-remote-path))
+  (add-to-list 'tramp-remote-path 'tramp-own-remote-path)
+
+  ;; Container methods that aren't auto-registered (unlike docker/podman).
+  ;; After enabling, `/distrobox:NAME:/path' and `/flatpak:APP-ID:/path'
+  ;; resolve like any other TRAMP host.
+  (tramp-enable-distrobox-method)
+  (tramp-enable-flatpak-method))
 
 ;;; Eshell performance tuning & TRAMP integration (see eshell.el)
 (load! "eshell")
