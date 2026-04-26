@@ -741,7 +741,8 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
 (map! :leader
       :desc "Vterm popup"        "o t" #'+vterm/toggle
       :desc "Vterm here"         "o T" #'+vterm/here
-      :desc "Browser (eww) here" "o B" #'zach/eww-here)
+      :desc "Browser (eww) here" "o B" #'zach/eww-here
+      :desc "TRAMP dashboard"    "o D" #'tramp-dashboard)
 
 ;;; Vterm TUI stability
 (setq vterm-always-compile-module t)
@@ -1623,6 +1624,7 @@ Auto-prefixes the filename with today's date when DIR contains
 (load! "arr-search")          ;; Search-and-add across *arr services
 (load! "eww")                 ;; Emacs-as-browser (eww + shr + URL routing)
 (load! "org-remark")          ;; Universal annotation layer (all buffer types)
+(load! "tramp-dashboard")     ;; Org-style dashboard for entering TRAMP systems
 
 ;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
 ;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
