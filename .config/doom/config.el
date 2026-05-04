@@ -230,7 +230,9 @@
         :n "a"   #'dirvish-quick-access
         :n "s"   #'dirvish-quicksort
         :n "y"   #'dirvish-yank-menu
-        :n "f"   #'dirvish-fd))
+        :n "f"   #'dirvish-fd
+        :n "N"   #'dired-create-empty-file
+        :n "?"   #'dirvish-dispatch))
 
 ;;; Treemacs: quiet down the file watcher.
 ;;;
