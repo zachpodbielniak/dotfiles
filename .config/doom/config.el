@@ -947,6 +947,64 @@ Comment threads -> `reddigg-view-comments'; subreddit pages ->
         :localleader
         :desc "Live preview" "p" #'grip-mode))
 
+;;; Markdown / Org -> rich-text clipboard.  Renders source to HTML and
+;;; puts it on the system clipboard tagged text/html, so paste targets
+;;; that understand rich text (Slack, Gmail, GitHub web editor, browser
+;;; composers) get formatted output without a preview round-trip.
+(defun zach/--copy-html-to-clipboard (html)
+  "Put HTML on the system clipboard with text/html MIME type."
+  (let ((cmd (cond ((and (getenv "WAYLAND_DISPLAY")
+                         (executable-find "wl-copy"))
+                    '("wl-copy" "--type" "text/html"))
+                   ((executable-find "xclip")
+                    '("xclip" "-selection" "clipboard" "-t" "text/html"))
+                   (t (user-error "Need wl-copy or xclip on PATH")))))
+    (with-temp-buffer
+      (insert html)
+      (apply #'call-process-region (point-min) (point-max)
+             (car cmd) nil nil nil (cdr cmd)))
+    (message "Copied %d bytes as rich text" (length html))))
+
+(defun zach/markdown-copy-as-rich-text (beg end)
+  "Convert region (or whole buffer) markdown to HTML, copy as rich text."
+  (interactive (if (use-region-p)
+                   (list (region-beginning) (region-end))
+                 (list (point-min) (point-max))))
+  (unless (executable-find "pandoc")
+    (user-error "pandoc not on PATH"))
+  (let* ((src  (buffer-substring-no-properties beg end))
+         (html (with-temp-buffer
+                 (insert src)
+                 (unless (zerop (call-process-region
+                                 (point-min) (point-max)
+                                 "pandoc" t t nil
+                                 "-f" "gfm" "-t" "html"))
+                   (error "pandoc failed: %s" (buffer-string)))
+                 (buffer-string))))
+    (zach/--copy-html-to-clipboard html)))
+
+(defun zach/org-copy-as-rich-text (beg end)
+  "Convert region (or whole buffer) org to HTML, copy as rich text.
+Uses org's built-in HTML exporter -- no pandoc dependency."
+  (interactive (if (use-region-p)
+                   (list (region-beginning) (region-end))
+                 (list (point-min) (point-max))))
+  (require 'ox-html)
+  (let ((html (org-export-string-as
+               (buffer-substring-no-properties beg end)
+               'html t)))
+    (zach/--copy-html-to-clipboard html)))
+
+(after! markdown-mode
+  (map! :map markdown-mode-map
+        :localleader
+        :desc "Copy as rich text" "y" #'zach/markdown-copy-as-rich-text))
+
+(after! org
+  (map! :map org-mode-map
+        :localleader
+        :desc "Copy as rich text" "y" #'zach/org-copy-as-rich-text))
+
 ;;; Code screenshots (replaces carbon-now.nvim)
 (use-package! carbon-now-sh
   :defer t
