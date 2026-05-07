@@ -369,7 +369,8 @@ ROWS is a list of (KEY DESCRIPTION) pairs."
    '(("g" "re-fetch and re-render this case (incl. comments)")
      ("o" "open case in browser (Lightning UI)")
      ("y" "copy case URL to kill ring")
-     ("c" "jump to the Activity section (comments + emails)")
+     ("c" "jump to the Activity section")
+     ("M" "toggle EmailMessages in Activity (off by default)")
      ("?" "this help"))))
 
 ;;; ----------------------------------------------------- queues mode
@@ -597,6 +598,7 @@ Re-invoked by `sf-cases-refresh'.")
     (define-key map "o" #'sf-case-browse-url)
     (define-key map "y" #'sf-case-yank-url)
     (define-key map "c" #'sf-case-jump-to-activity)
+    (define-key map "M" #'sf-case-toggle-emails)
     (define-key map "?" #'sf-case-show-keys)
     map)
   "Keymap for `sf-case-mode'.")
@@ -607,6 +609,7 @@ Re-invoked by `sf-cases-refresh'.")
     "o" #'sf-case-browse-url
     "y" #'sf-case-yank-url
     "c" #'sf-case-jump-to-activity
+    "M" #'sf-case-toggle-emails
     "?" #'sf-case-show-keys
     "q" #'quit-window))
 
@@ -614,6 +617,16 @@ Re-invoked by `sf-cases-refresh'.")
   "Major mode for viewing a single Salesforce case.")
 
 (defvar-local sf--case-id nil "Salesforce Id of the case rendered in this buffer.")
+
+(defvar-local sf--current-rec nil
+  "Cached Case record alist for the case displayed in this buffer.
+Populated by `sf--render-case'; used by toggles like `sf-case-toggle-emails'
+to re-render without refetching from Salesforce.")
+
+(defvar-local sf--show-emails nil
+  "When non-nil, EmailMessages are included in this buffer's Activity timeline.
+Off by default — emails are usually verbose noise next to the comment /
+chat thread.  Toggle interactively with `sf-case-toggle-emails' (\\[sf-case-toggle-emails]).")
 
 (defun sf--fetch-case-detail (where-clause)
   "Run case-detail SOQL with WHERE-CLAUSE, augment with ConversationEntries.
@@ -690,13 +703,14 @@ is `initial', `comment', `email', or `message'."
                     :date (or (alist-get 'CreatedDate c) "")
                     :data c)
               acc)))
-    (dotimes (i (length emails))
-      (let ((e (aref emails i)))
-        (push (list :type 'email
-                    :date (or (alist-get 'MessageDate e)
-                              (alist-get 'CreatedDate e) "")
-                    :data e)
-              acc)))
+    (when sf--show-emails
+      (dotimes (i (length emails))
+        (let ((e (aref emails i)))
+          (push (list :type 'email
+                      :date (or (alist-get 'MessageDate e)
+                                (alist-get 'CreatedDate e) "")
+                      :data e)
+                acc))))
     (dotimes (i (length entries))
       (let ((e (aref entries i)))
         (push (list :type 'message
@@ -824,14 +838,24 @@ EndUser → blue tint (`sf-incoming-email'), Agent/Bot → green tint
 
 (defun sf--render-activity (rec)
   "Render a combined Activity timeline (comments + emails + messages) from REC.
-Inserts an `Activity' header followed by one block per item, newest first."
-  (let* ((items (sf--collect-activity rec))
-         (n     (length items)))
+Inserts an `Activity' header followed by one block per item, newest first.
+When `sf--show-emails' is nil the header notes how many emails are hidden
+and how to toggle them on."
+  (let* ((items   (sf--collect-activity rec))
+         (n       (length items))
+         (e-count (length (or (alist-get 'records
+                                         (alist-get 'EmailMessages rec)) [])))
+         (hidden  (and (not sf--show-emails) (> e-count 0))))
     (insert "\n" (propertize "Activity" 'face '(:weight bold)))
     (cond
-     ((zerop n) (insert " (none)\n"))
+     ((and (zerop n) (not hidden)) (insert " (none)\n"))
      (t
-      (insert (format " (%d, newest first)\n" n))
+      (insert (format " (%d, newest first%s)\n"
+                      n
+                      (if hidden
+                          (format " — %d email%s hidden, press M to show"
+                                  e-count (if (= e-count 1) "" "s"))
+                        "")))
       (insert (make-string 72 ?─) "\n")
       (dolist (item items)
         (pcase (plist-get item :type)
@@ -848,8 +872,10 @@ Inserts an `Activity' header followed by one block per item, newest first."
          (buf      (get-buffer-create
                     (format "*sf-case: %s*" case-num))))
     (with-current-buffer buf
-      (sf-case-mode)
+      (unless (eq major-mode 'sf-case-mode)
+        (sf-case-mode))
       (setq-local sf--case-id id)
+      (setq-local sf--current-rec rec)
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert (propertize (format "Case %s — %s\n" case-num subject)
@@ -905,6 +931,17 @@ Auto-detects type via `sf--detect-case-key'."
   (let ((url (sf--case-url sf--case-id)))
     (kill-new url)
     (message "Yanked: %s" url)))
+
+(defun sf-case-toggle-emails ()
+  "Toggle whether EmailMessages appear in this case's Activity timeline.
+Re-renders from the cached record without refetching from Salesforce when
+possible; falls back to `sf-case-refresh' if the cache is missing."
+  (interactive)
+  (setq sf--show-emails (not sf--show-emails))
+  (message "Emails %s" (if sf--show-emails "shown" "hidden"))
+  (cond
+   (sf--current-rec (sf--render-case sf--current-rec))
+   (t (sf-case-refresh))))
 
 (defun sf-case-jump-to-activity ()
   "Jump to the Activity section (comments + emails) in this case buffer."
