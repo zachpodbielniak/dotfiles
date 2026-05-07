@@ -1685,6 +1685,7 @@ Auto-prefixes the filename with today's date when DIR contains
 (load! "eww")                 ;; Emacs-as-browser (eww + shr + URL routing)
 (load! "org-remark")          ;; Universal annotation layer (all buffer types)
 (load! "tramp-dashboard")     ;; Org-style dashboard for entering TRAMP systems
+(load! "sf")                  ;; Salesforce Service Cloud client (case triage)
 
 ;;; Email: mu4e via Proton Mail Bridge (IMAP/SMTP on localhost)
 ;;; Maildir: ~/.local/share/mail/proton  (synced by mbsync)
