@@ -78,6 +78,43 @@ entries past this limit aren't fetched."
   :type 'integer
   :group 'sf)
 
+(defcustom sf-author-colors
+  '("#f5e0dc"  ; Rosewater
+    "#f2cdcd"  ; Flamingo
+    "#f5c2e7"  ; Pink
+    "#cba6f7"  ; Mauve
+    "#f38ba8"  ; Red
+    "#eba0ac"  ; Maroon
+    "#fab387"  ; Peach
+    "#f9e2af"  ; Yellow
+    "#a6e3a1"  ; Green
+    "#94e2d5"  ; Teal
+    "#89dceb"  ; Sky
+    "#74c7ec"  ; Sapphire
+    "#89b4fa"  ; Blue
+    "#b4befe"  ; Lavender
+    "#f4dbd6"  ; Macchiato Rosewater
+    "#f5bde6"  ; Macchiato Pink
+    "#c6a0f6"  ; Macchiato Mauve
+    "#ed8796"  ; Macchiato Red
+    "#f5a97f"  ; Macchiato Peach
+    "#eed49f"  ; Macchiato Yellow
+    "#a6da95"  ; Macchiato Green
+    "#8bd5ca"  ; Macchiato Teal
+    "#7dc4e4"  ; Macchiato Sapphire
+    "#b7bdf8") ; Macchiato Lavender
+  "Per-author foreground colors used to colorize names in the Activity timeline.
+Each commenter's name is hashed (stable across sessions) into an index of
+this list, so every occurrence of the same person's name in any case
+detail buffer gets the same color.
+
+Defaults are 14 Catppuccin Mocha accents plus 10 Macchiato variants for
+24 distinct entries — enough that even cases with many participants
+rarely collide.  With more authors than colors, hash collisions are
+inevitable; extend this list with more readable colors if needed."
+  :type '(repeat string)
+  :group 'sf)
+
 (defface sf-internal-comment
   '((((background dark))
      :background "#3d3528" :extend t)
@@ -218,6 +255,49 @@ caller can fall back to plain rendering."
   (if (and (stringp iso) (>= (length iso) 16))
       (concat (substring iso 0 10) " " (substring iso 11 16))
     (or iso "")))
+
+(defun sf--name-key (s)
+  "Normalize string S for use as a per-person color hash key.
+Strips a trailing email part (\"Bob <b@x.com>\" → \"bob\"), lowercases,
+and trims, so that different display formats for the same person collapse
+to the same hash key."
+  (when (stringp s)
+    (downcase
+     (string-trim
+      (replace-regexp-in-string " *<[^>]+>$" "" s)))))
+
+(defun sf--author-face (name)
+  "Return a face spec colorizing NAME consistently for this person.
+Hashes NAME (after normalization) into `sf-author-colors' and returns
+\(:foreground COLOR :weight bold).  Returns nil for nil/empty input so
+the caller can fall back to the surrounding face."
+  (when (and (stringp name) (not (string-empty-p name)) sf-author-colors)
+    (let* ((key   (sf--name-key name))
+           (idx   (mod (abs (sxhash-equal key)) (length sf-author-colors)))
+           (color (nth idx sf-author-colors)))
+      `(:foreground ,color :weight bold))))
+
+(defun sf--insert-activity-header (segments &optional surround-face)
+  "Insert an Activity-item header from SEGMENTS, terminated with newline.
+Each segment is one of:
+- a string (rendered with SURROUND-FACE, defaults to `shadow'); or
+- a cons cell (NAME . t), which colorizes NAME via `sf--author-face'
+  for stable per-person identity; or
+- nil, which is silently skipped (handy for conditional segments)."
+  (let ((sface (or surround-face 'shadow))
+        (first t))
+    (insert "\n" (propertize "── " 'face sface))
+    (dolist (seg segments)
+      (when seg
+        (unless first (insert (propertize " · " 'face sface)))
+        (setq first nil)
+        (cond
+         ((and (consp seg) (eq (cdr seg) t))
+          (insert (propertize (car seg)
+                              'face (or (sf--author-face (car seg)) sface))))
+         ((stringp seg)
+          (insert (propertize seg 'face sface))))))
+    (insert (propertize " ──\n" 'face sface))))
 
 (defun sf--format-value (v)
   "Stringify a JSON value V for display in a case detail buffer."
@@ -632,15 +712,14 @@ is `initial', `comment', `email', or `message'."
          (internal  (eq (alist-get 'IsPublished c) :false))
          (visibility  (if internal "internal" "public"))
          (block-face  (if internal 'sf-internal-comment 'sf-public-comment))
-         (header-face (if internal
+         (surround    (if internal
                           '(:inherit shadow :slant italic)
                         'shadow))
          (body      (or (alist-get 'CommentBody c) ""))
          (start     (point)))
-    (insert "\n"
-            (propertize (format "── comment · %s · %s · %s ──\n"
-                                author created visibility)
-                        'face header-face))
+    (sf--insert-activity-header
+     (list "comment" (cons author t) created visibility)
+     surround)
     (insert body
             (if (string-suffix-p "\n" body) "" "\n"))
     (add-face-text-property start (point) block-face)))
@@ -667,10 +746,8 @@ is `initial', `comment', `email', or `message'."
          (body      (replace-regexp-in-string
                      "\r" "" (or (alist-get 'TextBody e) "")))
          (start     (point)))
-    (insert "\n"
-            (propertize (format "── email · %s · %s · %s ──\n"
-                                sender date direction)
-                        'face 'shadow))
+    (sf--insert-activity-header
+     (list "email" (cons sender t) date direction))
     (insert (propertize (format "  Subject: %s\n" subject) 'face 'shadow))
     (when (and (not incoming) (not (string-empty-p to-addr)))
       (insert (propertize (format "  To: %s\n" to-addr) 'face 'shadow)))
@@ -710,9 +787,8 @@ SuppliedName/SuppliedEmail (or Contact.Name / CreatedBy.Name fallbacks)."
                    ((and creator (not (string-empty-p creator))) creator)
                    (t "(unknown)")))
          (start   (point)))
-    (insert "\n"
-            (propertize (format "── case opened · %s · %s ──\n" sender created)
-                        'face 'shadow))
+    (sf--insert-activity-header
+     (list "case opened" (cons sender t) created))
     (insert rendered (if (string-suffix-p "\n" rendered) "" "\n"))
     (add-face-text-property start (point) 'sf-incoming-email)))
 
@@ -734,15 +810,12 @@ EndUser → blue tint (`sf-incoming-email'), Agent/Bot → green tint
                            ((string= actor-type "Agent")   'sf-public-comment)
                            ((string= actor-type "Bot")     'sf-public-comment)
                            (t nil)))
-         (extra      (if (or (string-empty-p msg-type)
-                             (string= msg-type "Text"))
-                         ""
-                       (format " · %s" (downcase msg-type))))
+         (extra      (and (not (string-empty-p msg-type))
+                          (not (string= msg-type "Text"))
+                          (downcase msg-type)))
          (start      (point)))
-    (insert "\n"
-            (propertize (format "── message · %s · %s · %s%s ──\n"
-                                actor timestamp direction extra)
-                        'face 'shadow))
+    (sf--insert-activity-header
+     (list "message" (cons actor t) timestamp direction extra))
     (insert (if (string-empty-p content) "(empty message)\n" content)
             (if (or (string-empty-p content) (string-suffix-p "\n" content))
                 "" "\n"))
