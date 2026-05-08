@@ -3,6 +3,26 @@
 ;; This file controls what Doom modules are enabled and what order they load
 ;; in. Remember to run 'doom sync' after modifying it!
 
+;; Workaround for Emacs 31 + transient. Several upstream packages
+;; (claude-code, jira.el, ...) put a top-level `;;;###autoload' cookie before
+;; a `transient-define-prefix' form. Emacs 31's `loaddefs-gen.el' tries to
+;; load the package source so it can recognize the macro and emit a clean
+;; autoload, but the load fails: it forces `load-suffixes' to '(".el") and
+;; then bundled `transient.el.gz' trips a recursive-load error inside
+;; jka-compr. With the macro property never set, the generator falls back
+;; to copying the macro form verbatim into <pkg>-autoloads.el. Loading that
+;; file before transient is loaded then crashes with `void-function
+;; (transient-define-prefix)'. Define stub no-op macros so the autoloads
+;; load cleanly; the real macros in transient.el take over once the package
+;; is actually loaded, at which point each affected package re-runs its
+;; `transient-define-*' forms with the real definitions.
+(dolist (sym '(transient-define-prefix
+               transient-define-suffix
+               transient-define-infix
+               transient-define-argument))
+  (unless (fboundp sym)
+    (eval `(defmacro ,sym (&rest _) nil))))
+
 ;; NOTE: Press 'SPC h d h' (or 'C-h d h' for non-vim users) to access Doom's
 ;;   documentation. There you'll find a link to Doom's Module Index where all of
 ;;   our modules are listed, including what flags they support.
