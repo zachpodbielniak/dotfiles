@@ -181,7 +181,6 @@ dep_dirs:
     mkdir -p $HOME/.opencode/skills
 
     mkdir -p $HOME/.librewolf/native-messaging-hosts
-    mkdir -p $HOME/.config/emacs/.local/cache/auto-save
 
     mkdir -p $HOME/.cache/docling/models
 
