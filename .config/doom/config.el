@@ -487,6 +487,7 @@ compositor seat."
 (load! "org-remark")          ;; Universal annotation layer (all buffer types)
 (load! "tramp-dashboard")     ;; Org-style dashboard for entering TRAMP systems
 (load! "sf")                  ;; Salesforce Service Cloud client (case triage)
+(load! "art-of-war")          ;; Art of War daily-study client (SPC s a)
 
 
 ;;;; =========================================================================
