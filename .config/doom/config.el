@@ -229,6 +229,51 @@
 ;;; Clipboard paste (GTK GUI)
 (map! "C-S-v" #'clipboard-yank)
 
+;;; pgtk + Wayland clipboard: let wl-copy own CLIPBOARD, not Emacs.
+;;;
+;;; Two failure modes when Emacs (pgtk) owns CLIPBOARD itself:
+;;;
+;;;   1. Stale reads. The pgtk daemon doesn't always honor
+;;;      `wl_data_source.cancelled' when another app copies, so Emacs
+;;;      thinks it still owns CLIPBOARD and `gui-selection-value' returns
+;;;      its own stale kill-ring head.
+;;;
+;;;   2. Self-deadlock. With `save-interprogram-paste-before-kill' on,
+;;;      every kill triggers a clipboard READ. If Emacs is the current
+;;;      owner, a synchronous `wl-paste' call hangs: the compositor
+;;;      relays `wl_data_source.send' back to Emacs while Emacs's main
+;;;      thread is blocked in read() waiting for wl-paste. The second
+;;;      `x' wedges the editor. (Confirmed via gdb thread dump.)
+;;;
+;;; Fix: take Emacs out of the owner role. `select-enable-clipboard nil'
+;;; stops `gui-select-text' from claiming CLIPBOARD; we then bridge
+;;; explicitly via wl-copy/wl-paste, which daemonize and hold ownership
+;;; out-of-process. wl-paste can always read because the owner is a
+;;; separate process, not us.
+;;;
+;;; Writeup: ~/Documents/notes/03_resources/technical/emacs/clipboard_paste_broken_after_kill.org
+(when (and (eq window-system 'pgtk)
+           (executable-find "wl-copy")
+           (executable-find "wl-paste"))
+  (setq select-enable-clipboard nil
+        select-enable-primary   nil
+        save-interprogram-paste-before-kill t
+        interprogram-cut-function
+        (lambda (text)
+          (let ((proc (make-process :name "wl-copy"
+                                    :buffer nil
+                                    :command '("wl-copy")
+                                    :connection-type 'pipe
+                                    :noquery t)))
+            (process-send-string proc text)
+            (process-send-eof proc)))
+        interprogram-paste-function
+        (lambda ()
+          (with-temp-buffer
+            (when (zerop (call-process "wl-paste" nil t nil "-n"))
+              (let ((s (buffer-string)))
+                (unless (string-empty-p s) s)))))))
+
 ;;; browse-kill-ring: evil keybinds (defaults are Emacs-style)
 (after! browse-kill-ring
   (set-evil-initial-state! 'browse-kill-ring-mode 'normal)
