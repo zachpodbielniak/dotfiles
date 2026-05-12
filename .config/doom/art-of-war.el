@@ -271,6 +271,23 @@ Built lazily by `aow--ensure-index'.")
     m)
   "Keymap for `aow-reader-mode'.")
 
+;; Evil intercepts single-key motion/normal-state bindings (n=search-next,
+;; r=replace, p=paste, RET=evil-ret, ...) before they reach the major-mode
+;; map.  Re-bind them in evil's normal+motion states so the reader's keys
+;; actually fire under Doom.
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal motion) aow-reader-mode-map
+    (kbd "q")   #'quit-window
+    (kbd "RET") #'aow-reader-jump-to-canonical
+    (kbd "n")   #'aow-reader-next-verse
+    (kbd "p")   #'aow-reader-prev-verse
+    (kbd "r")   #'aow-random-verse
+    (kbd "t")   #'aow-todays-verse
+    (kbd "c")   #'aow-reader-open-chapter
+    (kbd "m")   #'aow-reader-multi-translation
+    (kbd "?")   #'aow-reader-show-keys)
+  (evil-set-initial-state 'aow-reader-mode 'motion))
+
 (define-derived-mode aow-reader-mode special-mode "AoW"
   "Major mode for displaying a single verse in a popup buffer."
   (setq buffer-read-only t)
