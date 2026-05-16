@@ -34,6 +34,12 @@
 ;;   Alternatively, press 'gd' (or 'C-c c d') on a module to browse its
 ;;   directory (for easy access to its source code).
 
+;; Profile package init/config times.  Set before `doom!' so it's
+;; active when use-package expands any of the macros below.  After
+;; startup, inspect with `M-x use-package-report' — sortable table
+;; of per-package init/config/require costs.
+(setq use-package-compute-statistics t)
+
 (doom! :input
        ;;bidi              ; (tfel ot) thgir etirw uoy gnipleh
        ;;chinese
