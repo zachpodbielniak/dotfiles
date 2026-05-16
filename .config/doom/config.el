@@ -534,6 +534,7 @@ compositor seat."
 (load! "sf")                  ;; Salesforce Service Cloud client (case triage)
 (load! "art-of-war")          ;; Art of War daily-study client (SPC s a)
 (load! "container-registry-browse") ;; Container registry search + tag browse (SPC s c)
+(load! "+games")              ;; Games launcher + built-in/3rd-party game bundle (SPC G)
 
 
 ;;;; =========================================================================

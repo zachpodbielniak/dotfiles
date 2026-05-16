@@ -215,3 +215,49 @@
 ;; Not on MELPA — install direct from GitHub.
 (package! jellyfin-emms-mpv
   :recipe (:host github :repo "emacs-os/jellyfin-emms-mpv.el"))
+
+
+;;; --- Games (loaded by +games.el) ---
+
+;; ElCity — turn-based SimCity clone in Emacs Lisp.  Not on MELPA.
+(package! elcity
+  :recipe (:host github :repo "vkazanov/elcity"))
+
+;; Chess — John Wiegley's full chess client.  GNU ELPA.
+(package! chess)
+
+;; 2048 — the tile-merger.  MELPA.
+(package! 2048-game)
+
+;; Malyon — Z-machine interpreter; runs Infocom .z3/.z5/.z8 files.  MELPA.
+(package! malyon)
+
+;; NetHack — drives the real `nethack' binary from an Emacs buffer.
+;; Needs the nethack package binary installed (dnf install nethack).  MELPA.
+(package! nethack)
+
+;; Sudoku.  MELPA.
+(package! sudoku)
+
+;; Minesweeper.  MELPA.
+(package! minesweeper)
+
+;; Texas Hold'em poker.  GNU ELPA.
+(package! poker)
+
+;; GNU Go — play Go against the GNU Go engine.
+;; Needs `gnugo' binary on PATH (dnf install gnugo).  GNU ELPA.
+(package! gnugo)
+
+;; Speed-type — typing trainer using Project Gutenberg prose.  MELPA.
+(package! speed-type)
+
+;; Autotetris — watch Emacs play tetris by itself.  MELPA.
+(package! autotetris-mode)
+
+;; Fireplace — animated ASCII fireplace (ambience, not a game).  MELPA.
+(package! fireplace)
+
+;; Tamagotchi — virtual pet, first-elisp-project quality but fun.  GitHub only.
+(package! tamagotchi
+  :recipe (:host github :repo "tiatatida/tamagotchi-on-emacs"))
