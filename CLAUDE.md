@@ -96,6 +96,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Default location: $HOME/Documents/notes
 - can use our second_brain MCP to interact with this 
 
+## Doom Emacs Config (`./.config/doom/`)
+
+- Custom elisp files live flat in `./.config/doom/` and are loaded from `config.el` via `(load! "filename")` (no `.el` extension). See the loader block near `(load! "art-of-war")` for the pattern.
+- All custom `.el` files use the AGPLv3 header from `art-of-war.el:1-16`. Use the `;;; filename.el --- short -*- lexical-binding: t; -*-` header line and end with `(provide 'filename)` + `;;; filename.el ends here`.
+- Doom localleader is `SPC m`, **not** comma (comma is taken by evil-snipe). Use `:localleader "x"` bindings as `SPC m x`.
+- Color palette for faces is catppuccin-mocha — see `art-of-war.el:87-112` for the swatch.
+
+### Evil + tabulated-list-mode keybindings (the recurring footgun)
+
+When you define a `tabulated-list-mode`-derived major mode and want `RET`, `g`, `c`, etc. to do something:
+
+1. **`define-key` on the mode-map is not enough.** Under `doom/evil-collection`, these buffers land in evil **`normal` state**, where evil's own bindings (`RET` → `evil-ret`, `g` → `gg/gd` prefix, `G` → `evil-goto-line`, etc.) shadow the mode-map.
+2. **`map!` with `:n` / `:nm` is unreliable.** It expands to lazy `evil-define-key` which uses `evil-delay`; the binding may not land before the buffer is entered, and reloads (`SPC h r r`) don't re-trigger the delay.
+3. **The pattern that works** (see `sf.el:388` and `sf.el:486`):
+
+   ```elisp
+   (defvar my-mode-map
+     (let ((map (make-sparse-keymap)))
+       (set-keymap-parent map tabulated-list-mode-map)
+       (define-key map (kbd "RET")      #'my-action)
+       (define-key map (kbd "<return>") #'my-action)  ; GUI emacs sends <return>
+       (define-key map "g" #'my-refresh)
+       map))
+
+   (with-eval-after-load 'evil
+     (evil-define-key* 'normal my-mode-map
+       (kbd "RET")      #'my-action
+       (kbd "<return>") #'my-action
+       "g"              #'my-refresh))
+   ```
+
+   `evil-define-key*` (with the asterisk) is the **immediate, non-deferred** variant. Use it.
+
+4. To pick up keybinding changes after editing, **kill the existing buffer** (`C-x k`) before `SPC h r r` — the old buffer's keymap inheritance is already snapshot.
+
+### Reference patterns to copy
+
+- License header + `defgroup`/`defcustom`/face block: `art-of-war.el:1-112`
+- `tabulated-list-mode` derived mode with evil-aware keybindings: `sf.el:378-410`
+- `url-retrieve-synchronously` + `json-parse-buffer` HTTP helper: `arr.el:147-228`, `jackett.el:144-148`
+- `map!` `:leader` `:prefix` for user-facing commands: `art-of-war.el:601-610`
+- `pluggable registry`-style data-driven dispatch: `container-registry-browse.el` (`--registries` alist + `-register` API)
+
 ## Script Documentation
 - For any scripts in ./bin/scripts, to understand details:
   - Check the corresponding markkdown file at with out second-brain mcp 02_areas/repos/dotfiles/<script_name>.md
