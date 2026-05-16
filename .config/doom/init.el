@@ -34,11 +34,18 @@
 ;;   Alternatively, press 'gd' (or 'C-c c d') on a module to browse its
 ;;   directory (for easy access to its source code).
 
-;; Profile package init/config times.  Set before `doom!' so it's
-;; active when use-package expands any of the macros below.  After
-;; startup, inspect with `M-x use-package-report' — sortable table
-;; of per-package init/config/require costs.
-(setq use-package-compute-statistics t)
+;; Profile package init/config times.  Doom's `:config use-package'
+;; module unconditionally resets `use-package-compute-statistics' to
+;; the value of `init-file-debug' during its own init.el (see
+;; modules/config/use-package/init.el:18), so a plain top-level setq
+;; here gets clobbered before any use-package! macros expand.  Hook
+;; into the window *after* doom's module init.els run but *before*
+;; the module config.els (where most use-package!s live) so our
+;; setting wins.  After startup: `M-x use-package-report' for a
+;; sortable per-package init/config/require table.  Remove this once
+;; the heavy packages are defaulted to `:defer t'.
+(add-hook 'doom-before-modules-config-hook
+          (lambda () (setq use-package-compute-statistics t)))
 
 (doom! :input
        ;;bidi              ; (tfel ot) thgir etirw uoy gnipleh

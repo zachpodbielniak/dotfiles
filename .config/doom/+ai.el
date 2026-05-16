@@ -53,15 +53,25 @@
 ;;; AI prefix (SPC a)
 (map! :leader :desc "AI" "a" nil)
 
-;;; Claude Code CLI (runs `claude` as subprocess via vterm)
+;;; Claude Code CLI (runs `claude` as subprocess via vterm).
+;;; Deferred — package is heavy (~3.4s configure cost when eager),
+;;; loads on first invocation via the keybindings below.  `:init'
+;;; runs before the package loads so the terminal-backend var is
+;;; in place before claude-code reads it.
 (use-package! claude-code
-  :config
-  (setq claude-code-terminal-backend 'vterm)
-  (map! :leader
-        :desc "Claude Code"        "a c" #'claude-code-start
-        :desc "Claude send region" "a s" #'claude-code-send-region
-        :desc "Claude send buffer" "a b" #'claude-code-send-buffer
-        :desc "Claude fix error"   "a f" #'claude-code-send-flymake-to-claude))
+  :defer t
+  :commands (claude-code-start
+             claude-code-send-region
+             claude-code-send-buffer
+             claude-code-send-flymake-to-claude)
+  :init
+  (setq claude-code-terminal-backend 'vterm))
+
+(map! :leader
+      :desc "Claude Code"        "a c" #'claude-code-start
+      :desc "Claude send region" "a s" #'claude-code-send-region
+      :desc "Claude send buffer" "a b" #'claude-code-send-buffer
+      :desc "Claude fix error"   "a f" #'claude-code-send-flymake-to-claude)
 
 ;;; gptel rewrite & context (missing keybindings for existing features)
 (map! :leader

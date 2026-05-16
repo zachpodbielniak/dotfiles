@@ -50,7 +50,25 @@
 ;;; commands — and can be populated from MPD on demand with
 ;;; `M-x emms-player-mpd-update-all-reset-cache' (no filesystem work:
 ;;; MPD sends its library metadata over the protocol).
+;; Deferred — emms's `:config' body is heavy (~3s of work: `emms-minimalistic'
+;; pulls in 7+ subsystems, sets up advice, defines evil keymaps, etc.).  The
+;; `SPC z' commands listed in `:commands' trigger load on first invocation.
+;; Side effect: the +2s-idle `emms-player-mpd-connect' inside `:config' no
+;; longer auto-runs at startup — MPD connects the first time you press
+;; `SPC z p' (or any other emms command).  Trade-off is worth the 3s save.
 (use-package! emms
+  :defer t
+  :commands (emms-pause
+             emms-stop
+             emms-next
+             emms-previous
+             emms-playlist-mode-go
+             emms-browser
+             emms-cache-set-from-mpd-all
+             emms-volume-raise
+             emms-volume-lower
+             emms-shuffle
+             emms-show)
   :config
   (emms-minimalistic)
   (require 'emms-playlist-mode)
@@ -196,21 +214,23 @@ without touching MPD's queue."
      (condition-case err
          (emms-player-mpd-connect)
        (error (message "EMMS: MPD initial connect failed: %s"
-                       (error-message-string err))))))
+                       (error-message-string err)))))))
 
-  (map! :leader
-        (:prefix ("z" . "music")
-         :desc "Play/pause"     "p" #'emms-pause
-         :desc "Stop"           "s" #'emms-stop
-         :desc "Next track"     "n" #'emms-next
-         :desc "Previous track" "N" #'emms-previous
-         :desc "Playlist"       "l" #'emms-playlist-mode-go
-         :desc "Browser"        "b" #'emms-browser
-         :desc "Browser: prime from MPD" "B" #'emms-cache-set-from-mpd-all
-         :desc "Volume up"      "+" #'emms-volume-raise
-         :desc "Volume down"    "-" #'emms-volume-lower
-         :desc "Shuffle"        "S" #'emms-shuffle
-         :desc "Now playing"    "i" #'emms-show)))
+;; Bindings live at top level so they're active without loading emms; the
+;; first key press triggers the use-package!  `:config' block above.
+(map! :leader
+      (:prefix ("z" . "music")
+       :desc "Play/pause"     "p" #'emms-pause
+       :desc "Stop"           "s" #'emms-stop
+       :desc "Next track"     "n" #'emms-next
+       :desc "Previous track" "N" #'emms-previous
+       :desc "Playlist"       "l" #'emms-playlist-mode-go
+       :desc "Browser"        "b" #'emms-browser
+       :desc "Browser: prime from MPD" "B" #'emms-cache-set-from-mpd-all
+       :desc "Volume up"      "+" #'emms-volume-raise
+       :desc "Volume down"    "-" #'emms-volume-lower
+       :desc "Shuffle"        "S" #'emms-shuffle
+       :desc "Now playing"    "i" #'emms-show))
 
 (provide '+emms)
 ;;; +emms.el ends here

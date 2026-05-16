@@ -31,7 +31,10 @@
 ;;; Code:
 
 ;;; Ement.el: native Matrix client (E2EE via pantalaimon on localhost:8009)
+;;; Deferred — ~0.9s configure cost; loads on first `SPC M M' / `M-x ement-…'.
 (use-package! ement
+  :defer t
+  :commands (ement-connect ement-room-list ement-view-room ement-disconnect)
   :config
   ;; setopt (not setq) so the defcustom :set hook adds kill-emacs-hook
   (setopt ement-save-sessions t)
@@ -43,33 +46,45 @@
     (condition-case err
         (apply fn event args)
       (wrong-type-argument
-       (propertize "[image unavailable]" 'face 'font-lock-comment-face))))
-  ;; Connect through pantalaimon for E2EE support
-  (defun zach/ement-connect ()
-    "Connect to Matrix via pantalaimon proxy.
+       (propertize "[image unavailable]" 'face 'font-lock-comment-face)))))
+
+;; Forward declarations to silence byte-compile warnings — ement isn't
+;; loaded at compile time and these references are inside a function
+;; that does `(require 'ement)' before touching them.
+(defvar ement-sessions)
+(declare-function ement-connect "ement")
+(declare-function ement--read-sessions "ement")
+
+;; Connect through pantalaimon for E2EE support.  Lives at top level so
+;; the `SPC M M' keybinding can autoload it; explicitly requires ement
+;; before calling its functions.
+(defun zach/ement-connect ()
+  "Connect to Matrix via pantalaimon proxy.
 Restores saved session if available, otherwise prompts for login."
-    (interactive)
-    (if ement-sessions
-        ;; Already connected — just reconnect the first session
-        (ement-connect :session (cdar ement-sessions))
-      ;; Try to restore saved session from disk
-      (condition-case nil
-          (let ((saved (ement--read-sessions)))
-            (if saved
-                (ement-connect :session (cdar saved))
-              (error "No saved session")))
-        (error
-         ;; No saved session — fresh login through pantalaimon
-         (let ((user-id (read-string "User ID: " nil 'ement-connect-user-id-history))
-               (password (read-passwd "Password: ")))
-           (ement-connect :uri-prefix "http://localhost:8009"
-                          :user-id user-id
-                          :password password))))))
-  (map! :leader
-        :desc "Matrix connect" "M M" #'zach/ement-connect
-        :desc "Matrix rooms"   "M r" #'ement-room-list
-        :desc "Matrix view"    "M t" #'ement-view-room
-        :desc "Matrix disconnect" "M d" #'ement-disconnect))
+  (interactive)
+  (require 'ement)
+  (if ement-sessions
+      ;; Already connected — just reconnect the first session
+      (ement-connect :session (cdar ement-sessions))
+    ;; Try to restore saved session from disk
+    (condition-case nil
+        (let ((saved (ement--read-sessions)))
+          (if saved
+              (ement-connect :session (cdar saved))
+            (error "No saved session")))
+      (error
+       ;; No saved session — fresh login through pantalaimon
+       (let ((user-id (read-string "User ID: " nil 'ement-connect-user-id-history))
+             (password (read-passwd "Password: ")))
+         (ement-connect :uri-prefix "http://localhost:8009"
+                        :user-id user-id
+                        :password password))))))
+
+(map! :leader
+      :desc "Matrix connect"    "M M" #'zach/ement-connect
+      :desc "Matrix rooms"      "M r" #'ement-room-list
+      :desc "Matrix view"       "M t" #'ement-view-room
+      :desc "Matrix disconnect" "M d" #'ement-disconnect)
 
 (provide '+ement)
 ;;; +ement.el ends here

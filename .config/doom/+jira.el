@@ -36,14 +36,15 @@
 ;;; Jira issue tracker (jira.el) — requires Emacs 30+ (rx compat)
 ;;; Auth: store credentials in ~/.authinfo.gpg:
 ;;;   machine <instance>.atlassian.net login <email> port https password <api-token>
+;;; Deferred — ~1.2s configure cost; loads on first `SPC J' / `M-x jira-issues'.
 (use-package! jira
   :when (>= emacs-major-version 30)
+  :defer t
+  :commands (jira-issues)
   :config
   (setq jira-base-url "https://dt-rnd.atlassian.net"
         jira-api-version 3
         auth-sources '("~/.authinfo"))
-  (map! :leader
-        :desc "Jira issues" "J" #'jira-issues)
   ;; Evil overrides in jira-issues-mode
   (evil-define-key* 'normal jira-issues-mode-map
     (kbd "RET") (lambda () (interactive)
@@ -114,6 +115,12 @@
                     (goto-char (point-min))
                     (special-mode))
                   (pop-to-buffer "*jira-keys*"))))
+
+;; Leader binding at top level so it's active without loading jira; first
+;; press triggers the use-package!  `:config' block above.  Lives under
+;; `SPC o' ("open") next to monday and the other launch-style commands.
+(when (>= emacs-major-version 30)
+  (map! :leader :desc "Jira issues" "o J" #'jira-issues))
 
 (provide '+jira)
 ;;; +jira.el ends here

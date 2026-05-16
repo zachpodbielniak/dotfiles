@@ -394,17 +394,17 @@
 ;;;; Phase 3: Git, File Navigation, Terminal, Tmux
 ;;;; =========================================================================
 
-;;; Tmux pane navigation (replaces vim-tmux-navigator)
-;;; Seamless Ctrl-h/j/k/l across Emacs windows and tmux panes
+;;; Tmux pane navigation (replaces vim-tmux-navigator).
+;;; Seamless Ctrl-h/j/k/l across Emacs windows and tmux panes.
+;;; Deferred — `tmux-navigate' is autoloaded; first C-h/j/k/l press loads it.
 (use-package! navigate
-  :config
-  (require 'navigate)
-  ;; Ensure C-l isn't swallowed by Doom's global recenter binding
-  ;; and that all four directions work in normal, motion, and visual states
-  (map! :nvm "C-h" (cmd! (tmux-navigate "left"))
-        :nvm "C-j" (cmd! (tmux-navigate "down"))
-        :nvm "C-k" (cmd! (tmux-navigate "up"))
-        :nvm "C-l" (cmd! (tmux-navigate "right"))))
+  :defer t
+  :commands (tmux-navigate))
+
+(map! :nvm "C-h" (cmd! (tmux-navigate "left"))
+      :nvm "C-j" (cmd! (tmux-navigate "down"))
+      :nvm "C-k" (cmd! (tmux-navigate "up"))
+      :nvm "C-l" (cmd! (tmux-navigate "right")))
 
 ;;; Git keybindings (extending magit + diff-hl from vc-gutter)
 (map! :leader
@@ -714,36 +714,49 @@ compositor seat."
 ;;;; Forge / kanban / inventory / language ports
 ;;;; =========================================================================
 
-;;; Git forge management (port of gitctl-nvim; backend: gitctl)
+;;; Git forge management (port of gitctl-nvim; backend: gitctl).
+;;; Deferred — loads on first `SPC g G' / `SPC g B'.
 (use-package! gitctl-emacs
-  :config
+  :defer t
+  :commands (gitctl-repos gitctl-browse)
+  :init
   (setq gitctl-cmd "gitctl"
-        gitctl-confirm-actions t)
-  (map! :leader
-        :desc "Git forge"        "g G" #'gitctl-repos
-        :desc "Git forge browse" "g B" #'gitctl-browse))
+        gitctl-confirm-actions t))
 
-;;; Kanban/ticket management (port of vimban-nvim; replaces local vimban.el)
+(map! :leader
+      :desc "Git forge"        "g G" #'gitctl-repos
+      :desc "Git forge browse" "g B" #'gitctl-browse)
+
+;;; Kanban/ticket management (port of vimban-nvim; replaces local vimban.el).
+;;; Deferred — loads on first `SPC v X'.
 (use-package! vimban-emacs
-  :config
+  :defer t
+  :commands (vimban-open vimban-kanban vimban-new
+             vimban-search vimban-dashboard vimban-people)
+  :init
   (setq vimban-cmd       "vimban"
-        vimban-directory "~/Documents/notes")
-  (map! :leader
-        :desc "Tickets"       "v v" #'vimban-open
-        :desc "Kanban board"  "v k" #'vimban-kanban
-        :desc "New ticket"    "v n" #'vimban-new
-        :desc "Search"        "v s" #'vimban-search
-        :desc "Dashboard"     "v d" #'vimban-dashboard
-        :desc "People"        "v p" #'vimban-people))
+        vimban-directory "~/Documents/notes"))
 
-;;; Personal inventory tracker (port of possessions-nvim; backend: possessions)
+(map! :leader
+      :desc "Tickets"       "v v" #'vimban-open
+      :desc "Kanban board"  "v k" #'vimban-kanban
+      :desc "New ticket"    "v n" #'vimban-new
+      :desc "Search"        "v s" #'vimban-search
+      :desc "Dashboard"     "v d" #'vimban-dashboard
+      :desc "People"        "v p" #'vimban-people)
+
+;;; Personal inventory tracker (port of possessions-nvim; backend: possessions).
+;;; Deferred — loads on first `SPC P X'.
 (use-package! possessions-emacs
-  :config
-  (setq possessions-cmd "possessions")
-  (map! :leader
-        :desc "Possessions"  "P P" #'possessions-open
-        :desc "Add item"     "P a" #'possessions-add
-        :desc "Search items" "P s" #'possessions-search))
+  :defer t
+  :commands (possessions-open possessions-add possessions-search)
+  :init
+  (setq possessions-cmd "possessions"))
+
+(map! :leader
+      :desc "Possessions"  "P P" #'possessions-open
+      :desc "Add item"     "P a" #'possessions-add
+      :desc "Search items" "P s" #'possessions-search)
 
 ;;; GLib/GObject C language support (port of crispy-nvim; backend: crispy-language-server)
 (use-package! crispy-emacs
@@ -765,9 +778,13 @@ compositor seat."
                          "--modules-path"
                          "/var/home/zach/source/projects/podomation/build/debug/modules")))
 
-;;; monday.com client (GraphQL API)
+;;; monday.com client (GraphQL API).  Lives under `SPC o' ("open")
+;;; next to jira and the other launch-style commands, freeing `SPC M'
+;;; for the ement Matrix prefix.  Deferred via `:commands' — first
+;;; `SPC o M' press loads the package.
 (use-package! monday
-  :commands (monday monday-boards)
-  :config
-  (map! :leader
-        :desc "monday.com" "M" #'monday))
+  :defer t
+  :commands (monday monday-boards))
+
+(map! :leader
+      :desc "monday.com" "o M" #'monday)
