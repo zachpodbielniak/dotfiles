@@ -563,13 +563,15 @@ Used by `org-roam-dailies-capture-templates' below."
                     "%<%Y-%m-%d>.org"
                     ,(concat "#+title: %<%Y-%m-%d>\n\n"
                              "* Reflection\n"
-                             "%(aow--todays-verse-as-org-block)\n\n")))))
-  ;; Make sure org-roam knows about the study tree (it lives under
-  ;; org-roam-directory already, but force a DB sync after bootstrap so
-  ;; chapter :ID: nodes are immediately resolvable.)
-  (let ((aow-dir (aow--base-dir)))
-    (when (and (fboundp 'org-roam-db-sync) (file-directory-p aow-dir))
-      (run-with-idle-timer 2 nil #'org-roam-db-sync))))
+                             "%(aow--todays-verse-as-org-block)\n\n"))))))
+
+;; Note: previously this section also scheduled `org-roam-db-sync' on a
+;; 2-second idle timer to make sure the bootstrap-generated chapter :ID:
+;; nodes were immediately resolvable.  In practice this caused Emacs to
+;; appear to hang shortly after startup on machines with a large notes
+;; tree (the sync prompts for schema upgrades and processes every .org
+;; file synchronously).  Run `M-x org-roam-db-sync' manually when needed
+;; — or enable `org-roam-db-autosync-mode' if you want background sync.
 
 ;;; ------------------------------------------------------ dashboard hook
 ;;;
