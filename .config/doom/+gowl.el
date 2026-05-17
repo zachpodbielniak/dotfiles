@@ -44,6 +44,11 @@
   ;; Initialize gowl Elisp integration (loads bundled modules)
   (gowl-start)
 
+  ;; Per-host monitor rotation: otg-zach and pda-zach have their panels
+  ;; physically mounted at 270°, so apply transform 3 to compensate.
+  (when (member (system-name) '("otg-zach" "pda-zach"))
+    (gowl-set-monitor-transform 3))
+
   ;; Window opacity — dim unfocused clients
   (gowl-enable-module "alpha")
   (gowl-set-focused-alpha 0.9)
