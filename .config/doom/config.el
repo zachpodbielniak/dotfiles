@@ -198,6 +198,13 @@
 (defconst IS-GOWL (and (fboundp 'gowl-running-p) (gowl-running-p)))
 (load! "+gowl")
 
+;;; CMacs feature detection — non-nil only on a cmacs build with the
+;;; inline video (GStreamer) overlay feature compiled in.  Used to
+;;; gate `(load! "cmacs")' and any future cmacs-only modules.
+;;; `cmacs-video-open' is a C-level DEFUN present only when cmacs is
+;;; built with the video feature, so its fboundp is the cleanest probe.
+(defconst IS-CMACS (fboundp 'cmacs-video-open))
+
 ;;; Modeline (tmux-style status bar with catppuccin colors and icons)
 (load! "+modeline")
 
@@ -535,6 +542,7 @@ compositor seat."
 (load! "art-of-war")          ;; Art of War daily-study client (SPC s a)
 (load! "container-registry-browse") ;; Container registry search + tag browse (SPC s c)
 (load! "+games")              ;; Games launcher + built-in/3rd-party game bundle (SPC G)
+(when IS-CMACS (load! "cmacs")) ;; RTSP/RTSPS camera dashboard (cmacs builds only; SPC o v)
 
 
 ;;;; =========================================================================
@@ -788,3 +796,38 @@ compositor seat."
 
 (map! :leader
       :desc "monday.com" "o M" #'monday)
+
+;;; ──────────────────────────────────────────────────────────────────
+;;; Prefer fresh .el over stale .elc on load
+;;; ──────────────────────────────────────────────────────────────────
+;;;
+;;; Default Emacs behaviour: when both `foo.el' and `foo.elc' exist,
+;;; ALWAYS load `foo.elc' regardless of mtime.  That makes editing
+;;; lisp/cmacs/*.el a foot-gun — Doom auto-byte-compiles in the
+;;; background, your edits land in the .el, and you can spend an
+;;; hour wondering why the new defcustom is "void variable" while
+;;; the stale .elc shadows your fresh source.
+;;;
+;;; Flipping this makes Emacs compare mtimes; the .el wins when it's
+;;; newer.  Cost: a stat() on each file load — invisible.
+(setq load-prefer-newer t)
+
+;;; ──────────────────────────────────────────────────────────────────
+;;; cmacs dev tree takes precedence over system install
+;;; ──────────────────────────────────────────────────────────────────
+;;;
+;;; The `make install' from 2026-04-26 dropped a system copy of
+;;; cmacs's lisp/ into /usr/share/emacs/31.0.50/lisp/cmacs/.  That
+;;; path is on `load-path' BEFORE the dev tree at
+;;; ~/source/projects/cmacs/lisp/cmacs/, so every (require ...) and
+;;; autoload pulls the months-old system version instead of whatever
+;;; you're editing right now.  Symptom: edits to lisp/cmacs/*.el
+;;; never take effect — even after wiping every .elc/.eln you can
+;;; find — because the SYSTEM .elc is what's being loaded.
+;;;
+;;; Unconditionally move the dev tree to the front of load-path.
+;;; `add-to-list' alone would be a no-op when the dir is already
+;;; present further down the list, so we delete + cons.
+(let ((dev "/var/home/zach/source/projects/cmacs/lisp/cmacs"))
+  (when (file-directory-p dev)
+    (setq load-path (cons dev (delete dev load-path)))))
