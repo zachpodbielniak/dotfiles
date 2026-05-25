@@ -375,6 +375,16 @@ external binaries are checked first with a friendly error."
                 :description "Virtual pet — care for it, don't let it die"
                 :cmd #'tamaemacs :source 'recipe)
 
+;; emacslife — local module living under .config/doom/emacslife/.
+;; Loaded by `(load! "emacslife/emacslife")' in config.el; the :requires
+;; lambda guards against direct M-x games-launch/emacslife invocation
+;; before that load fires.
+(games-register :id 'emacslife    :name "EmacsLife"
+                :category "Simulation"
+                :description "BitLife clone — live a comedic life year-by-year"
+                :cmd #'emacslife :source 'recipe :keybind "L"
+                :requires (lambda () (require 'emacslife)))
+
 (games-register :id 'chess         :name "Chess"
                 :category "Strategy"
                 :description "Full chess; built-in AI by default"
@@ -454,6 +464,7 @@ external binaries are checked first with a friendly error."
        :desc "Chess"                    "c" #'games-launch/chess
        ;; Simulation
        :desc "ElCity"                   "e" #'games-launch/elcity
+       :desc "EmacsLife"                "L" #'games-launch/emacslife
        ;; Puzzle
        :desc "2048"                     "2" #'games-launch/2048-game
        :desc "Sudoku"                   "S" #'games-launch/sudoku
