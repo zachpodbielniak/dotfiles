@@ -1,0 +1,456 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly DEFAULT_HOST="10.0.1.37"
+readonly DEFAULT_WATCH_INTERVAL=5
+
+# ============================================================================
+# Help
+# ============================================================================
+
+usage () {
+    cat <<EOF
+${SCRIPT_NAME} - Query Moonraker (Creality Pad / Klipper) for print status
+
+USAGE:
+    ${SCRIPT_NAME} [OPTIONS]
+
+OPTIONS:
+    -H, --host HOST       Printer host or IP (default: \${PRINTER_HOST:-${DEFAULT_HOST}})
+    -v, --verbose         Multi-line detailed output
+    -j, --json            Curated JSON output (stable schema, scriptable)
+    -y, --yaml            Curated YAML output (same schema as --json)
+        --raw             Raw, full Moonraker JSON response
+    -w, --watch [SECS]    Poll every SECS seconds (default: ${DEFAULT_WATCH_INTERVAL})
+    -h, --help            Show this help
+    --license             Show license information
+
+ENVIRONMENT:
+    PRINTER_HOST          Default host if -H is not given
+    NO_COLOR              Disable ANSI color output
+
+EXAMPLES:
+    ${SCRIPT_NAME}                            One-line summary
+    ${SCRIPT_NAME} -v                         Detailed view
+    ${SCRIPT_NAME} -j | jq .progress_pct      Script against curated JSON
+    ${SCRIPT_NAME} -y                         YAML output
+    ${SCRIPT_NAME} --raw                      Full raw Moonraker response
+    ${SCRIPT_NAME} -w                         Watch with default interval
+    ${SCRIPT_NAME} -w 2                       Watch every 2 seconds
+    PRINTER_HOST=printer.lan ${SCRIPT_NAME}   Use env override
+
+DESCRIPTION:
+    Queries the Moonraker HTTP API on a Klipper-based printer (e.g. Creality
+    Sonic Pad / Nebula Pad) and prints the current print status: filename,
+    progress, ETA, and hotend/bed temperatures. Computes ETA from
+    print_duration / progress.
+
+EOF
+}
+
+show_license () {
+    cat <<'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak — AGPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+EOF
+}
+
+# ============================================================================
+# Color helpers
+# ============================================================================
+
+if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]
+then
+    readonly C_RESET=""
+    readonly C_DIM=""
+    readonly C_BOLD=""
+    readonly C_RED=""
+    readonly C_GREEN=""
+    readonly C_YELLOW=""
+    readonly C_BLUE=""
+    readonly C_CYAN=""
+else
+    readonly C_RESET=$'\033[0m'
+    readonly C_DIM=$'\033[2m'
+    readonly C_BOLD=$'\033[1m'
+    readonly C_RED=$'\033[31m'
+    readonly C_GREEN=$'\033[32m'
+    readonly C_YELLOW=$'\033[33m'
+    readonly C_BLUE=$'\033[34m'
+    readonly C_CYAN=$'\033[36m'
+fi
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Format seconds into H:MM:SS (or M:SS if under an hour).
+# Args: seconds (float or int)
+format_duration () {
+    local secs="${1}"
+    local total
+    total=$(printf '%.0f' "${secs}")
+    if (( total < 0 ))
+    then
+        total=0
+    fi
+    local h=$((total / 3600))
+    local m=$(((total % 3600) / 60))
+    local s=$((total % 60))
+    if (( h > 0 ))
+    then
+        printf '%d:%02d:%02d' "${h}" "${m}" "${s}"
+    else
+        printf '%d:%02d' "${m}" "${s}"
+    fi
+}
+
+# Color a state string based on its value.
+# Args: state
+color_state () {
+    local state="${1}"
+    case "${state}" in
+        printing)            printf '%s' "${C_YELLOW}${state}${C_RESET}" ;;
+        complete)            printf '%s' "${C_GREEN}${state}${C_RESET}" ;;
+        paused)              printf '%s' "${C_BLUE}${state}${C_RESET}" ;;
+        error|cancelled)     printf '%s' "${C_RED}${state}${C_RESET}" ;;
+        standby|idle|*)      printf '%s' "${C_DIM}${state}${C_RESET}" ;;
+    esac
+}
+
+# Fetch raw JSON status from Moonraker.
+# Args: host
+fetch_status () {
+    local host="${1}"
+    local url="http://${host}/printer/objects/query?print_stats&display_status&virtual_sdcard&extruder&heater_bed"
+    if ! curl -fsS -m 5 "${url}"
+    then
+        echo "${SCRIPT_NAME}: failed to reach Moonraker at ${host}" >&2
+        return 1
+    fi
+}
+
+# Render a one-line summary from JSON on stdin.
+render_oneline () {
+    jq -r --arg cR "${C_RESET}" \
+          --arg cD "${C_DIM}" \
+          --arg cB "${C_BOLD}" \
+          --arg cRed "${C_RED}" \
+          --arg cGrn "${C_GREEN}" \
+          --arg cYel "${C_YELLOW}" \
+          --arg cBlu "${C_BLUE}" \
+          --arg cCyn "${C_CYAN}" '
+        .result.status as $s
+        | ($s.print_stats // {}) as $ps
+        | ($s.display_status // {}) as $ds
+        | ($s.virtual_sdcard // {}) as $vs
+        | ($s.extruder // {}) as $ex
+        | ($s.heater_bed // {}) as $bd
+        | ($ps.state // "unknown") as $state
+        | ($ds.progress // $vs.progress // 0) as $progress
+        | ($ps.print_duration // 0) as $pd
+        | (if ($state == "printing" and $progress > 0.001)
+              then (($pd / $progress) - $pd)
+              else 0 end) as $eta
+        | (if   $state == "printing"  then $cYel
+            elif $state == "complete" then $cGrn
+            elif $state == "paused"   then $cBlu
+            elif ($state == "error" or $state == "cancelled") then $cRed
+            else $cD end) as $sc
+        | ($ps.filename // "") as $fn
+        | "\($sc)\($state)\($cR)  " +
+          (if $fn != "" then "\($cB)\($fn)\($cR)  " else "(no file)  " end) +
+          "\($cCyn)\(($progress * 100) | . * 10 | round / 10)%\($cR)  " +
+          (if $eta > 0
+              then "ETA \($cCyn)<<ETA>>\($cR) (done \($cCyn)<<FINISH>>\($cR))  "
+              else "" end) +
+          "H \(($ex.temperature // 0) | round)/\(($ex.target // 0) | round)°C  " +
+          "B \(($bd.temperature // 0) | round)/\(($bd.target // 0) | round)°C  " +
+          "[eta_secs=\($eta)]"
+    ' | awk -v reset="${C_RESET}" -v cyan="${C_CYAN}" '
+        {
+            # Extract eta_secs marker, format ETA + finish time, substitute back.
+            if (match($0, /\[eta_secs=([0-9.]+)\]/, m)) {
+                line = $0
+                sub(/  \[eta_secs=[0-9.]+\]/, "", line)
+                secs = m[1] + 0
+                total = int(secs + 0.5)
+                if (total < 0) total = 0
+                h = int(total / 3600)
+                rem = total % 3600
+                mi = int(rem / 60)
+                se = rem % 60
+                if (h > 0) {
+                    eta = sprintf("%d:%02d:%02d", h, mi, se)
+                } else {
+                    eta = sprintf("%d:%02d", mi, se)
+                }
+                # Finish time: prefix day-of-week if not today
+                now = systime()
+                finish_ts = now + total
+                if (strftime("%Y%j", now) == strftime("%Y%j", finish_ts)) {
+                    finish = strftime("%H:%M", finish_ts)
+                } else {
+                    finish = strftime("%a %H:%M", finish_ts)
+                }
+                sub(/<<ETA>>/, eta, line)
+                sub(/<<FINISH>>/, finish, line)
+                print line
+            } else {
+                print
+            }
+        }
+    '
+}
+
+# Render a curated, machine-readable JSON object from raw Moonraker JSON on stdin.
+# Schema is stable across invocations and intended for scripting.
+# Args: host
+render_structured () {
+    local host="${1}"
+    local now
+    now=$(date +%s)
+    jq --arg host "${host}" --argjson now "${now}" '
+        .result.status as $s
+        | ($s.print_stats // {}) as $ps
+        | ($s.display_status // {}) as $ds
+        | ($s.virtual_sdcard // {}) as $vs
+        | ($s.extruder // {}) as $ex
+        | ($s.heater_bed // {}) as $bd
+        | ($ps.state // "unknown") as $state
+        | ($ds.progress // $vs.progress // 0) as $progress
+        | ($ps.print_duration // 0) as $pd
+        | (if ($state == "printing" and $progress > 0.001)
+              then (($pd / $progress) - $pd)
+              else null end) as $eta
+        | {
+            host: $host,
+            timestamp: ($now | todate),
+            state: $state,
+            filename: ($ps.filename // null),
+            message: ($ps.message // null),
+            progress: ($progress | . * 10000 | round / 10000),
+            progress_pct: ($progress * 100 | . * 10 | round / 10),
+            elapsed_seconds: ($pd | round),
+            eta_seconds: (if $eta == null then null else ($eta | round) end),
+            finish_epoch: (if $eta == null then null else ($now + ($eta | round)) end),
+            finish_iso: (if $eta == null then null else (($now + ($eta | round)) | todate) end),
+            file_position: ($vs.file_position // null),
+            file_size: ($vs.file_size // null),
+            extruder: {
+                temperature: ($ex.temperature // null),
+                target: ($ex.target // null)
+            },
+            bed: {
+                temperature: ($bd.temperature // null),
+                target: ($bd.target // null)
+            }
+        }
+    '
+}
+
+# Render a multi-line detailed view from JSON on stdin.
+render_verbose () {
+    local json
+    json=$(cat)
+
+    local state filename progress pd eta fp fsz
+    state=$(jq -r '.result.status.print_stats.state // "unknown"' <<<"${json}")
+    filename=$(jq -r '.result.status.print_stats.filename // ""' <<<"${json}")
+    progress=$(jq -r '(.result.status.display_status.progress // .result.status.virtual_sdcard.progress // 0)' <<<"${json}")
+    pd=$(jq -r '.result.status.print_stats.print_duration // 0' <<<"${json}")
+    fp=$(jq -r '.result.status.virtual_sdcard.file_position // 0' <<<"${json}")
+    fsz=$(jq -r '.result.status.virtual_sdcard.file_size // 0' <<<"${json}")
+
+    local ex_t ex_tgt bd_t bd_tgt
+    ex_t=$(jq -r '.result.status.extruder.temperature // 0' <<<"${json}")
+    ex_tgt=$(jq -r '.result.status.extruder.target // 0' <<<"${json}")
+    bd_t=$(jq -r '.result.status.heater_bed.temperature // 0' <<<"${json}")
+    bd_tgt=$(jq -r '.result.status.heater_bed.target // 0' <<<"${json}")
+
+    # ETA
+    if [[ "${state}" == "printing" ]] && awk -v p="${progress}" 'BEGIN{exit !(p>0.001)}'
+    then
+        eta=$(awk -v pd="${pd}" -v p="${progress}" 'BEGIN{printf "%.0f", (pd/p)-pd}')
+    else
+        eta="0"
+    fi
+
+    local progress_pct
+    progress_pct=$(awk -v p="${progress}" 'BEGIN{printf "%.1f", p*100}')
+
+    printf '%sState:%s     %s\n'         "${C_BOLD}" "${C_RESET}" "$(color_state "${state}")"
+    printf '%sFile:%s      %s%s%s\n'     "${C_BOLD}" "${C_RESET}" "${C_CYAN}" "${filename:-(none)}" "${C_RESET}"
+    printf '%sProgress:%s  %s%%\n'       "${C_BOLD}" "${C_RESET}" "${progress_pct}"
+    printf '%sElapsed:%s   %s\n'         "${C_BOLD}" "${C_RESET}" "$(format_duration "${pd}")"
+    if [[ "${eta}" != "0" ]]
+    then
+        local finish_fmt
+        if [[ "$(date '+%Y%j')" == "$(date -d "+${eta} seconds" '+%Y%j')" ]]
+        then
+            finish_fmt=$(date -d "+${eta} seconds" '+%H:%M:%S')
+        else
+            finish_fmt=$(date -d "+${eta} seconds" '+%a %Y-%m-%d %H:%M:%S')
+        fi
+        printf '%sETA:%s       %s\n'     "${C_BOLD}" "${C_RESET}" "$(format_duration "${eta}")"
+        printf '%sFinish:%s    %s\n'     "${C_BOLD}" "${C_RESET}" "${finish_fmt}"
+    fi
+    if (( fsz > 0 ))
+    then
+        printf '%sBytes:%s     %s / %s\n' "${C_BOLD}" "${C_RESET}" "${fp}" "${fsz}"
+    fi
+    printf '%sHotend:%s    %.1f / %.1f °C\n' "${C_BOLD}" "${C_RESET}" "${ex_t}" "${ex_tgt}"
+    printf '%sBed:%s       %.1f / %.1f °C\n' "${C_BOLD}" "${C_RESET}" "${bd_t}" "${bd_tgt}"
+}
+
+# ============================================================================
+# Parse arguments
+# ============================================================================
+
+host="${PRINTER_HOST:-${DEFAULT_HOST}}"
+output_mode="oneline"   # oneline | verbose | json | yaml | raw
+watch_mode=false
+watch_interval="${DEFAULT_WATCH_INTERVAL}"
+
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --license)
+            show_license
+            exit 0
+            ;;
+        -H|--host)
+            if [[ -z "${2:-}" ]]
+            then
+                echo "${SCRIPT_NAME}: missing argument for ${1}" >&2
+                exit 1
+            fi
+            host="${2}"
+            shift 2
+            ;;
+        -v|--verbose)
+            output_mode="verbose"
+            shift
+            ;;
+        -j|--json)
+            output_mode="json"
+            shift
+            ;;
+        -y|--yaml)
+            output_mode="yaml"
+            shift
+            ;;
+        --raw)
+            output_mode="raw"
+            shift
+            ;;
+        -w|--watch)
+            watch_mode=true
+            shift
+            # Optional numeric argument for interval
+            if [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+            then
+                watch_interval="${1}"
+                shift
+            fi
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "${SCRIPT_NAME}: unknown option '${1}'" >&2
+            echo "Try '${SCRIPT_NAME} --help' for more information." >&2
+            exit 1
+            ;;
+        *)
+            echo "${SCRIPT_NAME}: unexpected argument '${1}'" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# ============================================================================
+# Main
+# ============================================================================
+
+render_once () {
+    local json
+    if ! json=$(fetch_status "${host}")
+    then
+        return 1
+    fi
+
+    case "${output_mode}" in
+        json)
+            echo "${json}" | render_structured "${host}"
+            ;;
+        yaml)
+            if ! command -v yq >/dev/null 2>&1
+            then
+                echo "${SCRIPT_NAME}: --yaml requires yq (https://github.com/mikefarah/yq)" >&2
+                return 1
+            fi
+            echo "${json}" | render_structured "${host}" | yq -p json -o yaml
+            ;;
+        raw)
+            echo "${json}" | jq .
+            ;;
+        verbose)
+            echo "${json}" | render_verbose
+            ;;
+        oneline|*)
+            echo "${json}" | render_oneline
+            ;;
+    esac
+}
+
+if [[ "${watch_mode}" == "true" ]]
+then
+    # Hide cursor, restore on exit
+    if [[ -t 1 ]]
+    then
+        trap 'printf "\033[?25h"; exit' INT TERM EXIT
+        printf '\033[?25l'
+    fi
+    while true
+    do
+        if [[ -t 1 ]]
+        then
+            # Clear screen + home
+            printf '\033[2J\033[H'
+            printf '%s%s%s @ %s\n\n' "${C_DIM}" "$(date '+%Y-%m-%d %H:%M:%S')" "${C_RESET}" "${host}"
+        fi
+        render_once || true
+        sleep "${watch_interval}"
+    done
+else
+    render_once
+fi
