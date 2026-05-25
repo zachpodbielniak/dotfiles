@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+projects_root="${HOME}/.claude/projects"
+all=false
+
+print_help() {
+    cat <<'EOF'
+claude_sessions - Resume a Claude Code session via an fzf picker
+
+Usage:
+  claude_sessions [OPTIONS]
+
+Options:
+  -a, --all     Show sessions from every project (not just $PWD)
+  -h, --help    Show this help and exit
+
+Description:
+  Lists Claude Code sessions sorted by last-active time (newest first)
+  and resumes the selected one via `claude --resume <id>`. By default
+  only sessions for the current working directory are shown.
+
+Examples:
+  claude_sessions          # sessions for the current directory
+  claude_sessions --all    # every session, every project
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "${1}" in
+        -a|--all)
+            all=true
+            shift
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument '${1}'" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+done
+
+for dep in jq fzf; do
+    if ! command -v "${dep}" >/dev/null 2>&1; then
+        echo "Error: required dependency '${dep}' not found in PATH" >&2
+        exit 1
+    fi
+done
+
+# Emit TSV rows for every .jsonl in a project dir:
+#   epoch_ms <TAB> session_id <TAB> project_label <TAB> msg_count <TAB> summary
+#
+# Filesystem mtimes are the source of truth — sessions-index.json's
+# fileMtime field is observed to be stale and its entry list drifts
+# from what is actually on disk. The index is consulted only as an
+# optional decoration to pull a nicer summary string by sessionId.
+collect_from_dir() {
+    local dir="${1}"
+    local index_file="${dir}/sessions-index.json"
+    local human_label
+    human_label=$(basename "${dir}")
+
+    local -A idx_summary=()
+    local -A idx_count=()
+
+    if [[ -f "${index_file}" ]]; then
+        local proj_path
+        proj_path=$(jq -r '(.entries[0]?.projectPath // "")' "${index_file}" 2>/dev/null || echo "")
+        [[ -n "${proj_path}" && "${proj_path}" != "null" ]] && human_label=$(basename "${proj_path}")
+
+        local sid summary count
+        while IFS=$'\t' read -r sid summary count; do
+            [[ -z "${sid}" ]] && continue
+            idx_summary["${sid}"]="${summary}"
+            idx_count["${sid}"]="${count}"
+        done < <(jq -r '
+            .entries[]?
+            | [
+                .sessionId,
+                ((.summary // .firstPrompt // "") | gsub("[\\n\\r\\t]+"; " ")),
+                (.messageCount // 0 | tostring)
+              ]
+            | @tsv
+        ' "${index_file}" 2>/dev/null || true)
+    fi
+
+    shopt -s nullglob
+    local jsonl_files=( "${dir}"/*.jsonl )
+    shopt -u nullglob
+
+    local f sid mtime_s mtime_ms msg_count summary
+    for f in "${jsonl_files[@]}"; do
+        sid=$(basename "${f}" .jsonl)
+        mtime_s=$(stat -c %Y "${f}" 2>/dev/null || echo 0)
+        mtime_ms=$(( mtime_s * 1000 ))
+
+        summary="${idx_summary[${sid}]:-}"
+        msg_count="${idx_count[${sid}]:-0}"
+
+        if [[ -z "${summary}" ]]; then
+            summary=$(grep -m1 '"type":"user"' "${f}" 2>/dev/null \
+                | jq -r '((.message.content // "") | if type=="string" then . else tostring end)' 2>/dev/null \
+                | tr '\n\r\t' '   ' \
+                | head -c 200 || true)
+            [[ -z "${summary}" ]] && summary="(no preview)"
+        fi
+        summary="${summary:0:200}"
+
+        if [[ "${msg_count}" == "0" || -z "${msg_count}" ]]; then
+            msg_count=$(wc -l < "${f}" 2>/dev/null || echo 0)
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "${mtime_ms}" "${sid}" "${human_label}" "${msg_count}" "${summary}"
+    done
+}
+
+# Resolve which project directories to scan.
+declare -a project_dirs
+if [[ "${all}" == true ]]; then
+    shopt -s nullglob
+    project_dirs=( "${projects_root}"/*/ )
+    shopt -u nullglob
+else
+    encoded=$(printf '%s' "${PWD}" | tr './' '-')
+    project_dirs=( "${projects_root}/${encoded}/" )
+fi
+
+if [[ ${#project_dirs[@]} -eq 0 ]]; then
+    echo "No Claude session directories found under ${projects_root}" >&2
+    exit 1
+fi
+
+# Gather raw TSV rows from all targeted project dirs.
+raw_rows=""
+for dir in "${project_dirs[@]}"; do
+    dir="${dir%/}"
+    [[ -d "${dir}" ]] || continue
+    chunk=$(collect_from_dir "${dir}")
+    [[ -n "${chunk}" ]] && raw_rows+="${chunk}"$'\n'
+done
+
+if [[ -z "${raw_rows// /}" ]]; then
+    if [[ "${all}" == true ]]; then
+        echo "No Claude sessions found." >&2
+    else
+        echo "No Claude sessions found for ${PWD}" >&2
+    fi
+    exit 1
+fi
+
+# Sort by epoch_ms descending (newest first).
+sorted=$(printf '%s' "${raw_rows}" | sed '/^$/d' | sort -t$'\t' -k1,1nr)
+
+# Format each row into a column-aligned visible string followed by a
+# hidden tab + full session ID. fzf will show only the visible column.
+display_rows=()
+while IFS=$'\t' read -r mtime_ms sid project msg_count summary; do
+    [[ -z "${sid}" ]] && continue
+    mtime_s=$(( mtime_ms / 1000 ))
+    if (( mtime_s > 0 )); then
+        date_str=$(date -d "@${mtime_s}" +"%Y-%m-%d %H:%M" 2>/dev/null || echo "????-??-?? ??:??")
+    else
+        date_str="????-??-?? ??:??"
+    fi
+    short_sid="${sid:0:8}"
+    proj_short="${project:0:20}"
+    visible=$(printf '%-16s  %-8s  %-20s  %4s  %s' \
+        "${date_str}" "${short_sid}" "${proj_short}" "${msg_count}" "${summary}")
+    display_rows+=( "${visible}"$'\t'"${sid}" )
+done <<< "${sorted}"
+
+if [[ ${#display_rows[@]} -eq 0 ]]; then
+    echo "No Claude sessions found." >&2
+    exit 1
+fi
+
+selection=$(printf '%s\n' "${display_rows[@]}" | \
+    fzf -i --height=100% --tmux center \
+        --header="Claude sessions  (Enter: resume, Ctrl-C: cancel)" \
+        --delimiter=$'\t' --with-nth=1 \
+        --preview='printf "%s\n" {1}' --preview-window=down:3:wrap || true)
+
+if [[ -z "${selection}" ]]; then
+    exit 0
+fi
+
+session_id="${selection##*$'\t'}"
+if [[ -z "${session_id}" ]]; then
+    echo "Error: could not extract session ID from selection" >&2
+    exit 1
+fi
+
+exec claude --resume "${session_id}"
