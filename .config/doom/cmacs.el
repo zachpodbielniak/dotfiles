@@ -352,6 +352,29 @@ filesystem path written."
          :desc "Stop ALL"              "S" #'cmacs-cams-stop-all
          :desc "Refresh dashboard"     "g" #'cmacs-cams-refresh)))
 
+;;; ------------------------------------------------------ libreclaw chat archive
+;;
+;; Archive every libreclaw conversation to a readable .org file under
+;; ~/Documents/notes/02_areas/libreclaw_chats/.  Both the embedded
+;; ("libreclaw") and remote ("libreclaw-remote") subsystems write here;
+;; they have independent settings but we point both at the same dir.
+;;
+;; File names use the default format "%y%m%d-%H%M%S-<agent-name>.org"
+;; (e.g. 260522-143015-claude.org) — the timestamp is the conversation
+;; start time and <agent-name> is the libreclaw agent.name.
+;;
+;; These are plain `setq's: `defcustom' is idempotent and keeps a value
+;; already set, so this works whether or not cmacs-libreclaw is loaded
+;; yet.  The directory itself is created lazily on first write.  The
+;; `defvar's just declare the symbols special so byte-compilation is
+;; clean before cmacs-libreclaw{,-remote}.el define them for real.
+(defvar cmacs-libreclaw-save-conversations-dir)
+(defvar cmacs-libreclaw-remote-save-conversations-dir)
+(let ((libreclaw-chats
+       (expand-file-name "~/Documents/notes/02_areas/libreclaw_chats/")))
+  (setq cmacs-libreclaw-save-conversations-dir        libreclaw-chats
+        cmacs-libreclaw-remote-save-conversations-dir libreclaw-chats))
+
 (provide 'cmacs)
 
 ;;; cmacs.el ends here
