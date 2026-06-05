@@ -168,22 +168,88 @@
   (add-hook 'c-mode-common-hook
             (lambda () (setq tab-width 4 c-basic-offset 4 evil-shift-width 4))))
 
-;;; Transparent background (replaces transparent.nvim)
-;;; GUI: set frame alpha; Terminal: clear face backgrounds
-(if (display-graphic-p)
-    (if (eq system-type 'darwin)
-        ;; macOS NS port: alpha-background is not supported, use alpha instead
-        (set-frame-parameter nil 'alpha '(95 . 85))
-      (set-frame-parameter nil 'alpha-background 95))
-  (add-hook 'doom-load-theme-hook
-            (lambda ()
-              (set-face-background 'default nil)
-              (set-face-background 'fringe nil)
-              (when (facep 'solaire-default-face)
-                (set-face-background 'solaire-default-face nil)))))
-;; Apply alpha to new frames too
+;;; Background handling (replaces transparent.nvim)
+;;; GUI frames get a translucent background (alpha).  TTY frames instead
+;;; clear their background faces so Emacs inherits the *terminal emulator's*
+;;; own background.  Our terminal is already Catppuccin Mocha, and `-nw'
+;;; Emacs can only 256-color-approximate the theme's 24-bit hex — the dark
+;;; mocha base (#1e1e2e) collapses to a muddy dark blue.  Letting the real
+;;; terminal background show through is an exact match for free.
+;;;
+;;; This MUST run per-frame, not just on `doom-load-theme-hook'.  We run
+;;; `emacs --daemon' + `emacsclient -nw', so the theme loads exactly once
+;;; (against a non-graphic pseudo-frame) and never reloads for the TTY
+;;; frames created later — a load-time-only hook silently misses every
+;;; `-nw' client.  Hence `after-make-frame-functions'.  And use the magic
+;;; "unspecified-bg" TTY color, NOT nil: nil leaves `default' falling back
+;;; to the (global) theme background instead of clearing it.
+(defun zach/tty-inherit-terminal-bg (&optional frame)
+  "Clear theme backgrounds on a TTY FRAME so it inherits the terminal's own.
+Every face below carries a subtle Catppuccin *surface* color that `-nw'
+Emacs can only 256-approximate — and they all collapse to the same muddy
+blue.  Giving each the magic \"unspecified-bg\" value lets the real terminal
+background (already Catppuccin Mocha) show through instead.
+
+Frame-local, so GUI frames served by the same daemon keep the theme's
+backgrounds.  No-op on graphic frames.  Callable interactively (`M-x') to
+re-apply to the current frame after editing the face list / reloading.
+
+Trim the list to keep any element's tint — e.g. drop `hl-line' if you'd
+rather still see the current line highlighted (clearing it removes the
+highlight entirely under `-nw', it doesn't soften it)."
+  (interactive)
+  (let ((frame (or frame (selected-frame))))
+    (unless (display-graphic-p frame)
+      (dolist (face '(;; editing surface (+ Doom's solaire variants for files)
+                      default fringe
+                      solaire-default-face solaire-fringe-face
+                      solaire-hl-line-face
+                      ;; line-number gutter
+                      line-number line-number-current-line
+                      ;; current-line highlight (clearing = no highlight)
+                      hl-line
+                      ;; the tab bar at the top.  `gt'/`gT' cycle the *native*
+                      ;; tab-bar (we use `tab-bar-new-tab' in shell-runner.el);
+                      ;; centaur-tabs faces are kept too in case `:ui tabs'
+                      ;; renders its own bar — clearing unused faces is a no-op.
+                      tab-bar tab-bar-tab tab-bar-tab-inactive
+                      tab-bar-tab-group-current tab-bar-tab-group-inactive
+                      tab-bar-tab-ungrouped
+                      centaur-tabs-default
+                      centaur-tabs-unselected centaur-tabs-selected
+                      centaur-tabs-unselected-modified
+                      centaur-tabs-selected-modified
+                      centaur-tabs-close-unselected centaur-tabs-close-selected
+                      centaur-tabs-modified-marker-unselected
+                      centaur-tabs-modified-marker-selected
+                      centaur-tabs-active-bar-face
+                      ;; the statusbar (Doom `:ui modeline' = doom-modeline)
+                      mode-line mode-line-active mode-line-inactive
+                      doom-modeline-bar doom-modeline-bar-inactive
+                      ;; org / markdown code + quote blocks
+                      org-block org-block-begin-line org-block-end-line
+                      org-quote org-code org-verbatim
+                      markdown-code-face markdown-pre-face
+                      markdown-inline-code-face markdown-blockquote-face
+                      ;; org headings: indentation, folded-ellipsis, and tags
+                      ;; (org-tag also covers tags in the agenda).  NB: this
+                      ;; only helps if the blue is a *background*; if a tag/
+                      ;; ellipsis is blue *text*, see the foreground note below.
+                      org-indent org-hide org-ellipsis org-tag))
+        (when (facep face)
+          (set-face-background face "unspecified-bg" frame))))))
+
+(add-hook 'doom-load-theme-hook       #'zach/tty-inherit-terminal-bg)
+(add-hook 'after-make-frame-functions #'zach/tty-inherit-terminal-bg)
+(add-hook 'window-setup-hook          #'zach/tty-inherit-terminal-bg)
+
+;;; GUI: translucent frame background (alpha).  No effect on TTY frames.
 (if (eq system-type 'darwin)
-    (add-to-list 'default-frame-alist '(alpha . (85 . 75)))
+    ;; macOS NS port: alpha-background is not supported, use alpha instead.
+    (progn
+      (when (display-graphic-p) (set-frame-parameter nil 'alpha '(95 . 85)))
+      (add-to-list 'default-frame-alist '(alpha . (85 . 75))))
+  (when (display-graphic-p) (set-frame-parameter nil 'alpha-background 95))
   (add-to-list 'default-frame-alist '(alpha-background . 85)))
 
 ;; macOS native fullscreen creates a separate Space and drops transparency.
