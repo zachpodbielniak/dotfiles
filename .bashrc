@@ -45,8 +45,8 @@ _set_editor() {
 	# only allow vi/vim/nvim for this, not emacs for quick things
 	# since loading `emacs -nw` takes a good amount of time
 	#if [[ "${1}" == "vi" ]] || [[ "${1}" == "vim" ]] || [[ "${1}" == "nvim" ]]
-	if [[ ! "${1}" =~ emacs ]]
-	then
+	# if [[ ! "${1}" =~ emacs ]]
+	# then
 		export EDITOR="${1}"
 		export VISUAL="${1}"
 		export GIT_EDITOR="${1}"
@@ -54,9 +54,9 @@ _set_editor() {
 		alias vi="${EDITOR}"
 		alias v="${EDITOR}"
 		alias nano="${EDITOR}"
-    else
-		alias e="${1}"
-	fi
+    # else
+	# 	alias e="${1}"
+	# fi
 
 }
 
@@ -92,6 +92,7 @@ _have vi && _set_editor "vi"
 _have vim && _set_editor "vim"
 _have nvim && _set_editor "nvim"
 _have emacs && _set_editor "emacs -nw"
+_have emacsclient && _set_editor "emacsclient -nw -c"
 
 # source the files if we have them
 _source "${HOME}/.bashrc-functions"
@@ -126,6 +127,8 @@ set -o vi
 
 
 # Aliases
+_have emacsclient && alias e="emacsclient -nw -c"
+_have emacsclient && alias eg="emacsclient -c"
 
 # distrobox
 if [[ -d "${HOME}/../linuxbrew/.linuxbrew" ]]
