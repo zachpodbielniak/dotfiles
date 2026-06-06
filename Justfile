@@ -34,6 +34,7 @@ stow quadlets="true": dep_dirs
         --ignore=share \
         --ignore=.gitconfig \
         --ignore=deps \
+        --ignore=.claude \
         "${IGNORE_FLAGS[@]}" \
         .
 
@@ -49,6 +50,7 @@ stow quadlets="true": dep_dirs
         --ignore=examples \
         --ignore=share \
         --ignore=.gitignore \
+        --ignore=.claude \
         vimban
 
 
@@ -88,6 +90,7 @@ stow_alt quadlets="true": dep_dirs
         --ignore=share \
         --ignore=.gitconfig \
         --ignore=deps \
+        --ignore=.claude \
         "${IGNORE_FLAGS[@]}" \
         .
 
@@ -103,6 +106,7 @@ stow_alt quadlets="true": dep_dirs
         --ignore=examples \
         --ignore=share \
         --ignore=.gitignore \
+        --ignore=.claude \
         vimban
 
 
