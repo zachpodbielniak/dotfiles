@@ -92,7 +92,10 @@ _have vi && _set_editor "vi"
 _have vim && _set_editor "vim"
 _have nvim && _set_editor "nvim"
 _have emacs && _set_editor "emacs -nw"
-_have emacsclient && _set_editor "emacsclient -nw -c"
+# emacsclient_tty wraps `emacsclient -nw -c` so it resolves the concrete
+# controlling pts -- plain `emacsclient -nw` forwards "/dev/tty" to the daemon
+# (which has no controlling terminal) and breaks pipe editors like vipe(1).
+_have emacsclient && _have emacsclient_tty && _set_editor "emacsclient_tty"
 
 # source the files if we have them
 _source "${HOME}/.bashrc-functions"
