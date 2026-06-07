@@ -375,6 +375,31 @@ filesystem path written."
   (setq cmacs-libreclaw-save-conversations-dir        libreclaw-chats
         cmacs-libreclaw-remote-save-conversations-dir libreclaw-chats))
 
+;;; ------------------------------------------------------ cmacs-ai chat archive
+;;
+;; Archive every cmacs-ai chat to a readable .org file under
+;; ~/Documents/notes/02_areas/cmacs_ai_chats/ — a sibling of the
+;; libreclaw_chats area above, so AI chats live in the PARA notes but
+;; stay separate.  Chats are auto-saved after each send, after each
+;; response, and on buffer-kill; the editable `* Compose' region is
+;; excluded.  Re-open and continue a saved chat with
+;; `M-x cmacs-ai-resume-chat' (or `C-c C-o' in a chat) — the model's
+;; context is rebuilt from the transcript and further turns append to
+;; the same file.
+;;
+;; File names use the default format "%y%m%d-%H%M%S-<provider>.org"
+;; (e.g. 260605-142345-claude.org) — the timestamp is the chat start
+;; time and <provider> is the cmacs-ai provider.
+;;
+;; Plain `setq' (defcustom keeps an already-set value) so this works
+;; whether or not cmacs-ai is loaded yet; the `defvar' just declares the
+;; symbol special for clean byte-compilation.  Archiving is on by
+;; default (`cmacs-ai-chat-autosave' defaults to t), so only the
+;; directory needs setting; it is created lazily on first write.
+(defvar cmacs-ai-chat-dir)
+(setq cmacs-ai-chat-dir
+      (expand-file-name "~/Documents/notes/02_areas/cmacs_ai_chats/"))
+
 (provide 'cmacs)
 
 ;;; cmacs.el ends here

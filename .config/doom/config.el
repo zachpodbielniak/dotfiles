@@ -610,6 +610,7 @@ compositor seat."
 (load! "+games")              ;; Games launcher + built-in/3rd-party game bundle (SPC G)
 (load! "emacslife/emacslife") ;; EmacsLife — BitLife clone (SPC G L)
 (when IS-CMACS (load! "cmacs")) ;; RTSP/RTSPS camera dashboard (cmacs builds only; SPC o v)
+(when IS-CMACS (load! "+cmacs-ai")) ;; per-provider model overrides (ollama → gemma4:26b)
 
 
 ;;;; =========================================================================
