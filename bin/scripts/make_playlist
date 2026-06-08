@@ -1,0 +1,265 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# Media extensions recognised when a directory is given (case-insensitive).
+media_exts="mp3 flac ogg oga opus m4a aac wav wma alac aiff aif ape wv mpc \
+mp4 mkv avi mov webm flv wmv m4v mpg mpeg ts m2ts 3gp"
+
+usage () {
+	cat << 'EOF'
+make_playlist - Generate an (extended) M3U media playlist from files
+
+USAGE:
+	make_playlist [OPTIONS] [FILE|DIR ...]
+	find . -name '*.flac' | make_playlist [OPTIONS]
+
+OPTIONS:
+	-h, --help              Show this help message
+	--license               Show license information
+	-o, --output FILE       Write the playlist to FILE instead of stdout
+	-i, --input FILE        Existing playlist to use as a base; new entries
+	                        are appended to it. May be given multiple times.
+	-r, --relative          Write paths relative to the output dir (or CWD)
+	-a, --absolute          Write absolute paths (default)
+	-k, --keep              Write paths exactly as given on the command line
+	-s, --simple            Plain path-only playlist (omit #EXTM3U/#EXTINF)
+	--no-recurse            Do not descend into directories
+	--allow-duplicates      Do not skip entries whose path is already present
+
+DESCRIPTION:
+	Builds an extended M3U playlist (#EXTM3U with #EXTINF duration/title
+	lines) from the files passed as arguments. Directories are scanned
+	recursively for media files unless --no-recurse is given. Track
+	duration and title metadata are read with ffprobe when available;
+	otherwise a duration of -1 and the file's basename are used.
+
+	With -i, the named playlist(s) are loaded first and the new files are
+	appended, so you can grow a playlist over time. Duplicate paths are
+	skipped by default. -i and -o may reference the same file safely.
+
+	If no files are given on the command line and stdin is not a terminal,
+	newline-separated file paths are read from stdin.
+
+EXAMPLES:
+	make_playlist *.mp3 > mix.m3u
+	make_playlist -o mix.m3u ~/Music/album
+	make_playlist -i mix.m3u -o mix.m3u newtrack.flac
+	find ~/Music -name '*.opus' | make_playlist -r -o all.m3u
+
+EOF
+}
+
+output=""
+inputs=()
+files=()
+path_mode="absolute"
+simple=false
+recurse=true
+allow_dupes=false
+
+warn () {
+	printf 'make_playlist: %s\n' "${1}" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+	case "${1}" in
+		-h|--help) usage; exit 0 ;;
+		--license) echo "AGPLv3"; exit 0 ;;
+		-o|--output)
+			[[ $# -ge 2 ]] || { warn "${1} requires an argument"; exit 1; }
+			output="${2}"; shift 2 ;;
+		-i|--input)
+			[[ $# -ge 2 ]] || { warn "${1} requires an argument"; exit 1; }
+			inputs+=("${2}"); shift 2 ;;
+		-r|--relative) path_mode="relative"; shift ;;
+		-a|--absolute) path_mode="absolute"; shift ;;
+		-k|--keep) path_mode="keep"; shift ;;
+		-s|--simple) simple=true; shift ;;
+		--no-recurse) recurse=false; shift ;;
+		--allow-duplicates) allow_dupes=true; shift ;;
+		--) shift; while [[ $# -gt 0 ]]; do files+=("${1}"); shift; done ;;
+		-*) warn "unknown option: ${1}"; usage >&2; exit 1 ;;
+		*) files+=("${1}"); shift ;;
+	esac
+done
+
+# Fall back to reading file paths from stdin when none were given as args.
+if [[ ${#files[@]} -eq 0 && ! -t 0 ]]; then
+	while IFS= read -r _line; do
+		_line="${_line%$'\r'}"
+		[[ -n "${_line}" ]] && files+=("${_line}")
+	done
+fi
+
+if [[ ${#files[@]} -eq 0 && ${#inputs[@]} -eq 0 ]]; then
+	warn "no input files given"
+	usage >&2
+	exit 1
+fi
+
+# Base directory used when writing relative paths.
+if [[ -n "${output}" ]]; then
+	rel_base="$(dirname -- "$(realpath -m -- "${output}")")"
+else
+	rel_base="${PWD}"
+fi
+
+have_ffprobe=false
+command -v ffprobe >/dev/null 2>&1 && have_ffprobe=true
+
+# Transform an on-disk path into the string written to the playlist.
+transform_path () {
+	local f="${1}"
+	case "${path_mode}" in
+		absolute) realpath -m -- "${f}" ;;
+		relative) realpath -m --relative-to="${rel_base}" -- "${f}" ;;
+		keep)     printf '%s' "${f}" ;;
+	esac
+}
+
+# ffprobe a single tag value (prints nothing on failure).
+probe_tag () {
+	ffprobe -v error -show_entries "format_tags=${2}" \
+		-of default=noprint_wrappers=1:nokey=1 -- "${1}" 2>/dev/null || true
+}
+
+get_duration () {
+	local d
+	d="$(ffprobe -v error -show_entries format=duration \
+		-of default=noprint_wrappers=1:nokey=1 -- "${1}" 2>/dev/null || true)"
+	if [[ "${d}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+		printf '%.0f' "${d}"
+	else
+		printf '%d' -1
+	fi
+}
+
+get_title () {
+	local f="${1}" artist title base
+	artist="$(probe_tag "${f}" artist)"
+	title="$(probe_tag "${f}" title)"
+	base="$(basename -- "${f}")"; base="${base%.*}"
+	if [[ -n "${artist}" && -n "${title}" ]]; then
+		printf '%s - %s' "${artist}" "${title}"
+	elif [[ -n "${title}" ]]; then
+		printf '%s' "${title}"
+	else
+		printf '%s' "${base}"
+	fi
+}
+
+# Build the find name-filter expression once.
+find_name_args=()
+_first=true
+for _e in ${media_exts}; do
+	if [[ "${_first}" == true ]]; then
+		find_name_args+=( -iname "*.${_e}" ); _first=false
+	else
+		find_name_args+=( -o -iname "*.${_e}" )
+	fi
+done
+
+# Expand args into a NUL-delimited stream of concrete files.
+collect_files () {
+	local arg="${1}"
+	if [[ -d "${arg}" ]]; then
+		if [[ "${recurse}" == true ]]; then
+			find "${arg}" -type f \( "${find_name_args[@]}" \) -print0 \
+				| sort -z
+		else
+			warn "skipping directory (use without --no-recurse): ${arg}"
+		fi
+	elif [[ -f "${arg}" ]]; then
+		printf '%s\0' "${arg}"
+	else
+		warn "no such file or directory: ${arg}"
+	fi
+}
+
+real_files=()
+if [[ ${#files[@]} -gt 0 ]]; then
+	while IFS= read -r -d '' f; do
+		real_files+=("${f}")
+	done < <(for arg in "${files[@]}"; do collect_files "${arg}"; done)
+fi
+
+tmp="$(mktemp)"
+trap 'rm -f "${tmp}"' EXIT
+
+declare -A seen=()
+
+# Header.
+if [[ "${simple}" == false ]]; then
+	printf '#EXTM3U\n' >> "${tmp}"
+fi
+
+# Replay existing playlists first (de-duplicated, header stripped).
+for pl in ${inputs[@]+"${inputs[@]}"}; do
+	if [[ ! -f "${pl}" ]]; then
+		warn "input playlist not found: ${pl}"
+		continue
+	fi
+	buffer=()
+	while IFS= read -r line || [[ -n "${line}" ]]; do
+		line="${line%$'\r'}"
+		[[ "${line}" == \#EXTM3U* ]] && continue
+		[[ -z "${line}" ]] && continue
+		if [[ "${line}" == \#* ]]; then
+			buffer+=("${line}")
+			continue
+		fi
+		if [[ "${allow_dupes}" == false && -n "${seen["${line}"]:-}" ]]; then
+			buffer=()
+			continue
+		fi
+		seen["${line}"]=1
+		if [[ "${simple}" == false && ${#buffer[@]} -gt 0 ]]; then
+			printf '%s\n' "${buffer[@]}" >> "${tmp}"
+		fi
+		printf '%s\n' "${line}" >> "${tmp}"
+		buffer=()
+	done < "${pl}"
+done
+
+# Append the new files.
+for f in ${real_files[@]+"${real_files[@]}"}; do
+	p="$(transform_path "${f}")"
+	if [[ "${allow_dupes}" == false && -n "${seen["${p}"]:-}" ]]; then
+		continue
+	fi
+	seen["${p}"]=1
+	if [[ "${simple}" == false ]]; then
+		if [[ "${have_ffprobe}" == true ]]; then
+			dur="$(get_duration "${f}")"
+			ttl="$(get_title "${f}")"
+		else
+			dur="-1"
+			ttl="$(basename -- "${f}")"; ttl="${ttl%.*}"
+		fi
+		printf '#EXTINF:%s,%s\n' "${dur}" "${ttl}" >> "${tmp}"
+	fi
+	printf '%s\n' "${p}" >> "${tmp}"
+done
+
+if [[ -n "${output}" ]]; then
+	cat "${tmp}" > "${output}"
+	warn "wrote playlist: ${output}"
+else
+	cat "${tmp}"
+fi
