@@ -1,0 +1,155 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# nas-sleep-guard: detach the network sshfs mounts before the system suspends,
+# and restore them on resume.
+#
+# A dead NAS link leaves the mounts' I/O threads parked in uninterruptible (D)
+# state inside FUSE. The suspend freezer cannot freeze a D-state task, so the
+# suspend aborts ("tasks refusing to freeze") and logind retries forever -- the
+# machine appears hung and needs a hard power-off. This surfaced after the
+# 7.0.10 -> 7.0.11 kernel bump (Immutablue 44.20260606.0).
+#
+# There is no sleep.target in the systemd --user manager, so this runs as a
+# long-lived user service that holds a logind *delay* inhibitor and watches the
+# PrepareForSleep signal. On suspend it records which NAS mounts are active and
+# lazily unmounts them (returns even if the link is hung), then releases the
+# lock -- so the unmount is guaranteed to finish before the kernel freezes
+# userspace. On resume it restarts exactly those mounts (these are direct
+# mounts, not automounts, so resume must remount explicitly; it retries while
+# the network settles).
+
+# NOTE: intentionally no `-e`; this is an event loop that must survive benign
+# non-zero exits (e.g. unmounting a path that is already idle).
+set -uo pipefail
+
+# --- configuration -----------------------------------------------------------
+
+# sshfs mount units to detach before sleep / restore after resume.
+MOUNT_UNITS=(
+  var-home-zach-data-mnt-nas-dpool.mount
+  var-home-zach-data-mnt-nas-apool.mount
+  var-home-zach-data-mnt-nas-ypool.mount
+  var-home-zach-data-mnt-srvzach.mount
+)
+
+# Pin system binaries: a `systemd --user` service must not pick up the linuxbrew
+# shims that sit earlier on PATH.
+GDBUS=/usr/bin/gdbus
+INHIBIT=/usr/bin/systemd-inhibit
+FUSERMOUNT=/usr/bin/fusermount3
+SYSTEMCTL=/usr/bin/systemctl
+
+LOGIND_DEST=org.freedesktop.login1
+LOGIND_PATH=/org/freedesktop/login1
+
+# Mounts that were active when we suspended, restored on resume.
+TO_REMOUNT=()
+
+# --- delay inhibitor ---------------------------------------------------------
+# Held as a backgrounded `systemd-inhibit ... sleep infinity`; killing it
+# releases the lock and lets logind proceed with the suspend.
+
+lock_pid=""
+
+take_lock () {
+  [[ -n "${lock_pid}" ]] && kill -0 "${lock_pid}" 2>/dev/null && return 0
+  "${INHIBIT}" --what=sleep --who="nas-sleep-guard" \
+    --why="unmount NAS sshfs before suspend" --mode=delay \
+    sleep infinity &
+  lock_pid=$!
+  return 0
+}
+
+drop_lock () {
+  [[ -n "${lock_pid}" ]] && kill "${lock_pid}" 2>/dev/null
+  lock_pid=""
+  return 0
+}
+
+# --- mount handling ----------------------------------------------------------
+
+# Record which mounts are active, then lazily detach all of them. Lazy unmount
+# returns immediately even if the NAS link is hung. Runs while the delay
+# inhibitor is held, so it completes before logind freezes userspace.
+unmount_nas () {
+  local unit where
+  TO_REMOUNT=()
+  for unit in "${MOUNT_UNITS[@]}"; do
+    "${SYSTEMCTL}" --user is-active --quiet "${unit}" && TO_REMOUNT+=("${unit}")
+    where="$("${SYSTEMCTL}" --user show -p Where --value "${unit}" 2>/dev/null)"
+    [[ -n "${where}" ]] && "${FUSERMOUNT}" -uz "${where}" 2>/dev/null
+  done
+  "${SYSTEMCTL}" --user reset-failed "${MOUNT_UNITS[@]}" 2>/dev/null
+  return 0
+}
+
+# Restart the mounts that were active before suspend. The .mount units order
+# after network-online.target, but on resume the network may still be settling
+# and there is no `reconnect`, so a too-early attempt just fails -- retry a few
+# times in the background without blocking the signal loop.
+remount_nas () {
+  [[ ${#TO_REMOUNT[@]} -eq 0 ]] && return 0
+  local units=("${TO_REMOUNT[@]}")
+  (
+    for _ in 1 2 3 4 5 6; do
+      pending=()
+      for unit in "${units[@]}"; do
+        "${SYSTEMCTL}" --user is-active --quiet "${unit}" || pending+=("${unit}")
+      done
+      [[ ${#pending[@]} -eq 0 ]] && exit 0
+      "${SYSTEMCTL}" --user start "${pending[@]}" 2>/dev/null
+      sleep 5
+    done
+  ) &
+  return 0
+}
+
+# --- main loop ---------------------------------------------------------------
+
+mon_pid=""
+
+cleanup () {
+  drop_lock
+  [[ -n "${mon_pid}" ]] && kill "${mon_pid}" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT INT TERM
+
+# Arm the inhibitor before watching so the very first suspend can't slip past.
+take_lock
+
+# Single persistent monitor: catches PrepareForSleep(true) and (false) in order,
+# so there is no missed-signal race around resume.
+coproc MON { "${GDBUS}" monitor --system \
+  --dest "${LOGIND_DEST}" --object-path "${LOGIND_PATH}"; }
+# MON_PID is set automatically by the `coproc MON` above.
+# shellcheck disable=SC2153
+mon_pid="${MON_PID}"
+
+while IFS= read -r line <&"${MON[0]}"; do
+  case "${line}" in
+    *PrepareForSleep*true*)
+      unmount_nas
+      drop_lock        # release -> logind proceeds with the suspend
+      ;;
+    *PrepareForSleep*false*)
+      remount_nas      # resumed -> restore what was mounted (retries in bg)
+      take_lock        # re-arm for the next suspend
+      ;;
+  esac
+done
