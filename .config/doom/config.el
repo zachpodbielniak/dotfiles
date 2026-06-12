@@ -373,6 +373,12 @@ highlight entirely under `-nw', it doesn't soften it)."
 (setq initial-major-mode 'lisp-interaction-mode          ; *scratch* buffer
       doom-scratch-buffer-major-mode 'lisp-interaction-mode) ; SPC x scratch
 
+;; Keep the `=> result' eval overlay (eros) visible after eval. The default
+;; `command' duration erases it before the next command, so it vanished the
+;; instant the cursor moved. nil = persist until the next eval.
+(after! eros
+  (setq eros-eval-result-duration nil))
+
 ;;; Sync all Evil yank/delete operations to system clipboard
 (after! evil
   (setq evil-want-clipboard t)
