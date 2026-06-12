@@ -80,6 +80,9 @@
 (package! navigate
   :recipe (:host github :repo "keith/evil-tmux-navigator"))
 
+;; tmux-like multiple vterm sessions: spawn, cycle, project + dedicated terms
+(package! multi-vterm)
+
 ;; Justfile syntax highlighting (replaces vim-just)
 (package! just-mode)
 
@@ -153,12 +156,6 @@
   :recipe (:type git
            :host nil
            :repo "https://git.podbielniak.com/zachpodbielniak/gitctl-emacs"))
-
-;; vimban-emacs: Kanban/ticket management (port of vimban-nvim)
-(package! vimban-emacs
-  :recipe (:type git
-           :host nil
-           :repo "https://git.podbielniak.com/zachpodbielniak/vimban-emacs"))
 
 ;; possessions-emacs: Personal inventory tracker (port of possessions-nvim)
 (package! possessions-emacs

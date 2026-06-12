@@ -521,6 +521,15 @@ highlight entirely under `-nw', it doesn't soften it)."
 (add-hook! 'vterm-mode-hook
   (display-line-numbers-mode -1))
 
+;;; tmux-like multiple vterm sessions.  M-i stays the singleton popup;
+;;; multi-vterm adds named/numbered terminals you can cycle (SPC v t / T,
+;;; mirroring gt/gT), plus per-project and a dedicated bottom terminal.
+;;; Keybindings live under SPC v (see the leader block below).
+(use-package! multi-vterm
+  :after vterm
+  :config
+  (setq multi-vterm-dedicated-window-height-percent 30))
+
 ;;; C-Escape: send a literal Escape to the active buffer's underlying
 ;;; program.  Useful inside vterm running nvim or a nested `emacs -nw`,
 ;;; or — when running under gowl — inside a gowl-embedded Wayland app.
@@ -809,23 +818,17 @@ compositor seat."
       :desc "Git forge"        "g G" #'gitctl-repos
       :desc "Git forge browse" "g B" #'gitctl-browse)
 
-;;; Kanban/ticket management (port of vimban-nvim; replaces local vimban.el).
-;;; Deferred — loads on first `SPC v X'.
-(use-package! vimban-emacs
-  :defer t
-  :commands (vimban-open vimban-kanban vimban-new
-             vimban-search vimban-dashboard vimban-people)
-  :init
-  (setq vimban-cmd       "vimban"
-        vimban-directory "~/Documents/notes"))
-
+;;; vterm multiplexing under SPC v (tmux-like).  t/T cycle next/prev,
+;;; mirroring the gt/gT tab motions.
 (map! :leader
-      :desc "Tickets"       "v v" #'vimban-open
-      :desc "Kanban board"  "v k" #'vimban-kanban
-      :desc "New ticket"    "v n" #'vimban-new
-      :desc "Search"        "v s" #'vimban-search
-      :desc "Dashboard"     "v d" #'vimban-dashboard
-      :desc "People"        "v p" #'vimban-people)
+      :desc "vterm" "v" nil
+      (:prefix ("v" . "vterm")
+       :desc "New vterm"       "v" #'multi-vterm
+       :desc "Next vterm"      "t" #'multi-vterm-next
+       :desc "Prev vterm"      "T" #'multi-vterm-prev
+       :desc "Rename vterm"    "r" #'rename-buffer
+       :desc "Project vterm"   "p" #'multi-vterm-project
+       :desc "Dedicated vterm" "d" #'multi-vterm-dedicated-toggle))
 
 ;;; Personal inventory tracker (port of possessions-nvim; backend: possessions).
 ;;; Deferred — loads on first `SPC P X'.
