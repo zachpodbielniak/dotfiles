@@ -80,6 +80,16 @@
 ;;; Line numbers
 (setq display-line-numbers-type t)
 
+;;; Mouse-draggable window borders.
+;;; Vertical resize (stacked windows) already works by dragging the
+;;; mode-line.  Horizontal resize needs a grabbable handle — the default
+;;; 1px border between side-by-side windows is too thin to hit, so widen
+;;; the right divider into something the mouse can grab and drag.
+(setq window-divider-default-places  t
+      window-divider-default-right-width  6   ; px — the draggable handle
+      window-divider-default-bottom-width 1)
+(window-divider-mode 1)
+
 ;;; GTK-style right-click context menu (Emacs 28+).  Without this,
 ;;; mouse-3 is `mouse-save-then-kill'; with it, mouse-3 opens an
 ;;; extensible menu that packages like org-remark inject entries
