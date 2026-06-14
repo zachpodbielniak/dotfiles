@@ -121,10 +121,11 @@ FLAVOR is one of mocha, macchiato, frappe, or latte."
 
 (map! :leader
       (:prefix ("t" . "toggle")
-       (:prefix ("t" . "theme")
+       (:prefix ("t" . "theme/ui")
         :desc "Select (live preview)" "t" #'consult-theme
         :desc "Catppuccin flavor"     "f" #'zach/catppuccin-flavor
-        :desc "Default Emacs"         "d" #'zach/theme-default-emacs)))
+        :desc "Default Emacs"         "d" #'zach/theme-default-emacs
+        :desc "Transparency (toggle)" "o" #'zach/toggle-transparency)))
 
 ;;; Line numbers
 (setq display-line-numbers-type t)
@@ -310,6 +311,27 @@ highlight entirely under `-nw', it doesn't soften it)."
       (add-to-list 'default-frame-alist '(alpha . (85 . 75))))
   (when (display-graphic-p) (set-frame-parameter nil 'alpha-background 95))
   (add-to-list 'default-frame-alist '(alpha-background . 85)))
+
+;;; Transparency toggle (bound to SPC t t o).  Flip the GUI frame between fully
+;;; opaque and the configured translucency.  Linux/PGTK uses `alpha-background';
+;;; the macOS NS port uses `alpha'.  `zach/frame-alpha' mirrors the
+;;; `default-frame-alist' values just above — keep them in sync if you retune.
+(defvar zach/frame-alpha (if (eq system-type 'darwin) '(85 . 75) 85)
+  "Translucent alpha value to toggle back to; mirrors `default-frame-alist'.")
+
+(defun zach/toggle-transparency ()
+  "Toggle the current GUI frame between opaque and `zach/frame-alpha'.
+No-op on TTY frames — terminal transparency is the emulator's job."
+  (interactive)
+  (if (not (display-graphic-p))
+      (message "Transparency: TTY frame — set it in your terminal emulator")
+    (let* ((param  (if (eq system-type 'darwin) 'alpha 'alpha-background))
+           (opaque (if (eq system-type 'darwin) '(100 . 100) 100))
+           (cur    (frame-parameter nil param))
+           (active (if (consp cur) (car cur) cur))
+           (now-opaque (or (null active) (>= active 100))))
+      (set-frame-parameter nil param (if now-opaque zach/frame-alpha opaque))
+      (message "Transparency %s" (if now-opaque "on" "off (opaque)")))))
 
 ;; macOS native fullscreen creates a separate Space and drops transparency.
 ;; Use non-native fullscreen (maximized within current Space) instead.
