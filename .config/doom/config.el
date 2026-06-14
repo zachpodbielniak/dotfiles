@@ -84,6 +84,48 @@
 (setq doom-theme 'catppuccin
       catppuccin-flavor 'mocha)
 
+;;; Theme switcher
+;; `consult-theme' (from the :completion vertico module) is a live-preview
+;; theme selector: scroll the candidates and each one previews instantly,
+;; and the previously active theme is disabled before the new one loads.  It
+;; sees every installed theme (doom-*, catppuccin, the built-in Emacs themes
+;; like `tango'/`wombat'/`modus-*', etc.).  Selecting `catppuccin' restores
+;; whatever `catppuccin-flavor' is set to (mocha by default).
+;;
+;; Two cases consult-theme can't express, added below:
+;;   - "default Emacs" (no theme at all) -> disable every enabled theme.
+;;   - catppuccin *flavors* -> catppuccin is ONE theme whose look is chosen by
+;;     `catppuccin-flavor', so the flavors aren't separate consult entries.
+(defun zach/theme-default-emacs ()
+  "Disable all enabled themes and return to the bare default Emacs theme."
+  (interactive)
+  (mapc #'disable-theme (copy-sequence custom-enabled-themes))
+  ;; not advised like `load-theme', so re-run the tty bg fix by hand
+  (when (fboundp 'zach/tty-inherit-terminal-bg)
+    (zach/tty-inherit-terminal-bg))
+  (message "Theme: default Emacs (no theme)"))
+
+(defun zach/catppuccin-flavor (flavor)
+  "Switch Catppuccin to FLAVOR and reload, disabling any other active theme.
+FLAVOR is one of mocha, macchiato, frappe, or latte."
+  (interactive
+   (list (intern (completing-read "Catppuccin flavor: "
+                                  '("mocha" "macchiato" "frappe" "latte")
+                                  nil t nil nil "mocha"))))
+  (setq catppuccin-flavor flavor)
+  (mapc #'disable-theme (copy-sequence custom-enabled-themes))
+  ;; `load-theme' reads `catppuccin-flavor' at load time and fires
+  ;; `doom-load-theme-hook' (so the tty bg fix re-runs).
+  (load-theme 'catppuccin t)
+  (message "Catppuccin flavor: %s" flavor))
+
+(map! :leader
+      (:prefix ("t" . "toggle")
+       (:prefix ("t" . "theme")
+        :desc "Select (live preview)" "t" #'consult-theme
+        :desc "Catppuccin flavor"     "f" #'zach/catppuccin-flavor
+        :desc "Default Emacs"         "d" #'zach/theme-default-emacs)))
+
 ;;; Line numbers
 (setq display-line-numbers-type t)
 
