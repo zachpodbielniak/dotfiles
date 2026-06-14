@@ -29,6 +29,13 @@
 ;;; Custom splash screen
 (setq fancy-splash-image "~/Pictures/Immutablue/immutablue-logo.jpg")
 
+;;; Command-center dashboard as the startup buffer.  Set on
+;;; `doom-after-init-hook' so it wins the race against the `dashboard'
+;;; module's own `initial-buffer-choice' assignment (`cc-initial-buffer'
+;;; is defined when `command-center' loads in the Phase-5 block below).
+(add-hook 'doom-after-init-hook
+          (lambda () (setq initial-buffer-choice #'cc-initial-buffer)))
+
 ;;; Font: Hack Nerd Font Mono (matching gst terminal config)
 ;;; Nerd Font covers modeline icons, Noto Color Emoji for emoji
 (let ((sz (if IS-MAC 14 18))
@@ -521,7 +528,8 @@ highlight entirely under `-nw', it doesn't soften it)."
       :desc "Vterm popup"        "o t" #'+vterm/toggle
       :desc "Vterm here"         "o T" #'+vterm/here
       :desc "Browser (eww) here" "o B" #'zach/eww-here
-      :desc "TRAMP dashboard"    "o D" #'tramp-dashboard)
+      :desc "TRAMP dashboard"    "o d" #'tramp-dashboard
+      :desc "Command center"     "o D" #'command-center)
 
 ;;; Vterm TUI stability
 (setq vterm-always-compile-module t)
@@ -629,6 +637,7 @@ compositor seat."
 (load! "eww")                 ;; Emacs-as-browser (eww + shr + URL routing)
 (load! "org-remark")          ;; Universal annotation layer (all buffer types)
 (load! "tramp-dashboard")     ;; Org-style dashboard for entering TRAMP systems
+(load! "command-center")      ;; Bespoke two-column startup dashboard (SPC o D)
 (load! "sf")                  ;; Salesforce Service Cloud client (case triage)
 (load! "art-of-war")          ;; Art of War daily-study client (SPC s a)
 (load! "container-registry-browse") ;; Container registry search + tag browse (SPC s c)
