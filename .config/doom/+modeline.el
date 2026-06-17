@@ -77,9 +77,17 @@
 
   (defun zach-modeline--update-days ()
     "Update the days-since cache by calling the days_since script."
-    (let ((carnivore (string-trim (shell-command-to-string "days_since 2024-11-24")))
-          (soda      (string-trim (shell-command-to-string "days_since 2025-07-14")))
-          (coffee    (string-trim (shell-command-to-string "days_since 2025-09-20"))))
+    ;; Force the local `days_since' script to run locally: bind
+    ;; `default-directory' to a guaranteed-local path.  Otherwise, when the
+    ;; current buffer is on a remote (TRAMP) host, `shell-command-to-string'
+    ;; -> `process-file' routes the command over ssh, and `tramp-wait-for-output'
+    ;; blocks the main loop -> Emacs hangs.  `temporary-file-directory' (the
+    ;; variable) is always local, unlike `(expand-file-name "~/")', which
+    ;; expands to the *remote* home under a remote `default-directory'.
+    (let* ((default-directory temporary-file-directory)
+           (carnivore (string-trim (shell-command-to-string "days_since 2024-11-24")))
+           (soda      (string-trim (shell-command-to-string "days_since 2025-07-14")))
+           (coffee    (string-trim (shell-command-to-string "days_since 2025-09-20"))))
       (setq zach-modeline--days-cache
             (concat
              (propertize (format " 🥩:%s" carnivore) 'face '(:foreground "#f38ba8"))
@@ -108,7 +116,11 @@
 
   (defun zach-modeline--update-pomo ()
     "Update the pomodoro cache by calling the pomo script."
-    (let ((pomo (string-trim (shell-command-to-string "pomo"))))
+    ;; Run the local `pomo' script locally (see `zach-modeline--update-days'
+    ;; above): a remote `default-directory' would tunnel it over TRAMP/ssh and
+    ;; wedge the main loop in `tramp-wait-for-output'.
+    (let* ((default-directory temporary-file-directory)
+           (pomo (string-trim (shell-command-to-string "pomo"))))
       (setq zach-modeline--pomo-cache
             (if (string-empty-p pomo) ""
               (propertize (format " %s" pomo) 'face '(:foreground "#fab387"))))))
