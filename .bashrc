@@ -134,9 +134,12 @@ _have emacsclient && alias e="emacsclient -nw -c"
 _have emacsclient && alias eg="emacsclient -c"
 
 # distrobox
-if [[ -d "${HOME}/../linuxbrew/.linuxbrew" ]]
+if [[ -d "${HOME}/../linuxbrew/.linuxbrew" ]] && [[ -d "/var/home/linuxbrew/.linuxbrew/" ]]
 then 
     alias dc="distrobox create --additional-flags '-v /var/home/linuxbrew:/var/home/linuxbrew -v /home/linuxbrew:/home/linuxbrew'"
+elif [[ -d "${HOME}/../linuxbrew/.linuxbrew" ]]
+then
+    alias dc="distrobox create --additional-flags '-v /home/linuxbrew:/home/linuxbrew'"
 else 
     alias dc="distrobox create"
 fi
