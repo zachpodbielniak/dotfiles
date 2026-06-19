@@ -54,8 +54,25 @@
   (gowl-set-focused-alpha 0.9)
   (gowl-set-unfocused-alpha 0.9)
 
-  ;; Wallpaper
+  ;; Wallpaper (static fallback; the animated screensaver below draws over it)
   (gowl-set-wallpaper "~/Pictures/wallpaper.png")
+
+  ;; Animated screensaver wallpaper — cmacs --gowl ONLY (we are inside the
+  ;; IS-GOWL block, so this never runs under standalone GNOME Emacs).  It needs
+  ;; --with-cmacs-screensaver + the screensaver `.so' modules on
+  ;; CMACS_SCREENSAVER_MODULE_DIR (set by `just gowl').  Deferred on an idle
+  ;; timer so the compositor's XWayland server and monitors are up before the
+  ;; off-screen libregnum renderer (raylib via XWayland) is brought up.
+  (when (require 'cmacs-screensaver nil t)
+    (run-with-idle-timer
+     2 nil
+     (lambda ()
+       (when (and (fboundp 'cmacs-screensaver-supported-p)
+                  (cmacs-screensaver-supported-p))
+         (condition-case err
+             (cmacs-screensaver-set-wallpaper 'blackhole-cool)
+           (error (message "cmacs-screensaver: %s"
+                           (error-message-string err))))))))
 
   ;; Tiling gaps — outer gaps give the frame breathing room from edges
   (gowl-enable-module "vanitygaps")
