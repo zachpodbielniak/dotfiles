@@ -153,7 +153,10 @@ _have nvim && alias less="nvim +Man!"
 _have bat && alias cat="bat --theme='Catppuccin Mocha' --paging=never"
 
 # mutt alias 
-_have neomutt && alias mutt="neomutt" && alias m="mutt" 
+_have neomutt && alias mutt="neomutt" && alias m="mutt"
+
+# claude alias
+_have claude && alias gnuis='claude "/skill-bootstrap-libreclaw-agent gnuisaince"'
 
 # system command aliases 
 alias ls="ls --color=auto"
