@@ -50,7 +50,8 @@ static const gchar *ALL_COLUMNS[] = {
     "id", "content", "summary", "category", "subcategory", "importance",
     "source", "source_context", "conversation_id", "tags", "related_to",
     "is_archived", "is_pinned", "last_accessed_at", "access_count",
-    "confidence", "expires_at", "metadata", "created_at", "updated_at", NULL
+    "confidence", "expires_at", "metadata", "agent_name",
+    "created_at", "updated_at", NULL
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -79,6 +80,7 @@ typedef struct {
     gchar   *last_accessed_at;
     gint     access_count;
     gchar   *metadata;
+    gchar   *agent_name;
     gboolean has_embedding;
     gdouble  similarity;
     gdouble  relevance;
@@ -114,6 +116,168 @@ _c (const gchar *code, const gchar *text)
 #define _dim(t)    _c("2", t)
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Agent identity & configuration
+ *
+ * Memories are namespaced by an "agent name" so multiple agents can share one
+ * database. Each agent stores under its own name and, by default, only sees
+ * memories belonging to that name. The effective identity for a run is
+ * resolved (highest priority first) from:
+ *   1. the --agent-name NAME flag
+ *   2. the AGENT_MEMORIES_AGENT environment variable
+ *   3. the agent_name key in ~/.config/agent_memories.yaml
+ *   4. the built-in default (DEFAULT_AGENT_NAME)
+ * Pass --all-agents to ignore the namespace and operate across every agent.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define DEFAULT_AGENT_NAME "clawdbot"
+
+static gchar      *g_agent_name = NULL;     /* effective identity for this run */
+static gchar      *g_agent_override = NULL; /* set by --agent-name */
+static gboolean    g_agent_all = FALSE;     /* set by --all-agents */
+static GHashTable *g_config = NULL;         /* parsed ~/.config/agent_memories.yaml */
+
+static gchar *
+config_file_path (void)
+{
+    const gchar *override = g_getenv ("AGENT_MEMORIES_CONFIG");
+    if (override && *override)
+        return g_strdup (override);
+    const gchar *xdg = g_getenv ("XDG_CONFIG_HOME");
+    if (xdg && *xdg)
+        return g_build_filename (xdg, "agent_memories.yaml", NULL);
+    return g_build_filename (g_get_home_dir (), ".config", "agent_memories.yaml", NULL);
+}
+
+/* Minimal flat-YAML reader: supports "key: value" pairs, "# comment" lines,
+ * and optional surrounding single/double quotes on the value. Nested mappings
+ * and lists are not supported (none are needed yet). */
+static void
+config_load (void)
+{
+    g_config = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+
+    g_autofree gchar *path = config_file_path ();
+    g_autofree gchar *data = NULL;
+    if (!g_file_get_contents (path, &data, NULL, NULL))
+        return;
+
+    g_auto (GStrv) lines = g_strsplit (data, "\n", -1);
+    gint i;
+    for (i = 0; lines[i]; i++) {
+        g_autofree gchar *line = g_strdup (lines[i]);
+        g_strstrip (line);
+        if (line[0] == '\0' || line[0] == '#')
+            continue;
+
+        const gchar *colon = strchr (line, ':');
+        if (!colon)
+            continue;
+
+        g_autofree gchar *key = g_strndup (line, colon - line);
+        g_strstrip (key);
+        if (key[0] == '\0')
+            continue;
+
+        g_autofree gchar *val = g_strdup (colon + 1);
+        g_strstrip (val);
+
+        /* Strip a single layer of matching surrounding quotes */
+        gsize vlen = strlen (val);
+        if (vlen >= 2 &&
+            ((val[0] == '"'  && val[vlen - 1] == '"') ||
+             (val[0] == '\'' && val[vlen - 1] == '\''))) {
+            val[vlen - 1] = '\0';
+            memmove (val, val + 1, vlen - 1);
+        }
+
+        g_hash_table_insert (g_config, g_strdup (key), g_strdup (val));
+    }
+}
+
+static const gchar *
+config_get (const gchar *key)
+{
+    return g_config ? g_hash_table_lookup (g_config, key) : NULL;
+}
+
+/* Resolve g_agent_name from flag override, env, config, then built-in default. */
+static void
+resolve_agent_identity (void)
+{
+    if (g_agent_override && *g_agent_override) {
+        g_agent_name = g_strdup (g_agent_override);
+        return;
+    }
+    const gchar *env = g_getenv ("AGENT_MEMORIES_AGENT");
+    if (env && *env) {
+        g_agent_name = g_strdup (env);
+        return;
+    }
+    const gchar *cfg = config_get ("agent_name");
+    if (cfg && *cfg) {
+        g_agent_name = g_strdup (cfg);
+        return;
+    }
+    g_agent_name = g_strdup (DEFAULT_AGENT_NAME);
+}
+
+/* Pull the global flags (--agent-name NAME / --agent-name=NAME / --all-agents)
+ * out of a subcommand's argv before the per-command GOptionContext sees them.
+ * Compacts argv in place (preserving argv[0], the subcommand) and returns the
+ * new argument count. */
+static gint
+extract_global_flags (gint argc, gchar **argv)
+{
+    gint w = 1; /* keep argv[0] = subcommand name */
+    gint r;
+    for (r = 1; r < argc; r++) {
+        if (g_strcmp0 (argv[r], "--all-agents") == 0) {
+            g_agent_all = TRUE;
+        } else if (g_strcmp0 (argv[r], "--agent-name") == 0) {
+            if (r + 1 < argc) {
+                g_free (g_agent_override);
+                g_agent_override = g_strdup (argv[++r]);
+            }
+        } else if (g_str_has_prefix (argv[r], "--agent-name=")) {
+            g_free (g_agent_override);
+            g_agent_override = g_strdup (argv[r] + strlen ("--agent-name="));
+        } else {
+            argv[w++] = argv[r];
+        }
+    }
+    argv[w] = NULL;
+    return w;
+}
+
+/* SQL predicate scoping to the current agent, e.g. "agent_name = 'clawdbot'".
+ * Returns "TRUE" when operating across all agents. Uses PQescapeLiteral so the
+ * agent name is safe to embed directly. Caller frees with g_free(). */
+static gchar *
+agent_pred (PGconn *conn)
+{
+    if (g_agent_all || !g_agent_name || !*g_agent_name)
+        return g_strdup ("TRUE");
+
+    gchar *lit = PQescapeLiteral (conn, g_agent_name, strlen (g_agent_name));
+    if (!lit)
+        return g_strdup ("TRUE");
+    gchar *out = g_strdup_printf ("agent_name = %s", lit);
+    PQfreemem (lit);
+    return out;
+}
+
+/* " AND <pred>" fragment for appending to an existing WHERE clause, or "" when
+ * operating across all agents. Caller frees with g_free(). */
+static gchar *
+agent_and (PGconn *conn)
+{
+    if (g_agent_all || !g_agent_name || !*g_agent_name)
+        return g_strdup ("");
+    g_autofree gchar *pred = agent_pred (conn);
+    return g_strdup_printf (" AND %s", pred);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Memory struct helpers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -137,6 +301,7 @@ memory_free (Memory *mem)
     g_free (mem->updated_at);
     g_free (mem->last_accessed_at);
     g_free (mem->metadata);
+    g_free (mem->agent_name);
     g_free (mem);
 }
 
@@ -238,6 +403,8 @@ _memory_from_row (PGresult *res, gint row)
             m->access_count = PQgetisnull (res, row, c) ? 0 : atoi (PQgetvalue (res, row, c));
         else if (g_strcmp0 (name, "metadata") == 0)
             m->metadata = _pg_val (res, row, c);
+        else if (g_strcmp0 (name, "agent_name") == 0)
+            m->agent_name = _pg_val (res, row, c);
         else if (g_strcmp0 (name, "embedding") == 0)
             m->has_embedding = !PQgetisnull (res, row, c);
         else if (g_strcmp0 (name, "similarity") == 0)
@@ -528,7 +695,7 @@ db_add_memory (AppState *app, const gchar *content, const gchar *summary,
     const gchar *meta = metadata_json ? metadata_json : "{}";
     const gchar *pin_str = pinned ? "true" : "false";
 
-    const gchar *params[14];
+    const gchar *params[15];
     params[0]  = content;
     params[1]  = summary;
     params[2]  = category   ? category   : "general";
@@ -543,17 +710,18 @@ db_add_memory (AppState *app, const gchar *content, const gchar *summary,
     params[11] = meta;
     params[12] = conf_str;
     params[13] = expires_at;
+    params[14] = (g_agent_name && *g_agent_name) ? g_agent_name : DEFAULT_AGENT_NAME;
 
     PGresult *res = PQexecParams (app->conn,
         "INSERT INTO memories ("
         "  content, summary, category, subcategory, importance,"
         "  source, source_context, conversation_id,"
         "  tags, related_to, is_pinned, metadata,"
-        "  confidence, expires_at"
+        "  confidence, expires_at, agent_name"
         ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,"
-        "  $10::uuid, $11::boolean, $12::jsonb, $13::float, $14::timestamptz)"
+        "  $10::uuid, $11::boolean, $12::jsonb, $13::float, $14::timestamptz, $15)"
         " RETURNING id",
-        14, NULL, params, NULL, NULL, 0);
+        15, NULL, params, NULL, NULL, 0);
 
     gchar *memory_id = NULL;
     if (PQresultStatus (res) == PGRES_TUPLES_OK && PQntuples (res) > 0)
@@ -770,6 +938,12 @@ db_list_memories (PGconn *conn, const gchar *category, const gchar *subcategory,
 
     g_string_append (sql, " AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)");
 
+    /* Scope to the current agent (no-op with --all-agents) */
+    {
+        g_autofree gchar *ascope = agent_and (conn);
+        g_string_append (sql, ascope);
+    }
+
     /* Validate order_by */
     const gchar *safe_order = "created_at";
     gint i;
@@ -846,6 +1020,11 @@ db_search_fuzzy (PGconn *conn, const gchar *query, const gchar *category,
 
     g_string_append (sql, " AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)");
 
+    {
+        g_autofree gchar *ascope = agent_and (conn);
+        g_string_append (sql, ascope);
+    }
+
     g_autofree gchar *limit_str = g_strdup_printf ("%d", limit);
     g_string_append_printf (sql,
         " ORDER BY is_pinned DESC, "
@@ -900,6 +1079,11 @@ db_search_exact (PGconn *conn, const gchar *query, const gchar *category,
     }
 
     g_string_append (sql, " AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)");
+
+    {
+        g_autofree gchar *ascope = agent_and (conn);
+        g_string_append (sql, ascope);
+    }
 
     g_autofree gchar *limit_str = g_strdup_printf ("%d", limit);
     g_string_append_printf (sql,
@@ -961,6 +1145,11 @@ db_search_semantic (AppState *app, const gchar *query, const gchar *category,
 
     g_string_append (sql, " AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)");
 
+    {
+        g_autofree gchar *ascope = agent_and (app->conn);
+        g_string_append (sql, ascope);
+    }
+
     g_autofree gchar *limit_str = g_strdup_printf ("%d", limit);
     g_string_append_printf (sql, " ORDER BY similarity DESC LIMIT $%d", idx);
     g_ptr_array_add (plist, limit_str);
@@ -1005,15 +1194,24 @@ db_get_stats (PGconn *conn)
 
     PGresult *res;
 
-    res = PQexec (conn, "SELECT COUNT(*) FROM memories");
+    /* Scope every aggregate to the current agent (no-op with --all-agents) */
+    g_autofree gchar *apred = agent_pred (conn);
+
+    g_autofree gchar *q_total = g_strdup_printf (
+        "SELECT COUNT(*) FROM memories WHERE %s", apred);
+    res = PQexec (conn, q_total);
     gint64 total = (PQresultStatus (res) == PGRES_TUPLES_OK) ? g_ascii_strtoll (PQgetvalue (res, 0, 0), NULL, 10) : 0;
     PQclear (res);
 
-    res = PQexec (conn, "SELECT COUNT(*) FROM memories WHERE is_archived = TRUE");
+    g_autofree gchar *q_arch = g_strdup_printf (
+        "SELECT COUNT(*) FROM memories WHERE is_archived = TRUE AND %s", apred);
+    res = PQexec (conn, q_arch);
     gint64 archived = (PQresultStatus (res) == PGRES_TUPLES_OK) ? g_ascii_strtoll (PQgetvalue (res, 0, 0), NULL, 10) : 0;
     PQclear (res);
 
-    res = PQexec (conn, "SELECT COUNT(*) FROM memories WHERE is_pinned = TRUE");
+    g_autofree gchar *q_pin = g_strdup_printf (
+        "SELECT COUNT(*) FROM memories WHERE is_pinned = TRUE AND %s", apred);
+    res = PQexec (conn, q_pin);
     gint64 pinned = (PQresultStatus (res) == PGRES_TUPLES_OK) ? g_ascii_strtoll (PQgetvalue (res, 0, 0), NULL, 10) : 0;
     PQclear (res);
 
@@ -1029,9 +1227,10 @@ db_get_stats (PGconn *conn)
     /* by_category */
     json_builder_set_member_name (b, "by_category");
     json_builder_begin_array (b);
-    res = PQexec (conn,
+    g_autofree gchar *q_cat = g_strdup_printf (
         "SELECT category, COUNT(*) as count FROM memories "
-        "WHERE is_archived = FALSE GROUP BY category ORDER BY count DESC");
+        "WHERE is_archived = FALSE AND %s GROUP BY category ORDER BY count DESC", apred);
+    res = PQexec (conn, q_cat);
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
         gint i;
         for (i = 0; i < PQntuples (res); i++) {
@@ -1049,9 +1248,10 @@ db_get_stats (PGconn *conn)
     /* by_importance */
     json_builder_set_member_name (b, "by_importance");
     json_builder_begin_array (b);
-    res = PQexec (conn,
+    g_autofree gchar *q_imp = g_strdup_printf (
         "SELECT importance, COUNT(*) as count FROM memories "
-        "WHERE is_archived = FALSE GROUP BY importance ORDER BY count DESC");
+        "WHERE is_archived = FALSE AND %s GROUP BY importance ORDER BY count DESC", apred);
+    res = PQexec (conn, q_imp);
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
         gint i;
         for (i = 0; i < PQntuples (res); i++) {
@@ -1069,9 +1269,10 @@ db_get_stats (PGconn *conn)
     /* top_tags */
     json_builder_set_member_name (b, "top_tags");
     json_builder_begin_array (b);
-    res = PQexec (conn,
+    g_autofree gchar *q_tags = g_strdup_printf (
         "SELECT unnest(tags) as tag, COUNT(*) as count FROM memories "
-        "WHERE is_archived = FALSE GROUP BY tag ORDER BY count DESC LIMIT 20");
+        "WHERE is_archived = FALSE AND %s GROUP BY tag ORDER BY count DESC LIMIT 20", apred);
+    res = PQexec (conn, q_tags);
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
         gint i;
         for (i = 0; i < PQntuples (res); i++) {
@@ -1089,9 +1290,10 @@ db_get_stats (PGconn *conn)
     /* most_accessed */
     json_builder_set_member_name (b, "most_accessed");
     json_builder_begin_array (b);
-    res = PQexec (conn,
+    g_autofree gchar *q_acc = g_strdup_printf (
         "SELECT id, summary, access_count FROM memories "
-        "WHERE access_count > 0 ORDER BY access_count DESC LIMIT 10");
+        "WHERE access_count > 0 AND %s ORDER BY access_count DESC LIMIT 10", apred);
+    res = PQexec (conn, q_acc);
     if (PQresultStatus (res) == PGRES_TUPLES_OK) {
         gint i;
         for (i = 0; i < PQntuples (res); i++) {
@@ -1182,6 +1384,9 @@ memory_to_json_node (Memory *m)
     json_builder_set_member_name (b, "metadata");
     if (m->metadata) json_builder_add_string_value (b, m->metadata);
     else json_builder_add_null_value (b);
+    json_builder_set_member_name (b, "agent_name");
+    if (m->agent_name) json_builder_add_string_value (b, m->agent_name);
+    else json_builder_add_null_value (b);
     json_builder_set_member_name (b, "has_embedding");
     json_builder_add_boolean_value (b, m->has_embedding);
 
@@ -1251,6 +1456,8 @@ print_memory_detail (Memory *m)
              m->subcategory ? m->subcategory : "-");
     g_autofree gchar *c3 = _cyan ("Importance:");
     g_print ("  %s  %s\n", c3, m->importance ? m->importance : "normal");
+    g_autofree gchar *ca = _cyan ("Agent:");
+    g_print ("  %s       %s\n", ca, m->agent_name ? m->agent_name : "-");
     g_autofree gchar *c4 = _cyan ("Source:");
     g_print ("  %s      %s\n", c4, m->source ? m->source : "-");
     if (m->source_context) {
@@ -1341,6 +1548,7 @@ print_memory_table (GPtrArray *memories, const gchar **columns)
         else if (g_strcmp0 (cols[i], "tags") == 0) w = 25;
         else if (g_strcmp0 (cols[i], "created_at") == 0) w = 10;
         else if (g_strcmp0 (cols[i], "is_pinned") == 0) w = 3;
+        else if (g_strcmp0 (cols[i], "agent_name") == 0) w = 14;
 
         g_autofree gchar *upper = g_ascii_strup (cols[i], -1);
         g_string_append_printf (hdr, "%-*s", w, upper);
@@ -1388,6 +1596,7 @@ print_memory_table (GPtrArray *memories, const gchar **columns)
                 else g_print ("%-*s", w, "");
             }
             else if (g_strcmp0 (col, "is_pinned") == 0) { w = 3; g_print ("%-*s", w, m->is_pinned ? "*" : " "); }
+            else if (g_strcmp0 (col, "agent_name") == 0) { w = 14; g_print ("%-*.*s", w, w, m->agent_name ? m->agent_name : ""); }
             else { g_print ("%-*s", w, ""); }
         }
         g_print ("\n");
@@ -1453,10 +1662,11 @@ fzf_select_memory (PGconn *conn, const gchar *header, gboolean include_archived)
 
     /* Fetch everything in one query — no psql spawning for preview */
     const gchar *where = include_archived ? "TRUE" : "NOT is_archived";
+    g_autofree gchar *ascope = agent_and (conn);
     g_autofree gchar *sql = g_strdup_printf (
         "SELECT id, summary, category, importance, subcategory, source, "
         "tags, is_pinned, created_at, access_count, content "
-        "FROM memories WHERE %s ORDER BY is_pinned DESC, created_at DESC", where);
+        "FROM memories WHERE %s%s ORDER BY is_pinned DESC, created_at DESC", where, ascope);
 
     PGresult *res = PQexec (conn, sql);
     if (PQresultStatus (res) != PGRES_TUPLES_OK || PQntuples (res) == 0) {
@@ -1599,9 +1809,11 @@ fzf_search_memory (PGconn *conn, const gchar *initial_query)
         return NULL;
     }
 
-    PGresult *res = PQexec (conn,
+    g_autofree gchar *ascope = agent_and (conn);
+    g_autofree gchar *fsql = g_strdup_printf (
         "SELECT id, summary, category, content FROM memories "
-        "WHERE NOT is_archived ORDER BY is_pinned DESC, created_at DESC");
+        "WHERE NOT is_archived%s ORDER BY is_pinned DESC, created_at DESC", ascope);
+    PGresult *res = PQexec (conn, fsql);
     if (PQresultStatus (res) != PGRES_TUPLES_OK || PQntuples (res) == 0) {
         g_autofree gchar *msg = _yellow ("No memories found.");
         g_printerr ("%s\n", msg);
@@ -3358,9 +3570,11 @@ cmd_prune (AppState *app, gint argc, gchar **argv)
     g_option_context_add_main_entries (ctx, entries, NULL);
     g_option_context_parse (ctx, &argc, &argv, NULL);
 
-    PGresult *cnt = PQexec (app->conn,
+    g_autofree gchar *apred_p = agent_pred (app->conn);
+    g_autofree gchar *q_count = g_strdup_printf (
         "SELECT COUNT(*) FROM memories WHERE expires_at IS NOT NULL "
-        "AND expires_at < CURRENT_TIMESTAMP AND is_archived = FALSE");
+        "AND expires_at < CURRENT_TIMESTAMP AND is_archived = FALSE AND %s", apred_p);
+    PGresult *cnt = PQexec (app->conn, q_count);
     gint expired = (PQresultStatus (cnt) == PGRES_TUPLES_OK) ? atoi (PQgetvalue (cnt, 0, 0)) : 0;
     PQclear (cnt);
 
@@ -3368,9 +3582,11 @@ cmd_prune (AppState *app, gint argc, gchar **argv)
 
     if (dry_run) {
         g_print ("Would prune %d expired memories:\n", expired);
-        PGresult *res = PQexec (app->conn,
+        g_autofree gchar *q_sel = g_strdup_printf (
             "SELECT id, summary, expires_at FROM memories WHERE expires_at IS NOT NULL "
-            "AND expires_at < CURRENT_TIMESTAMP AND is_archived = FALSE ORDER BY expires_at");
+            "AND expires_at < CURRENT_TIMESTAMP AND is_archived = FALSE AND %s ORDER BY expires_at",
+            apred_p);
+        PGresult *res = PQexec (app->conn, q_sel);
         gint i;
         for (i = 0; i < PQntuples (res); i++)
             g_print ("  [%.8s] expired %s: %s\n",
@@ -3381,14 +3597,17 @@ cmd_prune (AppState *app, gint argc, gchar **argv)
     }
 
     PGresult *res;
-    if (do_delete)
-        res = PQexec (app->conn,
+    if (do_delete) {
+        g_autofree gchar *q_del = g_strdup_printf (
             "DELETE FROM memories WHERE expires_at IS NOT NULL "
-            "AND expires_at < CURRENT_TIMESTAMP");
-    else
-        res = PQexec (app->conn,
+            "AND expires_at < CURRENT_TIMESTAMP AND %s", apred_p);
+        res = PQexec (app->conn, q_del);
+    } else {
+        g_autofree gchar *q_arc = g_strdup_printf (
             "UPDATE memories SET is_archived = TRUE WHERE expires_at IS NOT NULL "
-            "AND expires_at < CURRENT_TIMESTAMP AND is_archived = FALSE");
+            "AND expires_at < CURRENT_TIMESTAMP AND is_archived = FALSE AND %s", apred_p);
+        res = PQexec (app->conn, q_arc);
+    }
 
     gint affected = atoi (PQcmdTuples (res));
     PQclear (res);
@@ -3410,11 +3629,13 @@ cmd_backfill (AppState *app, gint argc, gchar **argv)
     g_option_context_add_main_entries (ctx, entries, NULL);
     g_option_context_parse (ctx, &argc, &argv, NULL);
 
-    const gchar *where = include_archived
+    g_autofree gchar *apred_b = agent_pred (app->conn);
+    const gchar *archived_clause = include_archived
         ? "embedding IS NULL"
         : "embedding IS NULL AND is_archived = FALSE";
     g_autofree gchar *sql = g_strdup_printf (
-        "SELECT id, content, summary FROM memories WHERE %s ORDER BY created_at ASC", where);
+        "SELECT id, content, summary FROM memories WHERE %s AND %s ORDER BY created_at ASC",
+        archived_clause, apred_b);
 
     PGresult *res = PQexec (app->conn, sql);
     gint total = PQntuples (res);
@@ -3513,10 +3734,16 @@ print_help (void)
         "  config, personal\n\n"
         "Importance: low, normal, high, critical\n\n"
         "Examples:\n"
+        "Global options (place after the subcommand):\n"
+        "  --agent-name NAME    Scope to a specific agent (default: clawdbot)\n"
+        "  --all-agents         Operate across all agents (no namespace filter)\n\n"
+        "Examples:\n"
         "  agent_memories add \"Zach prefers YAML\" -c preference -t config\n"
         "  agent_memories search \"yaml preference\"\n"
         "  agent_memories search --semantic \"coding style preferences\"\n"
         "  agent_memories list --category decision --importance high\n"
+        "  agent_memories list --agent-name other-bot --category general\n"
+        "  agent_memories stats --all-agents\n"
         "  agent_memories show --fzf\n"
         "  agent_memories stats\n"
         "  agent_memories bootstrap --format json\n"
@@ -3541,11 +3768,16 @@ main (gint argc, gchar **argv)
         return 0;
     }
 
+    /* Load config and resolve agent identity before dispatch */
+    config_load ();
+
     const gchar *command = argv[1];
 
-    /* Shift argv past the subcommand */
+    /* Shift argv past the subcommand and strip global flags */
     gint sub_argc = argc - 1;
     gchar **sub_argv = argv + 1;
+    sub_argc = extract_global_flags (sub_argc, sub_argv);
+    resolve_agent_identity ();
 
     /* Connect to database */
     PGconn *conn = db_connect ();
