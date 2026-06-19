@@ -205,5 +205,18 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
             (make-frame '((fullscreen . nil)
                           (alpha-background . 85)))))))))
 
+;; Doom's persp-mode workspace autosave file
+;; (~/.config/emacs/.local/etc/workspaces/autosave) carries a cosmetic
+;; file-local `eval: (progn (pp-buffer)(indent-buffer))' footer.  persp visits
+;; that file to restore the session; the unsafe eval used to pop a confirmation
+;; that interrupted the visit and left a stray buffer lingering, which Doom's
+;; focus auto-revert then re-surfaced after unlocking the gowl screen lock
+;; (dumping a buffer full of elisp instead of returning you to where you were).
+;; Ignore that eval so the file is read silently and never lingers as a buffer:
+;; it is persp's internal state, the eval is only for human readability, and
+;; `indent-buffer' isn't even defined here (running it just errors).
+(add-to-list 'ignored-local-variable-values
+             '(eval progn (pp-buffer) (indent-buffer)))
+
 (provide '+gowl)
 ;;; +gowl.el ends here
