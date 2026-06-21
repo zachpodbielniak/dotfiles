@@ -192,8 +192,8 @@ window-state transitions."
               ;; Multi-monitor: position monitors to match physical layout.
               ;; Only runs when more than one monitor is connected.  A single
               ;; Emacs frame is kept regardless of monitor count.
-              (when (> (gowl-monitor-count) 1)
-                (cmacs-gowl-setup-monitors))
+              ;; (when (> (gowl-monitor-count) 1)
+              ;;   (cmacs-gowl-setup-monitors))
               ;; Re-apply the wallpaper once monitors have settled and their
               ;; scene_outputs are linked to the output layout.  The early
               ;; `gowl-set-wallpaper' (run during config load) races with the
