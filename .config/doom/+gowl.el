@@ -32,7 +32,8 @@
 ;;   - Frame transparency (alpha-background) without forcing fullscreen.
 ;;   - Event-driven bar-title sync (window-buffer-change-functions and
 ;;     window-selection-change-functions) instead of a polling timer.
-;;   - Multi-monitor layout via `cmacs-gowl-setup-monitors'.
+;;   - Multi-monitor physical layout via `cmacs-gowl-setup-monitors'.
+;;     A single Emacs frame is kept regardless of monitor count.
 ;;
 ;; The `(when IS-GOWL ...)' block here no-ops on non-gowl Emacs.
 ;; `cmacs-gowl-setup-monitors' is defined unconditionally so it can be
@@ -63,16 +64,16 @@
   ;; CMACS_SCREENSAVER_MODULE_DIR (set by `just gowl').  Deferred on an idle
   ;; timer so the compositor's XWayland server and monitors are up before the
   ;; off-screen libregnum renderer (raylib via XWayland) is brought up.
-  (when (require 'cmacs-screensaver nil t)
-    (run-with-idle-timer
-     2 nil
-     (lambda ()
-       (when (and (fboundp 'cmacs-screensaver-supported-p)
-                  (cmacs-screensaver-supported-p))
-         (condition-case err
-             (cmacs-screensaver-set-wallpaper 'blackhole-cool)
-           (error (message "cmacs-screensaver: %s"
-                           (error-message-string err))))))))
+  ;; (when (require 'cmacs-screensaver nil t)
+  ;;   (run-with-idle-timer
+  ;;    2 nil
+  ;;    (lambda ()
+  ;;      (when (and (fboundp 'cmacs-screensaver-supported-p)
+  ;;                 (cmacs-screensaver-supported-p))
+  ;;        (condition-case err
+  ;;            (cmacs-screensaver-set-wallpaper 'blackhole-cool)
+  ;;          (error (message "cmacs-screensaver: %s"
+  ;;                          (error-message-string err))))))))
 
   ;; Tiling gaps — outer gaps give the frame breathing room from edges
   (gowl-enable-module "vanitygaps")
@@ -188,15 +189,35 @@ window-state transitions."
               ;; there's a provider to receive the data.
               (when (fboundp 'cmacs-gowl-mode)
                 (cmacs-gowl-mode 1))
-              ;; Multi-monitor: position monitors then create per-monitor frames.
-              ;; Only runs when more than one monitor is connected.
+              ;; Multi-monitor: position monitors to match physical layout.
+              ;; Only runs when more than one monitor is connected.  A single
+              ;; Emacs frame is kept regardless of monitor count.
               (when (> (gowl-monitor-count) 1)
-                (cmacs-gowl-setup-monitors)))))
+                (cmacs-gowl-setup-monitors))
+              ;; Re-apply the wallpaper once monitors have settled and their
+              ;; scene_outputs are linked to the output layout.  The early
+              ;; `gowl-set-wallpaper' (run during config load) races with the
+              ;; dispatch thread's on_new_output: the per-monitor scene buffer
+              ;; is created before the scene_output is positioned, so the node
+              ;; never enters it and the wallpaper never renders -- and with
+              ;; the monitor geometry already settled, no later layout change
+              ;; re-evaluates it.  Re-dispatching here (after init, when all
+              ;; scene_outputs are linked) creates the buffer against the
+              ;; final positioned scene_outputs.  Idempotent (same-size skip).
+              (run-with-idle-timer
+               0.5 nil
+               (lambda ()
+                 (let ((info (gowl-wallpaper-info)))
+                   (when info
+                     (gowl-set-wallpaper
+                      (cdr (assq 'path info))
+                      (cdr (assq 'mode info))))))))))
 
 (defun cmacs-gowl-setup-monitors ()
-  "Position monitors to match physical layout and create one frame per monitor.
+  "Position monitors to match physical layout.
 Monitors are identified by name.  The layout below matches the GNOME
-config: two LG SDQHD side-by-side on top, laptop centered below."
+config: two LG SDQHD side-by-side on top, laptop centered below.
+A single Emacs frame is kept regardless of monitor count."
   (interactive)
   (let ((monitors (gowl-list-monitors))
         (layout nil))
@@ -213,14 +234,7 @@ config: two LG SDQHD side-by-side on top, laptop centered below."
           (edp (cdr (assoc "eDP-1" layout))))
       (when dp1 (gowl-set-monitor-position 0 0 dp1))
       (when dp2 (gowl-set-monitor-position 2560 0 dp2))
-      (when edp (gowl-set-monitor-position 1501 2880 edp)))
-    ;; Wait for layout to settle, then create one frame per extra monitor
-    (run-with-timer 0.5 nil
-      (lambda ()
-        (let ((n-extra (1- (gowl-monitor-count))))
-          (dotimes (_ n-extra)
-            (make-frame '((fullscreen . nil)
-                          (alpha-background . 85)))))))))
+      (when edp (gowl-set-monitor-position 1501 2880 edp)))))
 
 ;; Doom's persp-mode workspace autosave file
 ;; (~/.config/emacs/.local/etc/workspaces/autosave) carries a cosmetic
