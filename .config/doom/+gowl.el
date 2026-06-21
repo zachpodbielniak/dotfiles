@@ -77,7 +77,7 @@
 
   ;; Tiling gaps — outer gaps give the frame breathing room from edges
   (gowl-enable-module "vanitygaps")
-  (gowl-set-gaps '(("inner-gap" . "0") ("outer-gap" . "32")))
+  (gowl-set-gaps '(("inner-gap" . "32") ("outer-gap" . "32")))
 
   ;; Rounded corners -- because it looks cool
   (gowl-enable-module "roundcorners")
