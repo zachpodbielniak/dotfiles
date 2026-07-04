@@ -704,6 +704,7 @@ compositor seat."
 (load! "command-center")      ;; Bespoke two-column startup dashboard (SPC o D)
 (load! "sf")                  ;; Salesforce Service Cloud client (case triage)
 (load! "art-of-war")          ;; Art of War daily-study client (SPC s a)
+(load! "recipes")             ;; Recipe manager on org-roam (SPC o k / SPC o K)
 (load! "container-registry-browse") ;; Container registry search + tag browse (SPC s c)
 (load! "+games")              ;; Games launcher + built-in/3rd-party game bundle (SPC G)
 (load! "emacslife/emacslife") ;; EmacsLife — BitLife clone (SPC G L)
