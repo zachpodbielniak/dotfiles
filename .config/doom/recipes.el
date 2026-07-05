@@ -34,9 +34,11 @@
 ;;                       browser)
 ;;   recipes-find-roam — org-roam-node-find filtered to the :recipe: tag
 ;;
-;; In the browser (`recipes-mode'):
-;;   RET open · c new · g refresh · f filter-by-tag · / search
-;;   R set-rating · m mark-made-today · ? help · q quit
+;; In the browser (`recipes-mode') — `?' opens a transient with everything:
+;;   RET open · v cook-view · c new · I AI-import · g refresh
+;;   f filter-tag · V views · L sort-by-last-made · / search
+;;   R rate · X made-today · N AI-macros · p photo · B backlinks
+;;   m/u/U mark · b shopping-list · s schedule · e export · a assistant · q quit
 ;;
 ;; Metadata lives in the file-level property drawer (SERVINGS, PREP, COOK,
 ;; RATING, SOURCE, LAST_MADE) and in `#+filetags'.  Files that predate this
@@ -99,6 +101,21 @@ subfolders (e.g. `desserts/', `carnivore/breakfast/')."
 (defface recipes-folder-face
   '((t (:foreground "#6c7086" :slant italic)))
   "Face for the subfolder column."
+  :group 'recipes)
+
+(defface recipes-cook-title-face
+  '((t (:foreground "#cba6f7" :weight bold :height 1.7)))
+  "Face for the recipe title in cook mode."
+  :group 'recipes)
+
+(defface recipes-cook-heading-face
+  '((t (:foreground "#f9e2af" :weight bold :height 1.25)))
+  "Face for section headings in cook mode."
+  :group 'recipes)
+
+(defface recipes-cook-text-face
+  '((t (:foreground "#cdd6f4" :height 1.15)))
+  "Face for body text in cook mode."
   :group 'recipes)
 
 ;;; ------------------------------------------------------ paths
@@ -262,10 +279,44 @@ where org-roam expects the file-level drawer to live, before `#+title')."
             (insert ":PROPERTIES:\n" line "\n:END:\n"))))))
     (save-buffer)))
 
+(defun recipes--set-filetags (file tags)
+  "Rewrite FILE's `#+filetags:' line to TAGS (a list of strings).
+`recipe' is always included first.  If no `#+filetags:' line exists, one is
+inserted after `#+title:' (or at the top of the file)."
+  (with-current-buffer (find-file-noselect file)
+    (save-restriction
+      (widen)
+      (save-excursion
+        (let* ((case-fold-search t)
+               (clean (seq-remove (lambda (x) (or (string-empty-p x)
+                                                  (string= (downcase x) "recipe")))
+                                  tags))
+               (all (cons "recipe"
+                          (mapcar (lambda (s) (replace-regexp-in-string "[ \t]+" "_" s))
+                                  clean)))
+               (line (format "#+filetags: :%s:" (mapconcat #'identity all ":"))))
+          (goto-char (point-min))
+          (if (re-search-forward "^#\\+filetags:.*$" nil t)
+              (replace-match line t t)
+            (goto-char (point-min))
+            (if (re-search-forward "^#\\+title:.*$" nil t)
+                (progn (end-of-line) (insert "\n" line))
+              (insert line "\n"))))))
+    (save-buffer)))
+
 ;;; ------------------------------------------------------ browser mode
 
 (defvar-local recipes--tag-filter nil
   "When non-nil, the browser shows only recipes carrying this tag.")
+
+(defvar-local recipes--filter-fn nil
+  "Optional extra predicate on a recipe metadata plist for view filters.")
+
+(defvar-local recipes--filter-label nil
+  "Human-readable label for the active `recipes--filter-fn' view.")
+
+(defvar-local recipes--marked nil
+  "List of file-path ids marked for batch actions in the browser.")
 
 (defun recipes--entry-vector (m)
   "Build the tabulated-list column vector for metadata plist M."
@@ -286,7 +337,9 @@ where org-roam expects the file-level drawer to live, before `#+title')."
            (lambda (f)
              (let* ((m (recipes--file-metadata f))
                     (tags (plist-get m :tags)))
-               (when (or (null filter) (member filter tags))
+               (when (and (or (null filter) (member filter tags))
+                          (or (null recipes--filter-fn)
+                              (funcall recipes--filter-fn m)))
                  (list f (recipes--entry-vector m)))))
            (recipes--files)))))
 
@@ -327,16 +380,26 @@ every column but the last."
     (set-keymap-parent map tabulated-list-mode-map)
     (define-key map (kbd "RET")      #'recipes-open)
     (define-key map (kbd "<return>") #'recipes-open)
+    (define-key map "v" #'recipes-cook)
     (define-key map "c" #'recipes-capture)
     (define-key map "g" #'recipes-refresh)
     (define-key map "f" #'recipes-filter-tag)
     (define-key map "/" #'recipes-search)
     (define-key map "R" #'recipes-set-rating)
-    (define-key map "m" #'recipes-mark-made)
-    (define-key map "?" #'recipes-show-keys)
+    (define-key map "X" #'recipes-mark-made)
+    (define-key map "m" #'recipes-mark)
+    (define-key map "u" #'recipes-unmark)
+    (define-key map "U" #'recipes-unmark-all)
+    (define-key map "B" #'recipes-show-backlinks)
+    (define-key map "p" #'recipes-add-photo)
+    (define-key map "L" #'recipes-sort-by-last-made)
+    (define-key map "V" #'recipes-views)
+    (define-key map "?" #'recipes-dispatch)
     (define-key map "q" #'quit-window)
     map)
-  "Keymap for `recipes-mode'.")
+  "Keymap for `recipes-mode'.
+Additional keys are contributed by the recipes-plan / recipes-export /
+recipes-ai modules when they load.")
 
 ;; Evil intercepts single-key normal-state bindings (c=change, /=search,
 ;; m=set-mark, R/g/…) before they reach the major-mode map, so re-bind them
@@ -346,13 +409,21 @@ every column but the last."
   (evil-define-key* 'normal recipes-mode-map
     (kbd "RET")      #'recipes-open
     (kbd "<return>") #'recipes-open
+    "v" #'recipes-cook
     "c" #'recipes-capture
     "g" #'recipes-refresh
     "f" #'recipes-filter-tag
     "/" #'recipes-search
     "R" #'recipes-set-rating
-    "m" #'recipes-mark-made
-    "?" #'recipes-show-keys
+    "X" #'recipes-mark-made
+    "m" #'recipes-mark
+    "u" #'recipes-unmark
+    "U" #'recipes-unmark-all
+    "B" #'recipes-show-backlinks
+    "p" #'recipes-add-photo
+    "L" #'recipes-sort-by-last-made
+    "V" #'recipes-views
+    "?" #'recipes-dispatch
     "q" #'quit-window))
 
 (define-derived-mode recipes-mode tabulated-list-mode "Recipes"
@@ -376,9 +447,13 @@ every column but the last."
     (setq tabulated-list-entries entries)
     (setq tabulated-list-format (recipes--dynamic-format entries))
     (setq mode-line-process
-          (and recipes--tag-filter (format " [#%s]" recipes--tag-filter)))
+          (let ((parts (delq nil (list (and recipes--tag-filter
+                                            (format "#%s" recipes--tag-filter))
+                                       recipes--filter-label))))
+            (and parts (concat " [" (string-join parts " ") "]"))))
     (tabulated-list-init-header)
-    (tabulated-list-print t)))
+    (tabulated-list-print t)
+    (recipes--repaint-marks)))
 
 (defun recipes-open ()
   "Open the recipe at point."
@@ -386,6 +461,15 @@ every column but the last."
   (let ((file (tabulated-list-get-id)))
     (unless file (user-error "No recipe at point"))
     (find-file file)))
+
+(defun recipes--current-recipe ()
+  "Return the recipe file for the current context.
+Works from the browser (row at point) or while visiting a recipe file."
+  (or (and (derived-mode-p 'recipes-mode) (tabulated-list-get-id))
+      (and buffer-file-name
+           (string-prefix-p (recipes--dir) (expand-file-name buffer-file-name))
+           buffer-file-name)
+      (user-error "Not on a recipe")))
 
 (defun recipes-filter-tag (tag)
   "Filter the browser to recipes tagged TAG.  Empty input clears the filter."
@@ -438,7 +522,7 @@ every column but the last."
   "Echo the `recipes-mode' keymap."
   (interactive)
   (message
-   "RET open · c new · g refresh · f filter-tag · / search · R rate · m made-today · q quit"))
+   "RET open · v cook · c new · I import · m/u/U mark · b basket · s schedule · e export · ? menu · q quit"))
 
 ;;;###autoload
 (defun recipes ()
@@ -611,6 +695,258 @@ Always includes `recipe' first."
   (org-roam-node-find
    nil nil
    (lambda (node) (member "recipe" (org-roam-node-tags node)))))
+
+;;; ------------------------------------------------------ marking (multi-select)
+
+(defun recipes--repaint-marks ()
+  "Repaint the `*' glyph for every marked recipe currently visible."
+  (when recipes--marked
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let ((id (tabulated-list-get-id)))
+          (when (and id (member id recipes--marked))
+            (tabulated-list-put-tag "*")))
+        (forward-line 1)))))
+
+(defun recipes--selected-files ()
+  "Return the marked recipes, or the recipe at point if none are marked."
+  (or (reverse recipes--marked)
+      (let ((id (tabulated-list-get-id)))
+        (and id (list id)))))
+
+(defun recipes-mark ()
+  "Mark the recipe at point for a batch action and move to the next line."
+  (interactive)
+  (let ((id (tabulated-list-get-id)))
+    (when id
+      (cl-pushnew id recipes--marked :test #'equal)
+      (tabulated-list-put-tag "*" t))))
+
+(defun recipes-unmark ()
+  "Unmark the recipe at point and move to the next line."
+  (interactive)
+  (let ((id (tabulated-list-get-id)))
+    (when id
+      (setq recipes--marked (delete id recipes--marked))
+      (tabulated-list-put-tag " " t))))
+
+(defun recipes-unmark-all ()
+  "Clear all marks."
+  (interactive)
+  (setq recipes--marked nil)
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (tabulated-list-put-tag " ")
+      (forward-line 1)))
+  (message "Marks cleared"))
+
+;;; ------------------------------------------------------ views (filters)
+
+(defun recipes--last-made-days (lm)
+  "Return the absolute day number encoded in LAST_MADE string LM, or nil."
+  (when (and lm (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" lm))
+    (ignore-errors
+      (time-to-days (date-to-time (concat (match-string 1 lm) " 00:00"))))))
+
+(defun recipes-view-unrated ()
+  "Show only recipes that have no rating."
+  (interactive)
+  (setq recipes--filter-fn (lambda (m) (null (plist-get m :rating)))
+        recipes--filter-label "unrated")
+  (recipes-refresh)
+  (message "View: unrated"))
+
+(defun recipes-view-stale (days)
+  "Show only recipes not made within DAYS (never-made counts as stale)."
+  (interactive (list (read-number "Not made in how many days: " 60)))
+  (let ((cutoff (- (time-to-days (current-time)) days)))
+    (setq recipes--filter-fn
+          (lambda (m)
+            (let ((d (recipes--last-made-days (plist-get m :last-made))))
+              (or (null d) (< d cutoff))))
+          recipes--filter-label (format "stale>%dd" days)))
+  (recipes-refresh)
+  (message "View: not made in %d days" days))
+
+(defun recipes-view-clear ()
+  "Clear the active view filter (the tag filter is left untouched)."
+  (interactive)
+  (setq recipes--filter-fn nil recipes--filter-label nil)
+  (recipes-refresh)
+  (message "View cleared"))
+
+(defun recipes-sort-by-last-made ()
+  "Sort by Last Made so never/least-recently made recipes float to the top."
+  (interactive)
+  (setq tabulated-list-sort-key '("Last Made" . nil))
+  (tabulated-list-print t)
+  (recipes--repaint-marks))
+
+(transient-define-prefix recipes-views ()
+  "Filtered views over the recipe collection."
+  ["Views"
+   ("u" "unrated"            recipes-view-unrated)
+   ("s" "not made in N days" recipes-view-stale)
+   ("t" "by tag"             recipes-filter-tag)
+   ("c" "clear view"         recipes-view-clear)])
+
+;;; ------------------------------------------------------ cook mode
+
+(defvar-local recipes--cook-file nil
+  "Recipe file backing the current `recipes-cook-mode' buffer.")
+
+(defun recipes--body-lines (file)
+  "Return FILE's recipe body as lines, with the drawer and leading keywords stripped."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (when (looking-at "[ \t]*:PROPERTIES:")
+      (when (re-search-forward "^[ \t]*:END:[ \t]*$" nil t)
+        (delete-region (point-min) (min (point-max) (1+ (line-end-position))))))
+    (goto-char (point-min))
+    (while (and (not (eobp)) (looking-at "^\\(#\\+\\|[ \t]*$\\)"))
+      (forward-line 1))
+    (split-string (buffer-substring-no-properties (point) (point-max)) "\n")))
+
+(defun recipes-cook-edit ()
+  "Open the underlying recipe file for editing."
+  (interactive)
+  (when recipes--cook-file (find-file recipes--cook-file)))
+
+(defvar recipes-cook-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map "q" #'quit-window)
+    (define-key map "e" #'recipes-cook-edit)
+    map)
+  "Keymap for `recipes-cook-mode'.")
+
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal motion) recipes-cook-mode-map
+    "q" #'quit-window
+    "e" #'recipes-cook-edit)
+  (evil-set-initial-state 'recipes-cook-mode 'motion))
+
+(define-derived-mode recipes-cook-mode special-mode "Recipe-Cook"
+  "Distraction-free, large-type reader for cooking a recipe."
+  (setq buffer-read-only t)
+  (setq cursor-type nil)
+  (setq-local line-spacing 0.25))
+
+(defun recipes--cook-render (file m)
+  "Render recipe FILE (metadata plist M) into the current cook buffer."
+  (insert "\n  ")
+  (insert (propertize (or (plist-get m :title) (file-name-base file))
+                      'face 'recipes-cook-title-face))
+  (insert "\n\n")
+  (let ((meta (string-join
+               (delq nil
+                     (list (when (plist-get m :servings) (concat "Serves " (plist-get m :servings)))
+                           (when (plist-get m :prep)     (concat "Prep "   (plist-get m :prep)))
+                           (when (plist-get m :cook)     (concat "Cook "   (plist-get m :cook)))))
+               "    ·    ")))
+    (unless (string-empty-p meta)
+      (insert "  " (propertize meta 'face 'recipes-folder-face) "\n\n")))
+  (dolist (line (recipes--body-lines file))
+    (cond
+     ((string-match "^\\*+ +\\(.*\\)$" line)
+      (insert "\n  " (propertize (match-string 1 line) 'face 'recipes-cook-heading-face) "\n"))
+     ((string-match-p "^[ \t]*:[A-Za-z_]+:" line) nil)
+     (t (insert "  " (propertize line 'face 'recipes-cook-text-face) "\n")))))
+
+(defun recipes-cook ()
+  "Open a distraction-free cooking view of the recipe at point."
+  (interactive)
+  (let ((file (tabulated-list-get-id)))
+    (unless file (user-error "No recipe at point"))
+    (let ((buf (get-buffer-create "*recipe-cook*"))
+          (m (recipes--file-metadata file)))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (recipes-cook-mode)
+          (setq recipes--cook-file file)
+          (recipes--cook-render file m)
+          (goto-char (point-min))))
+      (switch-to-buffer buf))))
+
+;;; ------------------------------------------------------ backlinks + photo
+
+(declare-function org-roam-buffer-toggle "org-roam-mode")
+(declare-function org-download-clipboard "org-download")
+
+(defun recipes-show-backlinks ()
+  "Open the recipe at point and toggle the org-roam backlinks buffer."
+  (interactive)
+  (let ((file (tabulated-list-get-id)))
+    (unless file (user-error "No recipe at point"))
+    (unless (fboundp 'org-roam-buffer-toggle)
+      (user-error "org-roam is not available"))
+    (find-file file)
+    (org-roam-buffer-toggle)))
+
+(defun recipes-add-photo ()
+  "Open the recipe at point and paste a clipboard image under a Photos heading."
+  (interactive)
+  (let ((file (tabulated-list-get-id)))
+    (unless file (user-error "No recipe at point"))
+    (unless (fboundp 'org-download-clipboard)
+      (user-error "org-download is not available"))
+    (find-file file)
+    (unless (save-excursion (goto-char (point-min))
+                            (re-search-forward "^\\* Photos[ \t]*$" nil t))
+      (goto-char (point-max))
+      (unless (bolp) (insert "\n"))
+      (insert "\n* Photos\n"))
+    (goto-char (point-max))
+    (org-download-clipboard)))
+
+;;; ------------------------------------------------------ dispatcher
+
+(defun recipes--ai-available-p ()
+  "Non-nil when the recipes-ai module is loaded."
+  (fboundp 'recipes-ai-import))
+
+(declare-function recipes-ai-import "recipes-ai")
+(declare-function recipes-ai-extract-macros "recipes-ai")
+(declare-function recipes-ai-suggest-tags "recipes-ai")
+(declare-function recipes-ai-assistant "recipes-ai")
+(declare-function recipes-ai-scale "recipes-ai")
+(declare-function recipes-shopping-list "recipes-plan")
+(declare-function recipes-schedule "recipes-plan")
+(declare-function recipes-export "recipes-export")
+
+(transient-define-prefix recipes-dispatch ()
+  "All recipe-browser actions."
+  [["Open"
+    ("RET" "open"       recipes-open)
+    ("v"   "cook view"  recipes-cook)
+    ("B"   "backlinks"  recipes-show-backlinks)]
+   ["New / Import"
+    ("c"   "capture"    recipes-capture)
+    ("I"   "AI import"  recipes-ai-import :if recipes--ai-available-p)]
+   ["Metadata"
+    ("R"   "rate"       recipes-set-rating)
+    ("X"   "made today" recipes-mark-made)
+    ("p"   "add photo"  recipes-add-photo)
+    ("N"   "AI macros"  recipes-ai-extract-macros :if recipes--ai-available-p)
+    ("T"   "AI tags"    recipes-ai-suggest-tags   :if recipes--ai-available-p)]]
+  [["Marks"
+    ("m"   "mark"          recipes-mark)
+    ("u"   "unmark"        recipes-unmark)
+    ("U"   "unmark all"    recipes-unmark-all)]
+   ["Batch / Plan"
+    ("b"   "shopping list" recipes-shopping-list)
+    ("s"   "schedule"      recipes-schedule)
+    ("a"   "AI assistant"  recipes-ai-assistant :if recipes--ai-available-p)
+    ("S"   "AI scale"      recipes-ai-scale     :if recipes--ai-available-p)]
+   ["View / Export"
+    ("f"   "filter tag"        recipes-filter-tag)
+    ("V"   "views"             recipes-views)
+    ("L"   "sort by last-made" recipes-sort-by-last-made)
+    ("e"   "export"            recipes-export)
+    ("g"   "refresh"           recipes-refresh)]])
 
 ;;; ------------------------------------------------------ keybindings
 

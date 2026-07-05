@@ -705,6 +705,9 @@ compositor seat."
 (load! "sf")                  ;; Salesforce Service Cloud client (case triage)
 (load! "art-of-war")          ;; Art of War daily-study client (SPC s a)
 (load! "recipes")             ;; Recipe manager on org-roam (SPC o k / SPC o K)
+(load! "recipes-plan")        ;; Recipes: shopping list + meal planning
+(when IS-CMACS (load! "recipes-ai")) ;; Recipes: AI import + utilities (cmacs-ai / grok)
+(load! "recipes-export")      ;; Recipes: Forgejo-light HTML/PDF export + mu4e mail
 (load! "container-registry-browse") ;; Container registry search + tag browse (SPC s c)
 (load! "+games")              ;; Games launcher + built-in/3rd-party game bundle (SPC G)
 (load! "emacslife/emacslife") ;; EmacsLife — BitLife clone (SPC G L)
