@@ -1,0 +1,721 @@
+#!/usr/bin/python3
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+rotate_forgejo_mirror_tokens - roll the GitHub/GitLab PATs stored in Forgejo mirrors.
+
+Two self-hosted Forgejo instances use upstream GitHub/GitLab personal access
+tokens for mirroring:
+
+  * git-mirror.podbielniak.com  - PULL mirrors  (Forgejo pulls FROM github/gitlab)
+  * git.podbielniak.com         - PUSH mirrors  (Forgejo pushes TO github/gitlab)
+
+Neither mirror type can have its stored credential updated in place through the
+Forgejo REST API, so rotation means: read each mirror's config from the API, then
+DELETE + recreate it carrying over every setting except the token, which is
+replaced with the current ${GITHUB_TOKEN} / ${GITLAB_TOKEN}.
+
+Sibling of ./archive_repo (which creates the pull mirrors); the run_curl /
+detect_service / migrate patterns are adapted from it.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+
+SCRIPT_NAME = os.path.basename(sys.argv[0])
+
+# ---------------------------------------------------------------------------
+# Instance configuration
+# ---------------------------------------------------------------------------
+INSTANCES = {
+    "pull": {
+        "server_url": "https://git-mirror.podbielniak.com",
+        "token_env": "FORGEJO_MIRROR_TOKEN",
+    },
+    "push": {
+        "server_url": "https://git.podbielniak.com",
+        "token_env": "FORGEJO_TOKEN",
+    },
+}
+
+# Env vars holding the *new* upstream credentials, keyed by detected service.
+SERVICE_TOKEN_ENV = {
+    "github": "GITHUB_TOKEN",
+    "gitlab": "GITLAB_TOKEN",
+}
+
+# ---------------------------------------------------------------------------
+# Logging (colored [LEVEL] prefixes on stderr so stdout/pipes stay clean)
+# ---------------------------------------------------------------------------
+_print_lock = threading.Lock()
+
+if os.environ.get("NO_COLOR") or not sys.stderr.isatty():
+    C_RESET = C_RED = C_GREEN = C_YELLOW = C_BLUE = C_CYAN = C_DIM = ""
+else:
+    C_RESET = "\033[0m"
+    C_RED = "\033[0;31m"
+    C_GREEN = "\033[0;32m"
+    C_YELLOW = "\033[1;33m"
+    C_BLUE = "\033[0;34m"
+    C_CYAN = "\033[0;36m"
+    C_DIM = "\033[2m"
+
+_DEBUG = False
+
+
+def _emit(prefix, color, message):
+    with _print_lock:
+        print(f"{color}{prefix}{C_RESET} {message}", file=sys.stderr, flush=True)
+
+
+def log_info(msg):
+    _emit("[INFO]", C_BLUE, msg)
+
+
+def log_ok(msg):
+    _emit("[OK]", C_GREEN, msg)
+
+
+def log_warn(msg):
+    _emit("[WARN]", C_YELLOW, msg)
+
+
+def log_error(msg):
+    _emit("[ERROR]", C_RED, msg)
+
+
+def log_skip(msg):
+    _emit("[SKIP]", C_DIM, msg)
+
+
+def log_dry(msg):
+    _emit("[DRY-RUN]", C_CYAN, msg)
+
+
+def log_debug(msg):
+    if _DEBUG:
+        _emit("[DEBUG]", C_DIM, msg)
+
+
+def mask_token(value):
+    if not value:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}" if len(value) > 8 else "***"
+
+# ---------------------------------------------------------------------------
+# HTTP helper (curl, Forgejo/Gitea "Authorization: token" auth)
+# ---------------------------------------------------------------------------
+
+
+def api_request(base_url, path, method="GET", data=None, token=None):
+    """
+    Call the Forgejo API. Returns (status_code, parsed_json_or_None).
+
+    status_code is the real HTTP code (0 if curl failed to run/parse it), so
+    callers can reliably distinguish 204 (empty success), 404, and 4xx/5xx
+    without guessing from the body.
+    """
+    url = f"{base_url}{path}"
+    cmd = ["curl", "-sS", "-w", "\n%{http_code}", "-X", method]
+    if token:
+        cmd += ["-H", f"Authorization: token {token}"]
+    if data is not None:
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(data)]
+    cmd.append(url)
+
+    if _DEBUG:
+        safe = []
+        for i, arg in enumerate(cmd):
+            if i > 0 and cmd[i - 1] == "-H" and arg.startswith("Authorization: token "):
+                safe.append(f"Authorization: token {mask_token(arg.split(' ', 2)[2])}")
+            elif i > 0 and cmd[i - 1] == "-d":
+                safe.append(_redact_body(arg))
+            else:
+                safe.append(arg)
+        log_debug(f"{method} {url} :: {' '.join(safe)}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as exc:  # noqa: BLE001 - report and treat as failure
+        log_debug(f"curl invocation failed: {exc}")
+        return 0, None
+
+    out = result.stdout or ""
+    nl = out.rfind("\n")
+    if nl == -1:
+        body, code_str = out, ""
+    else:
+        body, code_str = out[:nl], out[nl + 1:]
+
+    try:
+        status = int(code_str.strip())
+    except ValueError:
+        status = 0
+        log_debug(f"could not parse HTTP status from curl (rc={result.returncode}): {result.stderr.strip()}")
+
+    parsed = None
+    if body.strip():
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            log_debug(f"non-JSON response body for {method} {url}: {body[:200]}")
+    return status, parsed
+
+
+def _redact_body(raw):
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    for key in ("auth_token", "auth_password", "remote_password"):
+        if key in obj:
+            obj[key] = "***REDACTED***"
+    return json.dumps(obj)
+
+
+def api_error_message(parsed):
+    if isinstance(parsed, dict):
+        return parsed.get("message") or parsed.get("error") or json.dumps(parsed)[:200]
+    return str(parsed)[:200] if parsed is not None else "no response"
+
+# ---------------------------------------------------------------------------
+# Service detection (host -> github/gitlab/...); adapted from archive_repo
+# ---------------------------------------------------------------------------
+
+
+def detect_service(url):
+    hostname = (urlparse(url).hostname or "").lower()
+    if "github.com" in hostname:
+        return "github"
+    if "gitlab.com" in hostname:
+        return "gitlab"
+    if "gitea" in hostname:
+        return "gitea"
+    if "gogs" in hostname:
+        return "gogs"
+    if "bitbucket" in hostname:
+        return "gitbucket"
+    if "codeberg.org" in hostname:
+        return "forgejo"
+    return "git"
+
+
+def token_for_service(service):
+    """Return the *new* upstream token for a service, or None if unavailable."""
+    env = SERVICE_TOKEN_ENV.get(service)
+    if not env:
+        return None
+    return os.environ.get(env)
+
+# ---------------------------------------------------------------------------
+# Repository enumeration
+# ---------------------------------------------------------------------------
+
+
+def get_repo(base_url, owner, name, token):
+    status, parsed = api_request(base_url, f"/repos/{owner}/{name}", token=token)
+    if status == 200 and isinstance(parsed, dict):
+        return parsed
+    if status == 404:
+        return None
+    log_warn(f"{owner}/{name}: unexpected response fetching repo (HTTP {status}): {api_error_message(parsed)}")
+    return None
+
+
+def list_owner_repos(base_url, owner, token):
+    """All repos under an org OR user. Tries /orgs first, falls back to /users."""
+    for kind in ("orgs", "users"):
+        repos = []
+        page = 1
+        got_any = False
+        while True:
+            status, parsed = api_request(
+                base_url, f"/{kind}/{owner}/repos?page={page}&limit=50", token=token
+            )
+            if status == 404:
+                break  # not this kind of owner; try the next
+            if status != 200 or not isinstance(parsed, list):
+                log_warn(f"{owner}: listing {kind} repos failed (HTTP {status}): {api_error_message(parsed)}")
+                break
+            got_any = True
+            repos.extend(parsed)
+            if len(parsed) < 50:
+                break
+            page += 1
+        if got_any:
+            return repos
+    log_warn(f"{owner}: no org or user with that name found")
+    return []
+
+
+def search_all_repos(base_url, token):
+    """Every repo the token can see (as the sole account, that is all of them)."""
+    repos = []
+    page = 1
+    while True:
+        status, parsed = api_request(
+            base_url, f"/repos/search?page={page}&limit=50", token=token
+        )
+        if status != 200 or not isinstance(parsed, dict):
+            log_error(f"repo search failed (HTTP {status}): {api_error_message(parsed)}")
+            break
+        data = parsed.get("data") or []
+        repos.extend(data)
+        if len(data) < 50:
+            break
+        page += 1
+    return repos
+
+
+def resolve_targets(base_url, token, orgs, repo_specs):
+    """
+    Build the de-duplicated list of repo objects to consider, honoring
+    --repo (owner-qualified) and --org filters, else a full-instance sweep.
+    """
+    targets = []
+    seen = set()
+
+    def add(repo):
+        full = repo.get("full_name")
+        if full and full not in seen:
+            seen.add(full)
+            targets.append(repo)
+
+    if repo_specs:
+        for spec in repo_specs:
+            owner, name = spec.split("/", 1)
+            repo = get_repo(base_url, owner, name, token)
+            if repo is None:
+                log_error(f"--repo {spec}: repository not found; skipping")
+                continue
+            add(repo)
+
+    if orgs:
+        for owner in orgs:
+            found = list_owner_repos(base_url, owner, token)
+            log_debug(f"--org {owner}: {len(found)} repo(s)")
+            for repo in found:
+                add(repo)
+
+    if not repo_specs and not orgs:
+        for repo in search_all_repos(base_url, token):
+            add(repo)
+
+    return targets
+
+# ---------------------------------------------------------------------------
+# Action collection (read-only) — figures out exactly what would be rotated
+# ---------------------------------------------------------------------------
+
+
+def owner_name(repo):
+    full = repo.get("full_name")
+    if full and "/" in full:
+        owner, name = full.split("/", 1)
+        return owner, name
+    owner = (repo.get("owner") or {})
+    return owner.get("login") or owner.get("username") or "?", repo.get("name", "?")
+
+
+def collect_pull_actions(base_url, forgejo_token, targets, counters):
+    actions = []
+    for repo in targets:
+        owner, name = owner_name(repo)
+        full = f"{owner}/{name}"
+        if not repo.get("mirror"):
+            log_skip(f"{full}: not a pull mirror")
+            counters["skipped"] += 1
+            continue
+        original_url = repo.get("original_url") or ""
+        if not original_url:
+            log_error(f"{full}: is a mirror but has no original_url — refusing to touch it")
+            counters["errors"] += 1
+            continue
+        service = detect_service(original_url)
+        new_token = token_for_service(service)
+        if not new_token:
+            env = SERVICE_TOKEN_ENV.get(service, f"<{service}>")
+            log_skip(f"{full}: upstream is {service} but ${env} is unset")
+            counters["skipped"] += 1
+            continue
+        actions.append({
+            "kind": "pull",
+            "owner": owner,
+            "name": name,
+            "full": full,
+            "service": service,
+            "original_url": original_url,
+            "private": bool(repo.get("private", False)),
+            "new_token": new_token,
+        })
+    return actions
+
+
+def collect_push_actions(base_url, forgejo_token, targets, args, counters):
+    actions = []
+    for repo in targets:
+        owner, name = owner_name(repo)
+        full = f"{owner}/{name}"
+        status, parsed = api_request(
+            base_url, f"/repos/{owner}/{name}/push_mirrors", token=forgejo_token
+        )
+        if status != 200 or not isinstance(parsed, list):
+            log_error(f"{full}: could not list push mirrors (HTTP {status}): {api_error_message(parsed)}")
+            counters["errors"] += 1
+            continue
+        if not parsed:
+            log_skip(f"{full}: no push mirrors")
+            counters["skipped"] += 1
+            continue
+        for mirror in parsed:
+            remote_name = mirror.get("remote_name")
+            remote_address = mirror.get("remote_address") or ""
+            label = f"{full}[{remote_name}]"
+            if not remote_name or not remote_address:
+                log_error(f"{label}: missing remote_name/remote_address — refusing to touch it")
+                counters["errors"] += 1
+                continue
+            service = detect_service(remote_address)
+            new_token = token_for_service(service)
+            if not new_token:
+                env = SERVICE_TOKEN_ENV.get(service, f"<{service}>")
+                log_skip(f"{label}: remote is {service} but ${env} is unset")
+                counters["skipped"] += 1
+                continue
+            if service == "github":
+                username = args.github_username
+            elif service == "gitlab":
+                username = args.gitlab_username
+            else:
+                username = args.github_username
+            actions.append({
+                "kind": "push",
+                "owner": owner,
+                "name": name,
+                "full": full,
+                "label": label,
+                "service": service,
+                "remote_name": remote_name,
+                "remote_address": remote_address,
+                "remote_username": username,
+                "interval": mirror.get("interval"),
+                "sync_on_commit": True if args.sync_on_commit else bool(mirror.get("sync_on_commit", False)),
+                "new_token": new_token,
+            })
+    return actions
+
+# ---------------------------------------------------------------------------
+# Action execution (mutating) — DELETE + recreate
+# ---------------------------------------------------------------------------
+
+
+def execute_pull_action(base_url, forgejo_token, action, delay):
+    full = action["full"]
+    # SAFETY: original_url + service + new_token were all captured before we get here.
+    status, parsed = api_request(
+        base_url, f"/repos/{action['owner']}/{action['name']}", method="DELETE", token=forgejo_token
+    )
+    if status not in (204, 200):
+        return False, f"delete failed (HTTP {status}): {api_error_message(parsed)}"
+
+    body = {
+        "clone_addr": action["original_url"],
+        "repo_name": action["name"],
+        "repo_owner": action["owner"],
+        "service": action["service"],
+        "mirror": True,
+        "private": action["private"],
+        "auth_token": action["new_token"],
+        "issues": True,
+        "labels": True,
+        "milestones": True,
+        "pull_requests": True,
+        "releases": True,
+        "wiki": True,
+    }
+    status, parsed = api_request(base_url, "/repos/migrate", method="POST", data=body, token=forgejo_token)
+    if status in (200, 201) and isinstance(parsed, dict) and "id" in parsed:
+        if delay > 0:
+            time.sleep(delay)
+        return True, None
+    return False, (
+        f"re-migrate failed (HTTP {status}): {api_error_message(parsed)} "
+        f"-- repo '{full}' was DELETED; recreate it manually from {action['original_url']}"
+    )
+
+
+def execute_push_action(base_url, forgejo_token, action, delay):
+    owner, name = action["owner"], action["name"]
+    # SAFETY: remote_address + service + username + new_token captured before this point.
+    status, parsed = api_request(
+        base_url,
+        f"/repos/{owner}/{name}/push_mirrors/{action['remote_name']}",
+        method="DELETE",
+        token=forgejo_token,
+    )
+    if status not in (204, 200):
+        return False, f"delete failed (HTTP {status}): {api_error_message(parsed)}"
+
+    body = {
+        "remote_address": action["remote_address"],
+        "remote_username": action["remote_username"],
+        "remote_password": action["new_token"],
+        "sync_on_commit": action["sync_on_commit"],
+    }
+    if action.get("interval"):
+        body["interval"] = action["interval"]
+    status, parsed = api_request(
+        base_url, f"/repos/{owner}/{name}/push_mirrors", method="POST", data=body, token=forgejo_token
+    )
+    if status in (200, 201) and isinstance(parsed, dict) and parsed.get("remote_name"):
+        if delay > 0:
+            time.sleep(delay)
+        return True, None
+    return False, (
+        f"recreate failed (HTTP {status}): {api_error_message(parsed)} "
+        f"-- push mirror '{action['label']}' -> {action['remote_address']} was DELETED; recreate it manually"
+    )
+
+
+def execute_actions(base_url, forgejo_token, actions, parallel, delay, counters):
+    def run(action):
+        if action["kind"] == "pull":
+            ok, err = execute_pull_action(base_url, forgejo_token, action, delay)
+            label = action["full"]
+        else:
+            ok, err = execute_push_action(base_url, forgejo_token, action, delay)
+            label = action["label"]
+        return action, ok, err, label
+
+    def record(result):
+        action, ok, err, label = result
+        if ok:
+            log_ok(f"{label} -> {action['service']} (rotated)")
+            counters["rotated"] += 1
+        else:
+            log_error(f"{label}: {err}")
+            counters["errors"] += 1
+
+    if parallel and parallel > 1:
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            futures = [pool.submit(run, a) for a in actions]
+            for fut in as_completed(futures):
+                record(fut.result())
+    else:
+        for action in actions:
+            record(run(action))
+
+# ---------------------------------------------------------------------------
+# Mode driver
+# ---------------------------------------------------------------------------
+
+
+def run_mode(mode, args):
+    """Run a single instance mode ('pull' or 'push'). Returns error count."""
+    cfg = INSTANCES[mode]
+    base_url = f"{cfg['server_url']}/api/v1"
+    token_env = args.forgejo_token_env or cfg["token_env"]
+    forgejo_token = os.environ.get(token_env)
+
+    counters = {"rotated": 0, "skipped": 0, "errors": 0}
+
+    log_info(f"{C_CYAN}=== mode={mode}  host={cfg['server_url']}  auth=${token_env}{C_RESET}")
+    if not forgejo_token:
+        log_error(f"${token_env} is not set — cannot authenticate to {cfg['server_url']}")
+        counters["errors"] += 1
+        return counters
+
+    targets = resolve_targets(base_url, forgejo_token, args.org, args.repo)
+    log_info(f"{len(targets)} repository(ies) in scope")
+    if mode == "pull" and args.sync_on_commit:
+        log_info("--sync-on-commit applies to push mirrors only; ignored for pull")
+    if not targets:
+        log_warn("nothing in scope; done")
+        return counters
+
+    if mode == "pull":
+        actions = collect_pull_actions(base_url, forgejo_token, targets, counters)
+    else:
+        actions = collect_push_actions(base_url, forgejo_token, targets, args, counters)
+
+    if not actions:
+        log_info(f"no mirrors to rotate  (skipped={counters['skipped']} errors={counters['errors']})")
+        return counters
+
+    verb = "would rotate" if args.dry_run else "will rotate"
+    log_info(f"{verb} {len(actions)} mirror(s):")
+    for action in actions:
+        label = action["full"] if action["kind"] == "pull" else action["label"]
+        dest = action.get("original_url") or action.get("remote_address")
+        line = f"{label} -> {action['service']}  ({dest})"
+        if action["kind"] == "push":
+            line += f"  sync_on_commit={action['sync_on_commit']}"
+        if args.dry_run:
+            log_dry(f"DELETE + recreate: {line}")
+        else:
+            log_info(f"  - {line}")
+
+    if args.dry_run:
+        counters["rotated"] += len(actions)  # count planned rotations for the summary
+        _summary(mode, counters, dry_run=True)
+        return counters
+
+    if not args.no_confirm:
+        if not sys.stdin.isatty():
+            log_error("refusing to mutate without a TTY to confirm; pass --no-confirm to proceed")
+            counters["errors"] += 1
+            return counters
+        with _print_lock:
+            print(
+                f"{C_YELLOW}About to DELETE and recreate {len(actions)} mirror(s) on "
+                f"{cfg['server_url']}. Continue? [y/N] {C_RESET}",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+        answer = sys.stdin.readline().strip().lower()
+        if answer not in ("y", "yes"):
+            log_warn("aborted by user")
+            return counters
+
+    execute_actions(base_url, forgejo_token, actions, args.parallel, args.delay, counters)
+    _summary(mode, counters, dry_run=False)
+    return counters
+
+
+def _summary(mode, counters, dry_run):
+    tag = "DRY-RUN " if dry_run else ""
+    msg = (
+        f"{tag}summary [{mode}]: rotated={counters['rotated']} "
+        f"skipped={counters['skipped']} errors={counters['errors']}"
+    )
+    if counters["errors"]:
+        log_error(msg)
+    else:
+        log_ok(msg)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+LICENSE_BLURB = """dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak
+
+Licensed under the GNU Affero General Public License v3 or later (AGPLv3+).
+This program comes with ABSOLUTELY NO WARRANTY. This is free software, and you
+are welcome to redistribute it under certain conditions.
+See <https://www.gnu.org/licenses/> for details."""
+
+
+def csv_list(value):
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=SCRIPT_NAME,
+        description="Rotate the GitHub/GitLab tokens stored in Forgejo pull/push mirrors "
+                    "by reading each mirror's config and recreating it with the new token.",
+        epilog=(
+            "Modes:\n"
+            "  pull  git-mirror.podbielniak.com (pull mirrors)  auth: $FORGEJO_MIRROR_TOKEN\n"
+            "  push  git.podbielniak.com        (push mirrors)  auth: $FORGEJO_TOKEN\n"
+            "  all   run pull then push\n\n"
+            "New upstream tokens are read from $GITHUB_TOKEN / $GITLAB_TOKEN.\n\n"
+            "Examples:\n"
+            f"  {SCRIPT_NAME} pull --dry-run\n"
+            f"  {SCRIPT_NAME} push --repo zachpodbielniak/foo,myorg/bar --no-confirm\n"
+            f"  {SCRIPT_NAME} all --org zachpodbielniak --dry-run\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("mode", choices=["pull", "push", "all"],
+                        help="which instance/mirror direction to rotate")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show planned delete/recreate for every mirror; change nothing")
+    parser.add_argument("--org", type=csv_list, default=[], metavar="NAME[,NAME...]",
+                        help="limit to these orgs/users (comma-separated)")
+    parser.add_argument("--repo", type=csv_list, default=[], metavar="OWNER/REPO[,...]",
+                        help="limit to these owner-qualified repos (comma-separated)")
+    parser.add_argument("--no-confirm", action="store_true",
+                        help="do not prompt before deleting/recreating mirrors")
+    parser.add_argument("--parallel", type=int, default=1, metavar="N",
+                        help="rotate up to N mirrors concurrently (default 1)")
+    parser.add_argument("--delay", type=float, default=0, metavar="SECONDS",
+                        help="sleep SECONDS after each successful rotation")
+    parser.add_argument("--sync-on-commit", action="store_true",
+                        help="force recreated PUSH mirrors to have sync-on-commit ENABLED, "
+                             "overriding each mirror's current setting (push mode only)")
+    parser.add_argument("--github-username", default="zachpodbielniak", metavar="USER",
+                        help="username paired with $GITHUB_TOKEN for recreated push mirrors")
+    parser.add_argument("--gitlab-username", default="oauth2", metavar="USER",
+                        help="username paired with $GITLAB_TOKEN for recreated push mirrors")
+    parser.add_argument("--forgejo-token-env", metavar="VAR",
+                        help="override the env var holding the Forgejo API token for this run")
+    parser.add_argument("--debug", action="store_true", help="verbose debugging (tokens masked)")
+    parser.add_argument("--license", action="store_true", help="show license summary and exit")
+    return parser
+
+
+def validate_repo_specs(repo_specs):
+    bad = [spec for spec in repo_specs if "/" not in spec]
+    if bad:
+        log_error(f"--repo values must be OWNER/REPO; invalid: {', '.join(bad)}")
+        return False
+    return True
+
+
+def main(argv):
+    global _DEBUG
+    parser = build_parser()
+
+    if "--license" in argv:
+        print(LICENSE_BLURB)
+        return 0
+
+    args = parser.parse_args(argv)
+    _DEBUG = args.debug
+
+    if args.repo and not validate_repo_specs(args.repo):
+        return 2
+    if args.parallel < 1:
+        log_error("--parallel must be >= 1")
+        return 2
+
+    modes = ["pull", "push"] if args.mode == "all" else [args.mode]
+    total_errors = 0
+    for mode in modes:
+        counters = run_mode(mode, args)
+        total_errors += counters["errors"]
+
+    return 1 if total_errors else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        log_warn("interrupted")
+        sys.exit(130)
