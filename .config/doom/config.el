@@ -996,6 +996,13 @@ compositor seat."
 ;;; Unconditionally move the dev tree to the front of load-path.
 ;;; `add-to-list' alone would be a no-op when the dir is already
 ;;; present further down the list, so we delete + cons.
-(let ((dev "/var/home/zach/source/projects/cmacs/lisp/cmacs"))
+;;;
+;;; The dev tree defaults to ~/source/projects/cmacs, but `just run'
+;;; (and `just gowl') export CMACS_LISP_DIR pointing at *whichever*
+;;; tree/worktree they were launched from, so running a feature branch
+;;; from a git worktree loads that worktree's lisp/cmacs instead of the
+;;; main checkout's.  Falls back to the main tree for a plain `emacs'.
+(let ((dev (or (getenv "CMACS_LISP_DIR")
+               "/var/home/zach/source/projects/cmacs/lisp/cmacs")))
   (when (file-directory-p dev)
     (setq load-path (cons dev (delete dev load-path)))))
