@@ -203,6 +203,11 @@
 ;; REST + WebSocket client for Home Assistant. On MELPA.
 (package! hass)
 
+;;; --- Time zones ---
+
+;; Time zone converter + world clock (M-x tzc-*). On MELPA.
+(package! tzc)
+
 ;;; --- Media ---
 
 ;; YouTube front-end: search, play via mpv, download via yt-dlp. On MELPA.

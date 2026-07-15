@@ -755,6 +755,26 @@ compositor seat."
 (load! "+emms")           ;; EMMS / MPD music client
 (load! "+jira")           ;; Jira issues + detail views
 
+;;; tzc — time zone converter / world clock.  No keybindings; use via
+;;; M-x tzc-convert-time, M-x tzc-convert-time-to-favourite-time-zones,
+;;; M-x tzc-world-clock.
+(use-package! tzc
+  :defer t
+  :config
+  (setq tzc-favourite-time-zones-alist
+        '(("America/Detroit"     "Detroit")
+          ("America/Chicago"     "Chicago")
+          ("America/Denver"      "Denver")
+          ("America/Los_Angeles" "Los Angeles")
+          ("UTC+0000"            "UTC")
+          ("Europe/London"       "London")
+          ("Europe/Vienna"       "Linz")
+          ("Europe/Warsaw"       "Gdansk")
+          ("Europe/Madrid"       "Barcelona")
+          ("Asia/Kolkata"        "Kolkata")
+          ("Asia/Tokyo"          "Tokyo")
+          ("Australia/Sydney"    "Sydney"))))
+
 
 ;;;; =========================================================================
 ;;;; Torrenting — qbittorrent-transient + Jackett + *arr glue
