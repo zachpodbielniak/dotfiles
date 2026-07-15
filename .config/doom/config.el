@@ -428,6 +428,23 @@ No-op on TTY frames — terminal transparency is the emulator's job."
               (let ((s (buffer-string)))
                 (unless (string-empty-p s) s)))))))
 
+;;; pgtk + GTK input-method context: shift gets stripped from S-SPC.
+;;;
+;;; With the IM context enabled (the default), any keypress that yields
+;;; a character is routed through GTK's input method, which commits
+;;; *text*, not key events.  Shift+Space commits " ", so Emacs receives
+;;; plain SPC and S-SPC bindings (e.g. magit's
+;;; magit-diff-show-or-scroll-up) can never fire.  Disabling the IM
+;;; context delivers raw key events.  Only costs system input-method
+;;; integration (ibus/fcitx CJK), which we don't use.
+;;;
+;;; The setq only affects *new* display connections (covers daemon
+;;; frames); the function call fixes the connection already established
+;;; before config.el loads in a normal GUI startup.
+(setq pgtk-use-im-context-on-new-connection nil)
+(when (eq (window-system) 'pgtk)
+  (pgtk-use-im-context nil))
+
 ;;; browse-kill-ring: evil keybinds (defaults are Emacs-style)
 (after! browse-kill-ring
   (set-evil-initial-state! 'browse-kill-ring-mode 'normal)
