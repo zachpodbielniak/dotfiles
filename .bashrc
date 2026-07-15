@@ -75,8 +75,8 @@ _path_prepend \
     "${HOME}/.npm-global/bin/" \
     "${HOME}/bin/nim/bin" \
     "${HOME}/bin/scripts" \
-    "${HOME}/bin/export"
-
+    "${HOME}/bin/export" \
+    "${HOME}/.grok/bin"
 
 _path_append \
     "/usr/local/bin" \
@@ -292,3 +292,11 @@ if [[ -n "$KITTY_WINDOW_ID" ]]; then
     export KITTY_WINDOW_ID
     export KITTY_LISTEN_ON
 fi
+
+# >>> grok installer >>>
+# Moved export logic to the _path_prepend logic further up
+if [[ -r "${HOME}/.grok/completions/bash/grok.bash" ]]
+then
+	source "${HOME}/.grok/completions/bash/grok.bash"
+fi
+# <<< grok installer <<<
