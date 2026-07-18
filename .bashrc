@@ -279,13 +279,22 @@ PERL_MM_OPT="INSTALL_BASE=${HOME}/perl5"; export PERL_MM_OPT;
 
 
 # Starship
-# Use system starship instead of the custom binary to avoid PS0 issues
-if [[ -f "$HOME/bin/starship/starship" ]]
+# Use system starship instead of the custom binary to avoid PS0 issues.
+#
+# Only initialize for interactive shells.  Non-interactive subprocesses
+# (Emacs `shell-command-to-string' in the doom modeline/dirvish, scp/rsync,
+# cron, plain scripts) still source this file, run under TERM=dumb, and would
+# otherwise install `starship_precmd' and spew:
+#   [ERROR] - (starship::print): Under a 'dumb' terminal (TERM=dumb).
+if [[ $- == *i* ]]
 then
-    eval "$($HOME/bin/starship/starship init bash)"
-elif command -v starship &>/dev/null
-then
-    eval "$(starship init bash)"
+    if [[ -f "$HOME/bin/starship/starship" ]]
+    then
+        eval "$($HOME/bin/starship/starship init bash)"
+    elif command -v starship &>/dev/null
+    then
+        eval "$(starship init bash)"
+    fi
 fi
 
 if [[ -n "$KITTY_WINDOW_ID" ]]; then
