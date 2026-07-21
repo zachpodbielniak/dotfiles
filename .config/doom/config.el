@@ -21,6 +21,22 @@
   (when (file-directory-p perl5lib)
     (setenv "PERL5LIB" (concat perl5lib ":" (or (getenv "PERL5LIB") "")))))
 
+;;; Scrub ssh-origin vars from the daemon's environment.  Fedora builds bash
+;;; with SSH_SOURCE_BASHRC, so any child `bash -c CMD' sources the full
+;;; ~/.bashrc (~0.7s) whenever SSH_CLIENT/SSH_CONNECTION is present.  These
+;;; vars leaked into the long-lived daemon's `process-environment' at runtime
+;;; (vector unknown -- likely an emacsclient connection over ssh), which made
+;;; every `shell-command-to-string' -- including the 15s pomo modeline timer --
+;;; stall typing for ~0.7-2s.  A desktop daemon has no ssh origin to declare;
+;;; SSH_AUTH_SOCK is deliberately left alone.  Re-scrub on every client
+;;; connection in case the importer strikes again.
+(defun zach--scrub-ssh-env (&rest _)
+  "Remove ssh-session origin vars that make bash source ~/.bashrc."
+  (dolist (var '("SSH_CLIENT" "SSH_CONNECTION" "SSH_TTY"))
+    (when (getenv var) (setenv var nil))))
+(zach--scrub-ssh-env)
+(add-hook 'server-after-make-frame-hook #'zach--scrub-ssh-env)
+
 
 ;;;; =========================================================================
 ;;;; Phase 1: Foundation — Theme, UI, Core Editor
