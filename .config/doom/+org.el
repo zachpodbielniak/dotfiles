@@ -286,5 +286,51 @@ Auto-prefixes the filename with today's date when DIR contains
 (after! org-download
   (setq org-download-screenshot-method "wl-paste -t image/png > %s"))
 
+;;; Copy the image linked at point OUT to the Wayland clipboard.
+;;; The reverse of org-download: given [[file:...]] / [[attachment:...]] /
+;;; plain-file image links, ship the raw bytes to wl-copy so other apps can
+;;; paste the image.  Must shell out directly — config.el sets
+;;; `select-enable-clipboard nil' and hands CLIPBOARD ownership to wl-copy,
+;;; so gui-set-selection can't put an image on the clipboard here.
+(defun zach/org-image-copy-to-clipboard ()
+  "Copy the image linked at point to the Wayland clipboard.
+Resolves file:/attachment:/plain file links, detects the MIME type
+from the extension, and hands the raw bytes to wl-copy so other apps
+can paste the image."
+  (interactive)
+  (unless (executable-find "wl-copy")
+    (user-error "wl-copy not on PATH"))
+  (let* ((link (let ((ctx (org-element-context)))
+                 (if (eq (org-element-type ctx) 'link) ctx
+                   (user-error "Point is not on a link"))))
+         (type (org-element-property :type link))
+         (path (org-element-property :path link))
+         (file (pcase type
+                 ("attachment" (org-attach-expand path))
+                 ("file"       (expand-file-name path))
+                 (_ (user-error "Not a file/attachment link: %s:" type))))
+         (ext  (downcase (or (file-name-extension file) "")))
+         (mime (pcase ext
+                 ("png"             "image/png")
+                 ((or "jpg" "jpeg") "image/jpeg")
+                 ("gif"             "image/gif")
+                 ("webp"            "image/webp")
+                 ("svg"             "image/svg+xml")
+                 ("bmp"             "image/bmp")
+                 ((or "tif" "tiff") "image/tiff")
+                 (_ (user-error "Unknown image type: .%s" ext)))))
+    (unless (file-readable-p file)
+      (user-error "Cannot read %s" file))
+    ;; call-process feeds FILE to wl-copy's stdin; wl-copy daemonizes and
+    ;; holds CLIPBOARD ownership, matching the select-enable-clipboard nil setup.
+    (call-process "wl-copy" file nil nil "-t" mime)
+    (message "Copied %s (%s) to clipboard"
+             (file-name-nondirectory file) mime)))
+
+(map! :map org-mode-map
+      :localleader
+      :desc "Copy image at point to clipboard" "Y"
+      #'zach/org-image-copy-to-clipboard)
+
 (provide '+org)
 ;;; +org.el ends here
