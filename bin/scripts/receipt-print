@@ -1,0 +1,1031 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly DEFAULT_HOST="receipt.podbielniak.com"
+readonly DEFAULT_PORT=9100
+readonly DEFAULT_TIMEOUT=10
+readonly DEFAULT_FEED=4
+readonly DEFAULT_TABS=4
+readonly DEFAULT_CODEPAGE="cp1252"
+readonly DEFAULT_QR_SIZE=6
+readonly DEFAULT_BARCODE_TYPE="code128"
+
+# Column counts for the built-in fonts. Measured on the TM-T20IV-SP with a
+# printed ruler: it uses the full 576 dot print area, so font A (12 dots wide)
+# gives 48 columns and font B (9 dots) gives 64. The widely quoted 42/56 figures
+# assume the narrower 512 dot area some models default to -- do not "correct"
+# these back without reprinting the ruler.
+readonly WIDTH_FONT_A=48
+readonly WIDTH_FONT_B=64
+
+# ============================================================================
+# Help
+# ============================================================================
+
+usage () {
+    cat <<EOF
+${SCRIPT_NAME} - Send text, QR codes and barcodes to an ESC/POS receipt printer
+
+USAGE:
+    ${SCRIPT_NAME} [OPTIONS] [FILE...]
+    command | ${SCRIPT_NAME} [OPTIONS]
+
+ARGUMENTS:
+    FILE...                Files to print. "-" means stdin. With no FILE and no
+                           --qr/--barcode/--cut-only, stdin is read implicitly.
+
+DESCRIPTION:
+    Reads text from FILE(s) or stdin, transliterates it to the printer's code
+    page, wraps it to the column width of the selected font, wraps it in ESC/POS
+    framing and sends the result to a network receipt printer over raw TCP
+    (JetDirect, port 9100).
+
+    Written for an Epson TM-T20IV-SP but speaks plain ESC/POS, so it should work
+    with any raw-socket thermal printer.
+
+    Input is sanitised on the way through: ANSI escape sequences are stripped and
+    stray C0 control bytes are removed, so piping colourised or even binary
+    output at the printer cannot leave it in a strange state. Use --raw to opt
+    out of the whole pipeline and send hand-built ESC/POS instead.
+
+OPTIONS:
+  Connection
+    -H, --host HOST        Printer host or IP (default: \${RECEIPT_PRINTER_HOST:-${DEFAULT_HOST}})
+    -p, --port PORT        Raw ESC/POS port (default: \${RECEIPT_PRINTER_PORT:-${DEFAULT_PORT}})
+        --timeout SECS     Connect and send timeout (default: ${DEFAULT_TIMEOUT})
+
+  Paper
+    -c, --cut              Cut the paper when done (default)
+    -n, --no-cut           Feed only, do not cut
+        --cut-only         Send nothing but a feed and a cut
+        --feed N           Blank lines fed before the end (default: ${DEFAULT_FEED})
+
+  Layout
+    -f, --font {a,b,auto}  Font A (${WIDTH_FONT_A} col), Font B (${WIDTH_FONT_B} col), or pick
+                           automatically from the longest line (default: b)
+    -w, --width N          Override the column width
+        --codepage NAME    cp1252, cp437 or cp858 (default: ${DEFAULT_CODEPAGE})
+        --tabs N           Tab expansion width (default: ${DEFAULT_TABS})
+        --align {left,center,right}
+                           Body alignment (default: left)
+        --bold             Print the body in bold
+        --double           Print the body double height
+        --reflow           Force paragraph reflow on, even for source code
+        --no-reflow        Wrap each source line independently instead of
+                           rejoining hard-wrapped lines into paragraphs first.
+                           Reflow is on by default for prose and is skipped
+                           automatically for anything that looks like code.
+        --no-wrap          Do not wrap or reflow; send lines exactly as given
+
+  Extras
+    -t, --title TEXT       Bold centred title with a rule under it
+    -T, --timestamp        Print a timestamp line below the title
+        --qr TEXT          Print a QR code (repeatable)
+        --qr-size N        QR module size, 1-16 (default: ${DEFAULT_QR_SIZE})
+        --barcode TEXT     Print a barcode (repeatable)
+        --barcode-type T   code128, code39, ean13, ean8, upca, itf or codabar
+                           (default: ${DEFAULT_BARCODE_TYPE})
+
+  Diagnostics and escape hatches
+        --raw              Send the input verbatim, with no encoding, wrapping
+                           or framing (for hand-built ESC/POS)
+        --status           Query printer status and exit without printing
+        --dry-run          Write the ESC/POS byte stream to stdout
+    -o, --output FILE      Write the ESC/POS byte stream to FILE
+    -h, --help             Show this help
+        --license          Show license information
+
+ENVIRONMENT:
+    RECEIPT_PRINTER_HOST   Default host if --host is not given
+    RECEIPT_PRINTER_PORT   Default port if --port is not given
+
+EXAMPLES:
+    echo "hello" | ${SCRIPT_NAME}
+    ${SCRIPT_NAME} notes.txt
+    ${SCRIPT_NAME} --no-cut --font a shopping-list.txt
+    git log --oneline -20 | ${SCRIPT_NAME} --title "Recent commits" --timestamp
+    ${SCRIPT_NAME} --cut-only
+    ${SCRIPT_NAME} --qr "https://podbielniak.com" --title "Scan me"
+    ${SCRIPT_NAME} --barcode "ABC-12345" --barcode-type code128
+    echo "Wi-Fi password" | ${SCRIPT_NAME} - --qr "WIFI:S=home;P=hunter2;;"
+    ${SCRIPT_NAME} --status
+    echo "test" | ${SCRIPT_NAME} --dry-run | od -c
+
+EXIT STATUS:
+    0   Success
+    1   Usage, input or printer error
+    2   Timed out talking to the printer
+
+EOF
+}
+
+show_license () {
+    cat <<'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak — AGPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+EOF
+}
+
+die () {
+    echo "${SCRIPT_NAME}: ${1}" >&2
+    exit "${2:-1}"
+}
+
+# ============================================================================
+# ESC/POS constants
+# ============================================================================
+
+readonly ESC=$'\x1b'
+readonly GS=$'\x1d'
+readonly LF=$'\x0a'
+
+# Epson code page numbers for `ESC t n`.
+codepage_id () {
+    case "${1}" in
+        cp437) echo 0 ;;
+        cp1252) echo 16 ;;
+        cp858) echo 19 ;;
+        *) die "unknown code page '${1}' (want cp1252, cp437 or cp858)" ;;
+    esac
+}
+
+# iconv target charset for a code page name.
+codepage_charset () {
+    case "${1}" in
+        cp437) echo "CP437" ;;
+        cp1252) echo "CP1252" ;;
+        cp858) echo "CP858" ;;
+        *) die "unknown code page '${1}' (want cp1252, cp437 or cp858)" ;;
+    esac
+}
+
+# `GS k m` barcode system id, function B.
+barcode_id () {
+    case "${1}" in
+        upca) echo 65 ;;
+        upce) echo 66 ;;
+        ean13) echo 67 ;;
+        ean8) echo 68 ;;
+        code39) echo 69 ;;
+        itf) echo 70 ;;
+        codabar) echo 71 ;;
+        code93) echo 72 ;;
+        code128) echo 73 ;;
+        *) die "unknown barcode type '${1}' (see --help)" ;;
+    esac
+}
+
+# Emit a single byte given its decimal value.
+byte () {
+    printf '%b' "\\$(printf '%03o' "${1}")"
+}
+
+# ============================================================================
+# Text pipeline
+# ============================================================================
+
+# Remove ANSI escape sequences: OSC (title, hyperlinks), CSI (colour, cursor),
+# two-character sequences, and charset selections.
+#
+# LC_ALL=C is load-bearing. Under a UTF-8 locale, bracket ranges like [@-~] use
+# collation order rather than byte order and silently fail to match, so the
+# escape sequences survive and only their leading ESC gets removed later by
+# `sanitize_controls', leaving visible "[33m" litter on the paper.
+strip_ansi () {
+    LC_ALL=C sed -E \
+        -e 's/\x1b\][^\x07\x1b]*(\x07|\x1b\\)//g' \
+        -e 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' \
+        -e 's/\x1b[@-Z\\-_]//g' \
+        -e 's/\x1b[()][A-Za-z0-9]//g'
+}
+
+# Transliterate UTF-8 to the printer's code page, in three tiers so that no
+# input can ever abort a print:
+#   1. //TRANSLIT      degrades what it can (em dash, ellipsis, box drawing)
+#   2. -c //TRANSLIT   additionally drops characters with no representation
+#   3. ASCII only      last resort; -c still fails on a truncated multi-byte
+#                      sequence at end of buffer, which is exactly what piping
+#                      genuinely binary data produces
+to_codepage () {
+    local charset="${1}"
+    local input="${2}"
+    local output="${3}"
+
+    if iconv -f UTF-8 -t "${charset}//TRANSLIT" -o "${output}" "${input}" 2>/dev/null
+    then
+        return 0
+    fi
+    if iconv -c -f UTF-8 -t "${charset}//TRANSLIT" -o "${output}" "${input}" 2>/dev/null
+    then
+        return 0
+    fi
+    LC_ALL=C tr -cd '\11\12\40-\176' < "${input}" > "${output}"
+}
+
+# Drop C0 control bytes other than LF, plus DEL. Bytes 0x80-0x9f are left alone:
+# in CP1252 they carry printable characters (curly quotes live at 0x93/0x94).
+sanitize_controls () {
+    LC_ALL=C tr -d '\000-\011\013-\037\177'
+}
+
+# Longest line length in bytes. Used by --font auto and by the reflow guard.
+longest_line () {
+    LC_ALL=C awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }' "${1}"
+}
+
+# Decide whether the input is source code rather than prose.
+#
+# Reflow is catastrophic for code -- it joins logical lines, so a defun becomes
+# one run-on paragraph. Prose almost never ends a line on a bracket or a
+# semicolon, while code does so constantly, and that separates the two cleanly:
+# an elisp file scores around 70%, an org recipe around 5%.
+looks_like_code () {
+    LC_ALL=C awk '
+        /^[ \t]*$/ { next }
+        { total++ }
+        /[;{}()\[\]][ \t]*$/ { code++ }
+        END {
+            if (total < 3) exit 1
+            exit ((code * 100) / total >= 25) ? 0 : 1
+        }
+    ' "${1}"
+}
+
+# Lay text out for the printer.
+#
+# Two things happen here. Reflow rejoins lines that the *source* hard-wrapped
+# for a screen back into logical paragraphs, so that a note wrapped at 70
+# columns is not re-broken at arbitrary points; the paragraph is then wrapped
+# once, to the printer's real width. Without it, a file like
+#
+#     2. Combine hot sauce, butter, vinegar, Worcestershire sauce, cayenne,
+#        garlic powder, and salt in a pot over medium heat.
+#
+# prints as a ragged mix of the source's breaks and ours.
+#
+# List items get a hanging indent, so continuations align under the text rather
+# than under the bullet. Fenced blocks, tables, headings and indented code are
+# never joined -- they are emitted line by line, wrapped only if over-long.
+#
+# Runs under LC_ALL=C after transliteration, where one byte is one column.
+format_text () {
+    local width="${1}"
+    local reflow="${2}"
+
+    local longest="${3}"
+
+    LC_ALL=C awk -v width="${width}" -v reflow="${reflow}" -v longest="${longest}" '
+        function spaces(n,   s) {
+            s = ""
+            while (length(s) < n) s = s " "
+            return s
+        }
+
+        # Hard-split a token that cannot fit on a line of its own.
+        function emit_chunks(text, indent,    avail, room) {
+            while (length(text) > 0) {
+                avail = width - length(indent)
+                if (avail < 1) avail = width
+                room = (length(text) < avail) ? length(text) : avail
+                print indent substr(text, 1, room)
+                text = substr(text, room + 1)
+            }
+        }
+
+        # Wrap TEXT to width, indenting the first line with I1 and every
+        # continuation with I2. Equal indents give a plain block; a wider I2
+        # gives the hanging indent used for list items.
+        function wrap_para(text, i1, i2,   n, words, k, w, out, cur, cand) {
+            # A pathological indent would leave no room for content.
+            if (length(i1) >= width - 8) i1 = ""
+            if (length(i2) >= width - 8) i2 = ""
+
+            n = split(text, words, /[ \t]+/)
+            cur = i1
+            out = ""
+            for (k = 1; k <= n; k++) {
+                w = words[k]
+                if (w == "") continue
+                cand = (out == "") ? w : out " " w
+                if (length(cur) + length(cand) <= width) {
+                    out = cand
+                    continue
+                }
+                if (out != "") {
+                    print cur out
+                    out = ""
+                    cur = i2
+                }
+                if (length(cur) + length(w) > width) {
+                    emit_chunks(w, cur)
+                    cur = i2
+                } else {
+                    out = w
+                }
+            }
+            if (out != "") print cur out
+            else if (n == 0) print ""
+        }
+
+        # Emit a single source line untouched apart from wrapping.
+        function verbatim(ind, rest) {
+            if (length(ind) + length(rest) <= width) print ind rest
+            else wrap_para(rest, ind, ind)
+        }
+
+        function flush() {
+            if (open) { wrap_para(buf, ind1, ind2); open = 0; buf = "" }
+        }
+
+        BEGIN {
+            fence = 0; open = 0; buf = ""; prev_len = 0
+            # A line only continues a paragraph if the line before it was full,
+            # which is what made the source break it. The floor stops a list of
+            # naturally short lines ("milk", "eggs") being run together.
+            fill_min = int(longest * 0.75)
+            if (fill_min < 40) fill_min = 40
+        }
+
+        {
+            line = $0
+            match(line, /^[ \t]*/)
+            ind = substr(line, 1, RLENGTH)
+            rest = substr(line, RLENGTH + 1)
+
+            # Length of the line before this one, captured before it is
+            # overwritten; the join test below needs it.
+            plen = prev_len
+            prev_len = length(line)
+
+            if (!reflow) { verbatim(ind, rest); next }
+
+            # Fenced blocks are preformatted; never join anything inside them.
+            if (rest ~ /^(```|~~~)/) {
+                flush(); print line; fence = !fence; next
+            }
+            if (tolower(rest) ~ /^#\+(begin|end)_/) {
+                flush(); print line
+                fence = (tolower(rest) ~ /^#\+begin_/)
+                next
+            }
+            if (fence) { print line; next }
+
+            if (rest == "") { flush(); print ""; next }
+
+            # Tables, org directives and keywords, markdown headings, and org
+            # drawer lines (:PROPERTIES:, :ID: ..., :END:) all stand alone.
+            if (rest ~ /^\|/ || rest ~ /^#\+/ || rest ~ /^#+[ \t]/ || rest ~ /^:/) {
+                flush(); verbatim(ind, rest); next
+            }
+
+            # An org heading at column 0. Checked before the bullet rule, which
+            # would otherwise claim "* Heading" as a list item.
+            if (ind == "" && rest ~ /^\*+[ \t]/) {
+                flush(); verbatim(ind, rest); next
+            }
+
+            # Deeply indented text with no paragraph open is a code block.
+            if (length(ind) >= 4 && !open) { verbatim(ind, rest); next }
+
+            # A list item opens a paragraph whose continuations hang under the
+            # text, not under the marker.
+            if (match(rest, /^([-*+]|[0-9]+[.)]|[a-zA-Z][.)])[ \t]+/)) {
+                flush()
+                ind1 = ind
+                ind2 = ind spaces(RLENGTH)
+                buf = rest
+                open = 1
+                next
+            }
+
+            # Anything else continues the open paragraph, or starts one.
+            if (open && plen >= fill_min) {
+                buf = buf " " rest
+            } else {
+                flush()
+                ind1 = ind
+                ind2 = ind
+                buf = rest
+                open = 1
+            }
+        }
+
+        END { flush() }
+    '
+}
+
+# ============================================================================
+# ESC/POS assembly
+# ============================================================================
+
+# Model 2 QR code, centred. Data keeps its UTF-8 bytes so scanned URLs survive.
+emit_qr () {
+    local data="${1}"
+    local size="${2}"
+    local out="${3}"
+
+    local len pl ph
+    len=$(printf '%s' "${data}" | LC_ALL=C wc -c)
+    len=$(( len + 3 ))
+    if (( len > 7092 ))
+    then
+        die "QR payload too large (${len} bytes)"
+    fi
+    pl=$(( len % 256 ))
+    ph=$(( len / 256 ))
+
+    {
+        printf '%s' "${ESC}a"; byte 1
+        printf '%s' "${GS}(k"; byte 4; byte 0; byte 49; byte 65; byte 50; byte 0
+        printf '%s' "${GS}(k"; byte 3; byte 0; byte 49; byte 67; byte "${size}"
+        printf '%s' "${GS}(k"; byte 3; byte 0; byte 49; byte 69; byte 49
+        printf '%s' "${GS}(k"; byte "${pl}"; byte "${ph}"; byte 49; byte 80; byte 48
+        printf '%s' "${data}"
+        printf '%s' "${GS}(k"; byte 3; byte 0; byte 49; byte 81; byte 48
+        printf '%s' "${ESC}a"; byte 0
+        printf '%s' "${LF}"
+    } >> "${out}"
+}
+
+# Barcode with human readable text below it, centred.
+emit_barcode () {
+    local data="${1}"
+    local type="${2}"
+    local out="${3}"
+
+    local m payload len
+    m=$(barcode_id "${type}")
+
+    # CODE128 needs an explicit code set; B covers the printable ASCII range.
+    payload="${data}"
+    if [[ "${type}" == "code128" ]]
+    then
+        payload="{B${data}"
+    fi
+
+    len=$(printf '%s' "${payload}" | LC_ALL=C wc -c)
+    if (( len < 1 || len > 255 ))
+    then
+        die "barcode payload must be 1-255 bytes (got ${len})"
+    fi
+
+    {
+        printf '%s' "${GS}h"; byte 162            # height in dots
+        printf '%s' "${GS}w"; byte 3              # module width
+        printf '%s' "${GS}H"; byte 2              # HRI text below the barcode
+        printf '%s' "${GS}f"; byte 0              # HRI font A
+        printf '%s' "${ESC}a"; byte 1
+        printf '%s' "${GS}k"; byte "${m}"; byte "${len}"
+        printf '%s' "${payload}"
+        printf '%s' "${LF}"
+        printf '%s' "${ESC}a"; byte 0
+    } >> "${out}"
+}
+
+# ============================================================================
+# Transport
+# ============================================================================
+
+# Send a payload file to the printer over raw TCP in a single connection.
+# The whole exchange runs under `timeout` because bash's /dev/tcp has no
+# connect timeout of its own.
+send_payload () {
+    local payload="${1}"
+    local host="${2}"
+    local port="${3}"
+    local tmo="${4}"
+
+    local rc=0
+    timeout "${tmo}" bash -c '
+        exec 3<>/dev/tcp/"$0"/"$1" || exit 1
+        cat "$2" >&3
+        exec 3>&- 3<&-
+    ' "${host}" "${port}" "${payload}" || rc=$?
+
+    case "${rc}" in
+        0) return 0 ;;
+        124) die "timed out after ${tmo}s talking to ${host}:${port}" 2 ;;
+        *) die "could not reach printer at ${host}:${port}" ;;
+    esac
+}
+
+# Real-time status query. DLE EOT 1 reports the printer, DLE EOT 4 the paper
+# sensor; both answer with a single byte.
+query_status () {
+    local host="${1}"
+    local port="${2}"
+    local tmo="${3}"
+
+    local response rc=0
+    response=$(timeout "${tmo}" bash -c '
+        exec 3<>/dev/tcp/"$0"/"$1" || exit 1
+        printf "\x10\x04\x01" >&3
+        IFS= read -r -n 1 -t 2 -u 3 s1 || s1=""
+        printf "\x10\x04\x04" >&3
+        IFS= read -r -n 1 -t 2 -u 3 s2 || s2=""
+        exec 3>&- 3<&-
+        printf "%s %s" "$(printf "%s" "$s1" | od -An -tu1 | tr -d " \n")" \
+                       "$(printf "%s" "$s2" | od -An -tu1 | tr -d " \n")"
+    ' "${host}" "${port}") || rc=$?
+
+    case "${rc}" in
+        0) : ;;
+        124) die "timed out after ${tmo}s talking to ${host}:${port}" 2 ;;
+        *) die "could not reach printer at ${host}:${port}" ;;
+    esac
+
+    local s1 s2
+    s1=$(echo "${response}" | cut -d' ' -f1)
+    s2=$(echo "${response}" | cut -d' ' -f2)
+
+    echo "printer:  ${host}:${port}"
+    if [[ -z "${s1}" ]]
+    then
+        echo "state:    connected, but no status response"
+    elif (( (s1 & 8) != 0 ))
+    then
+        echo "state:    offline"
+    else
+        echo "state:    online"
+    fi
+
+    if [[ -z "${s2}" ]]
+    then
+        echo "paper:    unknown"
+    elif (( (s2 & 96) == 96 ))
+    then
+        echo "paper:    out"
+    elif (( (s2 & 12) == 12 ))
+    then
+        echo "paper:    near end"
+    else
+        echo "paper:    ok"
+    fi
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main () {
+    local host="${RECEIPT_PRINTER_HOST:-${DEFAULT_HOST}}"
+    local port="${RECEIPT_PRINTER_PORT:-${DEFAULT_PORT}}"
+    local tmo="${DEFAULT_TIMEOUT}"
+    local cut=1
+    local cut_only=0
+    local feed="${DEFAULT_FEED}"
+    local font="b"
+    local width=""
+    local codepage="${DEFAULT_CODEPAGE}"
+    local tabs="${DEFAULT_TABS}"
+    local align="left"
+    local bold=0
+    local double=0
+    local wrap=1
+    local reflow=1
+    local title=""
+    local timestamp=0
+    local qr_size="${DEFAULT_QR_SIZE}"
+    local barcode_type="${DEFAULT_BARCODE_TYPE}"
+    local raw=0
+    local status=0
+    local dry_run=0
+    local output=""
+    local -a qr_codes=()
+    local -a barcodes=()
+    local -a input_files=()
+
+    while [[ $# -gt 0 ]]
+    do
+        case "${1}" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --license)
+                show_license
+                exit 0
+                ;;
+            -H|--host)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                host="${2}"
+                shift 2
+                ;;
+            -p|--port)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                port="${2}"
+                shift 2
+                ;;
+            --timeout)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                tmo="${2}"
+                shift 2
+                ;;
+            -c|--cut)
+                cut=1
+                shift
+                ;;
+            -n|--no-cut)
+                cut=0
+                shift
+                ;;
+            --cut-only)
+                cut_only=1
+                cut=1
+                shift
+                ;;
+            --feed)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                feed="${2}"
+                shift 2
+                ;;
+            -f|--font)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                font="${2}"
+                shift 2
+                ;;
+            -w|--width)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                width="${2}"
+                shift 2
+                ;;
+            --codepage)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                codepage="${2}"
+                shift 2
+                ;;
+            --tabs)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                tabs="${2}"
+                shift 2
+                ;;
+            --align)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                align="${2}"
+                shift 2
+                ;;
+            --bold)
+                bold=1
+                shift
+                ;;
+            --double)
+                double=1
+                shift
+                ;;
+            --reflow)
+                reflow=2
+                shift
+                ;;
+            --no-reflow)
+                reflow=0
+                shift
+                ;;
+            --no-wrap)
+                wrap=0
+                shift
+                ;;
+            -t|--title)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                title="${2}"
+                shift 2
+                ;;
+            -T|--timestamp)
+                timestamp=1
+                shift
+                ;;
+            --qr)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                qr_codes+=("${2}")
+                shift 2
+                ;;
+            --qr-size)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                qr_size="${2}"
+                shift 2
+                ;;
+            --barcode)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                barcodes+=("${2}")
+                shift 2
+                ;;
+            --barcode-type)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                barcode_type="${2}"
+                shift 2
+                ;;
+            --raw)
+                raw=1
+                shift
+                ;;
+            --status)
+                status=1
+                shift
+                ;;
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            -o|--output)
+                [[ -n "${2:-}" ]] || die "'${1}' requires a value"
+                output="${2}"
+                shift 2
+                ;;
+            --)
+                shift
+                while [[ $# -gt 0 ]]
+                do
+                    input_files+=("${1}")
+                    shift
+                done
+                ;;
+            -)
+                input_files+=("-")
+                shift
+                ;;
+            -*)
+                echo "${SCRIPT_NAME}: unknown option '${1}'" >&2
+                echo "Try '${SCRIPT_NAME} --help' for more information." >&2
+                exit 1
+                ;;
+            *)
+                input_files+=("${1}")
+                shift
+                ;;
+        esac
+    done
+
+    # ------------------------------------------------------------------ validate
+    # Bounded integer check: NAME VALUE MIN MAX
+    require_int () {
+        local name="${1}" value="${2}" min="${3}" max="${4}"
+        if [[ ! "${value}" =~ ^[0-9]+$ ]] || (( value < min || value > max ))
+        then
+            die "${name} must be a number between ${min} and ${max} (got '${value}')"
+        fi
+    }
+
+    require_int "port" "${port}" 1 65535
+    require_int "--timeout" "${tmo}" 1 3600
+    require_int "--feed" "${feed}" 0 255
+    require_int "--tabs" "${tabs}" 1 16
+    require_int "--qr-size" "${qr_size}" 1 16
+    if [[ -n "${width}" ]]
+    then
+        require_int "--width" "${width}" 8 255
+    fi
+
+    local align_id
+    case "${align}" in
+        left) align_id=0 ;;
+        center|centre) align_id=1 ;;
+        right) align_id=2 ;;
+        *) die "unknown alignment '${align}' (want left, center or right)" ;;
+    esac
+
+    local cp_id charset
+    cp_id=$(codepage_id "${codepage}")
+    charset=$(codepage_charset "${codepage}")
+    barcode_id "${barcode_type}" >/dev/null
+
+    case "${font}" in
+        a|b|auto) : ;;
+        *) die "unknown font '${font}' (want a, b or auto)" ;;
+    esac
+
+    for f in "${input_files[@]+"${input_files[@]}"}"
+    do
+        # "-" is the conventional marker for stdin; cat understands it directly.
+        [[ "${f}" == "-" ]] && continue
+        [[ -f "${f}" ]] || die "input file '${f}' not found"
+        [[ -r "${f}" ]] || die "input file '${f}' is not readable"
+    done
+
+    # ------------------------------------------------------------------- status
+    if (( status ))
+    then
+        query_status "${host}" "${port}" "${tmo}"
+        exit 0
+    fi
+
+    for tool in iconv expand awk sed timeout
+    do
+        command -v "${tool}" >/dev/null 2>&1 || die "required tool '${tool}' not found on PATH"
+    done
+
+    local workdir
+    workdir=$(mktemp -d -t receipt-print.XXXXXX) || die "could not create temp directory"
+    # shellcheck disable=SC2064  # expand workdir now, not at trap time
+    trap "rm -rf -- '${workdir}'" EXIT
+
+    local payload="${workdir}/payload"
+    : > "${payload}"
+
+    # --------------------------------------------------------------- read input
+    local have_input=0
+    local src="${workdir}/src"
+    : > "${src}"
+
+    # Reading stdin is only implied when there is nothing else to print. If a
+    # QR code, a barcode or --cut-only was asked for, stdin is left alone unless
+    # "-" is passed explicitly, otherwise `receipt-print --qr URL' would block
+    # forever any time it is invoked with a non-terminal stdin that stays open
+    # (which is exactly how Emacs and most scripts call it).
+    local wants_extras=0
+    if (( cut_only )) || [[ ${#qr_codes[@]} -gt 0 || ${#barcodes[@]} -gt 0 ]]
+    then
+        wants_extras=1
+    fi
+
+    if (( ! cut_only ))
+    then
+        if [[ ${#input_files[@]} -gt 0 ]]
+        then
+            cat -- "${input_files[@]}" > "${src}"
+            have_input=1
+        elif (( ! wants_extras ))
+        then
+            if [[ -t 0 ]]
+            then
+                echo "${SCRIPT_NAME}: no input given and stdin is a terminal" >&2
+                echo "Try '${SCRIPT_NAME} --help' for more information." >&2
+                exit 1
+            fi
+            cat > "${src}"
+            have_input=1
+        fi
+    fi
+
+    # --------------------------------------------------------------- raw passthru
+    if (( raw ))
+    then
+        cat "${src}" > "${payload}"
+    else
+        # ----------------------------------------------------------- transform
+        local body="${workdir}/body"
+        : > "${body}"
+
+        if (( have_input ))
+        then
+            local staged="${workdir}/staged"
+            LC_ALL=C tr -d '\r' < "${src}" | strip_ansi | expand -t "${tabs}" > "${staged}"
+
+            local encoded="${workdir}/encoded"
+            to_codepage "${charset}" "${staged}" "${encoded}"
+            sanitize_controls < "${encoded}" > "${body}"
+        fi
+
+        # Reflow defaults to on, but is skipped for anything that looks like
+        # source code unless it was asked for explicitly with --reflow.
+        local longest
+        longest=$(longest_line "${body}")
+        if (( reflow == 1 )) && looks_like_code "${body}"
+        then
+            reflow=0
+        elif (( reflow == 2 ))
+        then
+            reflow=1
+        fi
+
+        # Resolve the font and column width now that we can measure the text.
+        local font_id resolved_width
+        if [[ "${font}" == "auto" ]]
+        then
+            if (( longest <= WIDTH_FONT_A ))
+            then
+                font="a"
+            else
+                font="b"
+            fi
+        fi
+        if [[ "${font}" == "a" ]]
+        then
+            font_id=0
+            resolved_width="${WIDTH_FONT_A}"
+        else
+            font_id=1
+            resolved_width="${WIDTH_FONT_B}"
+        fi
+        [[ -n "${width}" ]] && resolved_width="${width}"
+
+        # ------------------------------------------------------------- framing
+        {
+            printf '%s' "${ESC}@"
+            printf '%s' "${ESC}t"; byte "${cp_id}"
+            printf '%s' "${ESC}M"; byte "${font_id}"
+            printf '%s' "${ESC}a"; byte "${align_id}"
+            printf '%s' "${ESC}E"; byte "${bold}"
+            printf '%s' "${GS}!"; byte $(( double ? 1 : 0 ))
+        } >> "${payload}"
+
+        if [[ -n "${title}" ]]
+        then
+            local enc_title enc_rule
+            enc_title=$(printf '%s' "${title}" |
+                iconv -c -f UTF-8 -t "${charset}//TRANSLIT" 2>/dev/null |
+                sanitize_controls || true)
+            enc_rule=$(LC_ALL=C awk -v w="${resolved_width}" \
+                'BEGIN { s = ""; while (length(s) < w) s = s "-"; print s }')
+            {
+                printf '%s' "${ESC}a"; byte 1
+                printf '%s' "${ESC}E"; byte 1
+                printf '%s%s' "${enc_title}" "${LF}"
+                printf '%s' "${ESC}E"; byte 0
+                if (( timestamp ))
+                then
+                    printf '%s%s' "$(date '+%Y-%m-%d %H:%M')" "${LF}"
+                fi
+                printf '%s%s' "${enc_rule}" "${LF}"
+                printf '%s' "${ESC}a"; byte "${align_id}"
+            } >> "${payload}"
+        elif (( timestamp ))
+        then
+            {
+                printf '%s' "${ESC}a"; byte 1
+                printf '%s%s' "$(date '+%Y-%m-%d %H:%M')" "${LF}"
+                printf '%s' "${ESC}a"; byte "${align_id}"
+            } >> "${payload}"
+        fi
+
+        if (( have_input ))
+        then
+            if (( wrap ))
+            then
+                # awk's print terminates every line, so a missing final
+                # newline is repaired for free here.
+                format_text "${resolved_width}" "${reflow}" "${longest}" < "${body}" >> "${payload}"
+            else
+                cat "${body}" >> "${payload}"
+                # Guarantee the last line is terminated so it actually prints.
+                if [[ -s "${body}" ]] &&
+                   [[ $(LC_ALL=C tail -c 1 "${body}" | od -An -tu1 | tr -d ' \n') != "10" ]]
+                then
+                    printf '%s' "${LF}" >> "${payload}"
+                fi
+            fi
+        fi
+
+        for code in "${qr_codes[@]+"${qr_codes[@]}"}"
+        do
+            printf '%s' "${LF}" >> "${payload}"
+            emit_qr "${code}" "${qr_size}" "${payload}"
+        done
+
+        for code in "${barcodes[@]+"${barcodes[@]}"}"
+        do
+            printf '%s' "${LF}" >> "${payload}"
+            emit_barcode "${code}" "${barcode_type}" "${payload}"
+        done
+
+        # ----------------------------------------------------------------- end
+        {
+            printf '%s' "${ESC}E"; byte 0
+            printf '%s' "${GS}!"; byte 0
+            printf '%s' "${ESC}a"; byte 0
+            printf '%s' "${ESC}d"; byte "${feed}"
+            if (( cut ))
+            then
+                printf '%s' "${GS}VB"; byte 0
+            fi
+        } >> "${payload}"
+    fi
+
+    # ------------------------------------------------------------------- output
+    if (( dry_run ))
+    then
+        cat "${payload}"
+        exit 0
+    fi
+
+    if [[ -n "${output}" ]]
+    then
+        cat "${payload}" > "${output}" || die "could not write to '${output}'"
+        exit 0
+    fi
+
+    send_payload "${payload}" "${host}" "${port}" "${tmo}"
+}
+
+main "$@"
