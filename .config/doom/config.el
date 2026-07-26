@@ -750,6 +750,7 @@ compositor seat."
 (when IS-CMACS (load! "recipes-ai")) ;; Recipes: AI import + utilities (cmacs-ai / grok)
 (load! "recipes-export")      ;; Recipes: Forgejo-light HTML/PDF export + mu4e mail
 (load! "container-registry-browse") ;; Container registry search + tag browse (SPC s c)
+(load! "receipt-print")       ;; ESC/POS thermal receipt printing (SPC C)
 (load! "+games")              ;; Games launcher + built-in/3rd-party game bundle (SPC G)
 (load! "emacslife/emacslife") ;; EmacsLife — BitLife clone (SPC G L)
 (when IS-CMACS (load! "cmacs")) ;; RTSP/RTSPS camera dashboard (cmacs builds only; SPC o v)
