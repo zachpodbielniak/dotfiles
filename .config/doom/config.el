@@ -529,6 +529,14 @@ No-op on TTY frames — terminal transparency is the emulator's job."
       (apply fn args)
     (wrong-type-argument (buffer-list))))
 
+;;; Disarm persp-mode's own `C-c p' keymap.  We drive workspaces entirely
+;;; through Doom's `SPC TAB' bindings, and `C-c p o' silently runs
+;;; (persp-mode -1), which nils `*persp-hash*' and breaks every workspace
+;;; command with "Wrong type argument: hash-table-p, nil" until Emacs is
+;;; restarted.  A stray C-c chord should not be able to do that.
+(after! persp-mode
+  (define-key persp-mode-map (kbd "C-c p") nil))
+
 
 ;;; Toggle-maximize: SPC w m m zooms current window, repeat to restore.
 (defvar +my/window-maximize-register nil
