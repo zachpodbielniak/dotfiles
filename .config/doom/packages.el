@@ -129,6 +129,12 @@
 ;; files under the PARA tree.
 (package! org-remark)
 
+;; Web-based graph visualization for org-roam — local server + browser UI.
+;; Not on MELPA — install direct from GitHub.
+(package! org-roam-ui
+  :recipe (:host github :repo "org-roam/org-roam-ui"
+           :files ("*.el" "out")))
+
 ;; Matrix chat client (native Emacs, E2EE via pantalaimon)
 (package! ement
   :recipe (:host github :repo "alphapapa/ement.el"))

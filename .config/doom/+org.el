@@ -131,6 +131,19 @@
         org-roam-completion-everywhere t
         org-roam-file-exclude-regexp "03_resources/technical/docs/"))
 
+;;; org-roam-ui: local web server + browser graph view on top of org-roam.
+;;; `SPC n u' starts the server and opens it in the default browser.
+(use-package! org-roam-ui
+  :after org-roam
+  :config
+  (setq org-roam-ui-sync-theme t
+        org-roam-ui-follow t
+        org-roam-ui-update-on-save t
+        org-roam-ui-open-on-start nil))
+
+(map! :leader
+      :desc "Org-roam-ui open" "n u" #'org-roam-ui-open)
+
 ;;; org-journal: replaces markdown journal at 02_areas/personal/journal/
 (after! org-journal
   (setq org-journal-dir (expand-file-name "02_areas/personal/journal/" org-directory)
