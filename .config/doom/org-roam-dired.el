@@ -25,11 +25,24 @@
 ;; Because the buffer really is dired, marks, `!', `A', `%', wdired and
 ;; `dired-get-marked-files' all keep working across a graph neighbourhood.
 ;;
-;;   SPC n g   browse from a node picked by completion
-;;   SPC n G   browse from the node/file at point
+;;   SPC n g   open the browser at the PARA top level
+;;   SPC n G   open it rooted at the node/file at point
 ;;
-;; Inside the buffer:  RET / l descend, h / - / ^ back, TAB flips between
-;; outbound links and backlinks, o / O open, ? for the full dispatcher.
+;; There is no search prompt on the way in.  `SPC n g' lands on the PARA
+;; directories and everything after that is keyboard navigation:
+;;
+;;   00_inbox 01_projects 02_areas 03_resources 04_archives   <- the "/"
+;;     l  ->  every 00_index.org beneath that directory
+;;       l  ->  the notes that index links to
+;;         l  ->  and onward, following id links
+;;
+;; `l' and RET are the same action, and behave exactly as they do in
+;; dired: they descend when the row acts like a directory (a real
+;; directory, or a node that links out) and open the file when it does
+;; not.  j / k move, h steps back, ^ returns to the top.  TAB flips a
+;; node view between its outbound links and its backlinks; o / O open;
+;; J is the one deliberate escape hatch to name-based lookup; ? shows
+;; the full dispatcher.
 ;;
 ;; Four things about the surrounding config shape this implementation.
 ;; They were each verified against the live Emacs, and each one is a bug
@@ -110,6 +123,22 @@ instead and says so in the echo area."
   :type 'boolean
   :group 'org-roam-dired)
 
+(defcustom org-roam-dired-para-dirs
+  '("00_inbox" "01_projects" "02_areas" "03_resources" "04_archives")
+  "Top-level PARA directories, listed as the root of the browser.
+These form the synthetic \"/\" of the graph: the roam graph has no single
+node everything hangs off, so the browser starts from the directory
+skeleton and drops into link traversal once you reach an index node.
+Entries that do not exist on disk are skipped."
+  :type '(repeat string)
+  :group 'org-roam-dired)
+
+(defcustom org-roam-dired-index-name "00_index.org"
+  "File name marking a directory's index node.
+The second level of the browser lists these beneath a PARA directory."
+  :type 'string
+  :group 'org-roam-dired)
+
 (defcustom org-roam-dired-sort 'path
   "Initial sort order for graph listings.
 Cycled in the buffer with \\<org-roam-dired-mode-map>\\[org-roam-dired-cycle-sort]."
@@ -147,17 +176,21 @@ has no file-level node and the title belongs to a heading inside it."
 
 ;;; ------------------------------------------------------ buffer-local state
 
-(defvar-local org-roam-dired--file nil
-  "Absolute path of the file this view is rooted at.")
-
-(defvar-local org-roam-dired--title nil
-  "Display title of the root node.")
-
-(defvar-local org-roam-dired--direction 'outbound
-  "Either `outbound' (links from the root) or `backlink' (links to it).")
+;; A "view" is a plist describing what the buffer is currently showing.
+;; Three kinds, which together make the graph walkable like a filesystem:
+;;
+;;   (:kind para)                       the PARA directories -- the "/"
+;;   (:kind index :dir D :title T)      every index node under directory D
+;;   (:kind graph :file F :title T :direction DIR)
+;;                                      one node's links, the real traversal
+;;
+;; `l' moves para -> index -> graph and then walks graph to graph; `h'
+;; pops back through whatever you came by.
+(defvar-local org-roam-dired--view nil
+  "Plist describing the current view.  See the commentary above.")
 
 (defvar-local org-roam-dired--history nil
-  "Stack of (FILE TITLE DIRECTION RETURN-FILE) for `org-roam-dired-back'.")
+  "Stack of (VIEW . RETURN-FILE) entries for `org-roam-dired-back'.")
 
 (defvar-local org-roam-dired--meta nil
   "Hash mapping absolute file name to a plist of node metadata.
@@ -177,6 +210,9 @@ so it must be set before `revert-buffer' runs.")
 
 (defvar org-roam-dired-mode-map
   (let ((map (make-sparse-keymap)))
+    ;; RET and l are the same "enter" action, exactly as in dired: it
+    ;; descends when the row behaves like a directory and opens the file
+    ;; when it does not.  j/k come free from dired-mode-map.
     (define-key map (kbd "RET")      #'org-roam-dired-descend)
     (define-key map (kbd "<return>") #'org-roam-dired-descend)
     (define-key map (kbd "TAB")      #'org-roam-dired-toggle-direction)
@@ -184,13 +220,14 @@ so it must be set before `revert-buffer' runs.")
     (define-key map "l" #'org-roam-dired-descend)
     (define-key map "h" #'org-roam-dired-back)
     (define-key map "-" #'org-roam-dired-back)
-    (define-key map "^" #'org-roam-dired-back)
+    (define-key map "^" #'org-roam-dired-top)
     (define-key map "F" #'org-roam-dired-forward-links)
     (define-key map "B" #'org-roam-dired-backlinks)
     (define-key map "o" #'org-roam-dired-open-other-window)
     (define-key map "O" #'org-roam-dired-open)
     (define-key map "." #'org-roam-dired-goto-root)
     (define-key map "H" #'org-roam-dired-history-jump)
+    (define-key map "J" #'org-roam-dired-jump)
     (define-key map "s" #'org-roam-dired-cycle-sort)
     (define-key map "?" #'org-roam-dired-dispatch)
     (define-key map "q" #'quit-window)
@@ -221,13 +258,14 @@ so it must be set before `revert-buffer' runs.")
     "l"  #'org-roam-dired-descend
     "h"  #'org-roam-dired-back
     "-"  #'org-roam-dired-back
-    "^"  #'org-roam-dired-back
+    "^"  #'org-roam-dired-top
     "F"  #'org-roam-dired-forward-links
     "B"  #'org-roam-dired-backlinks
     "o"  #'org-roam-dired-open-other-window
     "O"  #'org-roam-dired-open
     "."  #'org-roam-dired-goto-root
     "H"  #'org-roam-dired-history-jump
+    "J"  #'org-roam-dired-jump
     "s"  #'org-roam-dired-cycle-sort
     "gr" #'org-roam-dired-refresh
     "?"  #'org-roam-dired-dispatch
@@ -372,6 +410,79 @@ annotation hook looks entries up by it."
                                      (gethash (plist-get meta :id) tags))
                           table))
                table))
+    (org-roam-dired--mark-descendable table)
+    (cons (org-roam-dired--sorted-rels table root sort) table)))
+
+(defun org-roam-dired--files-with-outlinks (files)
+  "Return a hash marking which of FILES have at least one outbound id link.
+One query for the whole listing: this decides whether a row behaves like
+a directory (descend into it) or a file (open it), so it must not be a
+per-line lookup."
+  (let ((table (make-hash-table :test #'equal)))
+    (when files
+      (dolist (row (org-roam-db-query
+                    [:select :distinct nodes:file :from links
+                     :join nodes :on (= links:source nodes:id)
+                     :where (= links:type "id") :and (in nodes:file $v1)]
+                    (apply #'vector files)))
+        (puthash (car row) t table)))
+    table))
+
+(defun org-roam-dired--mark-descendable (table)
+  "Set :has-links on every entry of metadata TABLE."
+  (let* ((files nil))
+    (maphash (lambda (key _v) (push key files)) table)
+    (let ((linked (org-roam-dired--files-with-outlinks files)))
+      (dolist (f files)
+        (puthash f (plist-put (gethash f table) :has-links (gethash f linked))
+                 table))))
+  table)
+
+(defun org-roam-dired--collect-para ()
+  "Return (RELS . META) for the PARA top level.
+Each row is a real directory, titled from its own index node so the
+listing reads as names rather than bare paths."
+  (let* ((root (org-roam-dired--root))
+         (table (make-hash-table :test #'equal))
+         (rels nil))
+    (dolist (dir org-roam-dired-para-dirs)
+      (let ((abs (expand-file-name dir root)))
+        (when (file-directory-p abs)
+          (push dir rels)
+          (let* ((idx (expand-file-name org-roam-dired-index-name abs))
+                 ;; `--file-title' falls back to the file name, which for
+                 ;; an index file is the useless "00_index.org"; a
+                 ;; directory with no index node should read as itself.
+                 (node-title (and (file-exists-p idx)
+                                  (caar (org-roam-db-query
+                                         [:select title :from nodes
+                                          :where (= file $s1) :and (= level 0)]
+                                         idx))))
+                 (title (or node-title dir)))
+            ;; Key on the name dired will report for a directory row,
+            ;; which carries no trailing slash.
+            (puthash (directory-file-name abs)
+                     (list :title title :level 0 :count 1 :dir t)
+                     table)))))
+    (cons (nreverse rels) table)))
+
+(defun org-roam-dired--collect-index (dir &optional sort)
+  "Return (RELS . META) for every index node beneath DIR, ordered by SORT."
+  (let* ((root (org-roam-dired--root))
+         (dir (file-name-as-directory (expand-file-name dir)))
+         (table (make-hash-table :test #'equal))
+         ;; `$s1' -- the quoted-string placeholder.  `$r1' is emacsql's
+         ;; RAW slot and splices the pattern in unquoted, which silently
+         ;; matches nothing rather than erroring.
+         (rows (org-roam-db-query
+                [:select :distinct [nodes:file nodes:title nodes:id nodes:level nodes:pos]
+                 :from nodes :where (like nodes:file $s1)]
+                (concat dir "%" org-roam-dired-index-name))))
+    (dolist (row rows)
+      (let ((abs (expand-file-name (car row))))
+        (when (and (file-exists-p abs) (not (org-roam-dired--excluded-p abs)))
+          (org-roam-dired--merge-row table (cons abs (cdr row))))))
+    (org-roam-dired--mark-descendable table)
     (cons (org-roam-dired--sorted-rels table root sort) table)))
 
 (defun org-roam-dired--sorted-rels (table root sort)
@@ -514,16 +625,11 @@ also skips `dirvish--setup-dired', which keeps the local map as
           (add-hook 'dired-after-readin-hook #'org-roam-dired--annotate nil t)
           (org-roam-dired-mode 1))
         ;; State must land before `revert-buffer' fires the annotate hook.
-        (setq org-roam-dired--file (plist-get state :file)
-              org-roam-dired--title (plist-get state :title)
-              org-roam-dired--direction (plist-get state :direction)
+        (setq org-roam-dired--view (plist-get state :view)
               org-roam-dired--meta (plist-get state :meta)
               org-roam-dired--history history
               org-roam-dired--sort (or sort org-roam-dired-sort)))
-      (setq mode-line-process
-            (format " [%s %s]"
-                    (if (eq org-roam-dired--direction 'outbound) "→" "←")
-                    (or org-roam-dired--title "")))
+      (setq mode-line-process (org-roam-dired--mode-line))
       (revert-buffer)
       (goto-char (point-min))
       (dired-next-line 1))
@@ -533,55 +639,78 @@ also skips `dirvish--setup-dired', which keeps the local map as
 
 (defun org-roam-dired--check ()
   "Signal a `user-error' unless the current buffer is a graph view."
-  (unless org-roam-dired--file
+  (unless org-roam-dired--view
     (user-error "Not in an org-roam-dired buffer")))
 
-(defun org-roam-dired--visit (file &optional title direction push)
-  "Root the graph buffer at FILE, listing DIRECTION links, and show it.
-TITLE is the display name for FILE.  When PUSH is non-nil, remember the
-current view on the history stack first."
+(defun org-roam-dired--view-title (view)
+  "Return the display title for VIEW."
+  (pcase (plist-get view :kind)
+    ('para "PARA")
+    (_ (or (plist-get view :title) ""))))
+
+(defun org-roam-dired--mode-line ()
+  "Return the `mode-line-process' string for the current view."
+  (pcase (plist-get org-roam-dired--view :kind)
+    ('para " [PARA]")
+    ('index (format " [index: %s]" (org-roam-dired--view-title org-roam-dired--view)))
+    (_ (format " [%s %s]"
+               (if (eq (plist-get org-roam-dired--view :direction) 'outbound) "→" "←")
+               (org-roam-dired--view-title org-roam-dired--view)))))
+
+(defun org-roam-dired--collect-view (view sort)
+  "Return (RELS . META) for VIEW, ordered by SORT."
+  (pcase (plist-get view :kind)
+    ('para (org-roam-dired--collect-para))
+    ('index (org-roam-dired--collect-index (plist-get view :dir) sort))
+    (_ (org-roam-dired--collect (plist-get view :file)
+                                (plist-get view :direction)
+                                sort))))
+
+(defun org-roam-dired--goto (view &optional push)
+  "Show VIEW in the graph buffer.
+When PUSH is non-nil, remember the current view on the history stack
+first, along with the line point was on, so `org-roam-dired-back' can
+restore it."
   (org-roam-dired--require)
-  (let* ((file (expand-file-name file))
-         (title (or title (file-name-nondirectory file)))
-         (direction (or direction 'outbound))
-         ;; Sort order lives in the graph buffer, but `--visit' can be
-         ;; called from anywhere, so read it across explicitly.
-         (sort (let ((buf (get-buffer org-roam-dired-buffer-name)))
-                 (or (and buf (buffer-live-p buf)
-                          (buffer-local-value 'org-roam-dired--sort buf))
-                     org-roam-dired-sort)))
-         (res (org-roam-dired--collect file direction sort))
+  (let* ((buf (get-buffer org-roam-dired-buffer-name))
+         (live (and buf (buffer-live-p buf)))
+         ;; Sort lives in the graph buffer, but `--goto' can be called
+         ;; from anywhere, so read it across explicitly.
+         (sort (or (and live (buffer-local-value 'org-roam-dired--sort buf))
+                   org-roam-dired-sort))
+         (res (org-roam-dired--collect-view view sort))
          (flipped nil))
-    ;; Most nodes are outbound leaves, so an empty result is the normal
-    ;; case rather than an error.  Try the other direction before giving up.
-    (when (and (null (car res)) org-roam-dired-auto-flip-on-empty)
-      (let* ((other (if (eq direction 'outbound) 'backlink 'outbound))
-             (alt (org-roam-dired--collect file other sort)))
+    ;; A graph view with no links in the requested direction is the
+    ;; common case, not an error -- try the other way before giving up.
+    (when (and (null (car res))
+               (eq (plist-get view :kind) 'graph)
+               org-roam-dired-auto-flip-on-empty)
+      (let* ((other (if (eq (plist-get view :direction) 'outbound)
+                        'backlink 'outbound))
+             (alt-view (plist-put (copy-sequence view) :direction other))
+             (alt (org-roam-dired--collect-view alt-view sort)))
         (when (car alt)
-          (setq res alt direction other flipped t))))
+          (setq res alt view alt-view flipped t))))
     (unless (car res)
       ;; Never hand dired an empty file list: it reads (DIR . nil) as
       ;; "list DIR itself" and would dump the entire notes tree.  Bailing
       ;; here also means a failed descend leaves the current view intact.
-      (user-error "%s is a leaf: no id links in either direction" title))
-    (let ((history (when (buffer-live-p (get-buffer org-roam-dired-buffer-name))
-                     (with-current-buffer org-roam-dired-buffer-name
-                       (if (and push org-roam-dired--file)
-                           (cons (list org-roam-dired--file
-                                       org-roam-dired--title
-                                       org-roam-dired--direction
+      (user-error "%s is empty" (org-roam-dired--view-title view)))
+    (let ((history (when live
+                     (with-current-buffer buf
+                       (if (and push org-roam-dired--view)
+                           (cons (cons org-roam-dired--view
                                        (dired-get-filename nil t))
                                  org-roam-dired--history)
                          org-roam-dired--history)))))
-      (let ((buf (org-roam-dired--render
-                  (car res)
-                  (list :file file :title title
-                        :direction direction :meta (cdr res)))))
-        (with-current-buffer buf
+      (let ((new (org-roam-dired--render
+                  (car res) (list :view view :meta (cdr res)))))
+        (with-current-buffer new
           (setq org-roam-dired--history history))
-        (pop-to-buffer-same-window buf)))
+        (pop-to-buffer-same-window new)))
     (when flipped
-      (message "No outbound links from %s — showing backlinks instead" title))))
+      (message "No outbound links from %s — showing backlinks instead"
+               (org-roam-dired--view-title view)))))
 
 (defun org-roam-dired--file-title (file)
   "Return the best display title for FILE from the roam database."
@@ -594,17 +723,35 @@ current view on the history stack first."
       (file-name-nondirectory file)))
 
 (defun org-roam-dired-descend ()
-  "Browse the graph neighbourhood of the file at point."
+  "Enter the thing at point, dired-style.
+A directory row opens the index nodes beneath it.  A node that links out
+behaves like a directory, so we descend into its links.  A node that
+links nowhere behaves like a file, so we open it."
   (interactive)
   (org-roam-dired--check)
-  (let ((file (dired-get-filename nil t)))
+  (let* ((file (dired-get-filename nil t))
+         (meta (and file org-roam-dired--meta
+                    (gethash file org-roam-dired--meta))))
     (unless file
       (user-error "No file on this line"))
-    (org-roam-dired--visit file
-                           (or (plist-get (gethash file org-roam-dired--meta) :title)
-                               (org-roam-dired--file-title file))
-                           org-roam-dired--direction
-                           t)))
+    (cond
+     ;; PARA level: step into the directory's index nodes.
+     ((file-directory-p file)
+      (org-roam-dired--goto (list :kind 'index :dir file
+                                  :title (or (plist-get meta :title)
+                                             (file-name-nondirectory file)))
+                            t))
+     ;; A node with outbound links is a "directory": walk into them.
+     ((plist-get meta :has-links)
+      (org-roam-dired--goto (list :kind 'graph :file file
+                                  :title (or (plist-get meta :title)
+                                             (org-roam-dired--file-title file))
+                                  :direction (or (plist-get org-roam-dired--view
+                                                            :direction)
+                                                 'outbound))
+                            t))
+     ;; A node with no outbound links is a "file": open it.
+     (t (org-roam-dired--open file nil)))))
 
 (defun org-roam-dired-back ()
   "Return to the previous view on the history stack."
@@ -612,10 +759,20 @@ current view on the history stack first."
   (org-roam-dired--check)
   (unless org-roam-dired--history
     (user-error "No previous view"))
-  (pcase-let* ((`(,file ,title ,direction ,return-file)
-                (pop org-roam-dired--history))
-               (history org-roam-dired--history))
-    (org-roam-dired--visit file title direction nil)
+  (let* ((entry (pop org-roam-dired--history))
+         (history org-roam-dired--history))
+    (org-roam-dired--goto (car entry) nil)
+    (with-current-buffer org-roam-dired-buffer-name
+      (setq org-roam-dired--history history)
+      (when (cdr entry)
+        (ignore-errors (dired-goto-file (cdr entry)))))))
+
+(defun org-roam-dired--reshow (view)
+  "Re-render VIEW without touching the history stack."
+  (org-roam-dired--check)
+  (let ((history org-roam-dired--history)
+        (return-file (dired-get-filename nil t)))
+    (org-roam-dired--goto view nil)
     (with-current-buffer org-roam-dired-buffer-name
       (setq org-roam-dired--history history)
       (when return-file
@@ -624,18 +781,18 @@ current view on the history stack first."
 (defun org-roam-dired--set-direction (direction)
   "Re-render the current root in DIRECTION without touching history."
   (org-roam-dired--check)
-  (let ((history org-roam-dired--history))
-    (org-roam-dired--visit org-roam-dired--file org-roam-dired--title
-                           direction nil)
-    (with-current-buffer org-roam-dired-buffer-name
-      (setq org-roam-dired--history history))))
+  (unless (eq (plist-get org-roam-dired--view :kind) 'graph)
+    (user-error "Direction only applies to a node view"))
+  (org-roam-dired--reshow
+   (plist-put (copy-sequence org-roam-dired--view) :direction direction)))
 
 (defun org-roam-dired-toggle-direction ()
   "Flip between outbound links and backlinks for the current root."
   (interactive)
   (org-roam-dired--check)
   (org-roam-dired--set-direction
-   (if (eq org-roam-dired--direction 'outbound) 'backlink 'outbound)))
+   (if (eq (plist-get org-roam-dired--view :direction) 'outbound)
+       'backlink 'outbound)))
 
 (defun org-roam-dired-forward-links ()
   "Show outbound links for the current root."
@@ -653,7 +810,7 @@ Unlike a plain `revert-buffer', which would replay the file list this
 buffer was built with, this picks up changes made since."
   (interactive)
   (org-roam-dired--check)
-  (org-roam-dired--set-direction org-roam-dired--direction))
+  (org-roam-dired--reshow org-roam-dired--view))
 
 (defun org-roam-dired-cycle-sort ()
   "Cycle the listing between path, title and modified-time order."
@@ -675,20 +832,25 @@ buffer was built with, this picks up changes made since."
     (user-error "No previous view"))
   (let* ((choices (mapcar (lambda (entry)
                             (cons (format "%s  [%s]"
-                                          (nth 1 entry)
-                                          (if (eq (nth 2 entry) 'outbound)
-                                              "outbound" "backlinks"))
+                                          (org-roam-dired--view-title (car entry))
+                                          (plist-get (car entry) :kind))
                                   entry))
                           org-roam-dired--history))
          (pick (completing-read "Back to: " choices nil t))
          (entry (cdr (assoc pick choices)))
          ;; Truncate the stack at the chosen entry so `back' stays coherent.
          (rest (cdr (memq entry org-roam-dired--history))))
-    (org-roam-dired--visit (nth 0 entry) (nth 1 entry) (nth 2 entry) nil)
+    (org-roam-dired--goto (car entry) nil)
     (with-current-buffer org-roam-dired-buffer-name
       (setq org-roam-dired--history rest)
-      (when (nth 3 entry)
-        (ignore-errors (dired-goto-file (nth 3 entry)))))))
+      (when (cdr entry)
+        (ignore-errors (dired-goto-file (cdr entry)))))))
+
+(defun org-roam-dired-top ()
+  "Jump back to the PARA top level, the \"/\" of the browser."
+  (interactive)
+  (org-roam-dired--check)
+  (org-roam-dired--goto (list :kind 'para) t))
 
 ;;; ------------------------------------------------------ opening
 
@@ -725,16 +887,21 @@ buffer was built with, this picks up changes made since."
   "Open the file this view is rooted at."
   (interactive)
   (org-roam-dired--check)
-  (find-file org-roam-dired--file))
+  (let ((file (plist-get org-roam-dired--view :file)))
+    (unless file
+      (user-error "This view is not rooted at a node"))
+    (find-file file)))
 
 ;;; ------------------------------------------------------ dispatcher
 
 (transient-define-prefix org-roam-dired-dispatch ()
   "All org-roam graph-browser actions."
   [["Navigate"
-    ("RET" "descend"      org-roam-dired-descend)
+    ("RET" "enter"        org-roam-dired-descend)
     ("h"   "back"         org-roam-dired-back)
+    ("^"   "top (PARA)"   org-roam-dired-top)
     ("H"   "history"      org-roam-dired-history-jump)
+    ("J"   "jump to node" org-roam-dired-jump)
     ("."   "root node"    org-roam-dired-goto-root)]
    ["Direction"
     ("TAB" "toggle"       org-roam-dired-toggle-direction)
@@ -753,14 +920,12 @@ buffer was built with, this picks up changes made since."
 ;;;###autoload
 (defun org-roam-dired ()
   "Browse the org-roam link graph as a dired buffer.
-Prompts for the node to start from."
+Opens straight at the PARA top level -- no prompt.  From there `l'
+descends: a directory into its index nodes, an index node into the notes
+it links to, and onward through the graph.  `h' comes back."
   (interactive)
   (org-roam-dired--require)
-  (let ((node (org-roam-node-read nil nil nil t "Browse graph from node: ")))
-    (org-roam-dired--visit (org-roam-node-file node)
-                           (org-roam-node-title node)
-                           'outbound
-                           nil)))
+  (org-roam-dired--goto (list :kind 'para) nil))
 
 ;;;###autoload
 (defun org-roam-dired-at-point ()
@@ -775,27 +940,25 @@ buffer, and the visited file otherwise."
                      (buffer-file-name buffer-file-name))))
     (unless file
       (user-error "No org-roam node or file at point"))
-    (org-roam-dired--visit file
-                           (if node
-                               (org-roam-node-title node)
-                             (org-roam-dired--file-title file))
-                           'outbound
-                           nil)))
+    (org-roam-dired--goto (list :kind 'graph :file file
+                                :title (if node
+                                           (org-roam-node-title node)
+                                         (org-roam-dired--file-title file))
+                                :direction 'outbound)
+                          nil)))
 
-;;; ------------------------------------------------------ completion UI
-
-;; Node selection is an ordinary `completing-read', so by default it
-;; lands in the short vertico popup at the foot of the frame -- 17 rows
-;; to pick from among ~1150 nodes, with the three-column display
-;; template squeezed into whatever width is left.  Show it in a
-;; full-frame buffer instead.  `vertico-multiform-commands' scopes this
-;; to these two commands, so every other completion is untouched.
-(with-eval-after-load 'vertico-multiform
-  (require 'vertico-buffer nil t)
-  (dolist (cmd '(org-roam-dired org-roam-dired-at-point))
-    (add-to-list 'vertico-multiform-commands
-                 `(,cmd buffer
-                   (vertico-buffer-display-action . (display-buffer-full-frame))))))
+(defun org-roam-dired-jump ()
+  "Re-root the browser at a node picked by name.
+The deliberate escape hatch from tree walking -- everything else in this
+buffer is keyboard navigation, not search."
+  (interactive)
+  (org-roam-dired--require)
+  (let ((node (org-roam-node-read nil nil nil t "Jump to node: ")))
+    (org-roam-dired--goto (list :kind 'graph
+                                :file (org-roam-node-file node)
+                                :title (org-roam-node-title node)
+                                :direction 'outbound)
+                          t)))
 
 ;;; ------------------------------------------------------ keybindings
 
