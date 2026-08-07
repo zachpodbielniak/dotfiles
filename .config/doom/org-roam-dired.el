@@ -782,6 +782,21 @@ buffer, and the visited file otherwise."
                            'outbound
                            nil)))
 
+;;; ------------------------------------------------------ completion UI
+
+;; Node selection is an ordinary `completing-read', so by default it
+;; lands in the short vertico popup at the foot of the frame -- 17 rows
+;; to pick from among ~1150 nodes, with the three-column display
+;; template squeezed into whatever width is left.  Show it in a
+;; full-frame buffer instead.  `vertico-multiform-commands' scopes this
+;; to these two commands, so every other completion is untouched.
+(with-eval-after-load 'vertico-multiform
+  (require 'vertico-buffer nil t)
+  (dolist (cmd '(org-roam-dired org-roam-dired-at-point))
+    (add-to-list 'vertico-multiform-commands
+                 `(,cmd buffer
+                   (vertico-buffer-display-action . (display-buffer-full-frame))))))
+
 ;;; ------------------------------------------------------ keybindings
 
 (map! :leader

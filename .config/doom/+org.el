@@ -129,7 +129,20 @@
         org-roam-dailies-directory "02_areas/dailies/"
         org-roam-db-gc-threshold most-positive-fixnum
         org-roam-completion-everywhere t
-        org-roam-file-exclude-regexp "03_resources/technical/docs/"))
+        org-roam-file-exclude-regexp "03_resources/technical/docs/")
+
+  ;; Node-picker columns.  Doom's default is
+  ;;   "${doom-hierarchy:*} ${doom-type:12} ${doom-tags:42}"
+  ;; and `doom-type' is the PARA path, which runs to 41 characters here
+  ;; ("03_resources/personal/emails/morning_brew") -- so a 12-column
+  ;; budget cut every entry down to "@02_areas/pe".  Swap the two widths:
+  ;; the path is the useful disambiguator in a PARA tree, tags rarely run
+  ;; past 20.  Total is 106 columns, which fits a standard frame.
+  (setq org-roam-node-display-template
+        (concat "${doom-hierarchy:*} "
+                (propertize "${doom-type:42}" 'face 'font-lock-keyword-face)
+                " "
+                (propertize "${doom-tags:20}" 'face '(:inherit org-tag :box nil)))))
 
 ;;; org-roam-ui: local web server + browser graph view on top of org-roam.
 ;;; `SPC n u' starts the server and opens it in the default browser.
