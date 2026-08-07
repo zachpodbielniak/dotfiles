@@ -741,6 +741,7 @@ compositor seat."
 (load! "arr-search")          ;; Search-and-add across *arr services
 (load! "eww")                 ;; Emacs-as-browser (eww + shr + URL routing)
 (load! "org-remark")          ;; Universal annotation layer (all buffer types)
+(load! "org-roam-dired")      ;; Browse the org-roam link graph as dired (SPC n g)
 (load! "tramp-dashboard")     ;; Org-style dashboard for entering TRAMP systems
 (load! "command-center")      ;; Bespoke two-column startup dashboard (SPC o D)
 (load! "sf")                  ;; Salesforce Service Cloud client (case triage)
