@@ -42,6 +42,18 @@ yield to any explicit model passed to `cmacs-ai-make-session' or to a non-nil
 (with-eval-after-load 'cmacs-ai
   (advice-add 'cmacs-ai-make-session :around #'+cmacs-ai--inject-provider-model))
 
+;;; ---------------------------------------------------------------- genmail
+
+;; GenMail's triage model is a brigade defcustom, not a cmacs-ai one, so it
+;; is not reached by the advice above -- genmail passes an explicit model.
+;; Set after the feature loads so this wins over the shipped default rather
+;; than being clobbered by the `defcustom'.
+
+(defvar cmacs-brigade-genmail-triage-model)
+
+(with-eval-after-load 'cmacs-brigade-genmail
+  (setq cmacs-brigade-genmail-triage-model "ollama/gemma4:31b-cloud"))
+
 (provide '+cmacs-ai)
 
 ;;; +cmacs-ai.el ends here
