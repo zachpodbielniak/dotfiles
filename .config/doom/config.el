@@ -52,6 +52,32 @@
 (add-hook 'doom-after-init-hook
           (lambda () (setq initial-buffer-choice #'cc-initial-buffer)))
 
+;;; Dashboard: stop `hl-line' bleeding onto the next row.
+;;; `hl-line-sticky-flag' makes the overlay run to the *start of the next
+;;; line*, and the dashboard centres each row with a `line-prefix' display
+;;; stretch — `(space :align-to (- center N))' from `+dashboard-center'.
+;;; That stretch belongs to the next line's first position, so Emacs paints
+;;; it with the hl-line face: a grey block the width of the left margin,
+;;; one row below the highlighted item.  Ending the range at end-of-line
+;;; keeps the overlay off it.  The highlight now hugs the text instead of
+;;; running to the window edge, which suits centred content anyway.
+(defun zach/dashboard-tame-hl-line ()
+  "Keep `hl-line' from painting the next row's centering stretch."
+  (setq-local hl-line-range-function
+              (lambda () (cons (line-beginning-position)
+                               (line-end-position)))))
+
+(add-hook '+dashboard-mode-hook #'zach/dashboard-tame-hl-line)
+
+;; The dashboard buffer may already exist by the time this file loads —
+;; `+dashboard-reload' regenerates its contents without re-running the
+;; major mode, so the hook alone would not reach it.  Apply directly too.
+(when-let* ((buf (get-buffer (or (bound-and-true-p doom-fallback-buffer-name)
+                                 "*doom*"))))
+  (with-current-buffer buf
+    (when (derived-mode-p '+dashboard-mode)
+      (zach/dashboard-tame-hl-line))))
+
 ;;; Font: Hack Nerd Font Mono (matching gst terminal config)
 ;;; Nerd Font covers modeline icons, Noto Color Emoji for emoji
 (let ((sz (if IS-MAC 14 18))
