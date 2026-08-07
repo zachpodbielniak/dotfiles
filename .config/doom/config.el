@@ -208,13 +208,42 @@ FLAVOR is one of mocha, macchiato, frappe, or latte."
 ;;; Dired: show dotfiles and parent directory (..)
 (setq dired-listing-switches "-ahl")
 
+;;; Dired: move by logical lines, not display rows.
+;;; `dired-next-line' goes through `line-move' -> `line-move-1' ->
+;;; `vertical-motion' (dired.el:2970), which overshoots by one logical line
+;;; when a row is wider than the window and `truncate-lines' is t — exactly
+;;; the state dirvish leaves its buffers in.  With the `git-msg' attribute
+;;; appending ~50 columns of commit message, any entry running past the
+;;; window edge is silently skipped by `j'.  Never by `k': the overshoot
+;;; only bites moving forward.  Measured in ~/source/projects/immutablue/build
+;;; at 113 columns wide — lines totalling 115-119 got jumped, 110 and 113
+;;; did not.  `forward-line' is purely logical, so it cannot overshoot.
+(defun zach/dired-next-line (arg)
+  "Move down ARG file lines, then position point at the filename."
+  (interactive "^p")
+  (let ((start (point)))
+    (forward-line (or arg 1))
+    (or (dired-move-to-filename)
+        ;; Header, blank or end-of-buffer line — stay put rather than
+        ;; parking point somewhere there is nothing to act on.
+        (progn (goto-char start)
+               (dired-move-to-filename)))))
+
+(defun zach/dired-previous-line (arg)
+  "Move up ARG file lines, then position point at the filename."
+  (interactive "^p")
+  (zach/dired-next-line (- (or arg 1))))
+
 ;;; wdired: bulk rename by editing filenames in dired
 (after! dired
   (setq wdired-allow-to-change-permissions t
         wdired-allow-to-redirect-links t)
   (map! :map dired-mode-map
         :localleader
-        "w" #'wdired-change-to-wdired-mode))
+        "w" #'wdired-change-to-wdired-mode)
+  (map! :map dired-mode-map
+        :n "j" #'zach/dired-next-line
+        :n "k" #'zach/dired-previous-line))
 
 ;;; Dirvish: enhanced dired with preview and multi-column layout
 ;; Preview deps: brew install libvips mediainfo
@@ -229,7 +258,12 @@ FLAVOR is one of mocha, macchiato, frappe, or latte."
   (map! :leader
         :desc "Dirvish"      "d d" #'dirvish
         :desc "Dirvish dwim" "d s" #'dirvish-side)
+  ;; dirvish installs its own local map, so the `dired-mode-map' bindings
+  ;; above never reach a dirvish buffer — which is the one that actually
+  ;; sets `truncate-lines'.  Bind here too.
   (map! :map dirvish-mode-map
+        :n "j"   #'zach/dired-next-line
+        :n "k"   #'zach/dired-previous-line
         :n "q"   #'dirvish-quit
         :n "TAB" #'dirvish-subtree-toggle
         :n "a"   #'dirvish-quick-access
