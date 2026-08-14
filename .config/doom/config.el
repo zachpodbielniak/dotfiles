@@ -816,6 +816,7 @@ compositor seat."
 (load! "emacslife/emacslife") ;; EmacsLife — BitLife clone (SPC G L)
 (when IS-CMACS (load! "cmacs")) ;; RTSP/RTSPS camera dashboard (cmacs builds only; SPC o v)
 (when IS-CMACS (load! "+cmacs-ai")) ;; per-provider model overrides (ollama → gemma4:26b)
+(when IS-CMACS (load! "+cmacs-ai-menu")) ;; C-a keybinds for the AI menu (ask/chat/brigade)
 ;; CAD file-type associations (.cad/.gcode/.stl/.step/...). Doom regenerates
 ;; its own autoloads and drops the dumped add-to-list cookies, so register
 ;; them explicitly here -- runs after Doom resets auto-mode-alist.
