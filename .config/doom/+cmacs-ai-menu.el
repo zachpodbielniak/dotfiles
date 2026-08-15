@@ -29,7 +29,9 @@
 ;; Two buffer-local overrides, each inheriting the whole tree and moving
 ;; the key it displaces rather than dropping it:
 ;;
-;;   magit / commit   `c' drafts a commit message; Chat moves to `C'
+;;   magit / commit   `g' is the Git group, `c' drafts a commit message,
+;;                    `r' reviews, `s' summarizes, `h' explains a hunk;
+;;                    Chat moves to `C'
 ;;   mu4e             `m' is the Mail group, `s' reads and summarizes;
 ;;                    "open the AI menu" moves to `M'
 ;;
@@ -159,7 +161,11 @@
 (set-keymap-parent +cmacs-ai-magit-map +cmacs-ai-map)
 
 (map! :map +cmacs-ai-magit-map
+      :desc "Git"                     "g" #'cmacs-ai-menu-pick-git
       :desc "Draft a commit message"  "c" #'cmacs-ai-suggest-commit-message
+      :desc "Review these changes"    "r" #'cmacs-ai-git-review
+      :desc "Summarize the changes"   "s" #'cmacs-ai-git-summary
+      :desc "Explain this hunk"       "h" #'cmacs-ai-git-explain-hunk
       :desc "Chat"                    "C" +cmacs-ai-chat-map)
 
 (map! :map (magit-mode-map magit-status-mode-map magit-diff-mode-map
