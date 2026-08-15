@@ -26,9 +26,12 @@
 ;;   C-a t   Tools       your own `cmacs-brigade-deftool' forms
 ;;   C-a g   Git         draft a commit message from the diff
 ;;
-;; In magit and commit buffers `c' is rebound to the commit drafter --
-;; `c' means commit everywhere else in magit -- and the Chat group moves
-;; to `C' there, so nothing is lost.
+;; Two buffer-local overrides, each inheriting the whole tree and moving
+;; the key it displaces rather than dropping it:
+;;
+;;   magit / commit   `c' drafts a commit message; Chat moves to `C'
+;;   mu4e             `m' is the Mail group, `s' reads and summarizes;
+;;                    "open the AI menu" moves to `M'
 ;;
 ;; Every command acts on the same target the right-click would: the region
 ;; if one is highlighted, otherwise whatever the resolvers make of point --
@@ -162,6 +165,33 @@
 (map! :map (magit-mode-map magit-status-mode-map magit-diff-mode-map
             git-commit-mode-map)
       :nvie "C-a" +cmacs-ai-magit-map)
+
+;;; --------------------------------------------------------- mu4e override
+;;
+;; Same idea for mail.  The Mail group only exists in a mu4e buffer, so
+;; there is no point spending a global key on it -- but inside mu4e it is
+;; the whole reason you reached for the menu, so it gets `m', and the
+;; general "open the AI menu" moves to `M'.  `s' summarizes outright,
+;; because reading the folder is the one action worth a single keystroke.
+
+(defvar +cmacs-ai-mu4e-map (make-sparse-keymap)
+  "C-a in mu4e buffers: the usual tree, plus the Mail group on `m'.")
+
+(set-keymap-parent +cmacs-ai-mu4e-map +cmacs-ai-map)
+
+(map! :map +cmacs-ai-mu4e-map
+      :desc "Mail"                    "m" #'cmacs-ai-menu-pick-mail
+      :desc "Open the AI menu"        "M" #'cmacs-ai-menu
+      ;; The headline action, one key.  In a headers buffer this reads
+      ;; every message in the folder; in a view buffer, the thread.
+      :desc "Read and summarize"      "s" #'cmacs-ai-mail-digest
+      :desc "What needs attention?"   "!" #'cmacs-ai-mail-attention
+      :desc "Draft a reply..."        "r" #'cmacs-ai-reply
+      :desc "Unsubscribe candidates"  "u" #'cmacs-ai-mail-unsubscribe-candidates
+      :desc "Ask about this mail..."  "?" #'cmacs-ai-mail-ask)
+
+(map! :map (mu4e-headers-mode-map mu4e-view-mode-map mu4e-main-mode-map)
+      :nvie "C-a" +cmacs-ai-mu4e-map)
 
 ;;; The prefix itself, in the states where it is useful.  Normal, visual
 ;;; (acting on a selection is the common case), insert and emacs.
