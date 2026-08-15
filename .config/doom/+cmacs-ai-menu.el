@@ -24,6 +24,11 @@
 ;;   C-a c   Chat        carry this into a conversation
 ;;   C-a b   Brigade     hand this to an agent
 ;;   C-a t   Tools       your own `cmacs-brigade-deftool' forms
+;;   C-a g   Git         draft a commit message from the diff
+;;
+;; In magit and commit buffers `c' is rebound to the commit drafter --
+;; `c' means commit everywhere else in magit -- and the Chat group moves
+;; to `C' there, so nothing is lost.
 ;;
 ;; Every command acts on the same target the right-click would: the region
 ;; if one is highlighted, otherwise whatever the resolvers make of point --
@@ -85,7 +90,7 @@
       :desc "Generate a test"         "t" #'cmacs-ai-test-region
       ;; Surface-specific: gsurf fetches the page body asynchronously, and
       ;; imgedit reads the image rather than any text.
-      :desc "Summarize gsurf page"    "g" #'cmacs-gsurf-summarize
+      :desc "Summarize gsurf page"    "S" #'cmacs-gsurf-summarize
       :desc "Ask about gsurf page..." "G" #'cmacs-gsurf-ask
       :desc "Describe image"          "i" #'cmacs-imgedit-ai-describe
       :desc "Edit image by prompt..." "I" #'cmacs-imgedit-ai-prompt)
@@ -128,12 +133,35 @@
       :desc "Chat"                    "c" +cmacs-ai-chat-map
       :desc "Brigade"                 "b" +cmacs-ai-brigade-map
       :desc "Tools (your deftools)"   "t" #'cmacs-ai-menu-pick-tools
+      ;; Git, from anywhere in a worktree -- not only from magit.
+      :desc "Draft a commit message"  "g" #'cmacs-ai-suggest-commit-message
       ;; The whole menu, the two ways the menu itself offers it.
       :desc "Open the AI menu"        "m" #'cmacs-ai-menu
       :desc "Pick any AI action"      "." #'cmacs-ai-menu-pick
       :desc "Run an action by name"   "x" #'cmacs-ai-run-action
       ;; What `C-a' used to do, kept one keystroke away.
       :desc "Beginning of line"       "C-a" #'move-beginning-of-line)
+
+;;; ------------------------------------------------------- magit override
+;;
+;; In a magit or commit buffer, `c' should mean commit -- that is what it
+;; means everywhere else in magit, and drafting the message is the thing
+;; you actually want the AI for there.  So this map inherits the whole
+;; C-a tree and rebinds just that one key, moving the Chat group to `C'
+;; rather than displacing it.  Everything else is unchanged.
+
+(defvar +cmacs-ai-magit-map (make-sparse-keymap)
+  "C-a in magit and commit buffers: the usual tree, with `c' for commit.")
+
+(set-keymap-parent +cmacs-ai-magit-map +cmacs-ai-map)
+
+(map! :map +cmacs-ai-magit-map
+      :desc "Draft a commit message"  "c" #'cmacs-ai-suggest-commit-message
+      :desc "Chat"                    "C" +cmacs-ai-chat-map)
+
+(map! :map (magit-mode-map magit-status-mode-map magit-diff-mode-map
+            git-commit-mode-map)
+      :nvie "C-a" +cmacs-ai-magit-map)
 
 ;;; The prefix itself, in the states where it is useful.  Normal, visual
 ;;; (acting on a selection is the common case), insert and emacs.
