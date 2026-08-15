@@ -24,6 +24,9 @@
 ;;   C-a c   Chat        carry this into a conversation
 ;;   C-a b   Brigade     hand this to an agent
 ;;   C-a t   Tools       your own `cmacs-brigade-deftool' forms
+;;   C-a e   Errors      diagnostics, build output, backtraces
+;;   C-a T   Terminal    vterm, eshell, comint, the REPLs, bacon
+;;   C-a n   Notes       org headings and roamgraph nodes
 ;;   C-a g   Git         draft a commit message from the diff
 ;;
 ;; Two buffer-local overrides, each inheriting the whole tree and moving
@@ -34,6 +37,9 @@
 ;;                    Chat moves to `C'
 ;;   mu4e             `m' is the Mail group, `s' reads and summarizes;
 ;;                    "open the AI menu" moves to `M'
+;;   terminals        `t' is the Terminal group (Tools moves to `T'),
+;;                    `e' explains, `f' fixes, `w' writes a command
+;;   org / roamgraph  `n' is the Notes group, `l' suggests links
 ;;
 ;; Every command acts on the same target the right-click would: the region
 ;; if one is highlighted, otherwise whatever the resolvers make of point --
@@ -138,6 +144,11 @@
       :desc "Chat"                    "c" +cmacs-ai-chat-map
       :desc "Brigade"                 "b" +cmacs-ai-brigade-map
       :desc "Tools (your deftools)"   "t" #'cmacs-ai-menu-pick-tools
+      ;; The other domain groups.  Each is empty outside its own buffers,
+      ;; so the picker simply says nothing applies.
+      :desc "Errors"                  "e" #'cmacs-ai-menu-pick-errors
+      :desc "Terminal"                "T" #'cmacs-ai-menu-pick-terminal
+      :desc "Notes"                   "n" #'cmacs-ai-menu-pick-notes
       ;; Git, from anywhere in a worktree -- not only from magit.
       :desc "Draft a commit message"  "g" #'cmacs-ai-suggest-commit-message
       ;; The whole menu, the two ways the menu itself offers it.
@@ -206,6 +217,56 @@
 ;;; claude-code prefix in +ai.el, and rebinding it there would silently
 ;;; take out `SPC a c', `SPC a r' and the rest of that group.
 (map! :nvie "C-a" +cmacs-ai-map)
+
+
+;;; ------------------------------------------------------ errors override
+;;
+;; Diagnostics are not confined to a mode, so there is no keymap to hang
+;; these on -- `C-a e' reaches them from anywhere, and the group is empty
+;; where there is no error.  The one shortcut worth having is the fix.
+
+(map! :map +cmacs-ai-map
+      :desc "Suggest a fix for this error" "E" #'cmacs-ai-errors-fix)
+
+;;; ---------------------------------------------------- terminal override
+;;
+;; `C-c C-i' in the result window is what puts a command back at the
+;; prompt.  It is sent, not run.
+
+(defvar +cmacs-ai-term-map (make-sparse-keymap)
+  "C-a in terminals: the usual tree, plus the Terminal group on `t'.")
+
+(set-keymap-parent +cmacs-ai-term-map +cmacs-ai-map)
+
+(map! :map +cmacs-ai-term-map
+      :desc "Terminal"                "t" #'cmacs-ai-menu-pick-terminal
+      :desc "Tools (your deftools)"   "T" #'cmacs-ai-menu-pick-tools
+      :desc "Explain what happened"   "e" #'cmacs-ai-term-explain
+      :desc "Fix this command"        "f" #'cmacs-ai-term-fix
+      :desc "Write a command..."      "w" #'cmacs-ai-term-write)
+
+(map! :map (vterm-mode-map eshell-mode-map shell-mode-map term-raw-map
+            comint-mode-map)
+      :nvie "C-a" +cmacs-ai-term-map)
+
+;;; ------------------------------------------------------- notes override
+;;
+;; Every entry here reads the OTHER notes through the brigade memory
+;; index, so they need `M-x cmacs-brigade-memory-build' to have run.
+
+(defvar +cmacs-ai-notes-map (make-sparse-keymap)
+  "C-a in org buffers: the usual tree, plus the Notes group on `n'.")
+
+(set-keymap-parent +cmacs-ai-notes-map +cmacs-ai-map)
+
+(map! :map +cmacs-ai-notes-map
+      :desc "Notes"                   "n" #'cmacs-ai-menu-pick-notes
+      :desc "Suggest links"           "l" #'cmacs-ai-notes-links
+      :desc "What does this contradict?" "k" #'cmacs-ai-notes-contradict
+      :desc "What is this missing?"   "?" #'cmacs-ai-notes-expand)
+
+(map! :map (org-mode-map cmacs-roamgraph-mode-map)
+      :nvie "C-a" +cmacs-ai-notes-map)
 
 (provide '+cmacs-ai-menu)
 
