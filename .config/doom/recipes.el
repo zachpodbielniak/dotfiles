@@ -38,7 +38,8 @@
 ;;   RET open · v cook-view · c new · I AI-import · g refresh
 ;;   f filter-tag · V views · L sort-by-last-made · / search
 ;;   R rate · X made-today · N AI-macros · p photo · B backlinks
-;;   m/u/U mark · b shopping-list · s schedule · e export · a assistant · q quit
+;;   m/u/U mark · D delete · b shopping-list · s schedule · e export
+;;   a assistant · q quit
 ;;
 ;; Metadata lives in the file-level property drawer (SERVINGS, PREP, COOK,
 ;; RATING, SOURCE, LAST_MADE) and in `#+filetags'.  Files that predate this
@@ -390,6 +391,7 @@ every column but the last."
     (define-key map "m" #'recipes-mark)
     (define-key map "u" #'recipes-unmark)
     (define-key map "U" #'recipes-unmark-all)
+    (define-key map "D" #'recipes-delete)
     (define-key map "B" #'recipes-show-backlinks)
     (define-key map "p" #'recipes-add-photo)
     (define-key map "L" #'recipes-sort-by-last-made)
@@ -419,6 +421,9 @@ recipes-ai modules when they load.")
     "m" #'recipes-mark
     "u" #'recipes-unmark
     "U" #'recipes-unmark-all
+    ;; `D' rather than `d': lowercase `d' stays evil's delete operator, and a
+    ;; destructive action should not sit under a one-key typo.
+    "D" #'recipes-delete
     "B" #'recipes-show-backlinks
     "p" #'recipes-add-photo
     "L" #'recipes-sort-by-last-made
@@ -522,7 +527,7 @@ Works from the browser (row at point) or while visiting a recipe file."
   "Echo the `recipes-mode' keymap."
   (interactive)
   (message
-   "RET open · v cook · c new · I import · m/u/U mark · b basket · s schedule · e export · ? menu · q quit"))
+   "RET open · v cook · c new · I import · m/u/U mark · D delete · b basket · s schedule · e export · ? menu · q quit"))
 
 ;;;###autoload
 (defun recipes ()
@@ -742,6 +747,66 @@ Always includes `recipe' first."
       (forward-line 1)))
   (message "Marks cleared"))
 
+;;; ------------------------------------------------------ deleting
+
+(declare-function org-roam-db-clear-file "org-roam-db")
+
+(defcustom recipes-delete-to-trash t
+  "When non-nil, `recipes-delete' moves recipe files to the system trash.
+Set to nil to unlink them outright.  Trashing is the default because a
+deleted recipe is otherwise unrecoverable unless the notes repo happened
+to be committed."
+  :type 'boolean
+  :group 'recipes)
+
+(defun recipes--delete-file (file)
+  "Delete recipe FILE and clean up everything that still points at it.
+Kills any buffer visiting FILE first — a live buffer would otherwise
+write the file back out on its next save — then removes the file and
+drops its node from the org-roam database."
+  (let ((buf (find-buffer-visiting file)))
+    (when buf
+      (with-current-buffer buf (set-buffer-modified-p nil))
+      (kill-buffer buf)))
+  (let ((delete-by-moving-to-trash recipes-delete-to-trash))
+    (delete-file file recipes-delete-to-trash))
+  (when (fboundp 'org-roam-db-clear-file)
+    (ignore-errors (org-roam-db-clear-file file))))
+
+(defun recipes--delete-prompt (names)
+  "Build the y/n confirmation prompt for deleting the recipes called NAMES.
+Long selections are elided so the prompt stays readable in the minibuffer."
+  (let* ((n (length names))
+         (verb (if recipes-delete-to-trash "Trash" "Permanently delete"))
+         (shown (if (> n 5) (append (seq-take names 5) (list "…")) names)))
+    (if (= n 1)
+        (format "%s recipe \"%s\"? " verb (car names))
+      (format "%s %d recipes (%s)? " verb n (string-join shown ", ")))))
+
+(defun recipes-delete ()
+  "Delete the marked recipes (or the recipe at point) after a y/n confirm.
+Honours `recipes-delete-to-trash', so by default the files land in the
+system trash rather than being unlinked."
+  (interactive)
+  (let ((files (recipes--selected-files)))
+    (unless files (user-error "No recipes selected"))
+    (let ((names (mapcar (lambda (f)
+                           (or (plist-get (recipes--file-metadata f) :title)
+                               (file-name-base f)))
+                         files)))
+      (if (not (y-or-n-p (recipes--delete-prompt names)))
+          (message "Deletion cancelled")
+        (dolist (file files) (recipes--delete-file file))
+        ;; Drop the deleted files from the mark list so a later batch action
+        ;; does not trip over paths that no longer exist.
+        (setq recipes--marked
+              (seq-remove (lambda (f) (member f files)) recipes--marked))
+        (when (derived-mode-p 'recipes-mode) (recipes-refresh))
+        (message "%s %d recipe%s"
+                 (if recipes-delete-to-trash "Trashed" "Deleted")
+                 (length files)
+                 (if (= (length files) 1) "" "s"))))))
+
 ;;; ------------------------------------------------------ views (filters)
 
 (defun recipes--last-made-days (lm)
@@ -935,7 +1000,8 @@ Always includes `recipe' first."
   [["Marks"
     ("m"   "mark"          recipes-mark)
     ("u"   "unmark"        recipes-unmark)
-    ("U"   "unmark all"    recipes-unmark-all)]
+    ("U"   "unmark all"    recipes-unmark-all)
+    ("D"   "delete"        recipes-delete)]
    ["Batch / Plan"
     ("b"   "shopping list" recipes-shopping-list)
     ("s"   "schedule"      recipes-schedule)
