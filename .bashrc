@@ -65,7 +65,6 @@ _set_editor() {
 _path_prepend \
     "${HOME}/.local/bin" \
     "${HOME}/.cargo/bin" \
-    "${HOME}/../linuxbrew/.linuxbrew/bin" \
     "/nix/var/nix/profiles/default/bin" \
     "${HOME}/perl5/bin" \
     "${HOME}/bin" \
@@ -82,7 +81,23 @@ _path_append \
     "/usr/local/bin" \
     "/usr/local/sbin" \
     "/usr/sbin" \
-    "/usr/bin" 
+    "/usr/bin"
+
+# linuxbrew goes AFTER /usr/bin on purpose: brew builds are sometimes missing
+# features the Fedora builds have -- brew's qemu ships without seccomp, which
+# breaks Claude Cowork's `-sandbox on` VM launch. Keep system binaries winning
+# and call the brew build by full path when you specifically want it.
+#
+# The prefix is resolved with `readlink -f` so it matches the exact string
+# /etc/profile.d/linuxbrew.sh appends. _path_append dedups by literal string,
+# so an unresolved "${HOME}/../linuxbrew/..." would leave that entry stranded
+# in the middle of $PATH ahead of /usr/bin instead of moving it to the end.
+_brew_prefix="$(readlink -f "${HOME}/../linuxbrew/.linuxbrew" 2>/dev/null)"
+if [[ -n "${_brew_prefix}" ]] && [[ -d "${_brew_prefix}/bin" ]]
+then
+	_path_append "${_brew_prefix}/bin" "${_brew_prefix}/sbin"
+fi
+unset _brew_prefix
 
 
 
