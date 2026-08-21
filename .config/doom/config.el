@@ -821,6 +821,7 @@ compositor seat."
 ;; its own autoloads and drops the dumped add-to-list cookies, so register
 ;; them explicitly here -- runs after Doom resets auto-mode-alist.
 (when IS-CMACS (require 'cmacs-cad-autoloads nil t))
+(when IS-CMACS (load! "+cmacs-dbexplorer")) ;; saved DB connections (M-x cmacs-dbexplorer)
 
 
 ;;;; =========================================================================
