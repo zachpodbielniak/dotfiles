@@ -16,10 +16,16 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# emacsclient_tty - run `emacsclient -nw -c` on the *concrete* controlling
-# terminal so it is safe to use as $EDITOR for pipe editors like vipe(1).
+# emacsclient_tty - $EDITOR wrapper around emacsclient that:
+#   1. Resolves the *concrete* controlling pts so pipe editors like vipe(1)
+#      work (plain `emacsclient -nw` forwards "/dev/tty" to the daemon).
+#   2. If this process is already inside Emacs (vterm, eat, eshell, bacon,
+#      M-x compile, ... -- INSIDE_EMACS is set), open a buffer in that
+#      instance instead of creating a nested TTY or PGTK frame.
+#   3. Otherwise pick a TTY frame (-nw) vs a PGTK GUI frame from the session:
+#      SSH or no X/Wayland -> terminal; local graphical session -> GUI.
 #
-# Why this exists:
+# Why the pts override exists:
 #   Tools such as vipe reopen the editor's stdin/stdout on /dev/tty before
 #   launching $EDITOR. `emacsclient -nw` resolves the terminal name with
 #   ttyname(STDOUT_FILENO) and forwards that *name* to the Emacs daemon,
@@ -31,12 +37,69 @@
 #   Resolving the concrete pts (e.g. /dev/pts/3) from the kernel and pointing
 #   emacsclient's stdin/stdout at it removes the ambiguity: the daemon can
 #   open /dev/pts/3 just fine, and we keep the daemon's instant start-up.
+#   The same redirection is kept for PGTK frames so $EDITOR waiters that
+#   rebind stdin/stdout still talk to a real terminal.
 
 set -euo pipefail
 
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+
+usage () {
+    cat << EOF
+${SCRIPT_NAME} - emacsclient wrapper for \$EDITOR (here, TTY, or PGTK)
+
+USAGE:
+    ${SCRIPT_NAME} [OPTIONS] [EMACSCLIENT_ARGS...]
+
+OPTIONS:
+    -h, --help      Show this help message
+    --license       Show license information
+    --here          Force the running Emacs (no new frame)
+    --tty           Force a terminal frame (emacsclient -nw -c)
+    --gui           Force a PGTK GUI frame (emacsclient -c)
+
+EXAMPLES:
+    ${SCRIPT_NAME} file.txt
+    ${SCRIPT_NAME} --here file.txt
+    ${SCRIPT_NAME} --tty file.txt
+    ${SCRIPT_NAME} --gui +42 file.txt
+    EDITOR=${SCRIPT_NAME} vipe
+
+DESCRIPTION:
+    Default target:
+        - inside Emacs (INSIDE_EMACS, e.g. vterm) -> existing instance
+        - SSH (SSH_CONNECTION / SSH_CLIENT / SSH_TTY) -> terminal (-nw)
+        - no X/Wayland display -> terminal (-nw)
+        - local session with WAYLAND_DISPLAY, DISPLAY, or
+          XDG_SESSION_TYPE=wayland|x11 -> PGTK GUI (no -nw)
+
+    The in-Emacs path does not pass -c/-nw, so the file opens as a buffer
+    in the parent instance and emacsclient waits for C-x # (server-edit).
+    That is the right \$EDITOR behaviour for git commit, visudo, vipe.
+
+    Remaining arguments are passed through to emacsclient. A concrete
+    controlling pts is bound to stdin/stdout when one exists (TTY/PGTK
+    paths only), so this is safe as \$EDITOR for pipe editors like vipe(1).
+
+EOF
+}
+
+show_license () {
+    cat << 'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak — AGPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+EOF
+}
+
 # resolve_tty: print the concrete controlling terminal (e.g. /dev/pts/3) on
 # stdout, or return non-zero when there is not a usable one.
-resolve_tty() {
+resolve_tty () {
     local t
     # ps reads the controlling terminal from the kernel, so it yields the
     # real pts even when our own stdin/stdout were redirected to /dev/tty.
@@ -49,12 +112,123 @@ resolve_tty() {
     return 1
 }
 
-if tty_dev="$(resolve_tty)"
+# inside_emacs: true when this process is a child of Emacs (vterm, eat,
+# eshell, bacon, compile, ...). Emacs exports INSIDE_EMACS to subprocesses.
+inside_emacs () {
+    [[ -n "${INSIDE_EMACS:-}" ]]
+}
+
+# session_wants_tty_frame: true when we should open emacsclient -nw rather
+# than a PGTK GUI frame. SSH always wins, even with forwarded DISPLAY.
+session_wants_tty_frame () {
+    if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]
+    then
+        return 0
+    fi
+
+    if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]
+    then
+        return 1
+    fi
+
+    case "${XDG_SESSION_TYPE:-}" in
+        wayland|x11)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+force_mode=""
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --license)
+            show_license
+            exit 0
+            ;;
+        --here)
+            force_mode="here"
+            shift
+            ;;
+        --tty)
+            force_mode="tty"
+            shift
+            ;;
+        --gui)
+            force_mode="gui"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# here: buffer in the parent Emacs. tty: -nw frame. gui: PGTK frame.
+# --tty/--gui still nest a frame even inside Emacs (escape hatch).
+target="tty"
+if [[ "${force_mode}" == "here" ]]
 then
-    exec emacsclient -nw -c "$@" <"${tty_dev}" >"${tty_dev}"
+    target="here"
+elif [[ "${force_mode}" == "gui" ]]
+then
+    target="gui"
+elif [[ "${force_mode}" == "tty" ]]
+then
+    target="tty"
+elif inside_emacs
+then
+    target="here"
+elif session_wants_tty_frame
+then
+    target="tty"
+else
+    target="gui"
 fi
 
-# No usable controlling terminal (e.g. invoked non-interactively): fall back
-# to a standalone `emacs -nw`, which opens whatever terminal it inherits from
-# its own process rather than delegating to the daemon.
-exec emacs -nw "$@"
+tty_dev=""
+if resolved_tty="$(resolve_tty)"
+then
+    tty_dev="${resolved_tty}"
+fi
+
+if [[ "${target}" == "here" ]]
+then
+    # No new frame, no pts steal: the daemon already owns the UI. emacsclient
+    # blocks until C-x # so this stays valid as $EDITOR.
+    exec emacsclient "$@"
+fi
+
+if [[ "${target}" == "tty" ]]
+then
+    if [[ -n "${tty_dev}" ]]
+    then
+        # Redirect both fds at the concrete pts so emacsclient does not
+        # forward the literal /dev/tty to the daemon.
+        # shellcheck disable=SC2094
+        exec emacsclient -nw -c "$@" <"${tty_dev}" >"${tty_dev}"
+    fi
+    # No usable controlling terminal (e.g. invoked non-interactively): fall
+    # back to a standalone `emacs -nw`, which opens whatever terminal it
+    # inherits from its own process rather than delegating to the daemon.
+    exec emacs -nw "$@"
+fi
+
+# Local graphical session: PGTK frame. Keep the pts override so $EDITOR
+# waiters that rebound stdin/stdout still have a real terminal.
+if [[ -n "${tty_dev}" ]]
+then
+    # shellcheck disable=SC2094
+    exec emacsclient -c "$@" <"${tty_dev}" >"${tty_dev}"
+fi
+exec emacsclient -c "$@"

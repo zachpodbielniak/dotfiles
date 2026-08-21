@@ -107,9 +107,11 @@ _have vi && _set_editor "vi"
 _have vim && _set_editor "vim"
 _have nvim && _set_editor "nvim"
 _have emacs && _set_editor "emacs -nw"
-# emacsclient_tty wraps `emacsclient -nw -c` so it resolves the concrete
-# controlling pts -- plain `emacsclient -nw` forwards "/dev/tty" to the daemon
-# (which has no controlling terminal) and breaks pipe editors like vipe(1).
+# emacsclient_tty wraps emacsclient so it resolves the concrete controlling
+# pts -- plain `emacsclient -nw` forwards "/dev/tty" to the daemon (which has
+# no controlling terminal) and breaks pipe editors like vipe(1).
+# Frame type is picked at invocation: inside Emacs (vterm) -> existing
+# buffer; SSH or headless -> -nw; local X/Wayland -> PGTK (pts override).
 _have emacsclient && _have emacsclient_tty && _set_editor "emacsclient_tty"
 
 # source the files if we have them
@@ -145,8 +147,9 @@ set -o vi
 
 
 # Aliases
-_have emacsclient && alias e="emacsclient -nw -c"
-_have emacsclient && alias eg="emacsclient -c"
+# e auto-detects (here if INSIDE_EMACS, else TTY/PGTK). eg forces a GUI frame.
+_have emacsclient_tty && alias e="emacsclient_tty"
+_have emacsclient_tty && alias eg="emacsclient_tty --gui"
 
 # distrobox
 if [[ -d "${HOME}/../linuxbrew/.linuxbrew" ]] && [[ -d "/var/home/linuxbrew/.linuxbrew/" ]]
