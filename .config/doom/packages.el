@@ -146,6 +146,24 @@
 (package! carbon-now-sh)
 
 
+;;; --- Email ---
+
+;; mu4e ships with the system `mu' (site-lisp), not straight. Declare it so
+;; straight does not try to satisfy nano-mu4e's `Package-Requires: (mu4e
+;; "1.12")' by cloning djcb/mu and running its autotools build, which fails.
+;; The pseudo-package entry is what straight's dependency resolver reads;
+;; `package!' just keeps Doom's help commands honest.
+(when (boundp 'straight-built-in-pseudo-packages)
+  (add-to-list 'straight-built-in-pseudo-packages 'mu4e))
+(package! mu4e :built-in 'prefer)
+
+;; NΛNO mu4e: thread-centric replacement for the mu4e headers view.
+;; Not on MELPA. Needs mu4e >= 1.12 (system `mu' provides it).
+(package! nano-mu4e
+  :recipe (:host github :repo "rougier/nano-mu4e"
+           :files ("nano-mu4e.el")))
+
+
 ;;; --- Jira ---
 
 ;; Jira issue tracker interface (list, view, edit, export issues)

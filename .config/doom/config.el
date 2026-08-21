@@ -838,6 +838,7 @@ compositor seat."
   (when-let ((mu4e-dir (car (file-expand-wildcards "/opt/homebrew/share/emacs/site-lisp/mu/mu4e"))))
     (add-to-list 'load-path mu4e-dir)))
 (load! "+mu4e")
+(load! "+nano-mu4e")     ;; NΛNO thread-centric headers view (SPC m N)
 
 (load! "+ement")          ;; Matrix client
 (load! "+emms")           ;; EMMS / MPD music client
