@@ -25,7 +25,8 @@
 ;;; Code:
 
 (defvar +cmacs-ai-provider-models
-  '((ollama . "gemma4:26b"))
+  '((ollama . "gemma4:26b")
+    (grok   . "grok-4.6"))
   "Alist of (PROVIDER . MODEL) overrides applied when no explicit model is given.
 Entries here take precedence over the C-level AI_*_DEFAULT_MODEL macros but
 yield to any explicit model passed to `cmacs-ai-make-session' or to a non-nil
@@ -41,6 +42,24 @@ yield to any explicit model passed to `cmacs-ai-make-session' or to a non-nil
 
 (with-eval-after-load 'cmacs-ai
   (advice-add 'cmacs-ai-make-session :around #'+cmacs-ai--inject-provider-model))
+
+;;; --------------------------------------------------------------- default
+
+;; cmacs-ai has *two* independent notions of "default provider" and only one
+;; of them is the Elisp layer's.  ai-glib's AiConfig reads
+;; ~/.config/ai-glib/config.yaml (default_provider: grok), but that is
+;; consulted only by `ai_simple_new'; every cmacs-ai entry point goes through
+;; `cmacs-ai-make-session', which reads the `cmacs-ai-default-provider'
+;; defcustom -- shipped as `claude'.  Unset, that is what M-x cmacs-ai-send
+;; and M-x cmacs-ai-chat use, and it fails with an Anthropic 401.
+;;
+;; The model deliberately does NOT go in `cmacs-ai-default-model': that is
+;; provider-agnostic, so it would hand "grok-4.6" to Claude on the next
+;; `cmacs-ai-chat-with-provider'.  It belongs in the per-provider alist above,
+;; which is what the advice consults first.
+
+(with-eval-after-load 'cmacs-ai
+  (setq cmacs-ai-default-provider 'grok))
 
 ;;; ---------------------------------------------------------------- genmail
 

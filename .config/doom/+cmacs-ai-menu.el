@@ -28,6 +28,8 @@
 ;;   C-a T   Terminal    vterm, eshell, comint, the REPLs, bacon
 ;;   C-a n   Notes       org headings and roamgraph nodes
 ;;   C-a g   Git         draft a commit message from the diff
+;;   C-a S   Send        answer written back into this buffer, in place
+;;   C-a D   Delete      remove the response block at point
 ;;
 ;; Two buffer-local overrides, each inheriting the whole tree and moving
 ;; the key it displaces rather than dropping it:
@@ -151,6 +153,13 @@
       :desc "Notes"                   "n" #'cmacs-ai-menu-pick-notes
       ;; Git, from anywhere in a worktree -- not only from magit.
       :desc "Draft a commit message"  "g" #'cmacs-ai-suggest-commit-message
+      ;; The one command that answers *in* the buffer rather than in a
+      ;; result window: the line (or region) at point goes out, the answer
+      ;; lands underneath it in the file's own notation.  On `S' rather
+      ;; than `s' so the magit and mu4e overrides below keep `s' for
+      ;; summarize; `D' removes a response block again.
+      :desc "Send, answer in buffer"  "S" #'cmacs-ai-send
+      :desc "Delete response block"   "D" #'cmacs-ai-send-delete-response
       ;; The whole menu, the two ways the menu itself offers it.
       :desc "Open the AI menu"        "m" #'cmacs-ai-menu
       :desc "Pick any AI action"      "." #'cmacs-ai-menu-pick
