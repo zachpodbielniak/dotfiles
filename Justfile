@@ -302,3 +302,11 @@ generate-nginx-private-ssl email="":
     fi
 
     certbot_helper --nginx-private -d localhost.podbielniak.com ${email_arg}
+
+
+install-skills:
+	#!/usr/bin/env bash
+	set -euo pipefail
+
+	npx skills add https://github.com/Leonxlnx/unlazy
+	npx skills add https://github.com/Leonxlnx/taste-skill
