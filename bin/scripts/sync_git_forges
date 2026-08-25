@@ -1,0 +1,1789 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# ==============================================================================
+# sync_git_forges - Reconcile owner/repo across Forgejo, GitLab, and GitHub
+# ==============================================================================
+# Forgejo is canonical (it is supposed to push-mirror out to GitLab and GitHub).
+# This script double-checks all three, fast-forwards anything that is strictly
+# behind, and attempts a simple merge when GitLab/GitHub picked up commits
+# first. Diverged history that will not merge cleanly is reported for a human.
+#
+# Never force-pushes.
+# ==============================================================================
+
+SCRIPT_NAME="$(basename "${0}")"
+readonly SCRIPT_NAME
+readonly VERSION="1.0.0"
+
+readonly DEFAULT_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}/sync_git_forges/config.yaml"
+readonly DEFAULT_FORGEJO_URL="git@git-ssh.podbielniak.com:{path}.git"
+readonly DEFAULT_GITLAB_URL="git@gitlab.com:{path}.git"
+readonly DEFAULT_GITHUB_URL="git@github.com:{path}.git"
+readonly DEFAULT_CANONICAL="forgejo"
+readonly LOG_LIMIT=20
+
+# Do not hang waiting for a password if SSH/HTTPS auth is broken.
+export GIT_TERMINAL_PROMPT=0
+
+# ------------------------------------------------------------------------------
+# Runtime flags (set in parse_args)
+# ------------------------------------------------------------------------------
+verbose=false
+debug=false
+dry_run=false
+strict=false
+fail_fast=false
+all_branches=false
+sync_tags=false
+canonical_only=false
+keep_work=false
+list_only=false
+read_stdin=false
+quiet=false
+
+config_path="${DEFAULT_CONFIG}"
+repos_csv=""
+branches_csv=""
+skip_csv=""
+
+# ------------------------------------------------------------------------------
+# Forge configuration (overridden by YAML)
+# ------------------------------------------------------------------------------
+canonical="${DEFAULT_CANONICAL}"
+url_template_forgejo="${DEFAULT_FORGEJO_URL}"
+url_template_gitlab="${DEFAULT_GITLAB_URL}"
+url_template_github="${DEFAULT_GITHUB_URL}"
+
+# Ordered forge names. skip_csv removes entries before work starts.
+FORGES=(forgejo gitlab github)
+
+# ------------------------------------------------------------------------------
+# Per-run state
+# ------------------------------------------------------------------------------
+declare -a CLI_REPOS=()
+declare -a CONFIG_REPOS=()
+declare -a SKIP_FORGES=()
+declare -a GLOBAL_BRANCHES=()
+declare -a WORK_DIRS=()
+declare -a FAILED_REPOS=()
+declare -a FAILED_REASONS=()
+
+count_repos=0
+count_insync=0
+count_ff=0
+count_merge=0
+count_push=0
+count_fail=0
+count_skip=0
+
+# Per-repo remote/head maps (reset at the start of each repo)
+declare -A REMOTE_URL=()
+declare -A REMOTE_OK=()
+declare -A HEADS_FORGEJO=()
+declare -A HEADS_GITLAB=()
+declare -A HEADS_GITHUB=()
+declare -A TAGS_FORGEJO=()
+declare -A TAGS_GITLAB=()
+declare -A TAGS_GITHUB=()
+
+# ==============================================================================
+# Help
+# ==============================================================================
+
+usage () {
+	cat << EOF
+${SCRIPT_NAME} - Sync owner/repo across Forgejo, GitLab, and GitHub
+
+USAGE:
+	${SCRIPT_NAME} [OPTIONS] [OWNER/REPO ...]
+
+OPTIONS:
+	-h, --help           Show this help message
+	--license            Show license information
+	-V, --version        Show version
+	-v, --verbose        Extra progress output
+	--debug              Log git commands
+	-n, --dry-run        Fetch and merge locally; do not push
+	-q, --quiet          Only print failures and the final summary
+	-c, --config PATH    YAML config (default: ${DEFAULT_CONFIG})
+	-r, --repos CSV      Comma-separated owner/repo list
+	--stdin              Read owner/repo (or CSV) lines from stdin
+	--branches CSV       Branches to sync (default: canonical HEAD)
+	--all-branches       Sync every branch present on any forge
+	--tags               Also sync tags (fast-forward / create only)
+	--skip CSV           Skip forges: github, gitlab, forgejo
+	--canonical-only     Only update Forgejo; do not push out to the others
+	--strict             Treat a missing non-canonical remote as a failure
+	--fail-fast          Stop on the first repo that fails
+	--keep-work          Keep temp clones (printed on failure)
+	--list               Print resolved repos and URLs, then exit
+
+EXAMPLES:
+	# Repos from the default YAML config
+	${SCRIPT_NAME}
+
+	# CSV on the CLI (ignores the YAML repos list, still uses forge URLs)
+	${SCRIPT_NAME} -r zachpodbielniak/dotfiles,immutablue/immutablue
+
+	# Positional specs, dry-run
+	${SCRIPT_NAME} --dry-run zachpodbielniak/dotfiles immutablue/hyacinth-macaw
+
+	# Newline/CSV list from a file
+	${SCRIPT_NAME} --stdin < repos.txt
+
+	# Every branch plus tags, keep worktrees if something conflicts
+	${SCRIPT_NAME} --all-branches --tags --keep-work -r copyleft-games/mcp-glib
+
+DESCRIPTION:
+	Forgejo (${DEFAULT_CANONICAL}) is the real upstream. It is supposed to
+	push-mirror to GitLab and GitHub, but those two sometimes get commits
+	first. For each owner/repo this script:
+
+	  1. ls-remote all three forges (fast path: already identical)
+	  2. Fetches into a temp clone when they differ
+	  3. Fast-forwards any remote that is strictly behind
+	  4. If history diverged, merges GitLab then GitHub into Forgejo
+	  5. Pushes the result to every remote that is still behind
+
+	A merge that conflicts is left for you to fix. Failed repos are listed
+	at the end with the SHAs and unique commits on each side.
+
+	Never force-pushes. Missing GitLab/GitHub remotes are warnings unless
+	--strict. A missing Forgejo repo is always a failure.
+
+CONFIG:
+	Default file: ${DEFAULT_CONFIG}
+
+	forges:
+	  forgejo:
+	    url: "git@git-ssh.podbielniak.com:{path}.git"
+	  gitlab:
+	    url: "git@gitlab.com:{path}.git"
+	  github:
+	    url: "git@github.com:{path}.git"
+	canonical: forgejo
+	repos:
+	  - zachpodbielniak/dotfiles
+	  - path: copyleft-games/mcp-glib
+	    github: copyleft-games/mcp-glib
+	    branches: [master]
+
+	{path} / {owner} / {repo} are substituted. A YAML file that is just a
+	list of owner/repo strings is also accepted.
+
+EOF
+}
+
+show_license () {
+	cat << 'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak — AGPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+EOF
+}
+
+# ==============================================================================
+# Logging
+# ==============================================================================
+
+if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]
+then
+	C_RESET=""
+	C_RED=""
+	C_GREEN=""
+	C_YELLOW=""
+	C_CYAN=""
+	C_DIM=""
+else
+	C_RESET=$'\033[0m'
+	C_RED=$'\033[31m'
+	C_GREEN=$'\033[32m'
+	C_YELLOW=$'\033[33m'
+	C_CYAN=$'\033[36m'
+	C_DIM=$'\033[2m'
+fi
+
+log_info () {
+	if [[ "${quiet}" == "true" ]]
+	then
+		return 0
+	fi
+	printf '%s\n' "${1}"
+}
+
+log_verbose () {
+	if [[ "${verbose}" != "true" ]] && [[ "${debug}" != "true" ]]
+	then
+		return 0
+	fi
+	if [[ "${quiet}" == "true" ]]
+	then
+		return 0
+	fi
+	printf '%s%s%s\n' "${C_DIM}" "${1}" "${C_RESET}"
+}
+
+log_debug () {
+	if [[ "${debug}" != "true" ]]
+	then
+		return 0
+	fi
+	printf '%s[DEBUG] %s%s\n' "${C_DIM}" "${1}" "${C_RESET}" >&2
+}
+
+log_ok () {
+	if [[ "${quiet}" == "true" ]]
+	then
+		return 0
+	fi
+	printf '%sOK%s    %s\n' "${C_GREEN}" "${C_RESET}" "${1}"
+}
+
+log_warn () {
+	printf '%sWARN%s  %s\n' "${C_YELLOW}" "${C_RESET}" "${1}" >&2
+}
+
+log_fail () {
+	printf '%sFAIL%s  %s\n' "${C_RED}" "${C_RESET}" "${1}" >&2
+}
+
+log_action () {
+	if [[ "${quiet}" == "true" ]]
+	then
+		return 0
+	fi
+	printf '%s%s%s %s\n' "${C_CYAN}" "${1}" "${C_RESET}" "${2}"
+}
+
+die () {
+	printf '%s: %s\n' "${SCRIPT_NAME}" "${1}" >&2
+	exit 2
+}
+
+short_sha () {
+	local sha="${1}"
+	if [[ ${#sha} -ge 7 ]]
+	then
+		printf '%s' "${sha:0:7}"
+	else
+		printf '%s' "${sha}"
+	fi
+}
+
+# ==============================================================================
+# Cleanup
+# ==============================================================================
+
+# Invoked via trap EXIT (ShellCheck cannot see that).
+# shellcheck disable=SC2329
+cleanup () {
+	local dir
+	if [[ "${keep_work}" == "true" ]]
+	then
+		return 0
+	fi
+	for dir in "${WORK_DIRS[@]+"${WORK_DIRS[@]}"}"
+	do
+		if [[ -n "${dir}" ]] && [[ -d "${dir}" ]]
+		then
+			rm -rf "${dir}"
+		fi
+	done
+}
+
+trap cleanup EXIT
+
+# ==============================================================================
+# Small helpers
+# ==============================================================================
+
+have_cmd () {
+	command -v "${1}" >/dev/null 2>&1
+}
+
+# Trim leading/trailing whitespace.
+trim () {
+	local value="${1}"
+	value="${value#"${value%%[![:space:]]*}"}"
+	value="${value%"${value##*[![:space:]]}"}"
+	printf '%s' "${value}"
+}
+
+# Split a CSV string into the nameref array, dropping empties.
+split_csv () {
+	local csv="${1}"
+	local -n _out="${2}"
+	local item
+	local -a raw=()
+
+	_out=()
+	if [[ -z "${csv}" ]]
+	then
+		return 0
+	fi
+
+	IFS=',' read -r -a raw <<< "${csv}"
+	for item in "${raw[@]}"
+	do
+		item="$(trim "${item}")"
+		if [[ -n "${item}" ]]
+		then
+			_out+=("${item}")
+		fi
+	done
+}
+
+# owner/repo, or group/sub/repo. Last segment is the project name.
+normalize_path () {
+	local path="${1}"
+	path="$(trim "${path}")"
+	path="${path%.git}"
+	path="${path#/}"
+	path="${path%/}"
+
+	if [[ -z "${path}" ]]
+	then
+		return 1
+	fi
+	if [[ "${path}" =~ ^https?:// ]] || [[ "${path}" =~ ^git@ ]] || [[ "${path}" =~ ^ssh:// ]]
+	then
+		log_fail "expected owner/repo, got a URL: ${path}"
+		return 1
+	fi
+	if [[ "${path}" != */* ]]
+	then
+		log_fail "expected owner/repo, got: ${path}"
+		return 1
+	fi
+	printf '%s\n' "${path}"
+}
+
+expand_url () {
+	local template="${1}"
+	local path="${2}"
+	local owner="${path%/*}"
+	local repo="${path##*/}"
+	local url="${template}"
+
+	url="${url//\{path\}/${path}}"
+	url="${url//\{owner\}/${owner}}"
+	url="${url//\{repo\}/${repo}}"
+	printf '%s\n' "${url}"
+}
+
+template_for_forge () {
+	local forge="${1}"
+	case "${forge}" in
+		forgejo)
+			printf '%s\n' "${url_template_forgejo}"
+			;;
+		gitlab)
+			printf '%s\n' "${url_template_gitlab}"
+			;;
+		github)
+			printf '%s\n' "${url_template_github}"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+forge_skipped () {
+	local forge="${1}"
+	local item
+	for item in "${SKIP_FORGES[@]+"${SKIP_FORGES[@]}"}"
+	do
+		if [[ "${item}" == "${forge}" ]]
+		then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# ==============================================================================
+# Head / tag maps
+# ==============================================================================
+
+heads_clear () {
+	HEADS_FORGEJO=()
+	HEADS_GITLAB=()
+	HEADS_GITHUB=()
+	TAGS_FORGEJO=()
+	TAGS_GITLAB=()
+	TAGS_GITHUB=()
+	REMOTE_URL=()
+	REMOTE_OK=()
+}
+
+heads_set () {
+	local forge="${1}"
+	local branch="${2}"
+	local sha="${3}"
+	case "${forge}" in
+		forgejo) HEADS_FORGEJO["${branch}"]="${sha}" ;;
+		gitlab)  HEADS_GITLAB["${branch}"]="${sha}" ;;
+		github)  HEADS_GITHUB["${branch}"]="${sha}" ;;
+	esac
+}
+
+heads_get () {
+	local forge="${1}"
+	local branch="${2}"
+	case "${forge}" in
+		forgejo) printf '%s' "${HEADS_FORGEJO[${branch}]:-}" ;;
+		gitlab)  printf '%s' "${HEADS_GITLAB[${branch}]:-}" ;;
+		github)  printf '%s' "${HEADS_GITHUB[${branch}]:-}" ;;
+	esac
+}
+
+tags_set () {
+	local forge="${1}"
+	local tag="${2}"
+	local sha="${3}"
+	case "${forge}" in
+		forgejo) TAGS_FORGEJO["${tag}"]="${sha}" ;;
+		gitlab)  TAGS_GITLAB["${tag}"]="${sha}" ;;
+		github)  TAGS_GITHUB["${tag}"]="${sha}" ;;
+	esac
+}
+
+tags_get () {
+	local forge="${1}"
+	local tag="${2}"
+	case "${forge}" in
+		forgejo) printf '%s' "${TAGS_FORGEJO[${tag}]:-}" ;;
+		gitlab)  printf '%s' "${TAGS_GITLAB[${tag}]:-}" ;;
+		github)  printf '%s' "${TAGS_GITHUB[${tag}]:-}" ;;
+	esac
+}
+
+# Print sorted unique keys from the three head maps (or tag maps).
+map_keys_union () {
+	local kind="${1}"
+	local -A seen=()
+	local k
+
+	case "${kind}" in
+		heads)
+			if [[ ${#HEADS_FORGEJO[@]} -gt 0 ]]
+			then
+				for k in "${!HEADS_FORGEJO[@]}"
+				do
+					seen["${k}"]=1
+				done
+			fi
+			if [[ ${#HEADS_GITLAB[@]} -gt 0 ]]
+			then
+				for k in "${!HEADS_GITLAB[@]}"
+				do
+					seen["${k}"]=1
+				done
+			fi
+			if [[ ${#HEADS_GITHUB[@]} -gt 0 ]]
+			then
+				for k in "${!HEADS_GITHUB[@]}"
+				do
+					seen["${k}"]=1
+				done
+			fi
+			;;
+		tags)
+			if [[ ${#TAGS_FORGEJO[@]} -gt 0 ]]
+			then
+				for k in "${!TAGS_FORGEJO[@]}"
+				do
+					seen["${k}"]=1
+				done
+			fi
+			if [[ ${#TAGS_GITLAB[@]} -gt 0 ]]
+			then
+				for k in "${!TAGS_GITLAB[@]}"
+				do
+					seen["${k}"]=1
+				done
+			fi
+			if [[ ${#TAGS_GITHUB[@]} -gt 0 ]]
+			then
+				for k in "${!TAGS_GITHUB[@]}"
+				do
+					seen["${k}"]=1
+				done
+			fi
+			;;
+	esac
+
+	if [[ ${#seen[@]} -eq 0 ]]
+	then
+		return 0
+	fi
+	printf '%s\n' "${!seen[@]}" | LC_ALL=C sort
+}
+
+record_failure () {
+	local spec="${1}"
+	local reason="${2}"
+	FAILED_REPOS+=("${spec}")
+	FAILED_REASONS+=("${reason}")
+	((count_fail++)) || true
+	log_fail "${spec}  ${reason}"
+}
+
+# ==============================================================================
+# Git wrappers
+# ==============================================================================
+
+git_cmd () {
+	if [[ "${debug}" == "true" ]]
+	then
+		log_debug "git $*"
+	fi
+	git "$@"
+}
+
+# Fill HEADS_* or TAGS_* for one forge from git ls-remote.
+# Returns 0 if the remote was reachable (even with zero refs).
+ls_remote_fill () {
+	local forge="${1}"
+	local url="${2}"
+	local kind="${3}"
+	local out
+	local sha ref name
+
+	if [[ "${kind}" == "heads" ]]
+	then
+		if ! out="$(git_cmd ls-remote --heads "${url}" 2>&1)"
+		then
+			log_verbose "ls-remote --heads ${forge} failed: ${out}"
+			return 1
+		fi
+	else
+		if ! out="$(git_cmd ls-remote --tags --refs "${url}" 2>&1)"
+		then
+			log_verbose "ls-remote --tags ${forge} failed: ${out}"
+			return 1
+		fi
+	fi
+
+	if [[ -z "${out}" ]]
+	then
+		return 0
+	fi
+
+	while IFS=$'\t' read -r sha ref
+	do
+		if [[ -z "${sha}" ]] || [[ -z "${ref}" ]]
+		then
+			continue
+		fi
+		if [[ "${kind}" == "heads" ]]
+		then
+			name="${ref#refs/heads/}"
+			heads_set "${forge}" "${name}" "${sha}"
+		else
+			name="${ref#refs/tags/}"
+			tags_set "${forge}" "${name}" "${sha}"
+		fi
+	done <<< "${out}"
+
+	return 0
+}
+
+detect_default_branch () {
+	local url="${1}"
+	local out
+	local line
+
+	if ! out="$(git_cmd ls-remote --symref "${url}" HEAD 2>&1)"
+	then
+		return 1
+	fi
+
+	while IFS= read -r line
+	do
+		if [[ "${line}" =~ ^ref:\ refs/heads/([^[:space:]]+) ]]
+		then
+			printf '%s\n' "${BASH_REMATCH[1]}"
+			return 0
+		fi
+	done <<< "${out}"
+
+	return 1
+}
+
+# ==============================================================================
+# Config
+# ==============================================================================
+
+load_yaml_repos () {
+	local file="${1}"
+	local kind
+	local i n
+	local item_type path fj gl gh br line
+
+	kind="$(yq -r 'type' "${file}")"
+
+	# A bare list of owner/repo strings.
+	if [[ "${kind}" == "!!seq" ]]
+	then
+		n="$(yq -r 'length' "${file}")"
+		i=0
+		while [[ ${i} -lt ${n} ]]
+		do
+			path="$(yq -r ".[${i}]" "${file}")"
+			path="$(normalize_path "${path}")" || return 1
+			CONFIG_REPOS+=("${path}"$'\t'"${path}"$'\t'"${path}"$'\t'"${path}"$'\t')
+			((i++)) || true
+		done
+		return 0
+	fi
+
+	n="$(yq -r '.repos // [] | length' "${file}")"
+	i=0
+	while [[ ${i} -lt ${n} ]]
+	do
+		item_type="$(yq -r ".repos[${i}] | type" "${file}")"
+		if [[ "${item_type}" == "!!str" ]]
+		then
+			path="$(yq -r ".repos[${i}]" "${file}")"
+			path="$(normalize_path "${path}")" || return 1
+			CONFIG_REPOS+=("${path}"$'\t'"${path}"$'\t'"${path}"$'\t'"${path}"$'\t')
+		else
+			path="$(yq -r ".repos[${i}].path // .repos[${i}].name // \"\"" "${file}")"
+			if [[ -z "${path}" ]]
+			then
+				log_fail "config repos[${i}] is a map without path:"
+				return 1
+			fi
+			path="$(normalize_path "${path}")" || return 1
+			fj="$(yq -r ".repos[${i}].forgejo // \"${path}\"" "${file}")"
+			gl="$(yq -r ".repos[${i}].gitlab // \"${path}\"" "${file}")"
+			gh="$(yq -r ".repos[${i}].github // \"${path}\"" "${file}")"
+			br="$(yq -r ".repos[${i}].branches // [] | join(\",\")" "${file}")"
+			fj="$(normalize_path "${fj}")" || return 1
+			gl="$(normalize_path "${gl}")" || return 1
+			gh="$(normalize_path "${gh}")" || return 1
+			CONFIG_REPOS+=("${path}"$'\t'"${fj}"$'\t'"${gl}"$'\t'"${gh}"$'\t'"${br}")
+		fi
+		((i++)) || true
+	done
+}
+
+load_config () {
+	local file="${1}"
+	local value
+
+	if [[ ! -f "${file}" ]]
+	then
+		if [[ "${file}" != "${DEFAULT_CONFIG}" ]]
+		then
+			die "config not found: ${file}"
+		fi
+		log_verbose "no config at ${file}; using built-in forge URLs"
+		return 0
+	fi
+
+	if ! have_cmd yq
+	then
+		die "yq is required to read ${file}"
+	fi
+
+	log_verbose "loading config ${file}"
+
+	# A file that is just a list of owner/repo strings has no forge keys.
+	if [[ "$(yq -r 'type' "${file}")" == "!!seq" ]]
+	then
+		load_yaml_repos "${file}"
+		return 0
+	fi
+
+	value="$(yq -r '.canonical // ""' "${file}")"
+	if [[ -n "${value}" ]] && [[ "${value}" != "null" ]]
+	then
+		canonical="${value}"
+	fi
+
+	value="$(yq -r '.forges.forgejo.url // .forges.forgejo.ssh_url // ""' "${file}")"
+	if [[ -n "${value}" ]] && [[ "${value}" != "null" ]]
+	then
+		url_template_forgejo="${value}"
+	fi
+	value="$(yq -r '.forges.gitlab.url // .forges.gitlab.ssh_url // ""' "${file}")"
+	if [[ -n "${value}" ]] && [[ "${value}" != "null" ]]
+	then
+		url_template_gitlab="${value}"
+	fi
+	value="$(yq -r '.forges.github.url // .forges.github.ssh_url // ""' "${file}")"
+	if [[ -n "${value}" ]] && [[ "${value}" != "null" ]]
+	then
+		url_template_github="${value}"
+	fi
+
+	value="$(yq -r '.branches // [] | join(",")' "${file}")"
+	if [[ -n "${value}" ]] && [[ "${value}" != "null" ]] && [[ ${#GLOBAL_BRANCHES[@]} -eq 0 ]]
+	then
+		split_csv "${value}" GLOBAL_BRANCHES
+	fi
+
+	load_yaml_repos "${file}"
+}
+
+# TSV: display_path, forgejo_path, gitlab_path, github_path, branches_csv
+add_cli_repo () {
+	local path="${1}"
+	path="$(normalize_path "${path}")" || return 1
+	CLI_REPOS+=("${path}"$'\t'"${path}"$'\t'"${path}"$'\t'"${path}"$'\t')
+}
+
+read_repos_stdin () {
+	local line item
+	local -a parts=()
+	while IFS= read -r line || [[ -n "${line}" ]]
+	do
+		line="$(trim "${line}")"
+		if [[ -z "${line}" ]] || [[ "${line}" =~ ^# ]]
+		then
+			continue
+		fi
+		split_csv "${line}" parts
+		for item in "${parts[@]+"${parts[@]}"}"
+		do
+			add_cli_repo "${item}" || return 1
+		done
+	done
+}
+
+# ==============================================================================
+# Work clone
+# ==============================================================================
+
+prepare_work_repo () {
+	local work="${1}"
+	local -n _branches="${2}"
+	local forge url branch refspec
+	local -a fetch_args
+
+	git_cmd init -q "${work}"
+	git_cmd -C "${work}" config --local advice.detachedHead false
+
+	for forge in "${FORGES[@]}"
+	do
+		if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+		then
+			continue
+		fi
+		url="${REMOTE_URL[${forge}]}"
+		git_cmd -C "${work}" remote add "${forge}" "${url}"
+
+		fetch_args=(fetch --prune)
+		if [[ "${sync_tags}" != "true" ]]
+		then
+			fetch_args+=(--no-tags)
+		fi
+
+		if [[ "${all_branches}" == "true" ]]
+		then
+			refspec="+refs/heads/*:refs/remotes/${forge}/*"
+			log_verbose "fetch ${forge} (all branches)"
+			if ! git_cmd -C "${work}" "${fetch_args[@]}" "${forge}" "${refspec}"
+			then
+				log_fail "fetch ${forge} failed (${url})"
+				return 1
+			fi
+		else
+			for branch in "${_branches[@]}"
+			do
+				refspec="+refs/heads/${branch}:refs/remotes/${forge}/${branch}"
+				log_verbose "fetch ${forge} ${branch}"
+				# A branch ls-remote already showed on this forge must fetch;
+				# a missing branch is expected and ignored.
+				if [[ -n "$(heads_get "${forge}" "${branch}")" ]]
+				then
+					if ! git_cmd -C "${work}" "${fetch_args[@]}" "${forge}" "${refspec}"
+					then
+						log_fail "fetch ${forge} ${branch} failed (${url})"
+						return 1
+					fi
+				else
+					git_cmd -C "${work}" "${fetch_args[@]}" "${forge}" "${refspec}" >/dev/null 2>&1 || true
+				fi
+			done
+		fi
+
+		if [[ "${sync_tags}" == "true" ]]
+		then
+			git_cmd -C "${work}" fetch --prune "${forge}" "+refs/tags/*:refs/rtags/${forge}/*" >/dev/null 2>&1 || true
+		fi
+	done
+}
+
+# Reload HEADS_* from the work repo so merge-base uses fetched objects.
+reload_heads_from_work () {
+	local work="${1}"
+	local forge branch sha ref
+
+	# Drop ls-remote SHAs and re-read from fetched refs. Leave REMOTE_OK /
+	# REMOTE_URL / TAGS_* alone.
+	HEADS_FORGEJO=()
+	HEADS_GITLAB=()
+	HEADS_GITHUB=()
+
+	for forge in "${FORGES[@]}"
+	do
+		if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+		then
+			continue
+		fi
+		while IFS= read -r ref
+		do
+			if [[ -z "${ref}" ]]
+			then
+				continue
+			fi
+			branch="${ref#refs/remotes/"${forge}"/}"
+			sha="$(git_cmd -C "${work}" rev-parse "${ref}")"
+			heads_set "${forge}" "${branch}" "${sha}"
+		done < <(git_cmd -C "${work}" for-each-ref --format='%(refname)' "refs/remotes/${forge}")
+	done
+}
+
+# Among the given SHAs, return the one that has every other as an ancestor.
+find_descendant () {
+	local work="${1}"
+	shift
+	local -a shas=("${@}")
+	local candidate other ok
+
+	if [[ ${#shas[@]} -eq 0 ]]
+	then
+		return 1
+	fi
+
+	for candidate in "${shas[@]}"
+	do
+		ok=1
+		for other in "${shas[@]}"
+		do
+			if ! git_cmd -C "${work}" merge-base --is-ancestor "${other}" "${candidate}"
+			then
+				ok=0
+				break
+			fi
+		done
+		if [[ ${ok} -eq 1 ]]
+		then
+			printf '%s\n' "${candidate}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+unique_shas () {
+	local -a in_shas=("${@}")
+	local -A seen=()
+	local sha
+	local -a out=()
+	for sha in "${in_shas[@]}"
+	do
+		if [[ -z "${sha}" ]]
+		then
+			continue
+		fi
+		if [[ -z "${seen[${sha}]:-}" ]]
+		then
+			seen["${sha}"]=1
+			out+=("${sha}")
+		fi
+	done
+	if [[ ${#out[@]} -eq 0 ]]
+	then
+		return 0
+	fi
+	printf '%s\n' "${out[@]}"
+}
+
+print_log_range () {
+	local work="${1}"
+	local range="${2}"
+	local label="${3}"
+	local count
+	local line
+
+	count="$(git_cmd -C "${work}" rev-list --count "${range}" 2>/dev/null || printf '0')"
+	if [[ "${count}" == "0" ]]
+	then
+		return 0
+	fi
+	log_info "    ${label} (${count}):"
+	while IFS= read -r line
+	do
+		log_info "      ${line}"
+	done < <(git_cmd -C "${work}" log -n "${LOG_LIMIT}" --oneline --no-decorate "${range}")
+	if [[ ${count} -gt ${LOG_LIMIT} ]]
+	then
+		log_info "      ... $((count - LOG_LIMIT)) more"
+	fi
+}
+
+print_divergence () {
+	local work="${1}"
+	local branch="${2}"
+	local forge_a forge_b sha_a sha_b
+
+	for forge_a in "${FORGES[@]}"
+	do
+		sha_a="$(heads_get "${forge_a}" "${branch}")"
+		if [[ -z "${sha_a}" ]]
+		then
+			continue
+		fi
+		for forge_b in "${FORGES[@]}"
+		do
+			if [[ "${forge_a}" == "${forge_b}" ]]
+			then
+				continue
+			fi
+			sha_b="$(heads_get "${forge_b}" "${branch}")"
+			if [[ -z "${sha_b}" ]] || [[ "${sha_a}" == "${sha_b}" ]]
+			then
+				continue
+			fi
+			# Only print each unordered pair once (canonical first, then name order).
+			if [[ "${forge_a}" > "${forge_b}" ]]
+			then
+				continue
+			fi
+			print_log_range "${work}" "${sha_a}..${sha_b}" "on ${forge_b} not in ${forge_a}"
+			print_log_range "${work}" "${sha_b}..${sha_a}" "on ${forge_a} not in ${forge_b}"
+		done
+	done
+}
+
+# Push src:dst to a remote from the work clone. Honours dry-run and
+# --canonical-only. Must run with -C work so we never push from $PWD.
+push_ref () {
+	local work="${1}"
+	local forge="${2}"
+	local src="${3}"
+	local ref="${4}"
+	local url
+	local -a args
+	local label
+
+	if [[ "${canonical_only}" == "true" ]] && [[ "${forge}" != "${canonical}" ]]
+	then
+		log_verbose "skip push to ${forge} (--canonical-only)"
+		return 0
+	fi
+
+	url="${REMOTE_URL[${forge}]}"
+	args=(-C "${work}" push)
+	if [[ "${dry_run}" == "true" ]]
+	then
+		args+=(--dry-run)
+	fi
+	args+=("${url}" "${src}:${ref}")
+
+	label="${src}"
+	if [[ "${src}" =~ ^[0-9a-f]{7,} ]]
+	then
+		label="$(short_sha "${src}")"
+	fi
+	log_action "PUSH" "${forge} ${ref} ${label}${dry_run:+ (dry-run)}"
+	if ! git_cmd "${args[@]}"
+	then
+		log_fail "push rejected: ${forge} ${ref}"
+		return 1
+	fi
+	((count_push++)) || true
+	return 0
+}
+
+# ==============================================================================
+# Branch / tag sync
+# ==============================================================================
+
+# Returns:
+#   0 insync / ff / merge success
+#   1 conflict or push failure (already recorded)
+sync_branch () {
+	local work="${1}"
+	local spec="${2}"
+	local branch="${3}"
+	local forge sha descendant start_forge other
+	local -a present_shas=()
+	local -a unique=()
+	local present_count=0
+	local missing_count=0
+	local all_equal=1
+	local first_sha=""
+	local new_sha
+	local merge_ok
+
+	log_verbose "branch ${branch}"
+
+	for forge in "${FORGES[@]}"
+	do
+		if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+		then
+			continue
+		fi
+		sha="$(heads_get "${forge}" "${branch}")"
+		if [[ -z "${sha}" ]]
+		then
+			((missing_count++)) || true
+			log_verbose "  ${forge}  (missing)"
+			continue
+		fi
+		((present_count++)) || true
+		present_shas+=("${sha}")
+		log_verbose "  ${forge}  $(short_sha "${sha}")"
+		if [[ -z "${first_sha}" ]]
+		then
+			first_sha="${sha}"
+		elif [[ "${sha}" != "${first_sha}" ]]
+		then
+			all_equal=0
+		fi
+	done
+
+	if [[ ${present_count} -eq 0 ]]
+	then
+		log_warn "${spec}  ${branch}: not present on any reachable forge"
+		((count_skip++)) || true
+		return 0
+	fi
+
+	# Fast path: same SHA everywhere that is reachable, and nobody is missing it.
+	if [[ ${all_equal} -eq 1 ]] && [[ ${missing_count} -eq 0 ]]
+	then
+		log_ok "${spec}  ${branch} in-sync ($(short_sha "${first_sha}"))"
+		((count_insync++)) || true
+		return 0
+	fi
+
+	mapfile -t unique < <(unique_shas "${present_shas[@]}")
+
+	# One lineage: fast-forward (or create) every remote to the newest SHA.
+	if descendant="$(find_descendant "${work}" "${unique[@]}")"
+	then
+		log_action "FF" "${spec}  ${branch} -> $(short_sha "${descendant}")"
+		for forge in "${FORGES[@]}"
+		do
+			if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+			then
+				continue
+			fi
+			sha="$(heads_get "${forge}" "${branch}")"
+			if [[ "${sha}" == "${descendant}" ]]
+			then
+				continue
+			fi
+			if ! push_ref "${work}" "${forge}" "${descendant}" "refs/heads/${branch}"
+			then
+				record_failure "${spec}" "${branch}: fast-forward push to ${forge} rejected"
+				return 1
+			fi
+		done
+		((count_ff++)) || true
+		return 0
+	fi
+
+	# Diverged: start from canonical if it has the branch, else the first remote
+	# that does, then merge each other remote that differs.
+	start_forge=""
+	if [[ -n "$(heads_get "${canonical}" "${branch}")" ]]
+	then
+		start_forge="${canonical}"
+	else
+		for forge in "${FORGES[@]}"
+		do
+			if [[ -n "$(heads_get "${forge}" "${branch}")" ]]
+			then
+				start_forge="${forge}"
+				break
+			fi
+		done
+	fi
+
+	if [[ -z "${start_forge}" ]]
+	then
+		record_failure "${spec}" "${branch}: no starting ref for merge"
+		return 1
+	fi
+
+	log_action "MERGE" "${spec}  ${branch} (base ${start_forge})"
+
+	if ! git_cmd -C "${work}" checkout -q -B "${branch}" "refs/remotes/${start_forge}/${branch}"
+	then
+		record_failure "${spec}" "${branch}: checkout ${start_forge}/${branch} failed"
+		return 1
+	fi
+
+	merge_ok=1
+	for other in "${FORGES[@]}"
+	do
+		if [[ "${other}" == "${start_forge}" ]]
+		then
+			continue
+		fi
+		sha="$(heads_get "${other}" "${branch}")"
+		if [[ -z "${sha}" ]]
+		then
+			continue
+		fi
+		if git_cmd -C "${work}" merge-base --is-ancestor "${sha}" HEAD
+		then
+			continue
+		fi
+		log_verbose "merging ${other}/${branch} ($(short_sha "${sha}"))"
+		if ! git_cmd -C "${work}" merge --no-edit -m "sync_git_forges: merge ${other} ${branch} into ${canonical}
+
+Automated reconciliation. Forgejo is canonical; ${other} had unique commits." "refs/remotes/${other}/${branch}"
+		then
+			merge_ok=0
+			git_cmd -C "${work}" merge --abort >/dev/null 2>&1 || true
+			break
+		fi
+	done
+
+	if [[ ${merge_ok} -ne 1 ]]
+	then
+		record_failure "${spec}" "${branch}: merge conflict (investigate and fix by hand)"
+		log_info "    heads:"
+		for forge in "${FORGES[@]}"
+		do
+			sha="$(heads_get "${forge}" "${branch}")"
+			if [[ -n "${sha}" ]]
+			then
+				log_info "      ${forge}  $(short_sha "${sha}")  ${sha}"
+			else
+				log_info "      ${forge}  (missing)"
+			fi
+		done
+		print_divergence "${work}" "${branch}"
+		if [[ "${keep_work}" == "true" ]]
+		then
+			log_info "    work tree kept: ${work}"
+		else
+			log_info "    re-run with --keep-work to inspect the temp clone"
+		fi
+		return 1
+	fi
+
+	new_sha="$(git_cmd -C "${work}" rev-parse HEAD)"
+	for forge in "${FORGES[@]}"
+	do
+		if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+		then
+			continue
+		fi
+		sha="$(heads_get "${forge}" "${branch}")"
+		if [[ "${sha}" == "${new_sha}" ]]
+		then
+			continue
+		fi
+		if ! push_ref "${work}" "${forge}" "${new_sha}" "refs/heads/${branch}"
+		then
+			record_failure "${spec}" "${branch}: merge succeeded locally, push to ${forge} rejected"
+			return 1
+		fi
+	done
+
+	log_ok "${spec}  ${branch} merged ($(short_sha "${new_sha}"))"
+	((count_merge++)) || true
+	return 0
+}
+
+sync_tags_for_repo () {
+	local work="${1}"
+	local spec="${2}"
+	local tag sha_o forge first_sha conflict
+	local -a tags=()
+	local -A tag_shas=()
+
+	mapfile -t tags < <(map_keys_union tags)
+	if [[ ${#tags[@]} -eq 0 ]]
+	then
+		return 0
+	fi
+
+	for tag in "${tags[@]}"
+	do
+		first_sha=""
+		conflict=0
+		tag_shas=()
+		for forge in "${FORGES[@]}"
+		do
+			if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+			then
+				continue
+			fi
+			sha_o="$(tags_get "${forge}" "${tag}")"
+			if [[ -z "${sha_o}" ]]
+			then
+				continue
+			fi
+			tag_shas["${forge}"]="${sha_o}"
+			if [[ -z "${first_sha}" ]]
+			then
+				first_sha="${sha_o}"
+			elif [[ "${sha_o}" != "${first_sha}" ]]
+			then
+				conflict=1
+			fi
+		done
+
+		if [[ ${conflict} -eq 1 ]]
+		then
+			record_failure "${spec}" "tag ${tag}: same name, different SHAs (will not move tags)"
+			for forge in "${FORGES[@]}"
+			do
+				sha_o="${tag_shas[${forge}]:-}"
+				if [[ -n "${sha_o}" ]]
+				then
+					log_info "      ${forge}  ${tag}  $(short_sha "${sha_o}")"
+				fi
+			done
+			if [[ "${fail_fast}" == "true" ]]
+			then
+				return 1
+			fi
+			continue
+		fi
+
+		if [[ -z "${first_sha}" ]]
+		then
+			continue
+		fi
+
+		# Fetch the tag object from whichever remote already has it, then push
+		# to remotes that do not.
+		for forge in "${FORGES[@]}"
+		do
+			if [[ -n "${tag_shas[${forge}]:-}" ]]
+			then
+				git_cmd -C "${work}" fetch --no-tags "${forge}" "refs/tags/${tag}:refs/tags/${tag}" >/dev/null 2>&1 || true
+				break
+			fi
+		done
+
+		for forge in "${FORGES[@]}"
+		do
+			if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+			then
+				continue
+			fi
+			if [[ -n "${tag_shas[${forge}]:-}" ]]
+			then
+				continue
+			fi
+			if ! push_ref "${work}" "${forge}" "refs/tags/${tag}" "refs/tags/${tag}"
+			then
+				record_failure "${spec}" "tag ${tag}: push to ${forge} rejected"
+				if [[ "${fail_fast}" == "true" ]]
+				then
+					return 1
+				fi
+			fi
+		done
+	done
+	return 0
+}
+
+# ==============================================================================
+# One repository
+# ==============================================================================
+
+# TSV row: display, forgejo_path, gitlab_path, github_path, branches_csv
+sync_repo () {
+	local row="${1}"
+	local display fj_path gl_path gh_path br_field
+	local forge url
+	local -a branches=()
+	local branch work need_work=0
+	local default_branch
+	local sha first_sha all_equal missing
+	local repo_failed=0
+
+	IFS=$'\t' read -r display fj_path gl_path gh_path br_field <<< "${row}"
+
+	heads_clear
+	((count_repos++)) || true
+	log_info ""
+	log_info "[${count_repos}] ${display}"
+
+	REMOTE_URL["forgejo"]="$(expand_url "$(template_for_forge forgejo)" "${fj_path}")"
+	REMOTE_URL["gitlab"]="$(expand_url "$(template_for_forge gitlab)" "${gl_path}")"
+	REMOTE_URL["github"]="$(expand_url "$(template_for_forge github)" "${gh_path}")"
+
+	# Reachability. Canonical must exist; others warn unless --strict.
+	for forge in "${FORGES[@]}"
+	do
+		url="${REMOTE_URL[${forge}]}"
+		log_verbose "ls-remote ${forge} ${url}"
+		if ls_remote_fill "${forge}" "${url}" "heads"
+		then
+			REMOTE_OK["${forge}"]=1
+			if [[ "${sync_tags}" == "true" ]]
+			then
+				ls_remote_fill "${forge}" "${url}" "tags" || true
+			fi
+		else
+			REMOTE_OK["${forge}"]=0
+			if [[ "${forge}" == "${canonical}" ]]
+			then
+				record_failure "${display}" "${canonical} is unreachable (${url})"
+				return 1
+			fi
+			if [[ "${strict}" == "true" ]]
+			then
+				record_failure "${display}" "${forge} is unreachable (${url})"
+				return 1
+			fi
+			log_warn "${display}  ${forge} unreachable, skipping that forge"
+		fi
+	done
+
+	# Branch list: per-repo YAML, then --branches, then canonical HEAD, then
+	# --all-branches as a union of whatever ls-remote returned.
+	if [[ -n "${br_field}" ]]
+	then
+		split_csv "${br_field}" branches
+	elif [[ ${#GLOBAL_BRANCHES[@]} -gt 0 ]]
+	then
+		branches=("${GLOBAL_BRANCHES[@]}")
+	elif [[ "${all_branches}" == "true" ]]
+	then
+		mapfile -t branches < <(map_keys_union heads)
+	else
+		default_branch="$(detect_default_branch "${REMOTE_URL[${canonical}]}" || true)"
+		if [[ -z "${default_branch}" ]]
+		then
+			if [[ -n "$(heads_get "${canonical}" "master")" ]]
+			then
+				default_branch="master"
+			elif [[ -n "$(heads_get "${canonical}" "main")" ]]
+			then
+				default_branch="main"
+			fi
+		fi
+		if [[ -z "${default_branch}" ]]
+		then
+			record_failure "${display}" "could not detect default branch on ${canonical}"
+			return 1
+		fi
+		branches=("${default_branch}")
+	fi
+
+	if [[ ${#branches[@]} -eq 0 ]]
+	then
+		log_warn "${display}  no branches to sync"
+		((count_skip++)) || true
+		return 0
+	fi
+
+	# Decide whether a temp clone is needed: any branch with a SHA mismatch
+	# or a missing branch on a reachable forge.
+	for branch in "${branches[@]}"
+	do
+		first_sha=""
+		all_equal=1
+		missing=0
+		for forge in "${FORGES[@]}"
+		do
+			if [[ "${REMOTE_OK[${forge}]:-0}" != "1" ]]
+			then
+				continue
+			fi
+			sha="$(heads_get "${forge}" "${branch}")"
+			if [[ -z "${sha}" ]]
+			then
+				missing=1
+				all_equal=0
+				continue
+			fi
+			if [[ -z "${first_sha}" ]]
+			then
+				first_sha="${sha}"
+			elif [[ "${sha}" != "${first_sha}" ]]
+			then
+				all_equal=0
+			fi
+		done
+		if [[ ${all_equal} -eq 1 ]] && [[ ${missing} -eq 0 ]] && [[ -n "${first_sha}" ]]
+		then
+			continue
+		fi
+		need_work=1
+		break
+	done
+
+	if [[ "${sync_tags}" == "true" ]]
+	then
+		need_work=1
+	fi
+
+	if [[ ${need_work} -eq 0 ]]
+	then
+		for branch in "${branches[@]}"
+		do
+			sha="$(heads_get "${canonical}" "${branch}")"
+			log_ok "${display}  ${branch} in-sync ($(short_sha "${sha}"))"
+			((count_insync++)) || true
+		done
+		return 0
+	fi
+
+	work="$(mktemp -d "${TMPDIR:-/tmp}/sync_git_forges.XXXXXX")"
+	WORK_DIRS+=("${work}")
+	log_verbose "work repo ${work}"
+
+	if ! prepare_work_repo "${work}" branches
+	then
+		record_failure "${display}" "fetch into work clone failed"
+		return 1
+	fi
+	reload_heads_from_work "${work}"
+
+	for branch in "${branches[@]}"
+	do
+		if ! sync_branch "${work}" "${display}" "${branch}"
+		then
+			repo_failed=1
+			if [[ "${fail_fast}" == "true" ]]
+			then
+				return 1
+			fi
+		fi
+	done
+
+	if [[ "${sync_tags}" == "true" ]]
+	then
+		if ! sync_tags_for_repo "${work}" "${display}"
+		then
+			repo_failed=1
+			if [[ "${fail_fast}" == "true" ]]
+			then
+				return 1
+			fi
+		fi
+	fi
+
+	if [[ ${repo_failed} -eq 1 ]]
+	then
+		return 1
+	fi
+	return 0
+}
+
+print_list () {
+	local row display fj gl gh br
+	local forge url
+	for row in "${@}"
+	do
+		IFS=$'\t' read -r display fj gl gh br <<< "${row}"
+		printf '%s\n' "${display}"
+		printf '  forgejo  %s\n' "$(expand_url "$(template_for_forge forgejo)" "${fj}")"
+		printf '  gitlab   %s\n' "$(expand_url "$(template_for_forge gitlab)" "${gl}")"
+		printf '  github   %s\n' "$(expand_url "$(template_for_forge github)" "${gh}")"
+		if [[ -n "${br}" ]]
+		then
+			printf '  branches %s\n' "${br}"
+		fi
+	done
+}
+
+print_summary () {
+	local i
+	log_info ""
+	log_info "=============================================="
+	log_info "Summary"
+	log_info "=============================================="
+	log_info "  Repos:              ${count_repos}"
+	log_info "  Branches in sync:   ${count_insync}"
+	log_info "  Fast-forwarded:     ${count_ff}"
+	log_info "  Merged:             ${count_merge}"
+	log_info "  Pushes:             ${count_push}"
+	log_info "  Skipped:            ${count_skip}"
+	log_info "  Failed:             ${count_fail}"
+	if [[ "${dry_run}" == "true" ]]
+	then
+		log_info "  Mode:           dry-run (no pushes)"
+	fi
+
+	if [[ ${#FAILED_REPOS[@]} -gt 0 ]]
+	then
+		log_info ""
+		log_fail "the following repos need a human:"
+		i=0
+		while [[ ${i} -lt ${#FAILED_REPOS[@]} ]]
+		do
+			printf '  - %s\n    %s\n' "${FAILED_REPOS[${i}]}" "${FAILED_REASONS[${i}]}" >&2
+			((i++)) || true
+		done
+		return 1
+	fi
+	return 0
+}
+
+# ==============================================================================
+# Args / main
+# ==============================================================================
+
+check_prerequisites () {
+	if ! have_cmd git
+	then
+		die "git is required"
+	fi
+}
+
+parse_args () {
+	local -a csv_repos=()
+	local item
+
+	while [[ $# -gt 0 ]]
+	do
+		case "${1}" in
+			-h|--help)
+				usage
+				exit 0
+				;;
+			--license)
+				show_license
+				exit 0
+				;;
+			-V|--version)
+				printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"
+				exit 0
+				;;
+			-v|--verbose)
+				verbose=true
+				shift
+				;;
+			--debug)
+				debug=true
+				verbose=true
+				shift
+				;;
+			-n|--dry-run)
+				dry_run=true
+				shift
+				;;
+			-q|--quiet)
+				quiet=true
+				shift
+				;;
+			-c|--config)
+				if [[ -z "${2:-}" ]]
+				then
+					die "--config requires a path"
+				fi
+				config_path="${2}"
+				shift 2
+				;;
+			-r|--repos)
+				if [[ -z "${2:-}" ]]
+				then
+					die "--repos requires a CSV list"
+				fi
+				repos_csv="${2}"
+				shift 2
+				;;
+			--stdin)
+				read_stdin=true
+				shift
+				;;
+			--branches)
+				if [[ -z "${2:-}" ]]
+				then
+					die "--branches requires a CSV list"
+				fi
+				branches_csv="${2}"
+				shift 2
+				;;
+			--all-branches)
+				all_branches=true
+				shift
+				;;
+			--tags)
+				sync_tags=true
+				shift
+				;;
+			--skip)
+				if [[ -z "${2:-}" ]]
+				then
+					die "--skip requires a CSV list"
+				fi
+				skip_csv="${2}"
+				shift 2
+				;;
+			--canonical-only)
+				canonical_only=true
+				shift
+				;;
+			--strict)
+				strict=true
+				shift
+				;;
+			--fail-fast)
+				fail_fast=true
+				shift
+				;;
+			--keep-work)
+				keep_work=true
+				shift
+				;;
+			--list)
+				list_only=true
+				shift
+				;;
+			--)
+				shift
+				while [[ $# -gt 0 ]]
+				do
+					add_cli_repo "${1}" || exit 2
+					shift
+				done
+				break
+				;;
+			-*)
+				die "unknown option '${1}' (try --help)"
+				;;
+			*)
+				add_cli_repo "${1}" || exit 2
+				shift
+				;;
+		esac
+	done
+
+	if [[ -n "${repos_csv}" ]]
+	then
+		split_csv "${repos_csv}" csv_repos
+		for item in "${csv_repos[@]+"${csv_repos[@]}"}"
+		do
+			add_cli_repo "${item}" || exit 2
+		done
+	fi
+
+	if [[ -n "${branches_csv}" ]]
+	then
+		split_csv "${branches_csv}" GLOBAL_BRANCHES
+	fi
+
+	if [[ -n "${skip_csv}" ]]
+	then
+		split_csv "${skip_csv}" SKIP_FORGES
+	fi
+}
+
+apply_skip_forges () {
+	local forge
+	local -a kept=()
+	for forge in "${FORGES[@]}"
+	do
+		if forge_skipped "${forge}"
+		then
+			log_verbose "skipping forge ${forge}"
+			continue
+		fi
+		kept+=("${forge}")
+	done
+	FORGES=("${kept[@]}")
+
+	if [[ ${#FORGES[@]} -lt 2 ]]
+	then
+		die "need at least two forges to sync (check --skip)"
+	fi
+	if forge_skipped "${canonical}"
+	then
+		die "cannot skip canonical forge '${canonical}'"
+	fi
+}
+
+main () {
+	local row
+	local -a queue=()
+
+	parse_args "$@"
+	check_prerequisites
+	load_config "${config_path}"
+	apply_skip_forges
+
+	if [[ "${read_stdin}" == "true" ]]
+	then
+		read_repos_stdin || exit 2
+	fi
+
+	# CLI / stdin specs replace the YAML repos list. Forge URLs still come
+	# from YAML (or the built-in defaults).
+	if [[ ${#CLI_REPOS[@]} -gt 0 ]]
+	then
+		queue=("${CLI_REPOS[@]}")
+	else
+		queue=("${CONFIG_REPOS[@]+"${CONFIG_REPOS[@]}"}")
+	fi
+
+	if [[ ${#queue[@]} -eq 0 ]]
+	then
+		die "no repositories specified (YAML repos:, --repos, positionals, or --stdin)"
+	fi
+
+	if [[ "${list_only}" == "true" ]]
+	then
+		print_list "${queue[@]}"
+		exit 0
+	fi
+
+	if [[ "${dry_run}" == "true" ]]
+	then
+		log_info "DRY RUN - fetches and local merges only, no pushes"
+	fi
+	log_verbose "canonical=${canonical}"
+	log_verbose "forgejo template: ${url_template_forgejo}"
+	log_verbose "gitlab  template: ${url_template_gitlab}"
+	log_verbose "github  template: ${url_template_github}"
+
+	for row in "${queue[@]}"
+	do
+		if ! sync_repo "${row}"
+		then
+			if [[ "${fail_fast}" == "true" ]]
+			then
+				break
+			fi
+		fi
+	done
+
+	if ! print_summary
+	then
+		exit 1
+	fi
+	exit 0
+}
+
+main "$@"
