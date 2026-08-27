@@ -310,3 +310,33 @@ install-skills:
 
 	npx skills add https://github.com/Leonxlnx/unlazy
 	npx skills add https://github.com/Leonxlnx/taste-skill
+
+
+# Element (im.riot.Riot) ships no `org.freedesktop.secrets=talk` in its
+# session bus policy, so Electron's safeStorage can't reach gnome-keyring
+# and the app opens with "Your system has a supported keyring but
+# encryption is not available." Other keyring-using flatpaks here
+# (Bitwarden, Proton Mail, Proton Bridge) already grant it upstream.
+#
+# Idempotent. Quit the app fully (including tray) before it takes effect.
+# Undo a single app with: flatpak override --user --reset <app-id>
+#
+# apply flatpak sandbox overrides that upstream manifests are missing
+flatpak-overrides:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # apps needing D-Bus access to the Secret Service (gnome-keyring)
+    secrets_apps=(im.riot.Riot)
+
+    for app in "${secrets_apps[@]}"
+    do
+        if ! flatpak info "${app}" &>/dev/null
+        then
+            echo "skipping ${app}: not installed"
+            continue
+        fi
+
+        flatpak override --user --talk-name=org.freedesktop.secrets "${app}"
+        echo "granted org.freedesktop.secrets to ${app}"
+    done
