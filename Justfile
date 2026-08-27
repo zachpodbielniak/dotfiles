@@ -1,3 +1,9 @@
+# hosts that own host-specific files in this repo (unit names contain the
+# hostname, e.g. postgres-lt-zach.container). Used to keep another host's
+# files from being stowed here. Add new hosts HERE only.
+known_hosts := "lt-zach mob-zach hacbook libreclaw-00 srv-zach"
+
+
 # normal stow operation
 # Pass quadlets=false to skip Podman quadlet units (.config/containers/systemd/*.container)
 stow quadlets="true": dep_dirs
@@ -6,14 +12,18 @@ stow quadlets="true": dep_dirs
 
     # build ignore flags for all known hostnames except the current host
     CURRENT_HOST=$(hostname -s)
-    KNOWN_HOSTS=(lt-zach mob-zach hacbook libreclaw-00 srv-zach)
+    KNOWN_HOSTS=({{known_hosts}})
     IGNORE_FLAGS=()
     for h in "${KNOWN_HOSTS[@]}"; do
         if [[ "$h" != "$CURRENT_HOST" ]]; then
-            IGNORE_FLAGS+=("--ignore=${h}")
-            # srv-zach also appears without hyphen in one mount filename
-            if [[ "$h" == "srv-zach" ]]; then
-                IGNORE_FLAGS+=("--ignore=srvzach")
+            # stow anchors --ignore regexes to the ENTIRE basename, so a bare
+            # "lt-zach" never matches postgres-lt-zach.container and the file
+            # gets stowed anyway. The .* wrappers are what make this work.
+            IGNORE_FLAGS+=("--ignore=.*${h}.*")
+            # some filenames drop the hyphen (var-home-zach-data-mnt-srvzach.mount)
+            hn="${h//-/}"
+            if [[ "$hn" != "$h" ]]; then
+                IGNORE_FLAGS+=("--ignore=.*${hn}.*")
             fi
         fi
     done
@@ -62,14 +72,18 @@ stow_alt quadlets="true": dep_dirs
 
     # build ignore flags for all known hostnames except the current host
     CURRENT_HOST=$(hostname -s)
-    KNOWN_HOSTS=(lt-zach mob-zach hacbook libreclaw-00 srv-zach)
+    KNOWN_HOSTS=({{known_hosts}})
     IGNORE_FLAGS=()
     for h in "${KNOWN_HOSTS[@]}"; do
         if [[ "$h" != "$CURRENT_HOST" ]]; then
-            IGNORE_FLAGS+=("--ignore=${h}")
-            # srv-zach also appears without hyphen in one mount filename
-            if [[ "$h" == "srv-zach" ]]; then
-                IGNORE_FLAGS+=("--ignore=srvzach")
+            # stow anchors --ignore regexes to the ENTIRE basename, so a bare
+            # "lt-zach" never matches postgres-lt-zach.container and the file
+            # gets stowed anyway. The .* wrappers are what make this work.
+            IGNORE_FLAGS+=("--ignore=.*${h}.*")
+            # some filenames drop the hyphen (var-home-zach-data-mnt-srvzach.mount)
+            hn="${h//-/}"
+            if [[ "$hn" != "$h" ]]; then
+                IGNORE_FLAGS+=("--ignore=.*${hn}.*")
             fi
         fi
     done
@@ -127,13 +141,18 @@ dry quadlets="true": dep_dirs
 
     # build ignore flags for all known hostnames except the current host
     CURRENT_HOST=$(hostname -s)
-    KNOWN_HOSTS=(lt-zach mob-zach hacbook libreclaw-00 srv-zach)
+    KNOWN_HOSTS=({{known_hosts}})
     IGNORE_FLAGS=()
     for h in "${KNOWN_HOSTS[@]}"; do
         if [[ "$h" != "$CURRENT_HOST" ]]; then
-            IGNORE_FLAGS+=("--ignore=${h}")
-            if [[ "$h" == "srv-zach" ]]; then
-                IGNORE_FLAGS+=("--ignore=srvzach")
+            # stow anchors --ignore regexes to the ENTIRE basename, so a bare
+            # "lt-zach" never matches postgres-lt-zach.container and the file
+            # gets stowed anyway. The .* wrappers are what make this work.
+            IGNORE_FLAGS+=("--ignore=.*${h}.*")
+            # some filenames drop the hyphen (var-home-zach-data-mnt-srvzach.mount)
+            hn="${h//-/}"
+            if [[ "$hn" != "$h" ]]; then
+                IGNORE_FLAGS+=("--ignore=.*${hn}.*")
             fi
         fi
     done
