@@ -385,3 +385,56 @@ build-ollama-vulkan:
     echo "verify GPU detection with:"
     echo "  podman run --rm --device /dev/dri --entrypoint bash \\"
     echo "    localhost/ollama-vulkan:latest -c 'ollama serve 2>&1 | grep \"inference compute\"'"
+
+
+# The Podman quadlets are NOT listed here - the quadlet generator wires them
+# into default.target itself, so they need no `systemctl --user enable`. These
+# units do. Idempotent; safe to re-run after any stow.
+#
+# var-home-zach-data-mnt-srvzach.mount is deliberately omitted (it mounts
+# srv-zach's home; enable it by hand if a given host actually wants it).
+#
+# enable the user units that need an explicit systemctl enable (start=true to also start)
+enable-units start="false":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    UNITS=(
+        var-home-zach-data-mnt-nas-apool.mount
+        var-home-zach-data-mnt-nas-dpool.mount
+        var-home-zach-data-mnt-nas-ypool.mount
+        nas-sleep-guard.service
+    )
+
+    systemctl --user daemon-reload
+
+    enabled=()
+    for u in "${UNITS[@]}"
+    do
+        if ! systemctl --user cat "${u}" &>/dev/null
+        then
+            echo "skipping ${u}: not installed (run 'just stow' first)"
+            continue
+        fi
+        systemctl --user enable "${u}" 2>&1 | grep -v '^Created symlink' || true
+        enabled+=("${u}")
+    done
+
+    # starting the sshfs mounts needs the NAS reachable; each has TimeoutSec=90,
+    # so this is opt-in rather than the default
+    if [ "{{start}}" = "true" ]
+    then
+        for u in "${enabled[@]}"
+        do
+            echo "starting ${u}"
+            systemctl --user start "${u}" || echo "  failed to start ${u} (NAS unreachable?)"
+        done
+    fi
+
+    echo
+    for u in "${enabled[@]}"
+    do
+        printf '%-42s enabled=%-9s active=%s\n' "${u}" \
+            "$(systemctl --user is-enabled "${u}" 2>&1)" \
+            "$(systemctl --user is-active "${u}" 2>&1)"
+    done
