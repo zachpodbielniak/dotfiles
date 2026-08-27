@@ -342,6 +342,18 @@ install-skills:
 # encryption is not available." Other keyring-using flatpaks here
 # (Bitwarden, Proton Mail, Proton Bridge) already grant it upstream.
 #
+# Deskflow (org.deskflow.deskflow) implements Wayland clipboard sharing by
+# shelling out to the wl-clipboard CLI (`wl-paste --list-types`, `wl-paste -n
+# -t <type>`, `wl-copy`), resolved through a plain PATH lookup. The flathub
+# build ships only deskflow and deskflow-core in /app/bin and org.kde.Platform
+# carries no wl-clipboard, so the sandbox PATH (/app/bin:/usr/bin) has neither
+# tool: deskflow logs "wl-clipboard tools not found, clipboard functionality
+# disabled" and the clipboard silently never syncs to any client. Exposing the
+# host /usr read-only and appending /run/host/usr/bin to PATH lets it find the
+# host binaries, which run fine under the runtime's glibc. Not a permissions
+# problem - mutter's security-context socket serves the sandbox clipboard
+# happily once the tools are reachable.
+#
 # Idempotent. Quit the app fully (including tray) before it takes effect.
 # Undo a single app with: flatpak override --user --reset <app-id>
 #
@@ -363,6 +375,30 @@ flatpak-overrides:
 
         flatpak override --user --talk-name=org.freedesktop.secrets "${app}"
         echo "granted org.freedesktop.secrets to ${app}"
+    done
+
+    # apps that shell out to host wl-clipboard for Wayland clipboard support
+    wl_clipboard_apps=(org.deskflow.deskflow)
+
+    for app in "${wl_clipboard_apps[@]}"
+    do
+        if ! flatpak info "${app}" &>/dev/null
+        then
+            echo "skipping ${app}: not installed"
+            continue
+        fi
+
+        if [[ ! -x /usr/bin/wl-copy ]] || [[ ! -x /usr/bin/wl-paste ]]
+        then
+            echo "warning: ${app} override applied but wl-clipboard is missing from the host"
+        fi
+
+        flatpak override --user \
+            --filesystem=host-os:ro \
+            --env=PATH=/app/bin:/usr/bin:/run/host/usr/bin \
+            "${app}"
+
+        echo "exposed host wl-clipboard to ${app}"
     done
 
 
