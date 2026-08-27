@@ -1,0 +1,308 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+DOC_DIR="${RUNTIME_DIR}/doc"
+PORTAL_UNIT="xdg-document-portal.service"
+WAIT_TIMEOUT=10
+WATCH_INTERVAL=5
+QUIET=false
+
+usage () {
+	cat << 'EOF'
+fix_flatpak_bwrap_error - Repair the flatpak document portal FUSE mount
+
+Fixes this class of launch failure:
+
+	bwrap: Can't find source path /run/user/<uid>/doc/by-app/<app-id>:
+	No such file or directory
+
+The xdg-document-portal FUSE mount at $XDG_RUNTIME_DIR/doc gets unmounted out
+from under the still-running portal daemon, so every flatpak that requests
+document-portal access refuses to start. The trap is that
+`systemctl --user status xdg-document-portal.service` keeps reporting
+active (running) with a live fusermount3 child, so the service looks healthy
+while the thing it provides is gone. Restarting the unit re-establishes the
+mount; no reboot and no flatpak repair are needed.
+
+USAGE:
+	fix_flatpak_bwrap_error [OPTIONS]
+
+OPTIONS:
+	-h, --help           Show this help message
+	--license            Show license information
+	-c, --check          Report mount health only, change nothing
+	-f, --force          Restart the portal even if the mount looks healthy
+	-w, --watch          Stay resident, repairing the mount whenever it drops
+	-i, --interval <n>   Seconds between checks in --watch mode (default: 5)
+	-t, --timeout <n>    Seconds to wait for the mount to return (default: 10)
+	-q, --quiet          Only report failures
+
+EXIT CODES:
+	0   Mount healthy, or repaired successfully
+	1   Repair failed, or --check found the mount missing
+	2   Not running in the host mount namespace
+
+EXAMPLES:
+	# A flatpak just died with a bwrap error - repair, then relaunch it
+	fix_flatpak_bwrap_error && flatpak run com.slack.Slack
+
+	# Ask whether the mount is healthy right now, without touching anything
+	fix_flatpak_bwrap_error --check
+
+	# Babysit the mount for the rest of the session
+	fix_flatpak_bwrap_error --watch --interval 10
+
+EOF
+}
+
+# Print to stdout unless --quiet was given.
+log () {
+	if [[ "${QUIET}" == "false" ]]
+	then
+		echo "${@}"
+	fi
+}
+
+# Errors always print, and always to stderr.
+err () {
+	echo "fix_flatpak_bwrap_error: ${*}" >&2
+}
+
+# True when ${DOC_DIR} carries a live fuse.portal mount.
+#
+# /proc/self/mountinfo is authoritative here: the directory itself always
+# exists (the portal creates it), so testing for the path tells you nothing.
+# The optional-fields section before the "-" separator is variable length,
+# which is why the filesystem type is found by scanning forward from the
+# separator rather than by a fixed column.
+doc_portal_is_mounted () {
+	awk -v dir="${DOC_DIR}" '
+		$5 == dir {
+			for (i = 6; i <= NF; i++) {
+				if ($i == "-") {
+					if ($(i + 1) == "fuse.portal") {
+						found = 1
+					}
+					break
+				}
+			}
+		}
+		END { exit(found ? 0 : 1) }
+	' /proc/self/mountinfo
+}
+
+# MainPID of the portal service, or 0 when it cannot be determined.
+portal_main_pid () {
+	systemctl --user show -p MainPID --value "${PORTAL_UNIT}" 2>/dev/null || echo 0
+}
+
+# An empty mount table for ${DOC_DIR} means something completely different
+# inside a distrobox, a flatpak sandbox, or any other mount namespace: the
+# host's mount simply is not visible there, and restarting the portal would
+# be the wrong fix. Compare our namespace against the portal's before
+# trusting what mountinfo says. Returns success when the comparison cannot
+# be made at all, so an unreadable /proc never blocks a legitimate repair.
+in_host_mount_namespace () {
+	local pid
+	local mine
+	local theirs
+
+	pid="$(portal_main_pid)"
+	if ! [[ "${pid}" =~ ^[0-9]+$ ]] || [[ "${pid}" -eq 0 ]]
+	then
+		return 0
+	fi
+
+	mine="$(readlink /proc/self/ns/mnt 2>/dev/null || true)"
+	theirs="$(readlink "/proc/${pid}/ns/mnt" 2>/dev/null || true)"
+
+	if [[ -z "${mine}" ]] || [[ -z "${theirs}" ]]
+	then
+		return 0
+	fi
+
+	[[ "${mine}" == "${theirs}" ]]
+}
+
+# Refuse to act when the host mount is out of reach. Restarting the portal
+# from inside a distrobox talks to the wrong (or no) systemd user manager,
+# and would leave the real problem on the host untouched.
+require_host_namespace () {
+	if in_host_mount_namespace
+	then
+		return 0
+	fi
+
+	err "running inside a foreign mount namespace (container or sandbox)"
+	err "the host's ${DOC_DIR} cannot be repaired from here - rerun on the host"
+	exit 2
+}
+
+# Summarise both halves of the failure: what the unit claims, and what the
+# mount table actually shows. Printing them together is the whole point --
+# the pair is what identifies this bug.
+report () {
+	local state
+
+	state="$(systemctl --user is-active "${PORTAL_UNIT}" 2>/dev/null || true)"
+	log "unit:  ${PORTAL_UNIT} (${state:-unknown})"
+
+	if doc_portal_is_mounted
+	then
+		log "mount: ${DOC_DIR} present (fuse.portal)"
+	else
+		log "mount: ${DOC_DIR} MISSING - flatpaks will fail with a bwrap error"
+	fi
+}
+
+# Poll for the mount to reappear, up to ${WAIT_TIMEOUT} seconds. The restart
+# returns before fusermount3 has finished handing the mount to the kernel,
+# so checking immediately afterwards races and reports a false failure.
+wait_for_mount () {
+	local deadline
+
+	deadline=$(( SECONDS + WAIT_TIMEOUT ))
+	while [[ "${SECONDS}" -lt "${deadline}" ]]
+	do
+		if doc_portal_is_mounted
+		then
+			return 0
+		fi
+		sleep 0.25
+	done
+
+	doc_portal_is_mounted
+}
+
+# Restart the portal and confirm the mount actually came back.
+repair () {
+	log "restarting ${PORTAL_UNIT} ..."
+	if ! systemctl --user restart "${PORTAL_UNIT}"
+	then
+		err "could not restart ${PORTAL_UNIT}"
+		return 1
+	fi
+
+	if ! wait_for_mount
+	then
+		err "${DOC_DIR} did not come back within ${WAIT_TIMEOUT}s"
+		err "inspect with: systemctl --user status ${PORTAL_UNIT}"
+		return 1
+	fi
+
+	log "ok: ${DOC_DIR} is mounted again (fuse.portal)"
+	return 0
+}
+
+# --watch: the mount has a habit of vanishing more than once in a session,
+# so this repairs it in place instead of waiting for the next failed launch.
+watch_loop () {
+	log "watching ${DOC_DIR} every ${WATCH_INTERVAL}s (ctrl-c to stop)"
+
+	while true
+	do
+		if ! doc_portal_is_mounted
+		then
+			err "$(date -Iseconds) mount vanished, repairing"
+			repair || true
+		fi
+		sleep "${WATCH_INTERVAL}"
+	done
+}
+
+main () {
+	local check_only=false
+	local force=false
+	local watch=false
+
+	while [[ $# -gt 0 ]]
+	do
+		case "${1}" in
+			-h|--help) usage; exit 0 ;;
+			--license) echo "AGPLv3"; exit 0 ;;
+			-c|--check) check_only=true; shift ;;
+			-f|--force) force=true; shift ;;
+			-w|--watch) watch=true; shift ;;
+			-q|--quiet) QUIET=true; shift ;;
+			-i|--interval) WATCH_INTERVAL="${2:-}"; shift 2 ;;
+			-t|--timeout) WAIT_TIMEOUT="${2:-}"; shift 2 ;;
+			*) err "unexpected argument '${1}'"; usage >&2; exit 1 ;;
+		esac
+	done
+
+	if ! [[ "${WATCH_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${WATCH_INTERVAL}" -lt 1 ]]
+	then
+		err "--interval must be a positive integer"
+		exit 1
+	fi
+
+	if ! [[ "${WAIT_TIMEOUT}" =~ ^[0-9]+$ ]] || [[ "${WAIT_TIMEOUT}" -lt 1 ]]
+	then
+		err "--timeout must be a positive integer"
+		exit 1
+	fi
+
+	if ! command -v systemctl > /dev/null 2>&1
+	then
+		err "systemctl not found; this script only makes sense on a systemd session"
+		exit 1
+	fi
+
+	if [[ ! -d "${RUNTIME_DIR}" ]]
+	then
+		err "runtime directory ${RUNTIME_DIR} does not exist"
+		exit 1
+	fi
+
+	report
+
+	# A healthy mount is a healthy mount no matter which namespace observed
+	# it, so report success and stop before the host-namespace gate below.
+	if doc_portal_is_mounted && [[ "${force}" == "false" ]] && [[ "${watch}" == "false" ]]
+	then
+		if [[ "${check_only}" == "false" ]]
+		then
+			log "nothing to do (pass --force to restart the portal anyway)"
+		fi
+		exit 0
+	fi
+
+	# Everything past here either repairs the mount or waits around to repair
+	# it, and neither is meaningful from inside a foreign mount namespace.
+	require_host_namespace
+
+	if [[ "${check_only}" == "true" ]]
+	then
+		exit 1
+	fi
+
+	if [[ "${watch}" == "true" ]]
+	then
+		if [[ "${force}" == "true" ]] || ! doc_portal_is_mounted
+		then
+			repair || true
+		fi
+		watch_loop
+	fi
+
+	repair
+}
+
+main "$@"
