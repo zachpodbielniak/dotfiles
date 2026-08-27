@@ -1,0 +1,57 @@
+# Ollama with the Vulkan backend, for Intel Arc GPUs.
+#
+# Why this exists: the official ollama image ships only CPU/CUDA, and the AMD
+# image (:rocm) needs /dev/kfd, which Intel hardware does not have. Intel's own
+# ipex-llm image uses SYCL but pins intel-level-zero-gpu 1.6.32224.5 (Jan 2025),
+# which predates Xe3 - on Panther Lake it enumerates no GPU and ollama silently
+# falls back to library=cpu.
+#
+# The upstream ollama release bundle *does* include a Vulkan backend
+# (lib/ollama/vulkan/libggml-vulkan.so), so we pair it with a Mesa new enough to
+# drive Xe3. Fedora is the base specifically for that: Ubuntu 24.04 ships Mesa
+# 24.x and would hit the same too-old-userspace wall as ipex-llm.
+ARG FEDORA_IMAGE=registry.fedoraproject.org/fedora:44
+FROM ${FEDORA_IMAGE}
+
+# Keep in sync with the ollama release you want; the bundle layout below
+# (bin/ollama + lib/ollama/...) has been stable across releases.
+ARG OLLAMA_VERSION=v0.33.1
+
+# mesa-vulkan-drivers provides ANV (the open-source Intel Vulkan driver);
+# vulkan-loader provides libvulkan.so.1 that libggml-vulkan.so dlopens.
+RUN set -eux && \
+    dnf install -y --setopt=install_weak_deps=False \
+        mesa-vulkan-drivers vulkan-loader tar zstd curl && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+# Unpacks to /usr/bin/ollama and /usr/lib/ollama/{vulkan,cuda_v12,...}
+RUN set -eux && \
+    curl -fsSL -o /tmp/ollama.tar.zst \
+        "https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst" && \
+    tar --zstd -xf /tmp/ollama.tar.zst -C /usr && \
+    rm -f /tmp/ollama.tar.zst && \
+    test -f /usr/lib/ollama/vulkan/libggml-vulkan.so
+
+# The CUDA backends are dead weight on this machine (~1GB) - drop them so the
+# image stays lean. Vulkan and the CPU backends are what actually get used.
+RUN rm -rf /usr/lib/ollama/cuda_v12 /usr/lib/ollama/cuda_v13
+
+# Bind on all interfaces so podman's PublishPort can reach it.
+ENV OLLAMA_HOST=0.0.0.0
+ENV OLLAMA_VULKAN=1
+
+# The B390 is Panther Lake's *integrated* Arc. Ollama discovers it via Vulkan but
+# then drops it ("dropping integrated GPU") unless iGPUs are explicitly enabled,
+# so without this the container detects the GPU and still runs on CPU.
+ENV OLLAMA_IGPU_ENABLE=1
+
+# Mesa also exposes llvmpipe (software rasterizer) as a Vulkan device. Pinning
+# device 0 keeps ollama from silently landing on it, which would look like GPU
+# offload while running at CPU speed.
+ENV GGML_VK_VISIBLE_DEVICES=0
+
+EXPOSE 11434
+
+ENTRYPOINT ["/usr/bin/ollama"]
+CMD ["serve"]

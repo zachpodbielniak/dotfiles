@@ -6,7 +6,7 @@ stow quadlets="true": dep_dirs
 
     # build ignore flags for all known hostnames except the current host
     CURRENT_HOST=$(hostname -s)
-    KNOWN_HOSTS=(lt-zach hacbook libreclaw-00 srv-zach)
+    KNOWN_HOSTS=(lt-zach mob-zach hacbook libreclaw-00 srv-zach)
     IGNORE_FLAGS=()
     for h in "${KNOWN_HOSTS[@]}"; do
         if [[ "$h" != "$CURRENT_HOST" ]]; then
@@ -62,7 +62,7 @@ stow_alt quadlets="true": dep_dirs
 
     # build ignore flags for all known hostnames except the current host
     CURRENT_HOST=$(hostname -s)
-    KNOWN_HOSTS=(lt-zach hacbook libreclaw-00 srv-zach)
+    KNOWN_HOSTS=(lt-zach mob-zach hacbook libreclaw-00 srv-zach)
     IGNORE_FLAGS=()
     for h in "${KNOWN_HOSTS[@]}"; do
         if [[ "$h" != "$CURRENT_HOST" ]]; then
@@ -127,7 +127,7 @@ dry quadlets="true": dep_dirs
 
     # build ignore flags for all known hostnames except the current host
     CURRENT_HOST=$(hostname -s)
-    KNOWN_HOSTS=(lt-zach hacbook libreclaw-00 srv-zach)
+    KNOWN_HOSTS=(lt-zach mob-zach hacbook libreclaw-00 srv-zach)
     IGNORE_FLAGS=()
     for h in "${KNOWN_HOSTS[@]}"; do
         if [[ "$h" != "$CURRENT_HOST" ]]; then
@@ -187,6 +187,11 @@ dep_dirs:
     mkdir -p $HOME/.librewolf/native-messaging-hosts
 
     mkdir -p $HOME/.cache/docling/models
+
+    # bind-mount sources for the Podman quadlets; podman errors out with
+    # "statfs ...: no such file or directory" rather than creating them
+    mkdir -p $HOME/.data/postgres
+    mkdir -p $HOME/.ollama
 
 
 # install deps
@@ -340,3 +345,24 @@ flatpak-overrides:
         flatpak override --user --talk-name=org.freedesktop.secrets "${app}"
         echo "granted org.freedesktop.secrets to ${app}"
     done
+
+
+# Neither the official ollama image (CPU/CUDA only) nor Intel's ipex-llm image
+# can drive this machine's Intel Arc B390 (Panther Lake): ipex-llm pins a
+# Jan-2025 Level Zero runtime that predates Xe3 and silently falls back to CPU.
+# This image pairs upstream ollama's Vulkan backend with a Mesa new enough for
+# Xe3. Required by ollama-mob-zach.container, which references it by name.
+#
+# build the local ollama Vulkan image for Intel Arc (mob-zach)
+build-ollama-vulkan:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    podman build -t localhost/ollama-vulkan:latest \
+        "{{justfile_directory()}}/.supporting_files/ollama_vulkan"
+
+    echo
+    echo "built localhost/ollama-vulkan:latest"
+    echo "verify GPU detection with:"
+    echo "  podman run --rm --device /dev/dri --entrypoint bash \\"
+    echo "    localhost/ollama-vulkan:latest -c 'ollama serve 2>&1 | grep \"inference compute\"'"
