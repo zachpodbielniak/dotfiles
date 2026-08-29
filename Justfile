@@ -224,8 +224,6 @@ bootstrap:
         exit 0
     fi
 
-    # needed for $(pomo)
-    cpan install YAML::XS < <(yes)
     # init pomo so it has a state file
     bash -c "source ${HOME}/.bashrc && pomo -s && pomo -S"
 
