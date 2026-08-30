@@ -1,0 +1,780 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "${0}")"
+readonly SCRIPT_NAME
+
+# Default Pulse/PipeWire native TCP port
+readonly DEFAULT_PORT="4713"
+
+# Tailscale CGNAT range. Zach's tailnet is NOT contained in 100.72.0.0/16 —
+# peers also live in 100.67/8-adjacent blocks inside 100.64.0.0/10.
+readonly DEFAULT_ACL="100.64.0.0/10"
+
+# Reconnect interval for module-tunnel-sink if the remote TCP server flaps
+readonly RECONNECT_MS="5000"
+
+# Offered in the client "what kind of output is this?" picker. `other` prompts
+# for a custom token. Local tunnel name becomes remote_<hostname>_<type>.
+readonly SINK_TYPES=(
+    speakers
+    headphones
+    bluetooth
+    hdmi
+    usb
+    dac
+    receiver
+    soundbar
+    other
+)
+
+# ============================================================================
+# CLI state
+# ============================================================================
+
+mode=""
+verbose=false
+dry_run=false
+local_name=""
+host_arg=""
+sink_arg=""
+type_arg=""
+peer_hostname=""
+peer_ip=""
+port="${DEFAULT_PORT}"
+acl="${DEFAULT_ACL}"
+listen_ip=""
+
+# ============================================================================
+# Help
+# ============================================================================
+
+usage () {
+    cat << EOF
+${SCRIPT_NAME} - Set up PipeWire/Pulse remote TCP audio over Tailscale
+
+USAGE:
+    ${SCRIPT_NAME} [OPTIONS]
+
+MODES:
+    -s, --server            Listen on this machine's Tailscale IPv4
+    -c, --client            Tunnel a remote sink onto this machine
+    -l, --list              Show loaded TCP / tunnel modules and sinks
+    -u, --unload            Unload TCP + tunnel-sink modules
+
+OPTIONS:
+    -n, --name NAME         Local tunnel sink name (client). Overrides
+                            remote_<hostname>_<type>
+    -H, --host HOST         Tailscale hostname or IP (skips host fzf)
+    -S, --sink SINK         Remote sink name (skips SSH listing + sink fzf)
+    -t, --type TYPE         Output type (skips type fzf): speakers,
+                            headphones, bluetooth, hdmi, usb, dac,
+                            receiver, soundbar, or a custom token
+    -p, --port PORT         TCP port (default: ${DEFAULT_PORT})
+        --listen IP         Bind address for --server (default: Tailscale IPv4)
+        --acl CIDR          auth-ip-acl for --server (default: ${DEFAULT_ACL})
+        --dry-run           Print pactl commands without loading modules
+    -v, --verbose           Verbose logging to stderr
+    -h, --help              Show this help message
+        --license           Show license information
+
+EXAMPLES:
+    # Audio server: bind Pulse TCP to the Tailscale IP
+    ${SCRIPT_NAME} --server
+
+    # Client: pick a tailnet host and sink in fzf
+    ${SCRIPT_NAME} --client
+
+    # Client: skip the pickers
+    ${SCRIPT_NAME} --client -H lt-zach --sink alsa_output.usb-Generic_USB_Audio-00.analog-stereo --type speakers
+    ${SCRIPT_NAME} --client -H lt-zach -n living_room --sink alsa_output.usb-Schiit_Audio_Schiit_Modi_3E-00.analog-stereo
+
+    # Inspect / tear down
+    ${SCRIPT_NAME} --list
+    ${SCRIPT_NAME} --unload
+
+DESCRIPTION:
+    Server mode loads module-native-protocol-tcp on this machine's Tailscale
+    IPv4, with auth-ip-acl=${DEFAULT_ACL}. PipeWire does not actually enforce
+    auth-ip-acl (valid args are listen, port, auth-anonymous), so the script
+    also sets auth-anonymous=1. Binding only to the Tailscale IP is the real
+    access control — any tailnet peer can then play without a Pulse cookie.
+
+    Client mode SSHes to the chosen host, runs 'pactl list sinks short',
+    and fzf-picks a sink from that list. A second picker asks what kind of
+    output it is (speakers, headphones, bluetooth, ...). The local tunnel
+    is named remote_<hostname>_<type> unless -n is given:
+
+        pactl load-module module-tunnel-sink \\
+            server=tcp:<ip>:<port> sink_name=<name> sink=<remote_sink>
+
+    Modules are session-only. They vanish when pipewire-pulse restarts.
+
+EOF
+}
+
+show_license () {
+    cat << 'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak — AGPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+EOF
+}
+
+# ============================================================================
+# Logging / errors
+# ============================================================================
+
+die () {
+    printf '%s: %s\n' "${SCRIPT_NAME}" "${1}" >&2
+    exit 1
+}
+
+log_info () {
+    printf '%s\n' "${1}"
+}
+
+log_verbose () {
+    if [[ "${verbose}" == true ]]
+    then
+        printf 'verbose: %s\n' "${1}" >&2
+    fi
+}
+
+need_arg () {
+    local opt="${1}"
+    local value="${2:-}"
+
+    if [[ -z "${value}" || "${value}" == -* ]]
+    then
+        die "${opt} requires an argument"
+    fi
+}
+
+require_commands () {
+    local cmd
+    for cmd in "${@}"
+    do
+        if ! command -v "${cmd}" >/dev/null 2>&1
+        then
+            die "required command not found: ${cmd}"
+        fi
+    done
+}
+
+set_mode () {
+    local new_mode="${1}"
+
+    if [[ -n "${mode}" && "${mode}" != "${new_mode}" ]]
+    then
+        die "cannot combine --${mode} and --${new_mode}"
+    fi
+    mode="${new_mode}"
+}
+
+# ============================================================================
+# Tailscale
+# ============================================================================
+
+# Print this machine's Tailscale IPv4, or die.
+get_local_tailscale_ip () {
+    local ip
+
+    require_commands tailscale
+    ip="$(tailscale ip -4 2>/dev/null || true)"
+    if [[ -z "${ip}" ]]
+    then
+        die "could not get Tailscale IPv4 (is tailscaled up?)"
+    fi
+    printf '%s\n' "${ip}"
+}
+
+# Resolve a hostname or IP to a Tailscale IPv4 via `tailscale ip -4`.
+resolve_tailscale_host () {
+    local query="${1}"
+    local ip
+
+    require_commands tailscale
+    ip="$(tailscale ip -4 "${query}" 2>/dev/null || true)"
+    if [[ -z "${ip}" ]]
+    then
+        die "could not resolve '${query}' on the tailnet"
+    fi
+    log_verbose "resolved ${query} -> ${ip}"
+    printf '%s\n' "${ip}"
+}
+
+# Print fzf rows for tailnet peers: "hostname | ip | os | status".
+# Excludes this machine (--self=false). Includes offline peers.
+list_tailscale_peers () {
+    require_commands tailscale
+    tailscale status --self=false | awk '
+        /^#/ { next }
+        /^[[:space:]]*$/ { next }
+        $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {
+            ip = $1
+            host = $2
+            os = $4
+            $1 = ""
+            $2 = ""
+            $3 = ""
+            $4 = ""
+            sub(/^[[:space:]]+/, "")
+            printf "%s | %s | %s | %s\n", host, ip, os, $0
+        }
+    '
+}
+
+# Short Tailscale hostname for a hostname or IPv4 query.
+lookup_peer_hostname () {
+    local query="${1}"
+    local name
+
+    if [[ "${query}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+    then
+        name="$(tailscale status | awk -v ip="${query}" '$1 == ip { print $2; exit }')"
+        if [[ -z "${name}" ]]
+        then
+            die "could not find a Tailscale hostname for ${query}"
+        fi
+        printf '%s\n' "${name}"
+        return 0
+    fi
+
+    # Strip MagicDNS suffix (lt-zach.anaconda-bebop.ts.net -> lt-zach)
+    printf '%s\n' "${query%%.*}"
+}
+
+# Set peer_hostname + peer_ip from -H/--host or an fzf picker.
+select_host () {
+    local selected
+
+    if [[ -n "${host_arg}" ]]
+    then
+        peer_ip="$(resolve_tailscale_host "${host_arg}")"
+        peer_hostname="$(lookup_peer_hostname "${host_arg}")"
+        return 0
+    fi
+
+    require_commands fzf
+    if [[ -z "$(list_tailscale_peers)" ]]
+    then
+        die "no Tailscale peers found"
+    fi
+    if ! selected="$(list_tailscale_peers | fzf --prompt='Tailscale host> ' --header='Select the PipeWire TCP server')"
+    then
+        die "host selection cancelled"
+    fi
+    if [[ -z "${selected}" ]]
+    then
+        die "host selection cancelled"
+    fi
+
+    peer_hostname="${selected%% | *}"
+    peer_ip="$(resolve_tailscale_host "${peer_hostname}")"
+}
+
+# ============================================================================
+# Sink selection
+# ============================================================================
+
+# Pulse sink names allow [A-Za-z0-9._]. Fold everything else to underscore.
+sanitize_ident () {
+    local raw="${1}"
+    local out
+
+    out="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._' '_')"
+    out="$(printf '%s' "${out}" | tr -s '_' | sed -E 's/^_+//; s/_+$//')"
+    if [[ -z "${out}" ]]
+    then
+        die "sanitized name is empty (from '${raw}')"
+    fi
+    printf '%s\n' "${out}"
+}
+
+require_tty () {
+    local hint="${1}"
+
+    if [[ ! -t 0 ]]
+    then
+        die "stdin is not a TTY; ${hint}"
+    fi
+}
+
+# List sinks on the remote via ssh. Needs the user session's PipeWire socket,
+# so XDG_RUNTIME_DIR is set if the login shell does not already have it.
+ssh_list_sinks () {
+    local ssh_target="${1}"
+    local output
+    local rc=0
+
+    require_commands ssh
+    log_verbose "ssh ${ssh_target} -- pactl list sinks short"
+    output="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "${ssh_target}" \
+        'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; pactl list sinks short' \
+        2>&1)" || rc=$?
+    if [[ "${rc}" -ne 0 ]]
+    then
+        die "ssh to ${ssh_target} failed (rc ${rc}): ${output}"
+    fi
+    if [[ -z "${output}" ]]
+    then
+        die "no sinks returned from ${ssh_target}"
+    fi
+    printf '%s\n' "${output}"
+}
+
+# Format `pactl list sinks short` as fzf rows: "name | state".
+format_sink_rows () {
+    awk -F'\t' 'NF >= 2 {
+        name = $2
+        state = (NF >= 5 ? $5 : "?")
+        printf "%s | %s\n", name, state
+    }'
+}
+
+# Pick a remote sink: SSH list + fzf, or --sink, or typed `other`.
+select_remote_sink () {
+    local ssh_target="${1}"
+    local selected
+    local sink_name
+    local rows
+
+    if [[ -n "${sink_arg}" ]]
+    then
+        printf '%s\n' "${sink_arg}"
+        return 0
+    fi
+
+    require_commands fzf
+    rows="$(ssh_list_sinks "${ssh_target}" | format_sink_rows)"
+    if [[ -z "${rows}" ]]
+    then
+        die "could not parse sinks from ${ssh_target}"
+    fi
+
+    if ! selected="$(
+        {
+            printf '%s\n' "${rows}"
+            printf '%s | %s\n' "other" "(type a sink name)"
+        } | fzf --prompt='Sink> ' --header="Sinks on ${ssh_target}"
+    )"
+    then
+        die "sink selection cancelled"
+    fi
+    if [[ -z "${selected}" ]]
+    then
+        die "sink selection cancelled"
+    fi
+
+    sink_name="${selected%% | *}"
+    if [[ "${sink_name}" == "other" ]]
+    then
+        require_tty "pass --sink SINK"
+        read -r -p "Remote sink name: " sink_name
+        if [[ -z "${sink_name}" ]]
+        then
+            die "remote sink name cannot be empty"
+        fi
+    fi
+    printf '%s\n' "${sink_name}"
+}
+
+# Pick speakers / headphones / bluetooth / ... for the local tunnel name.
+select_sink_type () {
+    local selected
+    local sink_type
+
+    if [[ -n "${type_arg}" ]]
+    then
+        sink_type="${type_arg}"
+    else
+        require_commands fzf
+        if ! selected="$(
+            printf '%s\n' "${SINK_TYPES[@]}" \
+                | fzf --prompt='Type> ' --header='What kind of output is this?'
+        )"
+        then
+            die "type selection cancelled"
+        fi
+        if [[ -z "${selected}" ]]
+        then
+            die "type selection cancelled"
+        fi
+        sink_type="${selected}"
+    fi
+
+    if [[ "${sink_type}" == "other" ]]
+    then
+        require_tty "pass --type TYPE"
+        read -r -p "Output type: " sink_type
+        if [[ -z "${sink_type}" ]]
+        then
+            die "output type cannot be empty"
+        fi
+    fi
+
+    sanitize_ident "${sink_type}"
+}
+
+# ============================================================================
+# pactl helpers
+# ============================================================================
+
+# Print "id<TAB>name<TAB>args" for loaded modules whose name matches awk regex pat.
+list_modules_matching () {
+    local pat="${1}"
+
+    pactl list modules | awk -v pat="${pat}" '
+        /^Module #/ {
+            if (name != "" && name ~ pat) {
+                printf "%s\t%s\t%s\n", id, name, args
+            }
+            id = $2
+            sub(/^#/, "", id)
+            name = ""
+            args = ""
+            next
+        }
+        /^\tName:/ {
+            name = $2
+            next
+        }
+        /^\tArgument:/ {
+            sub(/^\tArgument:[[:space:]]*/, "")
+            args = $0
+            next
+        }
+        END {
+            if (name != "" && name ~ pat) {
+                printf "%s\t%s\t%s\n", id, name, args
+            }
+        }
+    '
+}
+
+unload_module_id () {
+    local id="${1}"
+
+    if [[ "${dry_run}" == true ]]
+    then
+        log_info "dry-run: pactl unload-module ${id}"
+        return 0
+    fi
+    log_verbose "pactl unload-module ${id}"
+    pactl unload-module "${id}"
+}
+
+# Unload every loaded module whose name matches the awk regex.
+unload_modules_matching () {
+    local pat="${1}"
+    local id
+    local name
+    local args
+    local count=0
+
+    while IFS=$'\t' read -r id name args
+    do
+        [[ -z "${id}" ]] && continue
+        log_info "unloading ${name} #${id}${args:+ (${args})}"
+        unload_module_id "${id}"
+        count=$((count + 1))
+    done < <(list_modules_matching "${pat}")
+
+    if [[ "${count}" -eq 0 ]]
+    then
+        log_info "no matching modules loaded"
+    fi
+}
+
+# Unload an existing tunnel whose local sink_name matches, so we can replace it.
+unload_tunnel_named () {
+    local want_name="${1}"
+    local id
+    local name
+    local args
+    local found=false
+
+    while IFS=$'\t' read -r id name args
+    do
+        [[ -z "${id}" ]] && continue
+        if [[ " ${args} " == *" sink_name=${want_name} "* ]]
+        then
+            log_info "replacing existing ${name} #${id} (sink_name=${want_name})"
+            unload_module_id "${id}"
+            found=true
+        fi
+    done < <(list_modules_matching '^(module-tunnel-sink|module-tunnel-sink-new)$')
+
+    if [[ "${found}" != true ]]
+    then
+        log_verbose "no existing tunnel named ${want_name}"
+    fi
+}
+
+run_load_module () {
+    local module="${1}"
+    local args="${2}"
+    local module_id
+
+    if [[ "${dry_run}" == true ]]
+    then
+        log_info "dry-run: pactl load-module ${module} ${args}"
+        return 0
+    fi
+
+    log_verbose "pactl load-module ${module} ${args}"
+    if ! module_id="$(pactl load-module "${module}" "${args}")"
+    then
+        die "pactl load-module ${module} failed"
+    fi
+    log_info "loaded ${module} #${module_id}"
+    log_info "  ${args}"
+}
+
+# ============================================================================
+# Modes
+# ============================================================================
+
+cmd_server () {
+    local ts_ip
+    local desired_args
+    local id
+    local name
+    local args
+    local already=false
+
+    require_commands pactl
+
+    if [[ -n "${listen_ip}" ]]
+    then
+        ts_ip="${listen_ip}"
+    else
+        ts_ip="$(get_local_tailscale_ip)"
+    fi
+
+    # PipeWire implements listen/port/auth-anonymous. auth-ip-acl is accepted
+    # and stored but not enforced; we still pass it (Pulse compat + the ACL
+    # Zach asked for). Binding to the Tailscale IP is the real restriction.
+    desired_args="listen=${ts_ip} port=${port} auth-ip-acl=${acl} auth-anonymous=1"
+
+    while IFS=$'\t' read -r id name args
+    do
+        [[ -z "${id}" ]] && continue
+        if [[ "${args}" == *"${ts_ip}"* && "${args}" == *"${acl}"* && \
+              ( "${args}" == *"auth-anonymous=1"* || "${args}" == *"auth-anonymous=true"* ) ]]
+        then
+            log_info "already listening: ${name} #${id} (${args})"
+            already=true
+        else
+            log_info "replacing ${name} #${id} (${args})"
+            unload_module_id "${id}"
+        fi
+    done < <(list_modules_matching '^module-native-protocol-tcp$')
+
+    if [[ "${already}" == true ]]
+    then
+        return 0
+    fi
+
+    run_load_module "module-native-protocol-tcp" "${desired_args}"
+    log_info "Pulse TCP listening on tcp:${ts_ip}:${port} (ACL ${acl})"
+    log_info "On a client: ${SCRIPT_NAME} --client --host $(hostname -s 2>/dev/null || printf '%s' "${ts_ip}")"
+}
+
+cmd_client () {
+    local tunnel_name
+    local remote_sink
+    local sink_type
+    local host_ident
+    local args
+
+    require_commands pactl ssh
+
+    select_host
+    remote_sink="$(select_remote_sink "${peer_hostname}")"
+
+    if [[ -n "${local_name}" ]]
+    then
+        tunnel_name="${local_name}"
+    else
+        sink_type="$(select_sink_type)"
+        host_ident="$(sanitize_ident "${peer_hostname}")"
+        tunnel_name="remote_${host_ident}_${sink_type}"
+    fi
+
+    if [[ -z "${tunnel_name}" || -z "${remote_sink}" ]]
+    then
+        die "internal error: empty sink selection"
+    fi
+
+    unload_tunnel_named "${tunnel_name}"
+
+    args="server=tcp:${peer_ip}:${port} sink_name=${tunnel_name} sink=${remote_sink} reconnect_interval_ms=${RECONNECT_MS}"
+    run_load_module "module-tunnel-sink" "${args}"
+    log_info "local sink '${tunnel_name}' tunnels to ${remote_sink} on ${peer_hostname} (${peer_ip})"
+    log_info "set as default: pactl set-default-sink ${tunnel_name}"
+}
+
+cmd_list () {
+    local id
+    local name
+    local args
+    local found=false
+
+    require_commands pactl
+
+    log_info "TCP / tunnel modules:"
+    while IFS=$'\t' read -r id name args
+    do
+        [[ -z "${id}" ]] && continue
+        printf '  #%s  %s  %s\n' "${id}" "${name}" "${args}"
+        found=true
+    done < <(list_modules_matching '^(module-native-protocol-tcp|module-tunnel-sink|module-tunnel-sink-new)$')
+
+    if [[ "${found}" != true ]]
+    then
+        log_info "  (none)"
+    fi
+
+    log_info ""
+    log_info "Sinks:"
+    pactl list short sinks | awk -F'\t' '{ printf "  %s  %s\n", $2, $5 }'
+}
+
+cmd_unload () {
+    require_commands pactl
+    unload_modules_matching '^(module-native-protocol-tcp|module-tunnel-sink|module-tunnel-sink-new)$'
+}
+
+# ============================================================================
+# Parse arguments
+# ============================================================================
+
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --license)
+            show_license
+            exit 0
+            ;;
+        -s|--server)
+            set_mode "server"
+            shift
+            ;;
+        -c|--client)
+            set_mode "client"
+            shift
+            ;;
+        -l|--list)
+            set_mode "list"
+            shift
+            ;;
+        -u|--unload)
+            set_mode "unload"
+            shift
+            ;;
+        -n|--name)
+            need_arg "${1}" "${2:-}"
+            local_name="${2}"
+            shift 2
+            ;;
+        -H|--host)
+            need_arg "${1}" "${2:-}"
+            host_arg="${2}"
+            shift 2
+            ;;
+        -S|--sink)
+            need_arg "${1}" "${2:-}"
+            sink_arg="${2}"
+            shift 2
+            ;;
+        -t|--type)
+            need_arg "${1}" "${2:-}"
+            type_arg="${2}"
+            shift 2
+            ;;
+        -p|--port)
+            need_arg "${1}" "${2:-}"
+            port="${2}"
+            shift 2
+            ;;
+        --listen)
+            need_arg "${1}" "${2:-}"
+            listen_ip="${2}"
+            shift 2
+            ;;
+        --acl)
+            need_arg "${1}" "${2:-}"
+            acl="${2}"
+            shift 2
+            ;;
+        --dry-run)
+            dry_run=true
+            shift
+            ;;
+        -v|--verbose)
+            verbose=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die "unknown option '${1}' (try --help)"
+            ;;
+        *)
+            die "unexpected argument '${1}' (try --help)"
+            ;;
+    esac
+done
+
+if [[ $# -gt 0 ]]
+then
+    die "unexpected argument '${1}' (try --help)"
+fi
+
+if [[ ! "${port}" =~ ^[0-9]+$ ]] || [[ "${port}" -lt 1 || "${port}" -gt 65535 ]]
+then
+    die "invalid port: ${port}"
+fi
+
+if [[ -z "${mode}" ]]
+then
+    usage >&2
+    exit 1
+fi
+
+case "${mode}" in
+    server) cmd_server ;;
+    client) cmd_client ;;
+    list)   cmd_list ;;
+    unload) cmd_unload ;;
+    *)      die "internal error: unknown mode ${mode}" ;;
+esac
