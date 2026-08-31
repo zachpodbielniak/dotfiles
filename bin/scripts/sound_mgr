@@ -56,6 +56,7 @@ local_name=""
 host_arg=""
 sink_arg=""
 type_arg=""
+remove_all=false
 peer_hostname=""
 peer_ip=""
 port="${DEFAULT_PORT}"
@@ -76,8 +77,11 @@ USAGE:
 MODES:
     -s, --server            Listen on this machine's Tailscale IPv4
     -c, --client            Tunnel a remote sink onto this machine
+    -r, --remove            Unload client tunnel sink(s); does not touch the
+                            TCP listener. fzf the loaded tunnels (TAB for
+                            multi-select) unless -n / -H+--type / --all
     -l, --list              Show loaded TCP / tunnel modules and sinks
-    -u, --unload            Unload TCP + tunnel-sink modules
+    -u, --unload            Unload ALL TCP listeners and tunnel sinks
 
 OPTIONS:
     -n, --name NAME         Local tunnel sink name (client). Overrides
@@ -87,6 +91,7 @@ OPTIONS:
     -t, --type TYPE         Output type (skips type fzf): speakers,
                             headphones, bluetooth, hdmi, usb, dac,
                             receiver, soundbar, or a custom token
+        --all               With --remove: unload every tunnel sink
     -p, --port PORT         TCP port (default: ${DEFAULT_PORT})
         --listen IP         Bind address for --server (default: Tailscale IPv4)
         --acl CIDR          auth-ip-acl for --server (default: ${DEFAULT_ACL})
@@ -106,8 +111,14 @@ EXAMPLES:
     ${SCRIPT_NAME} --client -H lt-zach --sink alsa_output.usb-Generic_USB_Audio-00.analog-stereo --type speakers
     ${SCRIPT_NAME} --client -H lt-zach -n living_room --sink alsa_output.usb-Schiit_Audio_Schiit_Modi_3E-00.analog-stereo
 
-    # Inspect / tear down
+    # Inspect / tear down client tunnels
     ${SCRIPT_NAME} --list
+    ${SCRIPT_NAME} --remove
+    ${SCRIPT_NAME} --remove -n remote_lt_zach_speakers
+    ${SCRIPT_NAME} --remove -H lt-zach --type speakers
+    ${SCRIPT_NAME} --remove --all
+
+    # Nuclear: TCP listener + every tunnel
     ${SCRIPT_NAME} --unload
 
 DESCRIPTION:
@@ -124,6 +135,10 @@ DESCRIPTION:
 
         pactl load-module module-tunnel-sink \\
             server=tcp:<ip>:<port> sink_name=<name> sink=<remote_sink>
+
+    --remove unloads client tunnel sinks only (fzf, -n, -H/--type, or --all).
+    --unload also drops the TCP listener; use it on the server, or when you
+    want everything gone.
 
     Modules are session-only. They vanish when pipewire-pulse restarts.
 
@@ -508,20 +523,68 @@ unload_modules_matching () {
     fi
 }
 
-# Unload an existing tunnel whose local sink_name matches, so we can replace it.
+# Pull key=value from a pactl module Argument string.
+extract_modarg () {
+    local args="${1}"
+    local key="${2}"
+    local word
+    local -a words=()
+
+    # Argument strings are space-separated key=value tokens (no spaces in values).
+    read -r -a words <<< "${args}"
+    for word in "${words[@]}"
+    do
+        if [[ "${word}" == "${key}="* ]]
+        then
+            printf '%s\n' "${word#"${key}"=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Print fzf rows for loaded tunnel sinks: "sink_name | server | remote_sink | #id".
+list_tunnel_rows () {
+    local id
+    local name
+    local args
+    local sink_name
+    local server
+    local remote_sink
+
+    while IFS=$'\t' read -r id name args
+    do
+        [[ -z "${id}" ]] && continue
+        sink_name="$(extract_modarg "${args}" "sink_name" || printf '%s' "${name}")"
+        server="$(extract_modarg "${args}" "server" || printf '?')"
+        remote_sink="$(extract_modarg "${args}" "sink" || printf '?')"
+        printf '%s | %s | %s | #%s\n' "${sink_name}" "${server}" "${remote_sink}" "${id}"
+    done < <(list_modules_matching '^(module-tunnel-sink|module-tunnel-sink-new)$')
+}
+
+# Unload tunnel module(s) whose local sink_name matches.
+# action is "replacing" (client reload, missing is fine) or "removing" (error if missing).
 unload_tunnel_named () {
     local want_name="${1}"
+    local action="${2:-replacing}"
     local id
     local name
     local args
     local found=false
+    local default_sink
+
+    default_sink="$(pactl get-default-sink 2>/dev/null || true)"
 
     while IFS=$'\t' read -r id name args
     do
         [[ -z "${id}" ]] && continue
         if [[ " ${args} " == *" sink_name=${want_name} "* ]]
         then
-            log_info "replacing existing ${name} #${id} (sink_name=${want_name})"
+            if [[ "${default_sink}" == "${want_name}" ]]
+            then
+                log_info "note: '${want_name}' is the default sink"
+            fi
+            log_info "${action} ${name} #${id} (sink_name=${want_name})"
             unload_module_id "${id}"
             found=true
         fi
@@ -529,6 +592,10 @@ unload_tunnel_named () {
 
     if [[ "${found}" != true ]]
     then
+        if [[ "${action}" == "removing" ]]
+        then
+            die "no tunnel sink named '${want_name}'"
+        fi
         log_verbose "no existing tunnel named ${want_name}"
     fi
 }
@@ -668,6 +735,89 @@ cmd_unload () {
     unload_modules_matching '^(module-native-protocol-tcp|module-tunnel-sink|module-tunnel-sink-new)$'
 }
 
+# Drop client tunnel sink(s). Never unloads module-native-protocol-tcp.
+cmd_remove () {
+    local rows
+    local selected
+    local line
+    local id
+    local sink_name
+    local filter_ip=""
+    local matched=0
+
+    require_commands pactl
+
+    if [[ "${remove_all}" == true ]]
+    then
+        unload_modules_matching '^(module-tunnel-sink|module-tunnel-sink-new)$'
+        return 0
+    fi
+
+    if [[ -n "${local_name}" ]]
+    then
+        unload_tunnel_named "${local_name}" "removing"
+        return 0
+    fi
+
+    if [[ -n "${host_arg}" && -n "${type_arg}" ]]
+    then
+        select_host
+        sink_name="remote_$(sanitize_ident "${peer_hostname}")_$(select_sink_type)"
+        unload_tunnel_named "${sink_name}" "removing"
+        return 0
+    fi
+
+    rows="$(list_tunnel_rows || true)"
+    if [[ -z "${rows}" ]]
+    then
+        die "no tunnel sinks loaded"
+    fi
+
+    if [[ -n "${host_arg}" ]]
+    then
+        select_host
+        filter_ip="${peer_ip}"
+        rows="$(printf '%s\n' "${rows}" | awk -v ip="${filter_ip}" 'index($0, ip)')"
+        if [[ -z "${rows}" ]]
+        then
+            die "no tunnel sinks to ${peer_hostname} (${peer_ip})"
+        fi
+    fi
+
+    require_commands fzf
+    if ! selected="$(
+        printf '%s\n' "${rows}" | fzf --multi \
+            --prompt='Remove> ' \
+            --header='Select tunnel sink(s) to unload (TAB multi-select)'
+    )"
+    then
+        die "remove selection cancelled"
+    fi
+    if [[ -z "${selected}" ]]
+    then
+        die "remove selection cancelled"
+    fi
+
+    while IFS= read -r line
+    do
+        [[ -z "${line}" ]] && continue
+        id="${line##*#}"
+        sink_name="${line%% | *}"
+        if [[ -z "${id}" || ! "${id}" =~ ^[0-9]+$ ]]
+        then
+            die "could not parse module id from: ${line}"
+        fi
+        log_info "removing ${sink_name} #${id}"
+        unload_module_id "${id}"
+        matched=$((matched + 1))
+    done <<<"${selected}"
+
+    if [[ "${matched}" -eq 0 ]]
+    then
+        die "no tunnel sinks selected"
+    fi
+}
+
 # ============================================================================
 # Parse arguments
 # ============================================================================
@@ -697,6 +847,14 @@ do
             ;;
         -u|--unload)
             set_mode "unload"
+            shift
+            ;;
+        -r|--remove)
+            set_mode "remove"
+            shift
+            ;;
+        --all)
+            remove_all=true
             shift
             ;;
         -n|--name)
@@ -765,6 +923,11 @@ then
     die "invalid port: ${port}"
 fi
 
+if [[ "${remove_all}" == true && "${mode}" != "remove" ]]
+then
+    die "--all is only valid with --remove"
+fi
+
 if [[ -z "${mode}" ]]
 then
     usage >&2
@@ -776,5 +939,6 @@ case "${mode}" in
     client) cmd_client ;;
     list)   cmd_list ;;
     unload) cmd_unload ;;
+    remove) cmd_remove ;;
     *)      die "internal error: unknown mode ${mode}" ;;
 esac
