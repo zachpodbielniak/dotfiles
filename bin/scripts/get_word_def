@@ -19,9 +19,10 @@
 set -euo pipefail
 
 # --- Constants ---
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly SCRIPT_NAME="${0##*/}"
 readonly DICT_API="https://api.dictionaryapi.dev/api/v2/entries/en"
+readonly WIKT_API="https://en.wiktionary.org/api/rest_v1/page/definition"
 readonly URBAN_API="https://api.urbandictionary.com/v0/define"
 
 # --- Flags ---
@@ -119,55 +120,137 @@ parse_json () {
     fi
 }
 
-# Get definition from standard dictionary API (dictionaryapi.dev)
+# Percent-encode a word so it is safe in a URL path or query string
+url_encode () {
+    local raw="${1}"
+
+    if command -v jq &>/dev/null
+    then
+        printf '%s' "${raw}" | jq -sRr @uri
+        return 0
+    fi
+
+    printf '%s' "${raw}" | sed 's/ /%20/g; s/!/%21/g; s/"/%22/g; s/#/%23/g; s/\$/%24/g; s/&/%26/g; s/'\''/%27/g; s/(/%28/g; s/)/%29/g; s/+/%2B/g; s/\//%2F/g'
+}
+
+# HTTP GET a JSON body to stdout.
+# Writes to a temp file (not a pipe) and forces HTTP/1.1:
+# dictionaryapi.dev sits behind Cloudflare. curl's HTTP/2 plus
+# command substitution can stall with 0 bytes until --max-time.
+# Do not --retry: a stalled request is a timeout, and retries triple the wait.
+# Returns 0 if a non-empty body was fetched, 1 on timeout/network failure.
+fetch_json () {
+    local url="${1}"
+    local tmp
+    local curl_rc=0
+    local cat_rc=0
+
+    tmp=$(mktemp) || return 1
+
+    curl --silent --location \
+        --http1.1 \
+        --connect-timeout 5 \
+        --max-time 10 \
+        --user-agent "${SCRIPT_NAME}/${VERSION}" \
+        --header "Accept: application/json" \
+        -o "${tmp}" \
+        "${url}" || curl_rc=$?
+
+    if [[ ${curl_rc} -ne 0 ]] || [[ ! -s "${tmp}" ]]
+    then
+        rm -f "${tmp}"
+        return 1
+    fi
+
+    cat "${tmp}" || cat_rc=$?
+    rm -f "${tmp}"
+    return ${cat_rc}
+}
+
+# Strip HTML tags and a handful of entities from Wiktionary REST definitions
+strip_html () {
+    sed -E 's/<[^>]+>//g; s/&quot;/"/g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&#39;/'\''/g; s/&nbsp;/ /g'
+}
+
+# Print "<word>:" then one bullet per definition line
+emit_defs () {
+    local word="${1}"
+    local defs="${2}"
+    local line
+    local clean_line
+
+    echo "${word}:"
+    while IFS= read -r line
+    do
+        clean_line="${line}"
+        # Only strip wrapping quotes, not a definition that starts with a quote
+        if [[ "${clean_line}" == \"*\" ]]
+        then
+            clean_line="${clean_line#\"}"
+            clean_line="${clean_line%\"}"
+        fi
+        clean_line="$(printf '%s' "${clean_line}" | strip_html)"
+        clean_line="${clean_line#"${clean_line%%[![:space:]]*}"}"
+        clean_line="${clean_line%"${clean_line##*[![:space:]]}"}"
+        if [[ -z "${clean_line}" ]]
+        then
+            continue
+        fi
+        echo "- ${clean_line}"
+    done <<< "${defs}"
+    echo ""
+}
+
+# Look up a word: Wiktionary first (FOSS, fast), dictionaryapi.dev as fallback.
+# dictionaryapi.dev sits behind Cloudflare and is what made this script hang:
+# HTTP/2 streams that never complete, 0 bytes until --max-time.
 # Arguments:
 #   $1 - word to look up
 get_standard_def () {
     local word="${1}"
+    local encoded_word
     local response
-    local defs
+    local defs=""
 
-    # Make API request
-    if ! response=$(curl --silent --fail --max-time 10 "${DICT_API}/${word}" 2>/dev/null)
+    encoded_word=$(url_encode "${word}")
+
+    if response=$(fetch_json "${WIKT_API}/${encoded_word}")
     then
-        echo "Error: Failed to fetch definition for '${word}' (network error)" >&2
-        return 1
+        defs=$(echo "${response}" | parse_json '.en[].definitions[].definition') || defs=""
+        if [[ -n "${defs}" ]]
+        then
+            emit_defs "${word}" "${defs}"
+            return 0
+        fi
+        # Wiktionary 404 JSON: do not fall through to dictionaryapi.dev,
+        # that API currently stalls for a full --max-time on misses.
+        if echo "${response}" | grep -q '"status":404'
+        then
+            echo "Error: No definition found for '${word}'" >&2
+            return 1
+        fi
     fi
 
-    # Check for "word not found" response
-    if echo "${response}" | grep -q '"title":"No Definitions Found"'
+    # Wiktionary itself failed to respond; try the old Cloudflare API.
+    if response=$(fetch_json "${DICT_API}/${encoded_word}")
     then
-        echo "Error: No definition found for '${word}'" >&2
-        return 1
-    fi
-
-    # Check for empty response
-    if [[ -z "${response}" ]]
-    then
-        echo "Error: Empty response for '${word}'" >&2
-        return 1
-    fi
-
-    # Parse definitions from response
-    defs=$(echo "${response}" | parse_json '.[].meanings[].definitions[].definition')
-
-    # Check if we got any definitions
-    if [[ -z "${defs}" ]]
-    then
+        if echo "${response}" | grep -q '"title":"No Definitions Found"'
+        then
+            echo "Error: No definition found for '${word}'" >&2
+            return 1
+        fi
+        defs=$(echo "${response}" | parse_json '.[].meanings[].definitions[].definition') || defs=""
+        if [[ -n "${defs}" ]]
+        then
+            emit_defs "${word}" "${defs}"
+            return 0
+        fi
         echo "Error: Could not parse definitions for '${word}'" >&2
         return 1
     fi
 
-    # Output formatted definitions
-    echo "${word}:"
-    while IFS= read -r line
-    do
-        # Remove surrounding quotes if present
-        local clean_line="${line#\"}"
-        clean_line="${clean_line%\"}"
-        echo "- ${clean_line}"
-    done <<< "${defs}"
-    echo ""
+    echo "Error: Failed to fetch definition for '${word}' (network error)" >&2
+    return 1
 }
 
 # Get definition from Urban Dictionary API
@@ -179,11 +262,10 @@ get_urban_def () {
     local response
     local count
 
-    # URL encode the word (handle spaces and special chars)
-    encoded_word=$(printf '%s' "${word}" | sed 's/ /%20/g; s/!/%21/g; s/"/%22/g; s/#/%23/g; s/\$/%24/g; s/&/%26/g; s/'\''/%27/g; s/(/%28/g; s/)/%29/g; s/+/%2B/g')
+    encoded_word=$(url_encode "${word}")
 
-    # Make API request
-    if ! response=$(curl --silent --fail --max-time 10 "${URBAN_API}?term=${encoded_word}" 2>/dev/null)
+    # Make API request (HTTP/1.1 + temp file; see fetch_json)
+    if ! response=$(fetch_json "${URBAN_API}?term=${encoded_word}")
     then
         echo "Error: Failed to fetch Urban Dictionary definition for '${word}' (network error)" >&2
         return 1
@@ -232,7 +314,7 @@ get_urban_def () {
             echo "  Example: \"${example}\""
         fi
 
-        ((i++))
+        i=$((i + 1))
     done
     echo ""
 }
@@ -285,14 +367,23 @@ then
         exit 1
     fi
 
-    # Read words from stdin
+    # First line must arrive promptly. An inherited pipe that never
+    # closes (Emacs start-process, agent runners) would hang forever.
+    if ! IFS= read -r -t 5 entry
+    then
+        echo "Error: No words provided" >&2
+        show_help
+        exit 1
+    fi
+
+    read -r -a _line_words <<< "${entry}"
+    words+=("${_line_words[@]}")
+
+    # Remaining lines: producer already sent data, so EOF will come
     while IFS= read -r entry
     do
-        # Handle multiple words on one line
-        for word in ${entry}
-        do
-            words+=("${word}")
-        done
+        read -r -a _line_words <<< "${entry}"
+        words+=("${_line_words[@]}")
     done
 fi
 
