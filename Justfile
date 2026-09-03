@@ -332,6 +332,7 @@ install-skills:
 
 	npx skills add https://github.com/Leonxlnx/unlazy
 	npx skills add https://github.com/Leonxlnx/taste-skill
+    npx skills add https://github.com/petergyang/no-ai-slop
 
 
 # Element (im.riot.Riot) ships no `org.freedesktop.secrets=talk` in its
