@@ -112,6 +112,9 @@ _have emacs && _set_editor "emacs -nw"
 # no controlling terminal) and breaks pipe editors like vipe(1).
 # Frame type is picked at invocation: inside Emacs (vterm) -> existing
 # buffer; SSH or headless -> -nw; local X/Wayland -> PGTK (pts override).
+# ETUI=1 forces a TTY frame over that graphical default (not over --gui
+# / --here, and not inside Emacs). Uncomment to make `man` / `e` TUI-only.
+# export ETUI=1
 _have emacsclient && _have emacsclient_tty && _set_editor "emacsclient_tty"
 
 # source the files if we have them
@@ -135,7 +138,19 @@ shopt -s extglob
 # Uncomment the following line if you don't like systemctl's auto-paging feature:
 export SYSTEMD_PAGER=""
 export REGISTRY_AUTH_FILE="${HOME}/.config/containers/auth.json"
-_have nvim && export MANPAGER="nvim +Man!"
+# man pages: Emacs Man-mode via emacsclient_tty (TTY / PGTK / in-Emacs),
+# same dispatch as $EDITOR.  nvim +Man! stays on `less` and as fallback.
+if _have emacsclient_tty && _have eman
+then
+	export MANPAGER="eman --pager"
+	if [[ $- == *i* ]]
+	then
+		man() { eman "$@"; }
+	fi
+elif _have nvim
+then
+	export MANPAGER="nvim +Man!"
+fi
 # history config
 export HISTCONTROL=ignoreboth
 export HISTSIZE=5000

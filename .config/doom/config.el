@@ -791,6 +791,7 @@ compositor seat."
 ;;;; =========================================================================
 
 ;;; Load custom elisp modules (ported from nvim lua)
+(load! "man-pager")           ;; emacsclient man pager (eman / $MANPAGER)
 (load! "shell-runner")        ;; Shell command runner (from lua/custom/shell.lua)
 (load! "transclusion")        ;; Transclusion system (from core/mappings.lua)
 (load! "qbittorrent-webui")   ;; qBittorrent WebUI API client
