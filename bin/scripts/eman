@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# eman - view man pages in Emacs Man-mode via emacsclient_tty
+#   Replaces MANPAGER="nvim +Man!": same TTY / PGTK / in-Emacs dispatch as
+#   $EDITOR.  q in a dedicated client frame deletes the frame so the
+#   shell gets the prompt back.
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+
+REAL_MAN="/usr/bin/man"
+if [[ ! -x "${REAL_MAN}" ]]
+then
+    REAL_MAN="$(command -v man || true)"
+fi
+
+usage () {
+    cat << EOF
+${SCRIPT_NAME} - view man pages in Emacs via emacsclient_tty
+
+USAGE:
+    ${SCRIPT_NAME} [OPTIONS] [SECTION] PAGE
+    ${SCRIPT_NAME} --pager          (as \$MANPAGER; uses \$MAN_PN)
+    man PAGE                        (interactive bash function)
+
+OPTIONS:
+    -h, --help      Show this help message
+    --license       Show license information
+    --pager         MANPAGER mode: consume stdin, open \$MAN_PN
+    --here          Force the running Emacs (no new frame)
+    --tty           Force a terminal frame
+    --gui           Force a PGTK GUI frame
+
+EXAMPLES:
+    ${SCRIPT_NAME} ls
+    ${SCRIPT_NAME} 3 printf
+    ${SCRIPT_NAME} --tty git-log
+    MANPAGER="${SCRIPT_NAME} --pager" man ls
+
+DESCRIPTION:
+    Opens the page with Emacs \`man' (Man-mode: sections, xref buttons,
+    reuse of already-formatted buffers) through emacsclient_tty, so
+    the frame type matches \$EDITOR:
+
+        - inside Emacs (vterm, eat, ...) -> buffer in that instance
+        - ETUI=1                         -> terminal frame (-nw)
+        - SSH or no display              -> terminal frame (-nw)
+        - local X/Wayland                -> PGTK GUI frame
+
+    Metadata queries (--version, -w, ...) and piped stdout fall through
+    to ${REAL_MAN}.  If emacsclient cannot connect, the real man is used
+    as a fallback.  \`command man --help' still prints man(1) help.
+
+EOF
+}
+
+show_license () {
+    cat << 'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026 Zach Podbielniak — AGPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+EOF
+}
+
+lisp_quote () {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "${s}"
+}
+
+# dedicated_flag: t when emacsclient_tty will create a new frame that q
+# should delete.  nil when we open a buffer in the already-running Emacs.
+dedicated_flag () {
+    local dedicated=t
+    local f
+    if [[ -n "${INSIDE_EMACS:-}" && ${#client_flags[@]} -eq 0 ]]
+    then
+        dedicated=nil
+    fi
+    for f in "${client_flags[@]+"${client_flags[@]}"}"
+    do
+        case "${f}" in
+            --here) dedicated=nil ;;
+            --tty|--gui) dedicated=t ;;
+        esac
+    done
+    printf '%s' "${dedicated}"
+}
+
+run_real_man () {
+    # Don't recurse through this wrapper if we are also $MANPAGER.
+    if [[ ! -x "${REAL_MAN}" ]]
+    then
+        echo "${SCRIPT_NAME}: real man binary not found" >&2
+        exit 127
+    fi
+    MANPAGER="${MANPAGER_FALLBACK:-cat}" exec "${REAL_MAN}" "$@"
+}
+
+open_in_emacs () {
+    local page="$1"
+    local dedicated="$2"
+    local form
+
+    if ! command -v emacsclient_tty >/dev/null 2>&1
+    then
+        return 1
+    fi
+
+    # load! puts man-pager.el in doom-user-dir, which is not on `load-path`,
+    # so a daemon that hasn't reloaded config.el needs an explicit load.
+    form="(progn (unless (fboundp 'zach/man-pager) (load (expand-file-name \"man-pager\" doom-user-dir) nil 'nomessage)) (zach/man-pager $(lisp_quote "${page}") ${dedicated}))"
+    emacsclient_tty "${client_flags[@]+"${client_flags[@]}"}" -u --eval "${form}"
+}
+
+pager_mode=false
+client_flags=()
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --license)
+            show_license
+            exit 0
+            ;;
+        --pager)
+            pager_mode=true
+            shift
+            ;;
+        --here|--tty|--gui)
+            client_flags+=("$1")
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# MANPAGER: man already formatted the page onto our stdin.  Drain it so
+# man does not block on a full pipe, then reopen the page through Emacs
+# using the name man exported as MAN_PN (e.g. "ls(1)").
+if [[ "${pager_mode}" == true ]]
+then
+    cat >/dev/null || true
+    if [[ -z "${MAN_PN:-}" ]]
+    then
+        echo "${SCRIPT_NAME}: --pager requires MAN_PN (set by man(1))" >&2
+        exit 1
+    fi
+    if open_in_emacs "${MAN_PN}" "$(dedicated_flag)"
+    then
+        exit 0
+    fi
+    echo "${SCRIPT_NAME}: emacsclient failed in --pager mode" >&2
+    exit 1
+fi
+
+if [[ $# -eq 0 ]]
+then
+    run_real_man
+fi
+
+# Queries that print metadata rather than a page belong to real man.
+case "$1" in
+    --version|-V|-w|--where|--path|-W|--location|--usage)
+        run_real_man "$@"
+        ;;
+esac
+
+# Piped stdout: `man ls | grep foo` must keep working.  Explicit
+# --here/--tty/--gui still goes to Emacs (tests, script(1), etc.).
+if [[ ! -t 1 && ${#client_flags[@]} -eq 0 ]]
+then
+    run_real_man "$@"
+fi
+
+if open_in_emacs "$*" "$(dedicated_flag)"
+then
+    exit 0
+fi
+
+echo "${SCRIPT_NAME}: emacsclient failed, falling back to man" >&2
+run_real_man "$@"
