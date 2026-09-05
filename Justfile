@@ -322,10 +322,17 @@ install-skills:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    npx skills add https://github.com/Leonxlnx/unlazy -g
-    npx skills add https://github.com/Leonxlnx/taste-skill -g
-    npx skills add https://github.com/petergyang/no-ai-slop -g
-    npx skills add https://github.com/mvanhorn/last30days-skill -g
+    SKILLS=(
+        https://github.com/Leonxlnx/unlazy
+        https://github.com/Leonxlnx/taste-skill
+        https://github.com/petergyang/no-ai-slop
+        https://github.com/mvanhorn/last30days-skill
+    )
+
+    for skill in "${SKILLS[@]}"
+    do
+        npx skills add "${skill}" -g
+    done
 
 # Element (im.riot.Riot) ships no `org.freedesktop.secrets=talk` in its
 # session bus policy, so Electron's safeStorage can't reach gnome-keyring
