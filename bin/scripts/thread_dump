@@ -176,36 +176,20 @@ require_command () {
 	fi
 }
 
-# Copy this script to a remote host, execute it with forwarded args, then clean up.
-# Uses an EXIT trap on the remote shell to guarantee cleanup even on signal/failure.
+# Stream the script to a remote Bash without creating a shared temporary file.
 run_remote () {
-	local ssh_target="${1}"
-	shift
-	local remote_args=("$@")
-
-	local local_script
-	local_script=$(readlink -f "${BASH_SOURCE[0]}")
-	local remote_tmp
-	remote_tmp="/tmp/thread_dump_${$}_$(date +%s)"
-
-	printf 'Copying script to %s:%s ...\n' "${ssh_target}" "${remote_tmp}" >&2
-	scp -q "${local_script}" "${ssh_target}:${remote_tmp}" \
-		|| die "Failed to copy script to ${ssh_target}"
-
-	# Build a properly quoted argument string for the remote shell
-	local quoted_args=""
-	local arg
-	for arg in "${remote_args[@]}"; do
-		quoted_args+="$(printf '%q ' "${arg}")"
-	done
-
-	# Run remotely with an EXIT trap to guarantee cleanup of the tmp file
-	local rc=0
-	ssh "${ssh_target}" \
-		"trap 'rm -f \"${remote_tmp}\"' EXIT; chmod +x '${remote_tmp}' && '${remote_tmp}' ${quoted_args}" \
-		|| rc=$?
-
-	return "${rc}"
+    local ssh_target="${1}"
+    shift
+    local local_script
+    local_script=$(readlink -f "${BASH_SOURCE[0]}")
+    local remote_cmd="bash -s --"
+    local arg escaped
+    for arg in "$@"; do
+        # POSIX shell quoting also works when the remote login shell is not Bash.
+        escaped=${arg//\'/\'\\\'\'}
+        remote_cmd+=" '$escaped'"
+    done
+    ssh -- "$ssh_target" "$remote_cmd" < "$local_script"
 }
 
 
@@ -585,7 +569,14 @@ print_smaps_rollup () {
 # Only works with glibc-linked processes (not musl, Go, static builds, etc.).
 print_malloc_info () {
 	local target_pid="${1}"
-	local tmp_file="/tmp/thread_dump_malloc_info_${target_pid}_$$"
+    local tmp_file
+    if [[ "${opt_sudo}" == true ]]; then
+        local target_uid
+        target_uid=$(stat -c %u "/proc/${target_pid}") || return 1
+        tmp_file=$(sudo -u "#${target_uid}" mktemp /tmp/thread_dump_malloc_info.XXXXXXXXXX) || return 1
+    else
+        tmp_file=$(mktemp /tmp/thread_dump_malloc_info.XXXXXXXXXX) || return 1
+    fi
 
 	printf '=== Glibc Heap Stats (malloc_info) ===\n'
 
@@ -602,7 +593,11 @@ print_malloc_info () {
 
 	if [[ "${rc}" -ne 0 ]]; then
 		warn "malloc_info failed (exit ${rc}) -- process may not use glibc"
-		rm -f "${tmp_file}" 2>/dev/null || true
+        if [[ "${opt_sudo}" == true ]]; then
+            sudo rm -f -- "$tmp_file" 2>/dev/null || true
+        else
+            rm -f -- "$tmp_file" 2>/dev/null || true
+        fi
 		printf '======================================\n\n'
 		return 0
 	fi

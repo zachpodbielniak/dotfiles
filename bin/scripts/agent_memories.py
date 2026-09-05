@@ -26,8 +26,7 @@ ctr_id: str = os.environ.get("CONTAINER_ID", "")
 no_dbox_check: bool = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
 if not no_dbox_check and ctr_id != "dev":
     cmd: list[str] = ["distrobox", "enter", "dev", "--", *sys.argv]
-    subprocess.run(cmd)
-    sys.exit(0)
+    sys.exit(subprocess.run(cmd).returncode)
 
 # Standard library imports
 import argparse

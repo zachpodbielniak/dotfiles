@@ -39,85 +39,83 @@ EXAMPLES:
 EOF
 }
 
+umask 077
 cache_dir="${HOME}/.cache/cache_cmd"
 clear_cache=false
 clear_all=false
-ttl=""
-command=""
-
 while [[ $# -gt 0 ]]; do
-	case "${1}" in
-		-h|--help) usage; exit 0 ;;
-		--license) echo "AGPLv3"; exit 0 ;;
-		--clear) clear_cache=true; shift ;;
-		--clear-all) clear_all=true; shift ;;
-		--cache-dir) cache_dir="${2}"; shift 2 ;;
-		*)
-			if [[ -z "$ttl" ]]; then
-				ttl="${1}"
-				shift
-			elif [[ -z "$command" ]]; then
-				command="${1}"
-				shift
-			else
-				command="$command ${1}"
-				shift
-			fi
-			;;
-	esac
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --license) echo "AGPLv3"; exit 0 ;;
+        --clear) clear_cache=true; shift ;;
+        --clear-all) clear_all=true; shift ;;
+        --cache-dir) cache_dir="${2:?cache directory required}"; shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
 done
 
-mkdir -p "$cache_dir"
+if [[ -z "$cache_dir" || -L "$cache_dir" ]]; then
+    echo "Error: cache directory must be a real, private directory" >&2
+    exit 1
+fi
+mkdir -p -- "$cache_dir"
+if [[ ! -O "$cache_dir" ]] || (( (8#$(stat -c %a -- "$cache_dir") & 077) != 0 )); then
+    echo "Error: cache directory must be owned by you with no group/other permissions" >&2
+    exit 1
+fi
 
 if [[ "$clear_all" == true ]]; then
-	rm -rf "$cache_dir"/*
-	exit 0
+    # Remove only cache entries, never arbitrary files or subdirectories.
+    for entry in "$cache_dir"/*; do
+        [[ "${entry##*/}" =~ ^[[:xdigit:]]{64}$ ]] || continue
+        [[ -f "$entry" || -L "$entry" ]] && rm -f -- "$entry"
+    done
+    exit 0
 fi
-
-if [[ -z "$ttl" ]] || [[ -z "$command" ]]; then
-	echo "Error: ttl and command required" >&2
-	exit 1
-fi
-
-# Generate cache key from command
-cache_key=$(echo "$command" | sha256sum | awk '{print $1}')
-cache_file="$cache_dir/$cache_key"
 
 if [[ "$clear_cache" == true ]]; then
-	rm -f "$cache_file"
-	exit 0
+    [[ $# -ge 1 ]] || { echo "Error: command required" >&2; exit 1; }
+else
+    [[ $# -ge 2 ]] || { echo "Error: ttl and command required" >&2; exit 1; }
+    ttl="$1"
+    shift
+    if [[ ! "$ttl" =~ ^([0-9]{1,9})([smhd]?)$ ]]; then
+        echo "Error: invalid TTL (use seconds or an s/m/h/d suffix)" >&2
+        exit 1
+    fi
+    ttl_seconds=$((10#${BASH_REMATCH[1]}))
+    case "${BASH_REMATCH[2]}" in
+        m) ttl_seconds=$((ttl_seconds * 60)) ;;
+        h) ttl_seconds=$((ttl_seconds * 3600)) ;;
+        d) ttl_seconds=$((ttl_seconds * 86400)) ;;
+    esac
+fi
+# This utility intentionally accepts a shell command string.
+command="$*"
+cache_key=$(printf '%s\0%s' "$PWD" "$command" | sha256sum | cut -d' ' -f1)
+cache_file="$cache_dir/$cache_key"
+if [[ "$clear_cache" == true ]]; then
+    rm -f -- "$cache_file"
+    exit 0
 fi
 
-# Parse TTL to seconds
-parse_ttl () {
-	local ttl="$1"
-	if [[ "$ttl" =~ ^([0-9]+)(s|m|h|d)$ ]]; then
-		local num="${BASH_REMATCH[1]}"
-		local unit="${BASH_REMATCH[2]}"
-		case "$unit" in
-			s) echo "$num" ;;
-			m) echo "$((num * 60))" ;;
-			h) echo "$((num * 3600))" ;;
-			d) echo "$((num * 86400))" ;;
-		esac
-	else
-		echo "$ttl"  # assume seconds if no unit
-	fi
-}
-
-ttl_seconds=$(parse_ttl "$ttl")
-
-# Check if cache exists and is fresh
-if [[ -f "$cache_file" ]]; then
-	file_time=$(stat -c %Y "$cache_file")
-	current_time=$(date +%s)
-	age=$((current_time - file_time))
-
-	if [[ $age -lt $ttl_seconds ]]; then
-		cat "$cache_file"
-		exit 0
-	fi
+if [[ -f "$cache_file" && ! -L "$cache_file" ]]; then
+    file_time=$(stat -c %Y -- "$cache_file")
+    age=$(($(date +%s) - file_time))
+    if (( age >= 0 && age < ttl_seconds )); then
+        cat -- "$cache_file"
+        exit 0
+    fi
 fi
 
-# Cache miss or expired - execute command and cache result
-eval "$command" | tee "$cache_file"
+# Publish only complete successful output. Concurrent readers see an old or new
+# entry, never a partial write; a symlink at the key is replaced, not followed.
+temp_file=$(mktemp "$cache_dir/.pending.XXXXXXXXXX")
+trap 'rm -f -- "$temp_file"' EXIT
+if bash -o pipefail -c "$command" | tee -- "$temp_file"; then
+    mv -fT -- "$temp_file" "$cache_file"
+else
+    status=$?
+    exit "$status"
+fi
