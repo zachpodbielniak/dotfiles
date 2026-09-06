@@ -644,9 +644,53 @@ No-op on TTY frames — terminal transparency is the emulator's job."
   (setq c-default-style '((c-mode . "gnu")
                            (other . "gnu")))
   ;; Disable cc-mode electric reindentation on {, }, ;, :, #
-  (setq c-electric-flag nil)
-  (add-hook 'c-mode-hook (lambda () (electric-indent-local-mode -1)))
-  (add-hook 'c++-mode-hook (lambda () (electric-indent-local-mode -1))))
+  (setq c-electric-flag nil))
+
+(defun zach/c-plain-newline (count)
+  "Insert COUNT literal newlines without invoking indentation commands."
+  (interactive "*p")
+  (insert (make-string count ?\n)))
+
+(defun zach/c-plain-tab (count)
+  "Insert COUNT literal tabs without calculating C indentation."
+  (interactive "*p")
+  (insert (make-string count ?\t)))
+
+(defun zach/c-disable-smartparens-h ()
+  "Disable Smartparens' independent electric editing in C/C++ buffers."
+  (when (and (derived-mode-p 'c-mode 'c++-mode 'c-ts-mode 'c++-ts-mode)
+             (bound-and-true-p smartparens-mode))
+    (smartparens-mode -1)))
+
+;; Also guard against delayed activation by global-smartparens-mode.
+(add-hook 'smartparens-mode-hook #'zach/c-disable-smartparens-h)
+
+(defun zach/c-manual-indentation-h ()
+  "Keep C/C++ indentation manual, including Enter in Evil insert state."
+  (electric-indent-local-mode -1)
+  (setq-local c-electric-flag nil
+              electric-indent-inhibit t
+              evil-auto-indent nil)
+  (zach/c-disable-smartparens-h)
+  ;; Bypass mode-specific newline commands as well as Evil's indenting RET.
+  (local-set-key (kbd "RET") #'zach/c-plain-newline)
+  (local-set-key (kbd "<return>") #'zach/c-plain-newline)
+  (local-set-key (kbd "TAB") #'zach/c-plain-tab)
+  (local-set-key (kbd "<tab>") #'zach/c-plain-tab)
+  (when (fboundp 'evil-local-set-key)
+    (evil-local-set-key 'insert (kbd "RET") #'zach/c-plain-newline)
+    (evil-local-set-key 'insert (kbd "<return>") #'zach/c-plain-newline)
+    (evil-local-set-key 'insert (kbd "TAB") #'zach/c-plain-tab)
+    (evil-local-set-key 'insert (kbd "<tab>") #'zach/c-plain-tab)))
+
+(dolist (hook '(c-mode-common-hook c-ts-mode-hook c++-ts-mode-hook))
+  (add-hook hook #'zach/c-manual-indentation-h))
+
+;; Reloading Doom does not rerun major-mode hooks in already-open buffers.
+(dolist (buffer (buffer-list))
+  (with-current-buffer buffer
+    (when (derived-mode-p 'c-mode 'c++-mode 'c-ts-mode 'c++-ts-mode)
+      (zach/c-manual-indentation-h))))
 
 ;;; Disable electric-indent globally — manual format only (SPC f m)
 (electric-indent-mode -1)
