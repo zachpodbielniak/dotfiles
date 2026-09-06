@@ -296,13 +296,20 @@ FLAVOR is one of mocha, macchiato, frappe, or latte."
 (setq-default indent-tabs-mode t
               tab-width 4
               c-basic-offset 4
+              c-ts-mode-indent-offset 4
               evil-shift-width 4)
-;; Doom's CC module sets c-basic-offset from tab-width after config loads,
-;; so re-apply in the hook to ensure 4-wide tabs in C/C++ buffers.
-(after! cc-mode
-  (setq-default c-basic-offset 4)
-  (add-hook 'c-mode-common-hook
-            (lambda () (setq tab-width 4 c-basic-offset 4 evil-shift-width 4))))
+;; Keep whitespace +guess from replacing the explicit indentation settings.
+(setq +whitespace-guess-inhibit t)
+;; Apply after mode setup for both classic and tree-sitter C/C++ buffers.
+(defun zach/c-indent-settings-h ()
+  "Use literal tabs and four-column indentation in C/C++ buffers."
+  (setq-local indent-tabs-mode t
+              tab-width 4
+              c-basic-offset 4
+              c-ts-mode-indent-offset 4
+              evil-shift-width 4))
+(dolist (hook '(c-mode-common-hook c-ts-mode-hook c++-ts-mode-hook))
+  (add-hook hook #'zach/c-indent-settings-h))
 
 ;;; Background handling (replaces transparent.nvim)
 ;;; GUI frames get a translucent background (alpha).  TTY frames instead
