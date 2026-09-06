@@ -647,9 +647,17 @@ No-op on TTY frames — terminal transparency is the emulator's job."
   (setq c-electric-flag nil))
 
 (defun zach/c-plain-newline (count)
-  "Insert COUNT literal newlines without invoking indentation commands."
+  "Insert COUNT newlines, copying indentation without reformatting code."
   (interactive "*p")
-  (insert (make-string count ?\n)))
+  ;; Copy literal whitespace rather than asking the C indenter to rewrite it.
+  (let ((indentation
+         (save-excursion
+           (beginning-of-line)
+           (let ((start (point)))
+             (skip-chars-forward "\t " (line-end-position))
+             (buffer-substring-no-properties start (point))))))
+    (dotimes (_ count)
+      (insert "\n" indentation))))
 
 (defun zach/c-plain-tab (count)
   "Insert COUNT literal tabs without calculating C indentation."
