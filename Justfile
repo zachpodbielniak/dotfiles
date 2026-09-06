@@ -46,6 +46,8 @@ stow quadlets="true": dep_dirs
         --ignore=.gitconfig \
         --ignore=deps \
         --ignore=.claude \
+        --ignore=.codex \
+        --ignore=AGENTS.md \
         "${IGNORE_FLAGS[@]}" \
         .
 
@@ -106,6 +108,8 @@ stow_alt quadlets="true": dep_dirs
         --ignore=.gitconfig \
         --ignore=deps \
         --ignore=.claude \
+        --ignore=.codex \
+        --ignore=AGENTS.md \
         "${IGNORE_FLAGS[@]}" \
         .
 
@@ -200,6 +204,7 @@ dep_dirs:
     mkdir -p $HOME/.claude/agents
     mkdir -p $HOME/.claude/agent-memory
     mkdir -p $HOME/.opencode/skills
+    mkdir -p $HOME/.config/opencode
 
     mkdir -p $HOME/.librewolf/native-messaging-hosts
 
