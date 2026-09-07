@@ -204,7 +204,7 @@
   ;; Open a bar dropdown from the keyboard, without going for the mouse.
   (when (fboundp 'cmacs-gowl-bar-open-panel)
     (map! :leader
-          (:prefix ("b p" . "bar panel")
+          (:prefix ("W" . "gowl bar panel")
            :desc "Open a bar panel" "p" #'cmacs-gowl-bar-open-panel
            :desc "Network"          "n" (cmd! (gowl-bar-panel "network"))
            :desc "Audio"            "a" (cmd! (gowl-bar-panel "audio"))
