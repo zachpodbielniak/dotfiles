@@ -105,45 +105,116 @@
         (assq-delete-all 'alpha-background default-frame-alist))
   (add-to-list 'default-frame-alist '(alpha-background . 85))
 
-  ;; Status bar — top: title + system widgets + clock
+  ;; Status bar.
+  ;;
+  ;; Widgets live in three regions.  `center-anchor' pins the clock to
+  ;; dead centre so it stays put as its neighbours come and go -- a
+  ;; centred *group* slides sideways every time the weather widget has
+  ;; something to say.  The right region reads outward: the first entry
+  ;; ends up furthest right.
+  ;;
+  ;; Every one of these is a plugin.  `M-x cmacs-gowl-bar-plugins'
+  ;; lists what is registered, including anything dropped into
+  ;; ~/.config/gowl/bar-plugins/ as a .so or a plain .c file.
   (gowl-bar-enable)
   (gowl-bar-configure
     '(("position" . "top")
-      ("widgets" . "cpu memory disk:/var battery clock")
-      ("cpu-color" . "#a6e3a1")
-      ("memory-color" . "#89b4fa")
-      ("disk-color" . "#f9e2af")
-      ("battery-color" . "#94e2d5")
-      ("clock-color" . "#cdd6f4")
-      ;; Colorize title text — split on delimiters, cycle Catppuccin palette
+      ("height" . "30")
+
+      ;; Panel heroes and widget icons are Nerd Font glyphs.  The
+      ;; default is a fallback chain; naming the font you actually have
+      ;; skips the guessing.
+      ("theme-icon-font" . "FiraCode Nerd Font Mono 11")
+
+      ("widgets-left"   . "tags title")
+      ("widgets-center" . "clock weather")
+      ("widgets-right"  . "audio network cpu memory disk:/var temp battery")
+      ("center-anchor"  . "clock")
+
+      ;; Colours name palette roles, so a flavour change carries the
+      ;; whole bar -- panels, toasts and third-party widgets included.
+      ("cpu-color"     . "green")
+      ("memory-color"  . "blue")
+      ("disk-color"    . "yellow")
+      ("temp-color"    . "peach")
+      ("battery-color" . "teal")
+      ("clock-color"   . "text")
+      ("weather-color" . "sky")
+      ("audio-color"   . "mauve")
+      ("network-color" . "sapphire")
+
+      ;; Per-widget settings use `<widget>.<key>'.
+      ("clock.format"     . "%a %b %d  %H:%M")
+      ("weather.param"    . "Muskegon")
+      ("weather.units"    . "u")
+      ("title.max-width"  . "520")
+      ("network.ping-host" . "1.1.1.1")
+
+      ;; Colorize the title — split on delimiters, cycle Catppuccin.
       ("title-delimiters" . "-._/: *")
       ("title-delimiter-color" . "#585b70")
       ("title-palette" . "#89b4fa #a6e3a1 #f9e2af #f5c2e7 #94e2d5 #cba6f7 #fab387 #89dceb")))
 
-  ;; Bottom bar — networking + container + pomodoro (left → right).
-  ;; Same Catppuccin style as the top bar; per-widget colors picked
-  ;; from the same palette so it visually feels like a sibling.
+  ;; Bottom bar — networking, containers, pomodoro, and the buttons
+  ;; that used to be keybindings I never remembered.
   ;;
-  ;; pomo widget uses the default 10 s cmd interval (no @N override).
-  ;; At @1 the bar ticker pulled the whole compositor refresh to 1 Hz
-  ;; and spawned a subprocess every second even at idle — the pomodoro
-  ;; display doesn't need sub-10s granularity.
+  ;; `toggle:caffeine' asks its state-command whether idle inhibition
+  ;; is running and flips it; `button:record' starts and stops a region
+  ;; recording from one glyph (left records, right stops).
   (gowl-bar-configure
     '(("position" . "bottom")
-      ("widgets" . "ip podman cmd:~/bin/scripts/pomo")
-      ("ip-color" . "#cba6f7")
-      ("podman-color" . "#fab387")
-      ("cmd-color" . "#f5c2e7")
-      ;; Colorize the title (if any) the same way the top bar does
-      ("title-delimiters" . "-._/: *")
-      ("title-delimiter-color" . "#585b70")
-      ("title-palette" . "#89b4fa #a6e3a1 #f9e2af #f5c2e7 #94e2d5 #cba6f7 #fab387 #89dceb")))
+      ("height" . "26")
 
-  (defun gowl-bar-restart ()
-    "Kill and re-enable the gowl bar (fixes sizing after resize)."
-    (interactive)
-    (gowl-bar-disable)
-    (gowl-bar-enable))
+      ("widgets-left"  . "user host git")
+      ("widgets-right" . "ip podman tailscale cmd:~/bin/scripts/pomo toggle:caffeine button:record")
+
+      ("ip-color"        . "mauve")
+      ("podman-color"    . "peach")
+      ("tailscale-color" . "teal")
+      ("cmd-color"       . "pink")
+      ("git-color"       . "lavender")
+
+      ;; The tag row belongs to the top bar; two copies is noise.
+      ("tags.visible" . "false")
+
+      ("toggle:caffeine.state-command" . "pgrep -x systemd-inhibit")
+      ("toggle:caffeine.command-on"
+       . "sh -c 'systemd-inhibit --what=idle:sleep --why=caffeine sleep infinity &'")
+      ("toggle:caffeine.command-off" . "pkill -f 'systemd-inhibit.*caffeine'")
+      ("toggle:caffeine.icon-on"  . "\u2615")
+      ("toggle:caffeine.icon-off" . "\u2615")
+      ("toggle:caffeine.color-on" . "yellow")
+
+      ("button:record.icon" . "\u23fa")
+      ("button:record.command"
+       . "sh -c 'wf-recorder -g \"$(slurp)\" -f ~/Videos/rec-$(date +%F-%H%M%S).mp4'")
+      ("button:record.command-right" . "pkill -INT wf-recorder")
+      ("button:record.tooltip" . "Record a region; right-click to stop")
+      ("button:record.color" . "red")))
+
+  ;; Notifications also appear as on-screen cards over the bar, above
+  ;; fullscreen windows.  The Org history buffer is still the record;
+  ;; this is the part you actually see.  A notification from
+  ;; NetworkManager, wireplumber, podman or tailscale becomes clickable
+  ;; and opens that widget's dropdown --- see
+  ;; `cmacs-gowl-bar-toast-panel-rules'.
+  (when (fboundp 'cmacs-gowl-bar-toast-mode)
+    (cmacs-gowl-bar-toast-mode 1))
+
+  ;; Open a bar dropdown from the keyboard, without going for the mouse.
+  (when (fboundp 'cmacs-gowl-bar-open-panel)
+    (map! :leader
+          (:prefix ("b p" . "bar panel")
+           :desc "Open a bar panel" "p" #'cmacs-gowl-bar-open-panel
+           :desc "Network"          "n" (cmd! (gowl-bar-panel "network"))
+           :desc "Audio"            "a" (cmd! (gowl-bar-panel "audio"))
+           :desc "Clock"            "c" (cmd! (gowl-bar-panel "clock"))
+           :desc "System"           "s" (cmd! (gowl-bar-panel "cpu"))
+           :desc "Power"            "o" (cmd! (gowl-bar-panel "battery"))
+           :desc "Containers"       "d" (cmd! (gowl-bar-panel "podman"))
+           :desc "Tailscale"        "t" (cmd! (gowl-bar-panel "tailscale"))
+           :desc "List plugins"     "l" #'cmacs-gowl-bar-plugins
+           :desc "Reload a plugin"  "r" #'cmacs-gowl-bar-plugin-reload)))
 
   ;; Bar title sync: push the current buffer name to the top bar
   ;; whenever the visible buffer changes.  Previously polled at 5 Hz
