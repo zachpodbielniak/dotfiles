@@ -20,11 +20,18 @@ stow quadlets="true": dep_dirs
             # stow anchors --ignore regexes to the ENTIRE basename, so a bare
             # "lt-zach" never matches postgres-lt-zach.container and the file
             # gets stowed anyway. The .* wrappers are what make this work.
-            IGNORE_FLAGS+=("--ignore=.*${h}.*")
+            #
+            # The (?!.*\.mount$) lookahead exempts sshfs .mount units. Those are
+            # named after the REMOTE host they mount, not the host they belong
+            # on, so a filename match means the opposite of host-specific --
+            # var-home-zach-data-mnt-ltzach.mount has to land on mob-zach and
+            # otg-zach, precisely the hosts the ignore would skip it on. Mount
+            # units gate their host with ConditionHost= instead.
+            IGNORE_FLAGS+=("--ignore=(?!.*\\.mount$).*${h}.*")
             # some filenames drop the hyphen (var-home-zach-data-mnt-srvzach.mount)
             hn="${h//-/}"
             if [[ "$hn" != "$h" ]]; then
-                IGNORE_FLAGS+=("--ignore=.*${hn}.*")
+                IGNORE_FLAGS+=("--ignore=(?!.*\\.mount$).*${hn}.*")
             fi
         fi
     done
@@ -82,11 +89,18 @@ stow_alt quadlets="true": dep_dirs
             # stow anchors --ignore regexes to the ENTIRE basename, so a bare
             # "lt-zach" never matches postgres-lt-zach.container and the file
             # gets stowed anyway. The .* wrappers are what make this work.
-            IGNORE_FLAGS+=("--ignore=.*${h}.*")
+            #
+            # The (?!.*\.mount$) lookahead exempts sshfs .mount units. Those are
+            # named after the REMOTE host they mount, not the host they belong
+            # on, so a filename match means the opposite of host-specific --
+            # var-home-zach-data-mnt-ltzach.mount has to land on mob-zach and
+            # otg-zach, precisely the hosts the ignore would skip it on. Mount
+            # units gate their host with ConditionHost= instead.
+            IGNORE_FLAGS+=("--ignore=(?!.*\\.mount$).*${h}.*")
             # some filenames drop the hyphen (var-home-zach-data-mnt-srvzach.mount)
             hn="${h//-/}"
             if [[ "$hn" != "$h" ]]; then
-                IGNORE_FLAGS+=("--ignore=.*${hn}.*")
+                IGNORE_FLAGS+=("--ignore=(?!.*\\.mount$).*${hn}.*")
             fi
         fi
     done
@@ -152,11 +166,18 @@ dry quadlets="true": dep_dirs
             # stow anchors --ignore regexes to the ENTIRE basename, so a bare
             # "lt-zach" never matches postgres-lt-zach.container and the file
             # gets stowed anyway. The .* wrappers are what make this work.
-            IGNORE_FLAGS+=("--ignore=.*${h}.*")
+            #
+            # The (?!.*\.mount$) lookahead exempts sshfs .mount units. Those are
+            # named after the REMOTE host they mount, not the host they belong
+            # on, so a filename match means the opposite of host-specific --
+            # var-home-zach-data-mnt-ltzach.mount has to land on mob-zach and
+            # otg-zach, precisely the hosts the ignore would skip it on. Mount
+            # units gate their host with ConditionHost= instead.
+            IGNORE_FLAGS+=("--ignore=(?!.*\\.mount$).*${h}.*")
             # some filenames drop the hyphen (var-home-zach-data-mnt-srvzach.mount)
             hn="${h//-/}"
             if [[ "$hn" != "$h" ]]; then
-                IGNORE_FLAGS+=("--ignore=.*${hn}.*")
+                IGNORE_FLAGS+=("--ignore=(?!.*\\.mount$).*${hn}.*")
             fi
         fi
     done
@@ -433,6 +454,11 @@ build-ollama-vulkan:
 # var-home-zach-data-mnt-srvzach.mount is deliberately omitted (it mounts
 # srv-zach's home; enable it by hand if a given host actually wants it).
 #
+# var-home-zach-data-mnt-ltzach.mount IS listed: unlike srvzach it carries its
+# own ConditionHost=mob-zach/otg-zach, so enabling it everywhere is a no-op on
+# hosts that shouldn't mount lt-zach's home (conditions are evaluated at start,
+# not at enable, so those hosts just report active=inactive).
+#
 
 # enable the user units that need an explicit systemctl enable (start=true to also start)
 enable-units start="false":
@@ -443,6 +469,7 @@ enable-units start="false":
         var-home-zach-data-mnt-nas-apool.mount
         var-home-zach-data-mnt-nas-dpool.mount
         var-home-zach-data-mnt-nas-ypool.mount
+        var-home-zach-data-mnt-ltzach.mount
         nas-sleep-guard.service
     )
 
