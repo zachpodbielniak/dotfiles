@@ -75,7 +75,8 @@ _path_prepend \
     "${HOME}/bin/nim/bin" \
     "${HOME}/bin/scripts" \
     "${HOME}/bin/export" \
-    "${HOME}/.grok/bin"
+    "${HOME}/.grok/bin" \
+	"${HOME}/.opencode/bin"
 
 _path_append \
     "/usr/local/bin" \
@@ -342,3 +343,7 @@ then
 	source "${HOME}/.grok/completions/bash/grok.bash"
 fi
 # <<< grok installer <<<
+
+# opencode
+# export PATH=/home/zach/.opencode/bin:$PATH
+# added to correct path expansion above.
