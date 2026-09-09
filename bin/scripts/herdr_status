@@ -1,0 +1,222 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Emits a single status segment for herdr's tab bar (ui.tab_bar_right).
+# Every segment is spawned by the herdr server on an interval, so each one
+# must be fast, must never block, and must print exactly one short line.
+# A segment with nothing to say prints nothing and disappears from the bar.
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+
+usage () {
+    cat <<'EOF'
+herdr_status - emit one status segment for the herdr tab bar
+
+Usage:
+    herdr_status <segment>
+
+Segments:
+    agents      Live agent rollup by state, blocked first.
+                Silent when no agents are running.
+    ollama      Model currently resident in the ollama container.
+                Silent when nothing is loaded.
+    services    Backing quadlets that are NOT running.
+                Silent when everything is healthy.
+    bootc       OS image state: a staged deployment waiting on a reboot,
+                and whether the booted deployment has a transient /usr
+                overlay. Silent when running the latest image, locked.
+
+Options:
+    -h, --help      Show this help and exit
+    --license       Show license information and exit
+    --version       Show version and exit
+
+Examples:
+    herdr_status agents
+        => "1 needs you  2 working"
+
+    herdr_status ollama
+        => "qwen3:32b"
+
+    herdr_status services
+        => "down: postgres" (prints nothing when all are up)
+
+    herdr_status bootc
+        => "44.20260908.0  unlocked"
+
+Wired into ~/.config/herdr/config.toml as:
+
+    [[ui.tab_bar_right]]
+    type = "command"
+    command = "herdr_status agents"
+    interval_seconds = 3
+EOF
+}
+
+license () {
+    cat <<'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version. See <https://www.gnu.org/licenses/>.
+EOF
+}
+
+# Roll up every live agent by lifecycle state. herdr reports state on the
+# `agent_status` field; the states are working, idle, blocked, done, unknown.
+# Blocked is printed first and always, because it is the only state that means
+# a human has to do something right now.
+segment_agents () {
+    local statuses=""
+    local blocked working idle done_
+
+    # A herdr server that is down or slow must not stall the tab bar, so a
+    # failed query degrades to an empty segment instead of an error.
+    statuses="$(herdr agent list 2>/dev/null \
+        | yq -p json -r '.result.agents[].agent_status' 2>/dev/null \
+        || true)"
+
+    [[ -z "${statuses}" ]] && return 0
+
+    blocked="$(grep -cx 'blocked' <<< "${statuses}" || true)"
+    working="$(grep -cx 'working' <<< "${statuses}" || true)"
+    idle="$(grep -cx 'idle' <<< "${statuses}" || true)"
+    done_="$(grep -cx 'done' <<< "${statuses}" || true)"
+
+    local out=()
+    [[ "${blocked}" -gt 0 ]] && out+=("󰀦 ${blocked}")
+    [[ "${working}" -gt 0 ]] && out+=("󰑮 ${working}")
+    [[ "${done_}"   -gt 0 ]] && out+=("󰄬 ${done_}")
+    [[ "${idle}"    -gt 0 ]] && out+=("󰒲 ${idle}")
+
+    [[ "${#out[@]}" -eq 0 ]] && return 0
+    printf '%s\n' "${out[*]}"
+}
+
+# Report which model ollama currently holds in memory. This is the expensive
+# resource on this box, so knowing a 32B model is still resident is worth a
+# permanent slot in the bar. `ollama ps` prints a header plus one row per
+# loaded model; no rows means nothing is loaded.
+segment_ollama () {
+    local models=""
+
+    models="$(ollama ps 2>/dev/null | awk 'NR > 1 && NF { print $1 }' || true)"
+
+    [[ -z "${models}" ]] && return 0
+    printf '󰧑 %s\n' "$(paste -sd' ' <<< "${models}")"
+}
+
+# Surface only the backing containers that are down. A healthy system prints
+# nothing, so this segment is pure signal: if you can see it, something broke.
+# Unit names are host-qualified quadlets, so the current host is resolved at
+# call time rather than hardcoded.
+segment_services () {
+    local host=""
+    local down=()
+    local unit label
+
+    host="$(hostname -s)"
+
+    # label:unit pairs; the label is what shows in the bar.
+    local -a checks=(
+        "postgres:postgres-${host}.service"
+        "ollama:ollama-${host}.service"
+        "redis:redis.service"
+    )
+
+    for entry in "${checks[@]}"
+    do
+        label="${entry%%:*}"
+        unit="${entry#*:}"
+
+        # A unit that is not installed on this host is not a failure.
+        systemctl --user cat "${unit}" &>/dev/null || continue
+        systemctl --user is-active --quiet "${unit}" || down+=("${label}")
+    done
+
+    [[ "${#down[@]}" -eq 0 ]] && return 0
+    printf '󰀪 %s\n' "${down[*]}"
+}
+
+# OS image state for this bootc/ostree host. Two independent facts, either of
+# which is worth knowing before you start long-running work:
+#
+#   staged   - a newer deployment is already written and waiting on a reboot.
+#   unlocked - the booted deployment has a transient writable /usr (from
+#              `bootc usr-overlay` or `rpm-ostree usroverlay`). That overlay
+#              does NOT survive a reboot, so anything installed into /usr
+#              that way disappears the moment the staged image is booted.
+#              The two together are the dangerous pair, which is why this
+#              segment shows both.
+#
+# Reads rpm-ostree rather than bootc because `bootc status` requires root and
+# a status bar must never need a privilege prompt. Same deployment data.
+segment_bootc () {
+    local json="" staged="" unlocked=""
+    local out=()
+
+    json="$(rpm-ostree status --json 2>/dev/null || true)"
+    [[ -z "${json}" ]] && return 0
+
+    staged="$(yq -p json -r \
+        '.deployments[] | select(.staged == true) | .version' \
+        <<< "${json}" 2>/dev/null || true)"
+
+    unlocked="$(yq -p json -r \
+        '.deployments[] | select(.booted == true) | .unlocked' \
+        <<< "${json}" 2>/dev/null || true)"
+
+    [[ -n "${staged}" ]] && out+=("󰚰 ${staged}")
+
+    # "none" is the normal locked state; anything else is an active overlay.
+    [[ -n "${unlocked}" && "${unlocked}" != "none" ]] && out+=("󰌾 ${unlocked}")
+
+    [[ "${#out[@]}" -eq 0 ]] && return 0
+    printf '%b\n' "${out[*]}"
+}
+
+main () {
+    if [[ $# -ne 1 ]]
+    then
+        echo 'herdr_status requires exactly 1 positional argument' >&2
+        echo 'herdr_status <agents|ollama|services|bootc>' >&2
+        exit 1
+    fi
+
+    case "${1}" in
+        agents)             segment_agents ;;
+        ollama)             segment_ollama ;;
+        services)           segment_services ;;
+        bootc)              segment_bootc ;;
+        -h|--help)          usage ;;
+        --license)          license ;;
+        --version)          printf 'herdr_status %s\n' "${VERSION}" ;;
+        *)
+            printf 'unknown segment: %s\n' "${1}" >&2
+            echo 'herdr_status <agents|ollama|services|bootc>' >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
