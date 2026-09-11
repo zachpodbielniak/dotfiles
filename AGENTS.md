@@ -1,5 +1,5 @@
-# CLAUDE.md
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# AGENTS.md
+This file provides guidance to coding agents working in this repository.
 
 ## Things to NEVER do 
 - run `local_postgres drop` . never do this, instead prompt me to run `psql`. ALWAYS ask for permission to run psql commands.

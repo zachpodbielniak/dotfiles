@@ -59,7 +59,7 @@
 ;;      results are the common case here (most nodes are outbound leaves),
 ;;      so `org-roam-dired--visit' refuses before touching the buffer.
 ;;
-;;   3. `evil-define-key*' -- the pattern documented in CLAUDE.md -- does
+;;   3. `evil-define-key*' -- the pattern documented in AGENTS.md -- does
 ;;      NOT work for a minor mode.  See the keymap section below.
 ;;
 ;;   4. `dired-omit-expunge' runs on the *global* `dired-after-readin-hook',
@@ -234,7 +234,7 @@ so it must be set before `revert-buffer' runs.")
     map)
   "Keymap for `org-roam-dired-mode'.")
 
-;; CLAUDE.md documents `evil-define-key*' as the fix for evil shadowing a
+;; AGENTS.md documents `evil-define-key*' as the fix for evil shadowing a
 ;; mode map.  That advice is for DERIVED MAJOR MODES and does not carry
 ;; over here.  `evil-define-key*' installs an *auxiliary* keymap on the
 ;; map you hand it, and an auxiliary map only fires if its host map is
@@ -286,7 +286,7 @@ so it must be set before `revert-buffer' runs.")
     ;; `evil-define-minor-mode-key' entries are materialised into the
     ;; buffer-local `evil-mode-map-alist' by `evil-normalize-keymaps'.
     ;; Forcing a normalise here means a `SPC h r r' reload takes effect
-    ;; without having to kill the buffer first (CLAUDE.md footgun #4).
+    ;; without having to kill the buffer first (AGENTS.md footgun #4).
     (when (fboundp 'evil-normalize-keymaps)
       (evil-normalize-keymaps))))
 

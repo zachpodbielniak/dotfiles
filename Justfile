@@ -44,7 +44,6 @@ stow quadlets="true": dep_dirs
     stow \
         --ignore=LICENSE \
         --ignore=Justfile \
-        --ignore=CLAUDE.md \
         --ignore=tests \
         --ignore=Containerfile \
         --ignore=requirements.txt \
@@ -113,7 +112,6 @@ stow_alt quadlets="true": dep_dirs
     stow \
         --ignore=LICENSE \
         --ignore=Justfile \
-        --ignore=CLAUDE.md \
         --ignore=tests \
         --ignore=Containerfile \
         --ignore=requirements.txt \
