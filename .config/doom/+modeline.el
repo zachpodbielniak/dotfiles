@@ -75,19 +75,36 @@
   (defvar zach-modeline--days-timer nil
     "Timer for updating days-since cache.")
 
+  (defun zach-modeline--local-cmd (program &rest args)
+    "Run PROGRAM locally with ARGS; return trimmed stdout, or \"\" on failure.
+
+Stderr is discarded so a dying helper cannot paint a stack trace into
+the modeline.  `pomo' once dumped a 900-char YAML.pm @INC error onto
+the bar when Homebrew perl won over Fedora perl.
+
+Bind `default-directory' to a guaranteed-local path.  Otherwise, when
+the current buffer is on a remote (TRAMP) host, `call-process' routes
+the command over ssh and `tramp-wait-for-output' blocks the main loop.
+`temporary-file-directory' is always local, unlike
+`(expand-file-name \"~/\")', which expands to the *remote* home under
+a remote `default-directory'."
+    (let ((default-directory temporary-file-directory)
+          (buf (generate-new-buffer " *zach-modeline*")))
+      (unwind-protect
+          (if (and (executable-find program)
+                   (eq 0 (apply #'call-process program nil (list buf nil) nil args)))
+              (let ((out (string-trim (with-current-buffer buf (buffer-string)))))
+                (if (or (string-empty-p out) (> (length out) 64))
+                    ""
+                  out))
+            "")
+        (kill-buffer buf))))
+
   (defun zach-modeline--update-days ()
     "Update the days-since cache by calling the days_since script."
-    ;; Force the local `days_since' script to run locally: bind
-    ;; `default-directory' to a guaranteed-local path.  Otherwise, when the
-    ;; current buffer is on a remote (TRAMP) host, `shell-command-to-string'
-    ;; -> `process-file' routes the command over ssh, and `tramp-wait-for-output'
-    ;; blocks the main loop -> Emacs hangs.  `temporary-file-directory' (the
-    ;; variable) is always local, unlike `(expand-file-name "~/")', which
-    ;; expands to the *remote* home under a remote `default-directory'.
-    (let* ((default-directory temporary-file-directory)
-           (carnivore (string-trim (shell-command-to-string "days_since 2024-11-24")))
-           (soda      (string-trim (shell-command-to-string "days_since 2025-07-14")))
-           (coffee    (string-trim (shell-command-to-string "days_since 2025-09-20"))))
+    (let ((carnivore (zach-modeline--local-cmd "days_since" "2024-11-24"))
+          (soda      (zach-modeline--local-cmd "days_since" "2025-07-14"))
+          (coffee    (zach-modeline--local-cmd "days_since" "2025-09-20")))
       (setq zach-modeline--days-cache
             (concat
              (propertize (format " 🥩:%s" carnivore) 'face '(:foreground "#f38ba8"))
@@ -116,11 +133,7 @@
 
   (defun zach-modeline--update-pomo ()
     "Update the pomodoro cache by calling the pomo script."
-    ;; Run the local `pomo' script locally (see `zach-modeline--update-days'
-    ;; above): a remote `default-directory' would tunnel it over TRAMP/ssh and
-    ;; wedge the main loop in `tramp-wait-for-output'.
-    (let* ((default-directory temporary-file-directory)
-           (pomo (string-trim (shell-command-to-string "pomo"))))
+    (let ((pomo (zach-modeline--local-cmd "pomo")))
       (setq zach-modeline--pomo-cache
             (if (string-empty-p pomo) ""
               (propertize (format " %s" pomo) 'face '(:foreground "#fab387"))))))

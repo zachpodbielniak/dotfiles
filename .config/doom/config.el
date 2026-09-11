@@ -5,11 +5,18 @@
 
 ;;; exec-path: ensure Emacs can find tools regardless of how it was launched.
 ;;; When started from a desktop file or systemd, PATH is minimal and misses
-;;; linuxbrew, ~/bin/scripts, cargo, etc.  Add them here once rather than
-;;; patching each package individually.
-(dolist (dir '("/home/linuxbrew/.linuxbrew/bin"
-              "/home/linuxbrew/.linuxbrew/sbin"
-              "~/bin/scripts"
+;;; ~/bin/scripts, cargo, etc.  Add them here once rather than patching each
+;;; package individually.
+;;;
+;;; linuxbrew must sit AFTER /usr/bin, matching ~/.bashrc.  Brew perl 5.44
+;;; does not ship Fedora vendor modules (YAML.pm).  Prepending brew made
+;;; `#!/usr/bin/env perl` in `pomo` pick brew perl, and the 15s modeline
+;;; timer painted "Can't locate YAML.pm ... @INC ... /home/zach/perl5" on
+;;; the bar.  Resolve the prefix with `file-truename' (`/var/home/linuxbrew`)
+;;; so it dedups against /etc/profile.d/linuxbrew.sh; a raw
+;;; `/home/linuxbrew/...` string is a different PATH entry and would sit
+;;; ahead of /usr/bin forever.
+(dolist (dir '("~/bin/scripts"
               "~/bin"
               "~/.local/bin"
               "~/.cargo/bin"))
@@ -17,6 +24,21 @@
     (when (file-directory-p expanded)
       (add-to-list 'exec-path expanded)
       (setenv "PATH" (concat expanded ":" (getenv "PATH"))))))
+(let* ((brew-root (file-truename (expand-file-name "/home/linuxbrew/.linuxbrew")))
+       (brew-dirs (list (expand-file-name "bin" brew-root)
+                        (expand-file-name "sbin" brew-root))))
+  (dolist (dir brew-dirs)
+    (when (file-directory-p dir)
+      (setq exec-path
+            (append (cl-remove-if (lambda (p)
+                                    (and p (file-equal-p p dir)))
+                                  exec-path)
+                    (list dir)))
+      (let* ((old (or (getenv "PATH") ""))
+             (parts (split-string old path-separator t))
+             (kept (cl-remove-if (lambda (p) (file-equal-p p dir)) parts)))
+        (setenv "PATH" (string-join (append kept (list dir))
+                                    path-separator))))))
 (let ((perl5lib (expand-file-name "~/perl5/lib/perl5")))
   (when (file-directory-p perl5lib)
     (setenv "PERL5LIB" (concat perl5lib ":" (or (getenv "PERL5LIB") "")))))
