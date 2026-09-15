@@ -9,7 +9,7 @@ known_hosts := "lt-zach mob-zach hacbook libreclaw-00 srv-zach"
 # Stow matches --ignore against the entire basename, so directory names like
 # .agents and files like AGENTS.md are listed as-is.
 
-stow_pkg_ignores := "--ignore=LICENSE --ignore=Justfile --ignore=tests --ignore=Containerfile --ignore=requirements.txt --ignore=trees --ignore=share --ignore=.gitconfig --ignore=deps --ignore=.claude --ignore=.codex --ignore=.agents --ignore=AGENTS.md --ignore=AGENT.md"
+stow_pkg_ignores := "--ignore=LICENSE --ignore=Justfile --ignore=tests --ignore=Containerfile --ignore=requirements.txt --ignore=trees --ignore=share --ignore=docs --ignore=.gitconfig --ignore=deps --ignore=.claude --ignore=.codex --ignore=.agents --ignore=AGENTS.md --ignore=AGENT.md"
 
 # normal stow operation
 
@@ -488,3 +488,19 @@ enable-units start="false":
             "$(systemctl --user is-enabled "${u}" 2>&1)" \
             "$(systemctl --user is-active "${u}" 2>&1)"
     done
+
+# Discover this host's Flatpak profile and preview the managed browser files.
+librewolf-plan:
+    ./bin/scripts/librewolf-config plan
+
+# Close LibreWolf first; replacements receive numbered local backups.
+librewolf-apply:
+    ./bin/scripts/librewolf-config apply
+
+# Capture edits made to userChrome.css back into the managed source.
+librewolf-capture:
+    ./bin/scripts/librewolf-config capture
+
+# Check portable browser setup without changing a real profile.
+test-librewolf:
+    bash tests/scripts/test-librewolf-config.sh
