@@ -194,6 +194,7 @@ _have claude && alias gnuis='claude "/skill-bootstrap-libreclaw-agent gnuisaince
 
 # system command aliases 
 alias ls="ls --color=auto"
+_have eza && alias ls="eza"
 
 # common things
 alias flatpak="flatpak --user"
