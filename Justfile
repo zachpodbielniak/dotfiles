@@ -4,6 +4,13 @@
 
 known_hosts := "lt-zach mob-zach hacbook libreclaw-00 srv-zach"
 
+# repo-only paths that must not be symlinked into $HOME. Shared by stow,
+# stow_alt, and dry so a new ignore cannot land on one recipe and miss the rest.
+# Stow matches --ignore against the entire basename, so directory names like
+# .agents and files like AGENTS.md are listed as-is.
+
+stow_pkg_ignores := "--ignore=LICENSE --ignore=Justfile --ignore=tests --ignore=Containerfile --ignore=requirements.txt --ignore=trees --ignore=share --ignore=.gitconfig --ignore=deps --ignore=.claude --ignore=.codex --ignore=.agents --ignore=AGENTS.md --ignore=AGENT.md"
+
 # normal stow operation
 
 # Pass quadlets=false to skip Podman quadlet units (.config/containers/systemd/*.container)
@@ -42,18 +49,7 @@ stow quadlets="true": dep_dirs
     fi
 
     stow \
-        --ignore=LICENSE \
-        --ignore=Justfile \
-        --ignore=tests \
-        --ignore=Containerfile \
-        --ignore=requirements.txt \
-        --ignore=trees \
-        --ignore=share \
-        --ignore=.gitconfig \
-        --ignore=deps \
-        --ignore=.claude \
-        --ignore=.codex \
-        --ignore=AGENTS.md \
+        {{ stow_pkg_ignores }} \
         "${IGNORE_FLAGS[@]}" \
         .
 
@@ -110,18 +106,7 @@ stow_alt quadlets="true": dep_dirs
     fi
 
     stow \
-        --ignore=LICENSE \
-        --ignore=Justfile \
-        --ignore=tests \
-        --ignore=Containerfile \
-        --ignore=requirements.txt \
-        --ignore=trees \
-        --ignore=share \
-        --ignore=.gitconfig \
-        --ignore=deps \
-        --ignore=.claude \
-        --ignore=.codex \
-        --ignore=AGENTS.md \
+        {{ stow_pkg_ignores }} \
         "${IGNORE_FLAGS[@]}" \
         .
 
@@ -185,7 +170,7 @@ dry quadlets="true": dep_dirs
         IGNORE_FLAGS+=("--ignore=\\.container$")
     fi
 
-    stow --ignore=Justfile --simulate -v "${IGNORE_FLAGS[@]}" .
+    stow --simulate -v {{ stow_pkg_ignores }} "${IGNORE_FLAGS[@]}" .
 
 # test on the whole repo
 test:
