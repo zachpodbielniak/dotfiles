@@ -4,27 +4,44 @@
 (setq user-full-name "Zach Podbielniak")
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; cmacs dev tree takes precedence over system install
+;;; cmacs lisp: the tree that matches the binary that is running
 ;;; ──────────────────────────────────────────────────────────────────
 ;;;
-;;; The `make install' from 2026-04-26 dropped a system copy of
-;;; cmacs's lisp/ into /usr/share/emacs/31.0.50/lisp/cmacs/.  That
-;;; path is on `load-path' BEFORE the dev tree at
-;;; ~/source/projects/cmacs/lisp/cmacs/, so every (require ...) and
-;;; autoload pulls the months-old system version instead of whatever
-;;; you're editing right now.  Symptom: edits to lisp/cmacs/*.el
-;;; never take effect — even after wiping every .elc/.eln you can
-;;; find — because the SYSTEM .elc is what's being loaded.
+;;; cmacs ships its Lisp twice: in the checkout at
+;;; ~/source/projects/cmacs/lisp/cmacs/, and installed next to the
+;;; binary in /usr/share/emacs/<version>/lisp/cmacs/.  Which one a
+;;; running Emacs actually gets is decided by `load-path' at RUNTIME --
+;;; rebuilding or reinstalling cmacs does not change it.  Half of gowl
+;;; lives in that Lisp (`cmacs-gowl-mode' is what calls
+;;; `gowl-set-backdrop'; the keybind table is a defcustom), so the wrong
+;;; copy means a current compositor that nothing ever drives.
 ;;;
-;;; Unconditionally move the dev tree to the front of load-path.
-;;; `add-to-list' alone would be a no-op when the dir is already
-;;; present further down the list, so we delete + cons.
+;;; So: pick the tree that matches the binary.
 ;;;
-;;; The dev tree defaults to ~/source/projects/cmacs, but `just run'
-;;; (and `just gowl') export CMACS_LISP_DIR pointing at *whichever*
-;;; tree/worktree they were launched from, so running a feature branch
-;;; from a git worktree loads that worktree's lisp/cmacs instead of the
-;;; main checkout's.  Falls back to the main tree for a plain `emacs'.
+;;;   dev     `just run' and `just gowl' export CMACS_LISP_DIR pointing
+;;;           at whichever tree or worktree they were launched from, so
+;;;           a feature branch in a git worktree loads that worktree's
+;;;           lisp/cmacs.  A bare ./src/emacs exports nothing and is
+;;;           spotted instead by `invocation-directory': only a checkout
+;;;           has lisp/cmacs next to src/.  Either way that tree moves
+;;;           to the FRONT of `load-path'.
+;;;
+;;;   system  Everything else -- /usr/bin/emacs from the OS image.  Use
+;;;           the Lisp that shipped with it, and take any dev tree off
+;;;           `load-path' entirely.
+;;;
+;;; The system half is why this is no longer unconditional.  It used to
+;;; cons the dev tree on whenever that directory merely existed, which
+;;; on a machine that only happens to have a checkout lying around
+;;; (mob-zach, 2026-09-15) silently downgraded every cmacs library to
+;;; whatever the checkout was pinned at: no window backdrops and a dead
+;;; Super+" , while every effect module sat in /usr/lib64/gowl/modules
+;;; and `gowl-set-backdrop' was fboundp.  Reinstalling the image could
+;;; never fix it, because the binary was never the stale half.
+;;;
+;;; To develop against the installed binary anyway -- an `emacs
+;;; --daemon' out of /usr/bin, say -- set CMACS_LISP_DIR in its
+;;; environment; that is checked first and wins.
 ;;;
 ;;; This has to be the first thing in the file.  Doom's cached profile
 ;;; (.local/etc/@/init.32.0.el, written by `doom sync' under the
@@ -36,11 +53,57 @@
 ;;; `(load! "+gowl")' had already pulled in the system cmacs-gowl:
 ;;; under `just gowl' the old gowl keymap won and the scratchpad keys
 ;;; never existed.  The tripwire near the end of this file reports any
-;;; cmacs library that still arrives from somewhere else.
-(let ((dev (or (getenv "CMACS_LISP_DIR")
-               "/var/home/zach/source/projects/cmacs/lisp/cmacs")))
-  (when (file-directory-p dev)
-    (setq load-path (cons dev (delete dev load-path)))))
+;;; cmacs library that arrived from anywhere but the tree chosen here.
+
+(defvar zach/cmacs-lisp-dir nil
+  "Directory the cmacs Lisp libraries are expected to come from.
+The dev tree's lisp/cmacs under a dev build, the installed one under
+the binary from the OS image, nil when this Emacs ships no cmacs Lisp
+at all.  The tripwire near the end of this file warns about any cmacs
+library that arrived from somewhere else.")
+
+(defvar zach/cmacs-dev-p nil
+  "Non-nil when this Emacs is a cmacs dev build rather than the installed one.")
+
+(let* ((norm (lambda (dir)
+               ;; A directory spelled the way the comparisons below
+               ;; want it: resolved, with a trailing slash, so /home vs
+               ;; /var/home and a stray slash stop being differences.
+               (and dir (file-directory-p dir)
+                    (file-name-as-directory (file-truename dir)))))
+       ;; `just run' / `just gowl' name their own tree.  Checked first,
+       ;; so it doubles as the way to force a dev tree onto the
+       ;; installed binary.
+       (env (funcall norm (getenv "CMACS_LISP_DIR")))
+       ;; A bare ./src/emacs: `invocation-directory' is <tree>/src/ and
+       ;; lisp/cmacs is its sibling.  The installed binary gives
+       ;; /usr/bin/, whose sibling would be /usr/lisp/cmacs -- nothing.
+       (built (funcall norm (expand-file-name "../lisp/cmacs"
+                                              invocation-directory)))
+       (dev (or env built))
+       (kept nil))
+  (setq zach/cmacs-dev-p (and dev t))
+  ;; Drop every dev lisp/cmacs already on `load-path' -- the chosen one
+  ;; included, so it goes back on at the front rather than staying
+  ;; wherever it sat.  The installed copies under /usr stay: they are
+  ;; the fallback in system mode, and harmless behind the dev tree in
+  ;; dev mode.
+  (dolist (dir load-path)
+    (unless (and (stringp dir)
+                 (string-match-p "/lisp/cmacs/?\\'" dir)
+                 (let ((n (funcall norm dir)))
+                   (and n (not (string-prefix-p "/usr/" n)))))
+      (push dir kept)))
+  (setq load-path (nreverse kept))
+  (if dev
+      (setq zach/cmacs-lisp-dir dev
+            load-path (cons dev load-path))
+    ;; System: whatever `load-path' resolves cmacs-gowl to now is the
+    ;; copy that shipped with this binary.  Ask rather than hardcode a
+    ;; version directory that every image bump would stale.
+    (setq zach/cmacs-lisp-dir
+          (let ((found (locate-library "cmacs-gowl")))
+            (and found (file-name-directory (file-truename found)))))))
 
 ;;; exec-path: ensure Emacs can find tools regardless of how it was launched.
 ;;; When started from a desktop file or systemd, PATH is minimal and misses
@@ -1228,26 +1291,29 @@ compositor seat."
 (setq load-prefer-newer t)
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; Tripwire: cmacs libraries loaded from outside the dev tree
+;;; Tripwire: cmacs libraries loaded from the wrong tree
 ;;; ──────────────────────────────────────────────────────────────────
 ;;;
-;;; The dev tree moves to the front of `load-path' at the top of this
-;;; file.  Anything that loaded a cmacs library before that ran got the
-;;; stale system copy, and nothing says so: edits simply never show.
+;;; The top of this file picks one lisp/cmacs -- the dev tree under a
+;;; dev build, the installed one under /usr/bin/emacs -- and puts it in
+;;; front.  A cmacs library that loaded before that ran, or came out of
+;;; some other directory, is the copy that was not picked, and nothing
+;;; says so: under a dev build your edits simply never show, and under
+;;; the installed binary a stale checkout quietly replaces half of gowl.
 ;;; Say so.
-(let ((dev (or (getenv "CMACS_LISP_DIR")
-               "/var/home/zach/source/projects/cmacs/lisp/cmacs"))
-      (stale nil))
-  (when (file-directory-p dev)
-    (setq dev (file-name-as-directory (file-truename dev)))
+(when zach/cmacs-lisp-dir
+  (let ((stale nil))
     (dolist (entry load-history)
       (let ((file (car entry)))
         (when (and (stringp file)
                    (string-match-p "/lisp/cmacs/" file)
-                   (not (string-prefix-p dev (file-truename file))))
+                   (not (string-prefix-p zach/cmacs-lisp-dir
+                                         (file-truename file))))
           (push (file-name-base file) stale))))
     (when stale
       (display-warning
        'cmacs
-       (format "loaded from outside the dev tree %s, so edits to them will not show: %s"
-               dev (string-join (delete-dups (nreverse stale)) ", "))))))
+       (format "%s: loaded from outside %s, so these are not the copy this build ships: %s"
+               (if zach/cmacs-dev-p "dev build" "installed cmacs")
+               zach/cmacs-lisp-dir
+               (string-join (delete-dups (nreverse stale)) ", "))))))
