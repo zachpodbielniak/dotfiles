@@ -3,6 +3,45 @@
 ;; Identity
 (setq user-full-name "Zach Podbielniak")
 
+;;; ──────────────────────────────────────────────────────────────────
+;;; cmacs dev tree takes precedence over system install
+;;; ──────────────────────────────────────────────────────────────────
+;;;
+;;; The `make install' from 2026-04-26 dropped a system copy of
+;;; cmacs's lisp/ into /usr/share/emacs/31.0.50/lisp/cmacs/.  That
+;;; path is on `load-path' BEFORE the dev tree at
+;;; ~/source/projects/cmacs/lisp/cmacs/, so every (require ...) and
+;;; autoload pulls the months-old system version instead of whatever
+;;; you're editing right now.  Symptom: edits to lisp/cmacs/*.el
+;;; never take effect — even after wiping every .elc/.eln you can
+;;; find — because the SYSTEM .elc is what's being loaded.
+;;;
+;;; Unconditionally move the dev tree to the front of load-path.
+;;; `add-to-list' alone would be a no-op when the dir is already
+;;; present further down the list, so we delete + cons.
+;;;
+;;; The dev tree defaults to ~/source/projects/cmacs, but `just run'
+;;; (and `just gowl') export CMACS_LISP_DIR pointing at *whichever*
+;;; tree/worktree they were launched from, so running a feature branch
+;;; from a git worktree loads that worktree's lisp/cmacs instead of the
+;;; main checkout's.  Falls back to the main tree for a plain `emacs'.
+;;;
+;;; This has to be the first thing in the file.  Doom's cached profile
+;;; (.local/etc/@/init.32.0.el, written by `doom sync' under the
+;;; installed Emacs, which shares the dev build's version) puts the
+;;; /usr/share/emacs/32.0.50/lisp directories on `load-path' after
+;;; init.el has run, ahead of the dev build's own tree -- so the dev
+;;; tree has to move to the front here, before anything loads a cmacs
+;;; library.  It used to sit near the end of this file, after
+;;; `(load! "+gowl")' had already pulled in the system cmacs-gowl:
+;;; under `just gowl' the old gowl keymap won and the scratchpad keys
+;;; never existed.  The tripwire near the end of this file reports any
+;;; cmacs library that still arrives from somewhere else.
+(let ((dev (or (getenv "CMACS_LISP_DIR")
+               "/var/home/zach/source/projects/cmacs/lisp/cmacs")))
+  (when (file-directory-p dev)
+    (setq load-path (cons dev (delete dev load-path)))))
+
 ;;; exec-path: ensure Emacs can find tools regardless of how it was launched.
 ;;; When started from a desktop file or systemd, PATH is minimal and misses
 ;;; ~/bin/scripts, cargo, etc.  Add them here once rather than patching each
@@ -1189,28 +1228,26 @@ compositor seat."
 (setq load-prefer-newer t)
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; cmacs dev tree takes precedence over system install
+;;; Tripwire: cmacs libraries loaded from outside the dev tree
 ;;; ──────────────────────────────────────────────────────────────────
 ;;;
-;;; The `make install' from 2026-04-26 dropped a system copy of
-;;; cmacs's lisp/ into /usr/share/emacs/31.0.50/lisp/cmacs/.  That
-;;; path is on `load-path' BEFORE the dev tree at
-;;; ~/source/projects/cmacs/lisp/cmacs/, so every (require ...) and
-;;; autoload pulls the months-old system version instead of whatever
-;;; you're editing right now.  Symptom: edits to lisp/cmacs/*.el
-;;; never take effect — even after wiping every .elc/.eln you can
-;;; find — because the SYSTEM .elc is what's being loaded.
-;;;
-;;; Unconditionally move the dev tree to the front of load-path.
-;;; `add-to-list' alone would be a no-op when the dir is already
-;;; present further down the list, so we delete + cons.
-;;;
-;;; The dev tree defaults to ~/source/projects/cmacs, but `just run'
-;;; (and `just gowl') export CMACS_LISP_DIR pointing at *whichever*
-;;; tree/worktree they were launched from, so running a feature branch
-;;; from a git worktree loads that worktree's lisp/cmacs instead of the
-;;; main checkout's.  Falls back to the main tree for a plain `emacs'.
+;;; The dev tree moves to the front of `load-path' at the top of this
+;;; file.  Anything that loaded a cmacs library before that ran got the
+;;; stale system copy, and nothing says so: edits simply never show.
+;;; Say so.
 (let ((dev (or (getenv "CMACS_LISP_DIR")
-               "/var/home/zach/source/projects/cmacs/lisp/cmacs")))
+               "/var/home/zach/source/projects/cmacs/lisp/cmacs"))
+      (stale nil))
   (when (file-directory-p dev)
-    (setq load-path (cons dev (delete dev load-path)))))
+    (setq dev (file-name-as-directory (file-truename dev)))
+    (dolist (entry load-history)
+      (let ((file (car entry)))
+        (when (and (stringp file)
+                   (string-match-p "/lisp/cmacs/" file)
+                   (not (string-prefix-p dev (file-truename file))))
+          (push (file-name-base file) stale))))
+    (when stale
+      (display-warning
+       'cmacs
+       (format "loaded from outside the dev tree %s, so edits to them will not show: %s"
+               dev (string-join (delete-dups (nreverse stale)) ", "))))))
