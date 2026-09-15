@@ -1,0 +1,319 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+DEVKIT_BIN='/usr/libexec/mutter-devkit'
+DEFAULT_DISPLAY='wayland-gnome-nested'
+
+usage () {
+	cat <<'EOF'
+embedded_gnome - Run GNOME Shell in a window on the current Wayland session
+
+USAGE:
+	embedded_gnome [OPTIONS] [-- COMMAND [ARG...]]
+
+OPTIONS:
+	-h, --help                 Show this help message
+	--license                  Show license information
+	-c, --check                Verify prerequisites and exit
+	-n, --dry-run              Print the launch command and exit
+	-m, --mutter               Nested compositor only (no gnome-shell plugin)
+	--no-x11                   Do not start Xwayland in the nested session
+	-s, --size WxH[@R]         Nested monitor size (MUTTER_DEBUG_DUMMY_MODE_SPECS)
+	-d, --wayland-display NAME Nested Wayland socket name (default: wayland-gnome-nested)
+	-v, --verbose              Print the nested display and launch command on stderr
+
+EXAMPLES:
+	embedded_gnome
+	embedded_gnome --size 1920x1080@60
+	embedded_gnome --mutter -- gst
+	WAYLAND_DISPLAY=wayland-gnome-nested gst
+
+DESCRIPTION:
+	GNOME 50 dropped --nested (the X11 nested backend). Windowed GNOME is
+	mutter/gnome-shell --wayland --devkit, shown by mutter-devkit as a GTK
+	window on the parent compositor (gowl, GNOME, etc.).
+
+	Never omit --devkit: mutter --wayland without it takes KMS and replaces
+	this session instead of opening a window.
+
+	The nested compositor gets its own D-Bus session via dbus-run-session.
+	Launch clients against the nested display, not the parent:
+	WAYLAND_DISPLAY=wayland-gnome-nested <command>
+
+	Super/Alt-Tab stay on the parent compositor.
+
+	Fedora package for the viewer: mutter-devkit (add it to the image).
+
+EXIT STATUS:
+	0 success, 2 usage error, 1 missing prerequisite or child failure
+EOF
+}
+
+show_license () {
+	cat <<'EOF'
+embedded_gnome — Copyright (C) 2026 Zach Podbielniak — AGPLv3
+https://www.gnu.org/licenses/agpl-3.0.html
+EOF
+}
+
+die () {
+	printf 'embedded_gnome: %s\n' "${1}" >&2
+	exit 1
+}
+
+usage_error () {
+	printf 'embedded_gnome: %s\n' "${1}" >&2
+	printf 'Try '\''embedded_gnome --help'\'' for more information.\n' >&2
+	exit 2
+}
+
+have_cmd () {
+	command -v "${1}" >/dev/null 2>&1
+}
+
+# GNOME 50 hardcoded this path; a missing binary is a missing image package, not a PATH issue.
+require_devkit () {
+	if [[ -x "${DEVKIT_BIN}" ]]
+	then
+		return 0
+	fi
+
+	printf 'embedded_gnome: mutter-devkit is not installed (%s)\n' "${DEVKIT_BIN}" >&2
+	printf 'embedded_gnome: Fedora package is mutter-devkit; add it to the Hyacinth Macaw image.\n' >&2
+	printf 'embedded_gnome: do not dnf install; rpm-ostree install mutter-devkit + reboot is last resort.\n' >&2
+	return 1
+}
+
+require_parent_wayland () {
+	if [[ "${XDG_SESSION_TYPE:-}" == 'wayland' ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]
+	then
+		return 0
+	fi
+
+	printf 'embedded_gnome: parent session is not Wayland (XDG_SESSION_TYPE=%s WAYLAND_DISPLAY=%s)\n' \
+		"${XDG_SESSION_TYPE:-unset}" "${WAYLAND_DISPLAY:-unset}" >&2
+	printf 'embedded_gnome: for nested X11 use nested_x instead.\n' >&2
+	return 1
+}
+
+validate_size () {
+	local size="${1}"
+
+	if [[ "${size}" =~ ^[0-9]+x[0-9]+(@[0-9]+(\.[0-9]+)?)?$ ]]
+	then
+		return 0
+	fi
+
+	usage_error "invalid --size '${size}' (expected WxH or WxH@R, e.g. 1920x1080 or 1920x1080@60)"
+}
+
+check_prereqs () {
+	local compositor="${1}"
+
+	require_parent_wayland || return 1
+
+	if ! have_cmd dbus-run-session
+	then
+		printf 'embedded_gnome: dbus-run-session not found (Fedora package: dbus-daemon)\n' >&2
+		return 1
+	fi
+
+	if ! have_cmd "${compositor}"
+	then
+		printf 'embedded_gnome: %s not found (Fedora package: %s)\n' "${compositor}" "${compositor}" >&2
+		return 1
+	fi
+
+	require_devkit || return 1
+	return 0
+}
+
+print_cmd () {
+	local arg
+
+	for arg in "${@}"
+	do
+		printf '%q ' "${arg}"
+	done
+	printf '\n'
+}
+
+main () {
+	local compositor='gnome-shell'
+	local display="${DEFAULT_DISPLAY}"
+	local size=''
+	local no_x11=0
+	local dry_run=0
+	local check_only=0
+	local verbose=0
+	local extra_args=()
+	local launch_cmd=()
+
+	while [[ $# -gt 0 ]]
+	do
+		case "${1}" in
+			-h|--help)
+				usage
+				return 0
+				;;
+			--license)
+				show_license
+				return 0
+				;;
+			-c|--check)
+				check_only=1
+				shift
+				;;
+			-n|--dry-run)
+				dry_run=1
+				shift
+				;;
+			-m|--mutter)
+				compositor='mutter'
+				shift
+				;;
+			--no-x11)
+				no_x11=1
+				shift
+				;;
+			-v|--verbose)
+				verbose=1
+				shift
+				;;
+			-s|--size)
+				if [[ $# -lt 2 ]]
+				then
+					usage_error '--size requires a value'
+				fi
+				size="${2}"
+				shift 2
+				;;
+			--size=*)
+				size="${1#*=}"
+				shift
+				;;
+			-d|--wayland-display)
+				if [[ $# -lt 2 ]]
+				then
+					usage_error '--wayland-display requires a value'
+				fi
+				display="${2}"
+				shift 2
+				;;
+			--wayland-display=*)
+				display="${1#*=}"
+				shift
+				;;
+			--)
+				shift
+				extra_args=("${@}")
+				break
+				;;
+			-*)
+				usage_error "unknown option: ${1}"
+				;;
+			*)
+				usage_error "unexpected operand: ${1} (pass a nested command after --)"
+				;;
+		esac
+	done
+
+	if [[ -n "${size}" ]]
+	then
+		validate_size "${size}"
+	fi
+
+	if [[ -z "${display}" ]]
+	then
+		usage_error '--wayland-display must not be empty'
+	fi
+
+	if [[ ${#extra_args[@]} -gt 0 ]] && [[ "${compositor}" != 'mutter' ]]
+	then
+		usage_error 'COMMAND after -- is only valid with --mutter'
+	fi
+
+	if [[ ${check_only} -eq 1 ]]
+	then
+		check_prereqs "${compositor}"
+		printf 'embedded_gnome: prerequisites ok (compositor=%s display=%s devkit=%s)\n' \
+			"${compositor}" "${display}" "${DEVKIT_BIN}"
+		return 0
+	fi
+
+	# Dry-run still validates flags but does not require mutter-devkit, so the
+	# command can be inspected on an image that has not shipped the viewer yet.
+	if [[ ${dry_run} -eq 0 ]]
+	then
+		check_prereqs "${compositor}"
+	else
+		require_parent_wayland
+		if ! have_cmd dbus-run-session || ! have_cmd "${compositor}"
+		then
+			check_prereqs "${compositor}"
+		fi
+	fi
+
+	launch_cmd=(
+		dbus-run-session
+		--
+		"${compositor}"
+		--wayland
+		--devkit
+		--wayland-display
+		"${display}"
+	)
+
+	if [[ ${no_x11} -eq 1 ]]
+	then
+		launch_cmd+=(--no-x11)
+	fi
+
+	if [[ ${#extra_args[@]} -gt 0 ]]
+	then
+		launch_cmd+=(-- "${extra_args[@]}")
+	fi
+
+	if [[ -n "${size}" ]]
+	then
+		export MUTTER_DEBUG_DUMMY_MODE_SPECS="${size}"
+	fi
+
+	if [[ ${verbose} -eq 1 ]] || [[ ${dry_run} -eq 1 ]]
+	then
+		if [[ -n "${size}" ]]
+		then
+			printf 'MUTTER_DEBUG_DUMMY_MODE_SPECS=%q ' "${size}" >&2
+		fi
+		print_cmd "${launch_cmd[@]}" >&2
+	fi
+
+	if [[ ${dry_run} -eq 1 ]]
+	then
+		return 0
+	fi
+
+	printf 'embedded_gnome: nested WAYLAND_DISPLAY=%s (clients: WAYLAND_DISPLAY=%s <command>)\n' \
+		"${display}" "${display}" >&2
+
+	exec "${launch_cmd[@]}"
+}
+
+main "$@"
