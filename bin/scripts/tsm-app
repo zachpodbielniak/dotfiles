@@ -1,0 +1,179 @@
+#!/bin/bash
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+set -euo pipefail
+
+usage () {
+	cat <<'HELP'
+Usage: tsm-app [COMMAND]
+Run the TradeSkillMaster desktop app in its own Proton prefix, using the
+umu launcher and Proton runner bundled with the Lutris flatpak.
+
+  start               Launch the app detached (default command).
+  run                 Launch the app in the foreground.
+  stop                Stop the app.
+  status              Print whether the app is running.
+  install             Download the current installer, (re)install silently,
+                      then run fix-certs.
+  fix-certs           Seed the prefix's empty Windows CA store; without it the
+                      app's login fails with "unknown error".
+  paths               Print the prefix, WoW directory, and log locations.
+  -h, --help          Show help.
+  --license           Show license.
+
+The prefix lives in ~/data/games/tsm/prefix and is never shared with the
+Battle.net prefix, so the two never run separate wineservers on one prefix.
+In the app, set the WoW directory to the "World of Warcraft" path printed by
+`tsm-app paths` (as Z:\...). The app updates itself while running.
+
+Environment overrides: TSM_ROOT, TSM_PROTONPATH, TSM_WOW_DIR.
+
+Examples:
+  tsm-app
+  tsm-app status
+  tsm-app run
+  tsm-app install
+  tsm-app paths
+
+Exit status: 0 on success; nonzero for invalid input or failed operations.
+HELP
+}
+
+fail () {
+	printf 'tsm-app: %s\n' "$*" >&2
+	exit 1
+}
+
+# Locations: the prefix is ours, the runner and umu belong to the Lutris flatpak.
+lutris_app='net.lutris.Lutris'
+lutris_data="${HOME}/.var/app/${lutris_app}/data/lutris"
+tsm_root="${TSM_ROOT:-${HOME}/data/games/tsm}"
+tsm_prefix="${tsm_root}/prefix"
+tsm_logs="${tsm_root}/logs"
+tsm_setup="${tsm_root}/TSMSetup.exe"
+tsm_setup_url='https://app-cdn.tradeskillmaster.xyz/legacyDesktopApp/setup.exe'
+tsm_exe="${tsm_prefix}/drive_c/Program Files (x86)/TradeSkillMaster Application/app/TSMApplication.exe"
+proton_path="${TSM_PROTONPATH:-${lutris_data}/runners/wine/proton-cachyos-x86_64}"
+umu_run="${lutris_data}/runtime/umu/umu-run"
+wow_dir="${TSM_WOW_DIR:-${HOME}/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/compatdata/2555556235/pfx/drive_c/Program Files (x86)/World of Warcraft}"
+
+# Run a Windows executable in the TSM prefix through umu inside the Lutris
+# sandbox. The sandbox already sees $HOME; the WoW dir needs a rw override.
+umu () {
+	[[ -x "${umu_run}" ]] || fail "umu-run not found at ${umu_run}; launch Lutris once so it downloads umu."
+	[[ -x "${proton_path}/proton" ]] || fail "Proton runner not found at ${proton_path}; set TSM_PROTONPATH."
+	mkdir -p -- "${tsm_prefix}" "${tsm_logs}"
+	flatpak run \
+		--env=WINEPREFIX="${tsm_prefix}" \
+		--env=PROTONPATH="${proton_path}" \
+		--env=GAMEID=umu-tsm \
+		--env=STORE=none \
+		--command="${umu_run}" \
+		"${lutris_app}" "$@"
+}
+
+# The app bundles Python 3.4, whose ssl module raises "Empty certificate
+# data" when the Windows "CA" store is empty, as it is in a fresh Wine
+# prefix; login then fails with "unknown error". Seed that store with
+# ISRG Root X1 (already trusted in "Root") as a serialized cert-context
+# blob: property id 0x20, reserved 1, length, DER, all little-endian.
+fix_certs () {
+	local pem='/etc/pki/ca-trust/extracted/pem/directory-hash/ISRG_Root_X1.pem'
+	local reg="${tsm_root}/ca_store.reg"
+	local der sha1 len hex
+
+	[[ -f "${pem}" ]] || fail "Host CA not found: ${pem}"
+	der="$(openssl x509 -in "${pem}" -outform DER | od -An -v -tx1 | tr -d ' \n')"
+	sha1="$(openssl x509 -in "${pem}" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
+	len=$(( ${#der} / 2 ))
+	[[ ${len} -gt 0 ]] || fail 'Failed to convert the CA certificate to DER'
+	hex="$(le32 32)$(le32 1)$(le32 "${len}")${der}"
+	{
+		printf 'Windows Registry Editor Version 5.00\r\n\r\n'
+		printf '[HKEY_LOCAL_MACHINE\\Software\\Microsoft\\SystemCertificates\\CA\\Certificates\\%s]\r\n' "${sha1}"
+		printf '"Blob"=hex:%s\r\n' "$(sed -E 's/(..)/\1,/g; s/,$//' <<<"${hex}")"
+	} > "${reg}"
+	umu regedit /S "Z:${reg//\//\\}" >>"${tsm_logs}/regedit.log" 2>&1 || fail "regedit failed; see ${tsm_logs}/regedit.log"
+}
+
+# Print a 32-bit value as little-endian hex.
+le32 () {
+	printf '%08x' "${1}" | sed -E 's/(..)(..)(..)(..)/\4\3\2\1/'
+}
+
+is_running () {
+	pgrep -f 'TSMApplication\.exe' >/dev/null
+}
+
+# Warn when the sandbox cannot write the WoW folder; the app would silently
+# fail to write AppData.lua into the AppHelper addon.
+check_override () {
+	if ! flatpak override --user --show "${lutris_app}" | grep -qF -- "${wow_dir}"
+	then
+		printf 'tsm-app: warning: %s has no rw override for the WoW dir; fix with:\n' "${lutris_app}" >&2
+		printf '  flatpak override --user --filesystem=%q %s\n' "${wow_dir}" "${lutris_app}" >&2
+	fi
+}
+
+case "${1:-start}" in
+	-h|--help) usage; exit 0 ;;
+	--license) printf '%s\n' 'AGPL-3.0-or-later: https://www.gnu.org/licenses/agpl-3.0.html'; exit 0 ;;
+	start)
+		is_running && { printf 'tsm-app: already running\n'; exit 0; }
+		[[ -f "${tsm_exe}" ]] || fail 'App is not installed; run: tsm-app install'
+		check_override
+		umu "${tsm_exe}" >"${tsm_logs}/app.log" 2>&1 &
+		disown
+		printf 'tsm-app: started (log: %s)\n' "${tsm_logs}/app.log"
+		;;
+	run)
+		[[ -f "${tsm_exe}" ]] || fail 'App is not installed; run: tsm-app install'
+		check_override
+		umu "${tsm_exe}" 2>&1 | tee "${tsm_logs}/app.log"
+		;;
+	stop)
+		is_running || { printf 'tsm-app: not running\n'; exit 0; }
+		pkill -f 'TSMApplication\.exe'
+		printf 'tsm-app: stopped\n'
+		;;
+	status)
+		if is_running; then printf 'running\n'; else printf 'stopped\n'; exit 3; fi
+		;;
+	install)
+		is_running && fail 'Stop the app first: tsm-app stop'
+		mkdir -p -- "${tsm_root}"
+		curl -fsSL -o "${tsm_setup}" "${tsm_setup_url}" || fail "Download failed: ${tsm_setup_url}"
+		# Inno Setup installer; these flags skip every dialog.
+		umu "${tsm_setup}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- >"${tsm_logs}/install.log" 2>&1 \
+			|| fail "Installer failed; see ${tsm_logs}/install.log"
+		[[ -f "${tsm_exe}" ]] || fail "Installer exited cleanly but ${tsm_exe} is missing"
+		fix_certs
+		printf 'tsm-app: installed %s\n' "${tsm_exe}"
+		;;
+	fix-certs)
+		is_running && fail 'Stop the app first: tsm-app stop'
+		fix_certs
+		printf 'tsm-app: seeded the Windows CA store\n'
+		;;
+	paths)
+		printf 'prefix:  %s\nexe:     %s\nwow dir: %s\nwow (Z): Z:%s\nlogs:    %s\n' \
+			"${tsm_prefix}" "${tsm_exe}" "${wow_dir}" "${wow_dir//\//\\}" "${tsm_logs}"
+		;;
+	*)
+		usage >&2
+		exit 1
+		;;
+esac
