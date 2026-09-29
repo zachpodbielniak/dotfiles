@@ -34,6 +34,7 @@
 ;;     window-selection-change-functions) instead of a polling timer.
 ;;   - Multi-monitor physical layout via `cmacs-gowl-setup-monitors'.
 ;;     A single Emacs frame is kept regardless of monitor count.
+;;   - On mob-zach only, the PCsensor fishing pedal (see below).
 ;;
 ;; The `(when IS-GOWL ...)' block here no-ops on non-gowl Emacs.
 ;; `cmacs-gowl-setup-monitors' is defined unconditionally so it can be
@@ -49,6 +50,31 @@
   ;; physically mounted at 270°, so apply transform 3 to compensate.
   (when (member (system-name) '("otg-zach" "pda-zach"))
     (gowl-set-monitor-transform 3))
+
+  ;; WoW fishing pedal.  PCsensor FootSwitch (3553:b001) shows up as its
+  ;; own HID keyboard, so this claims that keyboard only.  Pedal A is one
+  ;; middle click at the cursor (the fishing addon binds that to
+  ;; cast-or-loot).  Pedal B runs `focus-client' on the window title:
+  ;; Battle.net is the same Proton app-id (`steam_app_2555556235'), so an
+  ;; app-id match would focus the launcher.  The title glob follows the
+  ;; game onto whichever tag it is on.  Other keys from the pedal are
+  ;; dropped.  mob-zach only — this file is stowed onto every host.
+  (when (equal (system-name) "mob-zach")
+    (require 'cmacs-gowl-input-remap)
+    (setq cmacs-gowl-input-remap-rules
+          '(("wow-pedals"
+             :match (:id "3553:b001" :type keyboard)
+             :unmatched drop
+             :log t
+             :map ((KEY_A . (button middle))
+                   (KEY_B . (action focus-client "title:World of Warcraft*"))))))
+    (cmacs-gowl-input-remap-define
+     "wow-pedals"
+     :match '(:id "3553:b001" :type keyboard)
+     :unmatched 'drop
+     :log t
+     :map '((KEY_A . (button middle))
+            (KEY_B . (action focus-client "title:World of Warcraft*")))))
 
   ;; Window opacity — dim unfocused clients
   (gowl-enable-module "alpha")
