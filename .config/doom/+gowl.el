@@ -88,6 +88,17 @@
   ;; `cmacs-gowl-float-rules' and are pushed by `cmacs-gowl-mode' below.
   (gowl-enable-module "windowrules")
 
+  ;; TradeSkillMaster (Proton, app-id `steam_app_tsm') lives on tag 9.
+  ;; Wine's fallback systray window -- `explorer.exe', no title, ignores
+  ;; close -- maps at random whenever TSM re-adds its tray icon (e.g.
+  ;; after a session re-login), and lands on whatever tag is focused.
+  ;; Its title is NULL, so a title rule can never match it; pin the
+  ;; whole app-id to tag 9 (bitmask 256) instead, which is where the
+  ;; real TSM windows already live.
+  (with-eval-after-load 'cmacs-gowl
+    (add-to-list 'cmacs-gowl-float-rules
+                 '(:app-id "steam_app_tsm" :tags 256)))
+
   ;; Dropdown terminals: guake-style drop-from-top windows toggled by
   ;; Super+grave.  Entries come from `cmacs-gowl-dropdowns' and are
   ;; pushed + adopted by `cmacs-gowl-mode' below.  Must be enabled
