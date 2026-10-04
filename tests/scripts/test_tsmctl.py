@@ -791,7 +791,7 @@ class RemoteMirrorTests(unittest.TestCase):
 
 
 class OptionalSourceCliTests(unittest.TestCase):
-	"""TSM + DataStore + Syndicator together: merge and reconcile."""
+	"""TSM + DataStore + Syndicator together: merge, reconcile and the commands built on them."""
 
 	@classmethod
 	def setUpClass(cls) -> None:
@@ -914,8 +914,110 @@ class OptionalSourceCliTests(unittest.TestCase):
 		status: dict[str, Any] = json.loads(self.run_cli("-o", "json", "-q", "status", wow=self.edge).stdout)
 		states: dict[str, str] = {r["source"]: r["state"] for r in next(s for s in status["sections"] if s["title"] == "Sources")["tables"][0]["rows"]}
 		self.assertEqual(states, {"tsm": "missing", "datastore": "used", "syndicator": "error"})
+		for command in (["attention"], ["get", "auctions"], ["get", "mail"], ["get", "currencies"], ["get", "recipes"]):
+			with self.subTest(command=command):
+				self.run_cli("-q", *command, wow=self.edge)
 		nothing: subprocess.CompletedProcess[str] = self.run_cli("--sources", "tsm", "status", wow=self.edge, check=False)
 		self.assertEqual(nothing.returncode, 1, "asking only for a source no account has is an error")
+
+	def test_auction_join_and_expiry(self) -> None:
+		rows: list[dict[str, Any]] = self.table("get", "auctions", "-n", "0")["rows"]
+		by_id: dict[int, dict[str, Any]] = {r["id"]: r for r in rows}
+		self.assertEqual(set(by_id), {111, 222, 333, 444})
+		joined: dict[str, Any] = by_id[111]
+		self.assertEqual(joined["sources"], "datastore+syndicator")
+		self.assertEqual(joined["item"], "i:1001::2:1692:6655", "item string from Syndicator's link")
+		self.assertEqual((joined["buyout_copper"], joined["total_copper"], joined["qty"]), (30000, 60000, 2))
+		self.assertAlmostEqual(joined["left"], 2000, delta=120, msg="Syndicator's absolute expiry wins over DataStore's scan + time left")
+		self.assertEqual(by_id[222]["bid_copper"], 5000)
+		self.assertLess(by_id[333]["left"], 0)
+		self.assertEqual(by_id[444]["sources"], "syndicator")
+		self.assertIsNone(by_id[444]["buyout_copper"])
+		soon: list[dict[str, Any]] = self.table("get", "auctions", "--expiring", "2h", "-n", "0")["rows"]
+		self.assertEqual({r["id"] for r in soon}, {111, 333, 444}, "--expiring keeps expired ones and drops #222")
+		self.assertEqual([r["id"] for r in soon], [444, 333, 111], "soonest (most overdue) first")
+		fallback: dict[str, Any] = self.table("get", "auctions", "--by", "char")
+		self.assertIn("key", fallback["columns"], "--by keeps the aggregated holdings view")
+
+	def test_mail(self) -> None:
+		rows: list[dict[str, Any]] = self.table("get", "mail", "-n", "0")["rows"]
+		self.assertEqual(len(rows), 4, "letter without money or items hidden")
+		self.assertEqual(rows[0]["char"], "Epsilon", "soonest to expire first")
+		money: dict[str, Any] = next(r for r in rows if r["money_copper"])
+		self.assertEqual((money["char"], money["money_copper"]), ("Alpha", 1000000))
+		self.assertAlmostEqual(money["left"], 2 * 86400 - 600, delta=120)
+		self.assertEqual(sum(1 for r in rows if r["pending"]), 1, "the alt's unseen mail is marked")
+		self.assertEqual(len(self.table("get", "mail", "--all", "-n", "0")["rows"]), 5)
+		urgent: list[dict[str, Any]] = self.table("get", "mail", "--expiring", "3d", "-n", "0")["rows"]
+		self.assertEqual({r["char"] for r in urgent}, {"Alpha", "Epsilon"})
+		self.assertEqual(len(urgent), 2)
+
+	def test_currencies(self) -> None:
+		rows: list[dict[str, Any]] = self.table("get", "currencies", "-n", "0")["rows"]
+		alpha: dict[str, dict[str, Any]] = {r["currency"]: r for r in rows if r["char"] == "Alpha"}
+		self.assertEqual((alpha["Trader's Tender"]["qty"], alpha["Trader's Tender"]["week"]), (1805, 3))
+		self.assertEqual((alpha["Valor"]["max"], alpha["Valor"]["weekly"]), (1000, 500))
+		self.assertEqual(alpha["Trader's Tender"]["source"], "datastore", "DataStore (dated) beats Syndicator")
+		delta: dict[str, Any] = next(r for r in rows if r["char"] == "Delta" and r["id"] == 2032)
+		self.assertEqual(delta["currency"], "Trader's Tender", "named through Alpha's counts")
+		epsilon: dict[str, Any] = next(r for r in rows if r["char"] == "Epsilon")
+		self.assertEqual((epsilon["currency"], epsilon["qty"], epsilon["source"]), ("Trader's Tender", 5, "syndicator"))
+		totals: dict[int, dict[str, Any]] = {r["id"]: r for r in self.table("get", "currencies", "--by", "currency")["rows"]}
+		self.assertEqual(totals[2032]["qty"], 1805 + 7 + 5)
+		self.assertNotIn(9999, totals, "zero balances are hidden")
+
+	def test_recipes(self) -> None:
+		rows: list[dict[str, Any]] = self.table("get", "recipes")["rows"]
+		self.assertEqual([(r["id"], r["category"], r["rank"]) for r in rows], [(12345, "Bags", "1/3")])
+		self.assertEqual(len(self.table("get", "recipes", "--all")["rows"]), 2)
+		self.assertEqual(len(self.table("get", "recipes", "--profession", "tail", "--char", "Alpha")["rows"]), 1)
+		self.assertEqual(len(self.table("get", "recipes", "--profession", "mining")["rows"]), 0)
+
+	def test_attention_order_and_thresholds(self) -> None:
+		doc: dict[str, Any] = json.loads(self.run_cli("-o", "json", "attention").stdout)
+		rows: list[dict[str, Any]] = doc["sections"][0]["tables"][0]["rows"]
+		order: list[tuple[str, str]] = [(r["kind"] if "kind" in r else r["what"], r["char"]) for r in rows]
+		self.assertEqual(order, [
+			("mail expiring", "Epsilon"), ("mail expiring", "Alpha"),
+			("auctions expired, collect", "Alpha"), ("auctions expired, collect", "Beta"),
+			("auctions expiring", "Alpha"), ("mail waiting", "Alpha"),
+			("not seen lately", "Gamma"), ("not seen lately", "Beta"),
+		])
+		expired: dict[str, Any] = rows[2]
+		self.assertEqual(expired["count"], 2, "DataStore's #333 and Syndicator's #444")
+		self.assertIsNone(rows[3]["count"], "Beta is known only from TSM's first-expiry time")
+		notes: list[str] = doc["sections"][0]["notes"]
+		self.assertTrue(notes[0].startswith("- log in to Linkedrealm: Epsilon"), notes)
+		self.assertTrue(notes[1].startswith("- log in to Testrealm: Alpha, Beta"), notes)
+		self.assertIn("Gamma (Testrealm)", notes[2])
+		tight: list[dict[str, Any]] = json.loads(self.run_cli("-o", "json", "attention", "--expiring", "30m", "--mail-expiring", "12h", "--stale", "25d").stdout)["sections"][0]["tables"][0]["rows"]
+		kinds: list[tuple[str, str]] = [(r["what"], r["char"]) for r in tight]
+		self.assertNotIn(("auctions expiring", "Alpha"), kinds)
+		self.assertNotIn(("mail expiring", "Epsilon"), kinds)
+		self.assertIn(("mail waiting", "Epsilon"), kinds)
+		self.assertNotIn(("not seen lately", "Beta"), kinds, "20 days is not stale at 25d")
+		self.assertIn(("not seen lately", "Gamma"), kinds)
+
+	def test_new_commands_all_formats(self) -> None:
+		commands: list[list[str]] = [
+			["attention"], ["get", "auctions"], ["get", "auctions", "--expiring", "6h"], ["get", "auctions", "--by", "item"],
+			["get", "mail"], ["get", "mail", "--expiring", "3d", "--all"], ["get", "currencies"], ["get", "currencies", "--by", "currency"],
+			["get", "recipes", "--all"], ["describe", "char", "Alpha"], ["get", "chars"], ["get", "accounts"], ["status"],
+			["get", "inventory", "--by", "location"], ["networth", "--by", "location"], ["report"],
+		]
+		for fmt in ("text", "wide", "org", "csv", "tsv", "json"):
+			for command in commands:
+				with self.subTest(fmt=fmt, command=command):
+					self.run_cli("-q", "-o", fmt, *command)
+
+	def test_describe_char_enriched(self) -> None:
+		doc: dict[str, Any] = json.loads(self.run_cli("-o", "json", "describe", "char", "Alpha").stdout)
+		values: dict[str, Any] = doc["sections"][0]["values"]
+		self.assertEqual((values["Level"], values["Race"], values["Posted auctions"]), (80, "Night Elf", 4))
+		self.assertEqual(values["Mail waiting (gold)"], 1000000)
+		titles: list[str] = [s["title"] for s in doc["sections"]]
+		for title in ("Auctions (soonest to end first)", "Mail with gold or items", "Currencies"):
+			self.assertIn(title, titles)
 
 	def test_status_reports_sources(self) -> None:
 		status: dict[str, Any] = json.loads(self.run_cli("-o", "json", "status").stdout)

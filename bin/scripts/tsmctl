@@ -154,6 +154,11 @@ SV_FILE_NAMES: tuple[str, ...] = tuple(name for names in SOURCE_FILES.values() f
 RECONCILE_TIE_SECONDS: int = 300
 SOURCE_PRIORITY: dict[str, int] = {"tsm": 0, "datastore": 1, "syndicator": 2}
 
+# `attention` defaults.
+DEFAULT_AUCTION_WINDOW: str = "12h"
+DEFAULT_MAIL_WINDOW: str = "3d"
+DEFAULT_STALE_AFTER: str = "14d"
+
 # DataStore's packed class ids (BaseInfo bits 7-10) -> TSM class tokens.
 DS_CLASS_TOKENS: dict[int, str] = {
 	1: "WARRIOR", 2: "PALADIN", 3: "HUNTER", 4: "ROGUE", 5: "PRIEST", 6: "DEATHKNIGHT", 7: "SHAMAN",
@@ -4202,6 +4207,9 @@ GET_RESOURCES: dict[str, tuple[str, ...]] = {
 	"ledger": ("ledger", "transactions", "txns", "all"),
 	"inventory": ("inventory", "inv", "items-held", "stock"),
 	"auctions": ("auctions", "auction", "ah", "posted"),
+	"mail": ("mail", "mails", "mailbox", "inbox"),
+	"currencies": ("currency", "currencies", "curr"),
+	"recipes": ("recipe", "recipes", "crafts"),
 	"groups": ("group", "groups"),
 	"prices": ("price", "prices"),
 	"sources": ("sources", "price-sources"),
@@ -4240,8 +4248,16 @@ def cmd_get(ctx: Context) -> Doc:
 		return get_gold_history(ctx)
 	if resource in LEDGER_RESOURCE_KIND or resource == "ledger":
 		return get_ledger(ctx, resource, query)
-	if resource in ("inventory", "auctions"):
-		return get_inventory(ctx, query, auctions_only=resource == "auctions")
+	if resource == "inventory":
+		return get_inventory(ctx, query, auctions_only=False)
+	if resource == "auctions":
+		return get_auctions(ctx, query)
+	if resource == "mail":
+		return get_mail(ctx, query)
+	if resource == "currencies":
+		return get_currencies(ctx, query)
+	if resource == "recipes":
+		return get_recipes(ctx, query)
 	if resource == "groups":
 		return get_groups(ctx)
 	if resource == "prices":
@@ -4623,6 +4639,361 @@ def cmd_search(ctx: Context, query: Optional[str]) -> Doc:
 	], rows, empty="no matching items in the TSM item cache")
 	doc.section(f"Items matching {text!r}").table(table)
 	apply_main(ctx, doc, table, default_limit=30)
+	return doc
+
+
+# ============================================================================
+# Commands: auctions, mail, currencies, recipes (DataStore / Syndicator)
+# ============================================================================
+
+def _window(ctx: Context, default_unit: str) -> Optional[int]:
+	"""--expiring as seconds, or None when not given."""
+	text: Optional[str] = getattr(ctx.args, "expiring", None)
+	return parse_duration(text, default_unit) if text else None
+
+
+def _with_query(ctx: Context, query: Optional[str]) -> None:
+	"""Treat a positional query as one more --item filter."""
+	if query:
+		ctx.args.item = list(getattr(ctx.args, "item", None) or []) + [query]
+
+
+def get_auctions(ctx: Context, query: Optional[str]) -> Doc:
+	"""
+	Every posted auction with its price, bid, time left and expiry, when
+	DataStore or Syndicator recorded them. With --by (or when only TSM is
+	available) it falls back to TSM's posted quantities valued at the
+	price source.
+	"""
+	data: TsmData = ctx.data
+	if getattr(ctx.args, "by", None) or not data.auctions:
+		doc: Doc = get_inventory(ctx, query, auctions_only=True)
+		if not data.auctions and not getattr(ctx.args, "by", None):
+			doc.sections[0].text("Per-auction prices and expiry need Altoholic's DataStore or Syndicator; these are TSM's posted quantities.")
+		return doc
+	_with_query(ctx, query)
+	filters: Filters = ctx.filters()
+	window: Optional[int] = _window(ctx, "h")
+	now: int = ctx.now
+	rows: list[dict[str, Any]] = []
+	for auction in data.auctions:
+		if not filters.owner_ok(auction.account, auction.char, auction.realm):
+			continue
+		if filters.items is not None and item_base(auction.item) not in filters.items:
+			continue
+		left: Optional[int] = auction.expires_at - now if auction.expires_at else None
+		if window is not None and (left is None or left > window):
+			continue
+		unit: Optional[int] = ctx.unit_value(auction.item, auction.realm)
+		rows.append({
+			"item": auction.item, "qty": auction.qty, "buyout": auction.buyout, "total": auction.buyout_total,
+			"bid": auction.bid or None, "value": unit, "vs": auction.buyout / unit if auction.buyout and unit else None,
+			"left": left, "expires": auction.expires_at, "char": auction.char, "realm": auction.realm,
+			"account": auction.account, "id": auction.auction_id or None, "sources": "+".join(auction.sources),
+		})
+	rows.sort(key=lambda r: (r["left"] is None, r["left"] or 0))
+	expired: list[dict[str, Any]] = [r for r in rows if r["left"] is not None and r["left"] <= 0]
+	doc = Doc("Auctions", "get_auctions")
+	section: Section = doc.section("Posted auctions")
+	pairs: list[tuple[str, Any, str]] = filters.describe() + [
+		("Auctions", len(rows), "int"),
+		("Units", sum(r["qty"] for r in rows), "int"),
+		("Buyout value", sum(r["total"] or 0 for r in rows), "money"),
+		("Expired, waiting to be collected", len(expired), "int"),
+		("Next to expire", next((r["expires"] for r in rows if r["left"] is not None and r["left"] > 0), None), "time"),
+	]
+	if window is not None:
+		pairs.append(("Expiring within", fmt_age(window) + " (expired ones included)", "str"))
+	section.kv(pairs)
+	table: Table = Table([
+		Column("item", "Item", "item", max_width=36), Column("qty", "Qty", "int"), money_col("buyout", "Buyout each"),
+		money_col("total", "Buyout"), money_col("bid", "Bid", wide=True), money_col("value", "Value each", wide=True),
+		Column("vs", "Buyout/value", "pct", wide=True), Column("left", "Left", "dur"), Column("expires", "Expires", "time"),
+		Column("char", "Character"), Column("realm", "Realm"), Column("account", "Account", wide=True),
+		Column("id", "Auction id", wide=True), Column("sources", "Sources", wide=True),
+	], rows, totals={"item": f"{len(rows)} auctions", "qty": sum(r["qty"] for r in rows), "total": sum(r["total"] or 0 for r in rows)},
+		empty="no posted auctions match")
+	section.table(table)
+	section.text("Buyout is per unit as the auction house reports it (DataStore); expiry is when the client said it ends (Syndicator, else DataStore's last AH visit plus the time left). Expired auctions have sold or gone back to the mailbox; log in to collect.")
+	apply_main(ctx, doc, table, default_limit=50)
+	return doc
+
+
+def get_mail(ctx: Context, query: Optional[str]) -> Doc:
+	"""Mail waiting in each character's mailbox, soonest to expire first."""
+	data: TsmData = ctx.data
+	_with_query(ctx, query)
+	filters: Filters = ctx.filters()
+	window: Optional[int] = _window(ctx, "d")
+	show_all: bool = bool(getattr(ctx.args, "all", False))
+	now: int = ctx.now
+	rows: list[dict[str, Any]] = []
+	letters: int = 0
+	for mail in data.mails:
+		if not filters.owner_ok(mail.account, mail.char, mail.realm):
+			continue
+		if filters.items is not None and (not mail.item or item_base(mail.item) not in filters.items):
+			continue
+		if not mail.has_value and not show_all:
+			letters += 1
+			continue
+		left: Optional[int] = mail.expires_at - now if mail.expires_at else None
+		if window is not None and (left is None or left > window):
+			continue
+		unit: Optional[int] = ctx.unit_value(mail.item, mail.realm) if mail.item else None
+		rows.append({
+			"char": mail.char, "realm": mail.realm, "sender": mail.sender or None, "subject": mail.subject or None,
+			"item": mail.item or None, "qty": mail.qty or None, "money": mail.money or None, "cod": mail.cod or None,
+			"value": unit * mail.qty if unit is not None and mail.qty else None, "expires": mail.expires_at, "left": left,
+			"returned": "yes" if mail.returned else "", "pending": "on its way" if mail.from_cache else "",
+			"account": mail.account, "source": mail.source,
+		})
+	doc: Doc = Doc("Mail", "get_mail")
+	section: Section = doc.section("Mail waiting")
+	pairs: list[tuple[str, Any, str]] = filters.describe() + [
+		("Entries", len(rows), "int"),
+		("Gold waiting", sum(r["money"] or 0 for r in rows), "money"),
+		("Item units waiting", sum(r["qty"] or 0 for r in rows), "int"),
+		("Items valued at", sum(r["value"] or 0 for r in rows), "money"),
+		("Next to expire", next((r["expires"] for r in rows if r["expires"]), None), "time"),
+	]
+	if window is not None:
+		pairs.append(("Expiring within", fmt_age(window), "str"))
+	section.kv(pairs)
+	table: Table = Table([
+		Column("char", "Character"), Column("realm", "Realm"), Column("sender", "From", max_width=22), Column("subject", "Subject", max_width=30, wide=True),
+		Column("item", "Item", "item", max_width=32), Column("qty", "Qty", "int"), money_col("money", "Money"), money_col("cod", "COD", wide=True),
+		money_col("value", "Item value"), Column("left", "Left", "dur"), Column("expires", "Expires", "time", wide=True),
+		Column("returned", "Returned", wide=True), Column("pending", "Pending"), Column("account", "Account", wide=True), Column("source", "Source", wide=True),
+	], rows, totals={"char": f"{len(rows)} entries", "qty": sum(r["qty"] or 0 for r in rows), "money": sum(r["money"] or 0 for r in rows), "value": sum(r["value"] or 0 for r in rows)},
+		empty="no mail with money or items" if data.mails or letters else "no mail data (needs Altoholic's DataStore or Syndicator)")
+	section.table(table)
+	if letters:
+		section.text(f"{letters} letter(s) without money or items are hidden; --all shows them.")
+	section.text("An attachment and the money of one mail are separate rows. 'On its way' is mail an alt sent that the recipient has not opened its mailbox to see.")
+	apply_main(ctx, doc, table, default_limit=50)
+	return doc
+
+
+def get_currencies(ctx: Context, query: Optional[str]) -> Doc:
+	"""Game currencies per character (--by char) or summed (--by currency)."""
+	data: TsmData = ctx.data
+	filters: Filters = ctx.filters()
+	by: str = getattr(ctx.args, "by", None) or "char"
+	if by not in ("char", "currency"):
+		raise TsmctlError("currencies --by must be char or currency")
+	text: str = (query or "").strip().lower()
+	held: list[CurrencyHolding] = [
+		c for c in data.currencies
+		if filters.owner_ok(c.account, c.char, c.realm) and (not text or text == str(c.currency_id) or text in c.name.lower())
+		and (c.qty > 0 or getattr(ctx.args, "all", False))
+	]
+	doc: Doc = Doc("Currencies", "get_currencies")
+	section: Section = doc.section("Currencies")
+	table: Table
+	if by == "char":
+		rows: list[dict[str, Any]] = [{
+			"char": c.char, "realm": c.realm, "currency": c.name or f"currency {c.currency_id}", "id": c.currency_id, "qty": c.qty,
+			"week": c.earned_this_week or None, "max": c.max_qty, "weekly": c.max_weekly, "updated": c.updated_at,
+			"account": c.account, "source": c.source,
+		} for c in held]
+		rows.sort(key=lambda r: (r["char"].lower(), r["realm"], -r["qty"]))
+		table = Table([
+			Column("char", "Character"), Column("realm", "Realm"), Column("currency", "Currency", max_width=34), Column("id", "Id", wide=True),
+			Column("qty", "Qty", "int"), Column("week", "This week", "int"), Column("max", "Cap", "int"), Column("weekly", "Weekly cap", "int", wide=True),
+			Column("updated", "Updated", "time", wide=True), Column("account", "Account", wide=True), Column("source", "Source", wide=True),
+		], rows, empty="no currency data (needs Altoholic's DataStore or Syndicator)")
+	else:
+		totals: dict[int, dict[str, Any]] = {}
+		for c in held:
+			entry: dict[str, Any] = totals.setdefault(c.currency_id, {"currency": c.name or f"currency {c.currency_id}", "id": c.currency_id, "qty": 0, "chars": 0, "top": "", "top_qty": -1})
+			entry["qty"] += c.qty
+			entry["chars"] += 1 if c.qty > 0 else 0
+			if c.qty > entry["top_qty"]:
+				entry["top"], entry["top_qty"] = f"{c.char} ({c.realm})", c.qty
+		rows = sorted(totals.values(), key=lambda r: -r["qty"])
+		table = Table([
+			Column("currency", "Currency", max_width=34), Column("id", "Id"), Column("qty", "Total", "int"),
+			Column("chars", "Characters", "int"), Column("top", "Most on"),
+		], rows, empty="no currency data (needs Altoholic's DataStore or Syndicator)")
+	section.table(table)
+	unnamed: int = len({c.currency_id for c in held if not c.name})
+	if unnamed:
+		section.text(f"{unnamed} currency id(s) have no name: DataStore lists names without ids, and a name is only matched to an id when a character's count pins it down.")
+	apply_main(ctx, doc, table, default_limit=0)
+	return doc
+
+
+RECIPE_DIFFICULTY: dict[int, str] = {0: "optimal", 1: "medium", 2: "easy", 3: "trivial"}
+
+
+def get_recipes(ctx: Context, query: Optional[str]) -> Doc:
+	"""Recipes each character's professions list (learned only unless --all)."""
+	data: TsmData = ctx.data
+	filters: Filters = ctx.filters()
+	profession: str = (getattr(ctx.args, "profession", None) or "").strip().lower()
+	text: str = (query or "").strip().lower()
+	show_all: bool = bool(getattr(ctx.args, "all", False))
+	rows: list[dict[str, Any]] = []
+	for recipe in data.recipes:
+		if not filters.owner_ok(recipe.account, recipe.char, recipe.realm):
+			continue
+		if profession and profession not in recipe.profession.lower():
+			continue
+		if not recipe.learned and not show_all:
+			continue
+		if text and text != str(recipe.recipe_id) and text not in recipe.category.lower() and text not in recipe.name.lower():
+			continue
+		rows.append({
+			"char": recipe.char, "realm": recipe.realm, "profession": recipe.profession, "category": recipe.category or None,
+			"recipe": recipe.name or None, "id": recipe.recipe_id, "rank": f"{recipe.rank}/{recipe.max_rank}" if recipe.max_rank > 1 else "",
+			"learned": "yes" if recipe.learned else "no", "difficulty": RECIPE_DIFFICULTY.get(recipe.difficulty, str(recipe.difficulty)),
+			"url": f"https://www.wowhead.com/spell={recipe.recipe_id}", "account": recipe.account,
+		})
+	rows.sort(key=lambda r: (r["char"].lower(), r["realm"], r["profession"], r["category"] or "", r["id"]))
+	doc: Doc = Doc("Recipes", "get_recipes")
+	section: Section = doc.section("Known recipes" if not show_all else "Recipes (learned and not)")
+	section.kv(filters.describe() + [
+		("Recipes", len(rows), "int"),
+		("Characters with recipes", len({(r["char"], r["realm"]) for r in rows}), "int"),
+		("Professions", ", ".join(sorted({r["profession"] for r in rows})) or None, "str"),
+	])
+	table: Table = Table([
+		Column("char", "Character"), Column("realm", "Realm"), Column("profession", "Profession"), Column("category", "Category", max_width=30),
+		Column("recipe", "Recipe", max_width=30, wide=True), Column("id", "Recipe id"), Column("rank", "Rank"), Column("learned", "Learned", wide=True),
+		Column("difficulty", "Difficulty", wide=True), Column("url", "Wowhead", wide=True), Column("account", "Account", wide=True),
+	], rows, empty="no recipe data (needs Altoholic's DataStore with the profession window opened once per character)")
+	section.table(table)
+	section.text("DataStore stores recipe (spell) ids and categories but not recipe names; the Wowhead column links each one.")
+	apply_main(ctx, doc, table, default_limit=100)
+	return doc
+
+
+# ============================================================================
+# Commands: attention (what needs a login)
+# ============================================================================
+
+ATTENTION_KINDS: dict[str, tuple[int, str]] = {
+	"mail-expiring": (1, "mail expiring"),
+	"auctions-expired": (2, "auctions expired, collect"),
+	"auctions-expiring": (3, "auctions expiring"),
+	"mail-waiting": (4, "mail waiting"),
+	"stale": (5, "not seen lately"),
+}
+
+
+def attention_rows(ctx: Context, auction_window: int, mail_window: int, stale_after: int) -> list[dict[str, Any]]:
+	"""
+	Everything that needs a character to log in, one row per character and
+	kind, in urgency order: mail about to expire (items and gold are lost
+	or bounced), auctions already expired (sold or returned, waiting in the
+	mailbox), auctions expiring within the window (relist), other mail
+	holding gold or items, then characters not seen for a while. Within a
+	kind the earliest deadline comes first. Characters for which neither
+	DataStore nor Syndicator recorded auctions or mail fall back to TSM's
+	own first-expiry times.
+	"""
+	data: TsmData = ctx.data
+	filters: Filters = ctx.filters()
+	now: int = ctx.now
+	groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+	def add(kind: str, account: str, char: str, realm: str, due: Optional[int], value: int, count: int, note: str = "") -> None:
+		row: dict[str, Any] = groups.setdefault((kind, char, realm), {
+			"priority": ATTENTION_KINDS[kind][0], "what": ATTENTION_KINDS[kind][1], "kind": kind, "realm": realm, "char": char,
+			"count": 0, "value": 0, "due": due, "account": account, "note": note,
+		})
+		row["count"] += count
+		row["value"] += value
+		if due is not None and (row["due"] is None or due < row["due"]):
+			row["due"] = due
+
+	detailed_auctions: set[tuple[str, str]] = set()
+	for auction in data.auctions:
+		detailed_auctions.add((auction.char.lower(), auction.realm))
+		if not filters.owner_ok(auction.account, auction.char, auction.realm) or auction.expires_at is None:
+			continue
+		# Syndicator-only auctions carry no price: value them at the price source.
+		value: int = auction.buyout_total if auction.buyout_total is not None else (ctx.unit_value(auction.item, auction.realm) or 0) * auction.qty
+		if auction.expires_at <= now:
+			add("auctions-expired", auction.account, auction.char, auction.realm, auction.expires_at, value, 1)
+		elif auction.expires_at - now <= auction_window:
+			add("auctions-expiring", auction.account, auction.char, auction.realm, auction.expires_at, value, 1)
+	detailed_mail: set[tuple[str, str]] = set()
+	for mail in data.mails:
+		detailed_mail.add((mail.char.lower(), mail.realm))
+		if not mail.has_value or not filters.owner_ok(mail.account, mail.char, mail.realm):
+			continue
+		value = mail.money + (ctx.unit_value(mail.item, mail.realm) or 0) * mail.qty if mail.item else mail.money
+		kind: str = "mail-expiring" if mail.expires_at is not None and mail.expires_at - now <= mail_window else "mail-waiting"
+		add(kind, mail.account, mail.char, mail.realm, mail.expires_at, value, 1)
+	# TSM alone knows only each character's first expiring auction and mail.
+	for (char_lower, realm), when in data.tsm_expiring_auction.items():
+		char: Optional[Character] = data.char_ref(char_lower, realm)
+		if char is None or (char_lower, realm) in detailed_auctions or not filters.char_ok(char):
+			continue
+		if when <= now:
+			add("auctions-expired", char.account, char.name, realm, when, 0, 0, "TSM: first auction expiry")
+		elif when - now <= auction_window:
+			add("auctions-expiring", char.account, char.name, realm, when, 0, 0, "TSM: first auction expiry")
+	for (char_lower, realm), when in data.tsm_expiring_mail.items():
+		char = data.char_ref(char_lower, realm)
+		if char is None or (char_lower, realm) in detailed_mail or not filters.char_ok(char):
+			continue
+		if when - now <= mail_window:
+			add("mail-expiring", char.account, char.name, realm, when, 0, 0, "TSM: first mail expiry")
+	for char in data.characters.values():
+		if filters.char_ok(char) and char.last_seen and now - char.last_seen > stale_after:
+			add("stale", char.account, char.name, char.realm, char.last_seen, char.money, 1, f"last seen {fmt_age(now - char.last_seen)} ago")
+	rows: list[dict[str, Any]] = list(groups.values())
+	for row in rows:
+		row["left"] = row["due"] - now if row["due"] is not None else None
+		if not row["count"]:
+			row["count"] = None
+	rows.sort(key=lambda r: (r["priority"], r["due"] is None, r["due"] or 0, r["realm"], r["char"]))
+	return rows
+
+
+def cmd_attention(ctx: Context) -> Doc:
+	"""The ops view: which characters on which realms need a login, and why."""
+	auction_window: int = parse_duration(getattr(ctx.args, "expiring", None) or DEFAULT_AUCTION_WINDOW, "h")
+	mail_window: int = parse_duration(getattr(ctx.args, "mail_expiring", None) or DEFAULT_MAIL_WINDOW, "d")
+	stale_after: int = parse_duration(getattr(ctx.args, "stale", None) or DEFAULT_STALE_AFTER, "d")
+	rows: list[dict[str, Any]] = attention_rows(ctx, auction_window, mail_window, stale_after)
+	doc: Doc = Doc("Needs attention", "attention")
+	section: Section = doc.section("Needs a login")
+	# Realms to visit: everything but staleness, most urgent realm first.
+	realms: dict[str, dict[str, Any]] = {}
+	for row in rows:
+		if row["kind"] == "stale":
+			continue
+		entry: dict[str, Any] = realms.setdefault(row["realm"], {"rank": (row["priority"], row["due"] or 0), "chars": []})
+		if row["char"] not in entry["chars"]:
+			entry["chars"].append(row["char"])
+	if realms:
+		for realm, entry in sorted(realms.items(), key=lambda kv: kv[1]["rank"]):
+			reasons: list[str] = sorted({r["what"] for r in rows if r["realm"] == realm and r["kind"] != "stale"}, key=lambda w: next(p for p, label in ATTENTION_KINDS.values() if label == w))
+			section.text(f"- log in to {realm}: {', '.join(entry['chars'])} ({'; '.join(reasons)})")
+	else:
+		section.text("- nothing time-bound needs a login")
+	stale: list[dict[str, Any]] = [r for r in rows if r["kind"] == "stale"]
+	if stale:
+		section.text(f"- not seen in {fmt_age(stale_after)}: " + ", ".join(f"{r['char']} ({r['realm']})" for r in stale))
+	section.kv([
+		("Auctions expiring within", fmt_age(auction_window), "str"),
+		("Mail expiring within", fmt_age(mail_window), "str"),
+		("Stale after", fmt_age(stale_after), "str"),
+	])
+	table: Table = Table([
+		Column("priority", "#", "int"), Column("what", "What"), Column("realm", "Realm"), Column("char", "Character"),
+		Column("count", "Count", "int"), money_col("value", "Value"), Column("left", "Due", "dur"), Column("due", "When", "time", wide=True),
+		Column("note", "Note", wide=True), Column("account", "Account", wide=True),
+	], rows, empty="nothing needs attention")
+	section.table(table)
+	if not ctx.data.auctions and not ctx.data.mails:
+		section.text("Without Altoholic's DataStore or Syndicator only TSM's first-expiry times and last-seen dates are known.")
+	section.text("Value is the buyout of the auctions, or the gold plus the items' value for mail; for stale characters it is their gold. Due is the deadline (negative: already past; for stale characters, when they were last seen).")
+	apply_main(ctx, doc, table)
 	return doc
 
 
@@ -5286,17 +5657,50 @@ def describe_char(ctx: Context, query: str) -> Doc:
 	pnl: Pnl = pnl_total(data, filters)
 	held: list[Holding] = [h for h in data.holdings if h.owner == char.name and h.realm == char.realm]
 	held_value: int = sum((ctx.unit_value(h.item, h.realm) or 0) * h.qty for h in held)
+	auctions: list[Auction] = [a for a in data.auctions if a.char == char.name and a.realm == char.realm]
+	mails: list[Mail] = [m for m in data.mails if m.char == char.name and m.realm == char.realm and m.has_value]
 	section: Section = doc.section(f"{char.name} - {char.realm}")
 	section.kv([
-		("Class", class_name(char.class_key), "str"), ("Faction", char.faction, "str"), ("Guild", char.guild or None, "str"),
-		("Account", char.account, "str"), ("Gold", char.money, "money"), ("Inventory value", held_value, "money"),
-		("Gold log updated", char.gold_log_updated or None, "time"),
+		("Level", char.level, "int"), ("Class", class_name(char.class_key) if char.class_key else None, "str"), ("Race", char.race or None, "str"),
+		("Faction", char.faction, "str"), ("Guild", char.guild or None, "str"), ("Account", char.account, "str"),
+		("Gold", char.money, "money"), ("Gold from", f"{char.money_source or 'tsm'}" + (f" as of {fmt_time(char.money_at)}" if char.money_at else ""), "str"),
+		("Inventory value", held_value, "money"),
+		("Posted auctions", len(auctions), "int"), ("Auction buyout value", sum(a.buyout_total or 0 for a in auctions), "money"),
+		("Mail waiting (gold)", sum(m.money for m in mails), "money"), ("Mail waiting (item units)", sum(m.qty for m in mails), "int"),
+		("Last seen", char.last_seen, "time"), ("Played", fmt_age(char.played) if char.played else None, "str"), ("Zone", char.zone or None, "str"),
+		("Gold log updated", char.gold_log_updated or None, "time"), ("Sources", ", ".join(char.sources) or None, "str"),
 	] + filters.describe() + [
 		("Revenue", pnl.revenue, "money"), ("Purchases", -pnl.purchases, "money"), ("Expenses", -pnl.expenses, "money"), ("Net", pnl.net, "money"),
 	])
 	profs: list[dict[str, Any]] = [{"profession": n, "level": lua_dict(p).get("level"), "max": lua_dict(p).get("maxLevel")} for n, p in sorted(char.professions.items())]
 	if profs:
 		doc.section("Professions", level=2).table(Table([Column("profession", "Profession"), Column("level", "Skill", "int"), Column("max", "Max", "int")], profs))
+	if auctions:
+		auction_rows: list[dict[str, Any]] = [{
+			"item": a.item, "qty": a.qty, "buyout": a.buyout, "total": a.buyout_total,
+			"left": a.expires_at - ctx.now if a.expires_at else None, "expires": a.expires_at,
+		} for a in auctions]
+		auction_rows.sort(key=lambda r: (r["left"] is None, r["left"] or 0))
+		auction_section: Section = doc.section("Auctions (soonest to end first)", level=2)
+		auction_section.table(Table([
+			Column("item", "Item", "item", max_width=36), Column("qty", "Qty", "int"), money_col("buyout", "Buyout each"),
+			money_col("total", "Buyout"), Column("left", "Left", "dur"), Column("expires", "Expires", "time"),
+		], auction_rows[:20], totals={"item": f"{len(auction_rows)} auctions", "qty": sum(r["qty"] for r in auction_rows), "total": sum(r["total"] or 0 for r in auction_rows)}))
+		if len(auction_rows) > 20:
+			auction_section.text(f"{len(auction_rows) - 20} more; `tsmctl get auctions --char {char.name} --realm \"{char.realm}\"` lists them all.")
+	if mails:
+		doc.section("Mail with gold or items", level=2).table(Table([
+			Column("sender", "From"), Column("item", "Item", "item", max_width=36), Column("qty", "Qty", "int"), money_col("money", "Money"),
+			Column("left", "Left", "dur"), Column("pending", "Pending"),
+		], [{
+			"sender": m.sender or None, "item": m.item or None, "qty": m.qty or None, "money": m.money or None,
+			"left": m.expires_at - ctx.now if m.expires_at else None, "pending": "on its way" if m.from_cache else "",
+		} for m in mails]))
+	currencies: list[CurrencyHolding] = sorted((c for c in data.currencies if c.char == char.name and c.realm == char.realm and c.qty > 0), key=lambda c: -c.qty)
+	if currencies:
+		doc.section("Currencies", level=2).table(Table([
+			Column("currency", "Currency", max_width=34), Column("qty", "Qty", "int"), Column("week", "This week", "int"), Column("max", "Cap", "int"),
+		], [{"currency": c.name or f"currency {c.currency_id}", "qty": c.qty, "week": c.earned_this_week or None, "max": c.max_qty} for c in currencies[:25]]))
 	by_loc: dict[tuple[str, str], list[int]] = {}
 	for holding in held:
 		entry: list[int] = by_loc.setdefault((filters.key(holding.item), holding.location), [0, 0])
@@ -5863,10 +6267,12 @@ def _register_in_index(ctx: Context, path: Path, node_id: str, title: str) -> No
 EPILOG: str = """\
 commands:
   status                       data sources (TSM, DataStore, Syndicator), freshness and warnings
+  attention                    which characters on which realms need a login, and why
   get <resource> [query]       list things; resources:
                                  accounts realms chars gold gold-history
                                  sales buys income expenses expired cancelled ledger
-                                 inventory auctions groups prices professions items sources
+                                 inventory auctions mail currencies recipes
+                                 groups prices professions items sources
   describe <kind> <name>       item | char | realm | group, in depth
   search <text>                find items by name or id
   pnl                          profit & loss (--by day|week|month|realm|char|source|group|item)
@@ -5887,6 +6293,14 @@ output:
 
 examples:
   tsmctl status
+  tsmctl attention
+  tsmctl attention --expiring 6h --mail-expiring 5d --stale 30d
+  tsmctl get auctions --expiring 6h
+  tsmctl get auctions --char Drgold --realm thorium -n 0 -o csv > auctions.csv
+  tsmctl get mail --expiring 3d
+  tsmctl get currencies --by currency
+  tsmctl get currencies "trader's tender"
+  tsmctl get recipes --profession tailoring --char Havemércy
   tsmctl --sources tsm,datastore get chars
   tsmctl report
   tsmctl report --since 7d --save
@@ -5917,6 +6331,8 @@ time values (--since/--until): 12h 7d 2w 3m 1y today yesterday week month ytd al
 
 price expressions: sources (tsmctl get sources) combined with min() max() avg() first() check(),
   + - * /, N%, and money like 10g or 1g50s, e.g. "first(dbmarket, 80% dbregionmarketavg)".
+
+durations (--expiring, --mail-expiring, --stale): 30m 6h 3d 2w (m = minutes here).
 
 data sources: TradeSkillMaster.lua (TSM), Altoholic's DataStore*.lua and Syndicator.lua, each
   optional and detected per account; --sources or `sources:` picks some. Where they overlap
@@ -6003,11 +6419,14 @@ def build_parser() -> argparse.ArgumentParser:
 	config.add_argument("action", nargs="?", default="view", help="view (default) or sample")
 
 	get: argparse.ArgumentParser = sub("get", "list a resource", cmd_get, aliases=["ls"])
-	get.add_argument("resource", help="accounts, realms, chars, gold, gold-history, sales, buys, income, expenses, expired, cancelled, ledger, inventory, auctions, groups, prices, professions, items, sources")
-	get.add_argument("query", nargs="?", help="optional item filter (name, id, i:ID) for ledger/inventory/prices")
-	get.add_argument("--by", metavar="KEY", help="gold-history: day|week|month; inventory: item|char|location|realm|group")
+	get.add_argument("resource", help="accounts, realms, chars, gold, gold-history, sales, buys, income, expenses, expired, cancelled, ledger, inventory, auctions, mail, currencies, recipes, groups, prices, professions, items, sources")
+	get.add_argument("query", nargs="?", help="optional filter: an item (name, id, i:ID) for ledger/inventory/auctions/mail/prices, a currency name or id, a recipe category or id")
+	get.add_argument("--by", metavar="KEY", help="gold-history: day|week|month; inventory/auctions: item|char|location|realm|group; currencies: char|currency")
 	get.add_argument("--location", action="append", metavar="LOC", help="inventory places: bag, bank, reagent_bank, void, mail, auction, warbank, guild")
 	get.add_argument("--min-value", metavar="MONEY", help="inventory: hide rows worth less than this (e.g. 500g)")
+	get.add_argument("--expiring", metavar="DURATION", help="auctions: only those ending within this (6h, 2d; expired included); mail: within this (3d; bare number = days)")
+	get.add_argument("--profession", metavar="NAME", help="recipes: only this profession (substring)")
+	get.add_argument("--all", action="store_true", help="mail: include letters without money or items; recipes: include unlearned; currencies: include zero balances")
 
 	describe: argparse.ArgumentParser = sub("describe", "describe one item, character, realm or TSM group", cmd_describe, aliases=["desc"])
 	describe.add_argument("kind", help="item, char, realm or group")
@@ -6045,6 +6464,11 @@ def build_parser() -> argparse.ArgumentParser:
 	deals.add_argument("--max-buy", metavar="MONEY", help="skip items costing more than this")
 	deals.add_argument("--commodities", action="store_true", help="include region-wide commodities (stackables)")
 	deals.add_argument("--no-pets", action="store_true", help="skip battle pets")
+
+	attention: argparse.ArgumentParser = sub("attention", "which characters on which realms need a login, and why", cmd_attention, aliases=["todo", "ops"])
+	attention.add_argument("--expiring", metavar="DURATION", help=f"auctions ending within this count (default {DEFAULT_AUCTION_WINDOW})")
+	attention.add_argument("--mail-expiring", metavar="DURATION", help=f"mail expiring within this is urgent (default {DEFAULT_MAIL_WINDOW}; bare number = days)")
+	attention.add_argument("--stale", metavar="DURATION", help=f"characters not seen for longer than this (default {DEFAULT_STALE_AFTER}; bare number = days)")
 
 	report: argparse.ArgumentParser = sub("report", "full business report", cmd_report)
 	report.add_argument("--top", type=int, metavar="N", help="rows per section (default 15)")
