@@ -29,6 +29,16 @@ tsmctl reads the files TSM leaves on disk and never writes to them:
       the AuctionDB market data the TSM desktop app downloads (realm min
       buyout, market value, historical; region market, sale avg, sale rate,
       sold per day).
+  * WTF/Account/<account>/SavedVariables/DataStore*.lua (optional)
+      Altoholic's DataStore: character level/race/class/played/zone, every
+      posted auction with its buyout and time left, mail with expiry, bag,
+      bank, void, warband and guild bank slots, currencies and known recipes.
+  * WTF/Account/<account>/SavedVariables/Syndicator.lua (optional)
+      Syndicator (Baganator): item links and absolute expiry times of posted
+      auctions, mail items, containers, currencies and the warband bank.
+
+TSM, DataStore and Syndicator are each optional and detected per account;
+where they overlap, the freshest copy wins (see TsmData.finish()).
 
 The WoW install can be local, or on another machine reached over ssh. Remote
 data is pulled with `find` and `tar c` only (read-only on the remote) into a
@@ -118,6 +128,60 @@ SSH_BASE_OPTIONS: list[str] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 # Relative paths (from the WoW flavor directory) that hold TSM data.
 SV_GLOB_DEPTH: int = 3
 APPDATA_REL: str = "Interface/AddOns/TradeSkillMaster_AppHelper/AppData.lua"
+
+# SavedVariables files read per WoW account folder, by data source. The
+# remote mirror copies exactly these names and nothing else.
+SOURCE_FILES: dict[str, tuple[str, ...]] = {
+	"tsm": ("TradeSkillMaster.lua",),
+	"datastore": (
+		"DataStore.lua", "DataStore_Characters.lua", "DataStore_Auctions.lua", "DataStore_Mails.lua",
+		"DataStore_Containers.lua", "DataStore_Currencies.lua", "DataStore_Crafts.lua",
+	),
+	"syndicator": ("Syndicator.lua",),
+}
+SOURCE_NAMES: tuple[str, ...] = tuple(SOURCE_FILES)
+SOURCE_ALIASES: dict[str, str] = {
+	"tradeskillmaster": "tsm", "altoholic": "datastore", "ds": "datastore",
+	"baganator": "syndicator", "syn": "syndicator",
+}
+SV_FILE_NAMES: tuple[str, ...] = tuple(name for names in SOURCE_FILES.values() for name in names)
+
+# When two sources hold the same thing (a character's bags, its gold...),
+# the freshest dated copy wins; copies this close to the freshest count as
+# the same moment and the source priority below breaks the tie. Five
+# minutes covers one logout: DataStore and TSM stamp the same session up to
+# a couple of minutes apart.
+RECONCILE_TIE_SECONDS: int = 300
+SOURCE_PRIORITY: dict[str, int] = {"tsm": 0, "datastore": 1, "syndicator": 2}
+
+# DataStore's packed class ids (BaseInfo bits 7-10) -> TSM class tokens.
+DS_CLASS_TOKENS: dict[int, str] = {
+	1: "WARRIOR", 2: "PALADIN", 3: "HUNTER", 4: "ROGUE", 5: "PRIEST", 6: "DEATHKNIGHT", 7: "SHAMAN",
+	8: "MAGE", 9: "WARLOCK", 10: "MONK", 11: "DRUID", 12: "DEMONHUNTER", 13: "EVOKER",
+}
+
+# Race ids (BaseInfo bits 11-17) -> (name, faction). DataStore stores no
+# faction, so it comes from the race unless TSM or Syndicator says.
+RACE_INFO: dict[int, tuple[str, str]] = {
+	1: ("Human", "Alliance"), 2: ("Orc", "Horde"), 3: ("Dwarf", "Alliance"), 4: ("Night Elf", "Alliance"),
+	5: ("Undead", "Horde"), 6: ("Tauren", "Horde"), 7: ("Gnome", "Alliance"), 8: ("Troll", "Horde"),
+	9: ("Goblin", "Horde"), 10: ("Blood Elf", "Horde"), 11: ("Draenei", "Alliance"), 22: ("Worgen", "Alliance"),
+	24: ("Pandaren", ""), 25: ("Pandaren", "Alliance"), 26: ("Pandaren", "Horde"), 27: ("Nightborne", "Horde"),
+	28: ("Highmountain Tauren", "Horde"), 29: ("Void Elf", "Alliance"), 30: ("Lightforged Draenei", "Alliance"),
+	31: ("Zandalari Troll", "Horde"), 32: ("Kul Tiran", "Alliance"), 34: ("Dark Iron Dwarf", "Alliance"),
+	35: ("Vulpera", "Horde"), 36: ("Mag'har Orc", "Horde"), 37: ("Mechagnome", "Alliance"),
+	52: ("Dracthyr", "Alliance"), 70: ("Dracthyr", "Horde"), 84: ("Earthen", "Horde"), 85: ("Earthen", "Alliance"),
+}
+
+# Holding places (the names the VENTURE export contract uses too) and the
+# coarser group each one is reconciled in. TSM only knows bag/bank/mail/
+# auction/warbank/guild, and its bag and bank counts include the reagent
+# bag and reagent bank, so a winner is chosen per group, not per place.
+PLACE_GROUPS: dict[str, str] = {
+	"bag": "bag", "bank": "bank", "reagent_bank": "bank", "void": "void", "mail": "mail",
+	"auction": "auction", "warbank": "warbank", "guild": "guild", "other": "other",
+}
+TSM_LOCATION_PLACES: dict[str, str] = {"reagentBank": "reagent_bank", "reagentbank": "reagent_bank"}
 
 # Accounting record kinds as stored by TSM, keyed by our short kind name.
 LEDGER_KEYS: dict[str, str] = {
@@ -550,6 +614,10 @@ class Settings(object):
 	author: str = DEFAULT_AUTHOR
 	categories: str = DEFAULT_CATEGORIES
 	sources: dict[str, str] = field(default_factory=dict)
+	# Which SavedVariables sources to read (tsm, datastore, syndicator);
+	# empty means every one that is present. `sources` above is unrelated:
+	# it records where each setting's value came from.
+	data_sources: list[str] = field(default_factory=list)
 
 
 def _config_layer(args: argparse.Namespace) -> tuple[dict[str, Any], Optional[Path]]:
@@ -606,6 +674,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
 	settings.ssh_options = [str(o) for o in lua_list(ssh_options)] if not isinstance(ssh_options, str) else shlex.split(ssh_options)
 	accounts: Any = pick("accounts", getattr(args, "account", None), ("TSMCTL_ACCOUNTS",), [])
 	settings.accounts = _split_multi(accounts)
+	settings.data_sources = parse_source_list(pick("sources", getattr(args, "sources", None), ("TSMCTL_SOURCES",), []))
 	settings.realm = str(pick("realm", getattr(args, "default_realm", None), ("TSMCTL_REALM",), "") or "")
 	settings.price_source = str(pick("price_source", getattr(args, "price_source", None), ("TSMCTL_PRICE_SOURCE",), DEFAULT_PRICE_SOURCE))
 	settings.market_source = str(pick("market_source", getattr(args, "market_source", None), ("TSMCTL_MARKET_SOURCE",), DEFAULT_MARKET_SOURCE))
@@ -637,6 +706,23 @@ def _split_multi(values: Any) -> list[str]:
 			if part:
 				result.append(part)
 	return result
+
+
+def parse_source_list(values: Any) -> list[str]:
+	"""
+	Normalise a --sources / `sources:` value into canonical source names,
+	in SOURCE_NAMES order. "all" (or nothing) means every source.
+	"""
+	wanted: set[str] = set()
+	for part in _split_multi(values):
+		name: str = part.lower()
+		if name == "all":
+			return []
+		name = SOURCE_ALIASES.get(name, name)
+		if name not in SOURCE_FILES:
+			raise TsmctlError(f"unknown data source {part!r}; choose from {', '.join(SOURCE_NAMES)} (or all)")
+		wanted.add(name)
+	return [name for name in SOURCE_NAMES if name in wanted]
 
 
 # ============================================================================
@@ -735,11 +821,17 @@ class DataSource(object):
 			return {}
 
 	def _sync(self, manifest: dict[str, Any]) -> None:
-		"""List remote files, then copy only the ones whose mtime/size changed."""
+		"""
+		List remote files, then copy only the ones whose mtime/size changed.
+		Every source's SavedVariables are mirrored whatever --sources says,
+		so switching sources never needs a re-copy; only exact file names
+		from SOURCE_FILES are listed.
+		"""
+		names: str = " -o ".join(f"-name {shlex.quote(name)}" for name in SV_FILE_NAMES)
 		listing_cmd: str = (
 			f"cd -- {self._remote_dir_expr()} 2>/dev/null || exit 3; "
 			f"find WTF/Account -mindepth {SV_GLOB_DEPTH} -maxdepth {SV_GLOB_DEPTH} -type f "
-			"-name TradeSkillMaster.lua -path '*/SavedVariables/*' -printf '%T@\\t%s\\t%p\\n' 2>/dev/null; "
+			f"\\( {names} \\) -path '*/SavedVariables/*' -printf '%T@\\t%s\\t%p\\n' 2>/dev/null; "
 			f"if [ -f {shlex.quote(APPDATA_REL)} ]; then find {shlex.quote(APPDATA_REL)} -printf '%T@\\t%s\\t%p\\n'; fi; true"
 		)
 		proc: subprocess.CompletedProcess[Any] = self._ssh(listing_cmd, timeout=60)
@@ -755,9 +847,12 @@ class DataSource(object):
 			rel: str = parts[2]
 			if rel.startswith("/") or ".." in Path(rel).parts:
 				continue
+			# Only names we asked for: a listing is data from another machine.
+			if rel != APPDATA_REL and Path(rel).name not in SV_FILE_NAMES:
+				continue
 			remote_files[rel] = [float(parts[0]), float(parts[1])]
 		if not remote_files:
-			raise TsmctlError(f"no TSM files found on {self.settings.host} under {self.settings.wow_dir}/{self.settings.flavor}")
+			raise TsmctlError(f"no TSM, DataStore or Syndicator files found on {self.settings.host} under {self.settings.wow_dir}/{self.settings.flavor}")
 
 		cached: dict[str, list[float]] = manifest.get("files", {}) if not self.settings.refresh else {}
 		wanted: list[str] = [
@@ -825,13 +920,21 @@ class DataSource(object):
 		if missing:
 			raise TsmctlError(f"remote tar did not include: {', '.join(sorted(missing))}")
 
-	def sv_files(self) -> list[tuple[str, Path]]:
-		"""Return (account, path) for every account's TradeSkillMaster.lua."""
+	def account_files(self) -> dict[str, dict[str, Path]]:
+		"""
+		Every known SavedVariables file per account folder:
+		{account: {file name: path}}. Only names from SOURCE_FILES count.
+		"""
 		base: Path = self.root / "WTF" / "Account"
-		found: list[tuple[str, Path]] = []
-		if base.is_dir():
-			for path in sorted(base.glob("*/SavedVariables/TradeSkillMaster.lua")):
-				found.append((path.parent.parent.name, path))
+		found: dict[str, dict[str, Path]] = {}
+		if not base.is_dir():
+			return found
+		for account_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+			sv: Path = account_dir / "SavedVariables"
+			for name in SV_FILE_NAMES:
+				path: Path = sv / name
+				if path.is_file():
+					found.setdefault(account_dir.name, {})[name] = path
 		return found
 
 	def appdata_file(self) -> Optional[Path]:
@@ -875,7 +978,12 @@ def wowhead_url(item: str) -> str:
 
 @dataclass(slots=True)
 class Character(object):
-	"""One character as TSM knows it (from the s@ sync scope)."""
+	"""
+	One character, merged across sources. TSM's s@ scope gives the key
+	("Name - Faction - Realm"), gold, class, professions and gold log;
+	DataStore adds level, race, played time, zone and when it was last
+	seen; Syndicator fills faction/race/class when nothing else knows them.
+	"""
 
 	key: str
 	name: str
@@ -888,6 +996,14 @@ class Character(object):
 	guild: str = ""
 	gold_log: list[tuple[int, int]] = field(default_factory=list)
 	gold_log_updated: int = 0
+	level: Optional[int] = None
+	race: str = ""
+	played: Optional[int] = None
+	last_seen: Optional[int] = None
+	zone: str = ""
+	money_source: str = ""
+	money_at: Optional[int] = None
+	sources: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -918,7 +1034,12 @@ class Txn(object):
 
 @dataclass(slots=True)
 class Holding(object):
-	"""A quantity of an item sitting somewhere (bags, bank, AH, warbank...)."""
+	"""
+	A quantity of an item sitting somewhere. `location` is the place:
+	bag, bank, reagent_bank, void, mail, auction, warbank or guild.
+	`source` is the SavedVariables source that won reconciliation for this
+	owner and place group; `updated_at` is that copy's timestamp.
+	"""
 
 	account: str
 	realm: str
@@ -927,6 +1048,8 @@ class Holding(object):
 	location: str
 	item: str
 	qty: int
+	source: str = "tsm"
+	updated_at: Optional[int] = None
 
 
 @dataclass(slots=True)
@@ -954,6 +1077,226 @@ class SvFileInfo(object):
 	path: Path
 	size: int
 	mtime: float
+	source: str = "tsm"
+
+
+@dataclass(slots=True)
+class Auction(object):
+	"""
+	One of the operator's own posted auctions, joined across DataStore
+	(price, bid, quantity, time left at the last AH visit) and Syndicator
+	(item link, absolute expiry) on the auction id.
+
+	`buyout` is per unit: DataStore stores C_AuctionHouse's buyoutAmount,
+	which is a unit price (Auctionator multiplies it by the quantity for
+	its totals). `bid` is the current bid as the client reported it, or 0.
+	`item` is a TSM-style item string (i:ID, i:ID::n:bonus..., p:species:
+	level:quality) and `link` the raw item link, kept for the export's
+	instrument mapping. `expires_at` is an epoch, None when unknown.
+	"""
+
+	account: str
+	char: str
+	realm: str
+	item: str
+	qty: int
+	auction_id: int
+	link: str = ""
+	buyout: Optional[int] = None
+	bid: Optional[int] = None
+	expires_at: Optional[int] = None
+	scanned_at: Optional[int] = None
+	ah_zone: int = 0
+	sources: list[str] = field(default_factory=list)
+
+	@property
+	def buyout_total(self) -> Optional[int]:
+		return self.buyout * self.qty if self.buyout is not None else None
+
+	@property
+	def bid_each(self) -> Optional[int]:
+		return self.bid // self.qty if self.bid and self.qty else None
+
+
+@dataclass(slots=True)
+class Mail(object):
+	"""
+	One mail entry waiting in a character's mailbox. DataStore stores each
+	attachment as its own entry and the money/letter as another, so one
+	in-game mail can be several of these. `from_cache` marks mail an alt
+	sent that the recipient has not opened its mailbox to see yet (it is
+	on its way, 30 days from sending). `cod` is the cash-on-delivery
+	amount; neither addon records it today, so it is 0 unless known.
+	"""
+
+	account: str
+	char: str
+	realm: str
+	sender: str = ""
+	subject: str = ""
+	money: int = 0
+	cod: int = 0
+	item: str = ""
+	link: str = ""
+	qty: int = 0
+	expires_at: Optional[int] = None
+	returned: bool = False
+	from_cache: bool = False
+	checked_at: Optional[int] = None
+	source: str = ""
+
+	@property
+	def has_value(self) -> bool:
+		"""True for mail worth collecting: money or an item (not a bare letter)."""
+		return self.money > 0 or bool(self.item)
+
+
+@dataclass(slots=True)
+class CurrencyHolding(object):
+	"""A character's balance of one game currency (currency id from the client)."""
+
+	account: str
+	char: str
+	realm: str
+	currency_id: int
+	name: str
+	qty: int
+	earned_this_week: Optional[int] = None
+	max_qty: Optional[int] = None
+	max_weekly: Optional[int] = None
+	updated_at: Optional[int] = None
+	source: str = ""
+
+
+@dataclass(slots=True)
+class KnownRecipe(object):
+	"""
+	A recipe a character's profession lists. DataStore keeps the recipe
+	(spell) id, its category and learned/rank bits but no recipe name or
+	result item, so `name` is usually empty.
+	"""
+
+	account: str
+	char: str
+	realm: str
+	profession: str
+	recipe_id: int
+	category_id: int = 0
+	category: str = ""
+	learned: bool = True
+	rank: int = 0
+	max_rank: int = 0
+	difficulty: int = 0
+	name: str = ""
+	source: str = ""
+
+
+@dataclass
+class CharObservation(object):
+	"""What one optional source says about a character, merged in finish()."""
+
+	source: str
+	account: str
+	name: str
+	realm: str
+	updated_at: Optional[int] = None
+	money: Optional[int] = None
+	faction: str = ""
+	class_key: str = ""
+	race: str = ""
+	level: Optional[int] = None
+	played: Optional[int] = None
+	last_seen: Optional[int] = None
+	zone: str = ""
+	guild: str = ""
+
+
+@dataclass
+class HoldingSet(object):
+	"""
+	Everything one source says is in one owner's place group, as of
+	`updated_at` (None = the source has no timestamp for it). Sets for the
+	same owner and group compete in reconcile_holdings(); the winner's
+	holdings replace everyone else's.
+	"""
+
+	source: str
+	account: str
+	owner: str
+	realm: str
+	faction: str
+	group: str
+	updated_at: Optional[int]
+	holdings: list[Holding] = field(default_factory=list)
+
+
+@dataclass
+class SourceStatus(object):
+	"""How one data source fared for one account, for `status`."""
+
+	account: str
+	source: str
+	state: str
+	files: int = 0
+	size: int = 0
+	file_mtime: Optional[float] = None
+	data_time: Optional[int] = None
+	note: str = ""
+
+
+def pick_freshest(candidates: list[tuple[str, Optional[int], Any]]) -> Optional[tuple[str, Optional[int], Any]]:
+	"""
+	The reconciliation rule, shared by gold, holdings, mail and currencies.
+	candidates are (source, timestamp or None, payload). The freshest dated
+	candidate wins; dated candidates within RECONCILE_TIE_SECONDS of it are
+	equally fresh and the source priority (tsm, datastore, syndicator)
+	breaks the tie. Undated candidates only win when none is dated, again
+	by priority.
+	"""
+	if not candidates:
+		return None
+	dated: list[tuple[str, Optional[int], Any]] = [c for c in candidates if c[1] is not None]
+	pool: list[tuple[str, Optional[int], Any]] = candidates
+	if dated:
+		newest: int = max(int(c[1] or 0) for c in dated)
+		pool = [c for c in dated if newest - int(c[1] or 0) <= RECONCILE_TIE_SECONDS]
+	return min(pool, key=lambda c: SOURCE_PRIORITY.get(c[0], 99))
+
+
+LINK_RE: re.Pattern[str] = re.compile(r"\|H(item|battlepet|keystone):([^|]*)\|h")
+
+
+def item_string_from_link(link: Optional[str], fallback_id: Optional[int] = None) -> str:
+	"""
+	Turn a WoW item link into a TSM-style item string:
+
+	    |Hitem:9944::::::::10:1446::1:2:6655:1692:...|h  ->  i:9944::2:1692:6655
+	    |Hbattlepet:1720:25:3:...|h                     ->  p:1720:25:3
+	    |Hkeystone:180653:...|h                          ->  i:180653
+
+	Fields after "item:" are id, enchant, 4 gems, suffix, unique, link
+	level, spec, modifier mask, context, then the bonus id count (index
+	12) and the bonus ids, which are kept sorted. Without a usable link,
+	fall back to i:<fallback_id>.
+	"""
+	match: Optional[re.Match[str]] = LINK_RE.search(link or "")
+	if match is None:
+		return f"i:{fallback_id}" if fallback_id else ""
+	kind, body = match.groups()
+	parts: list[str] = body.split(":")
+	if kind == "battlepet":
+		pet: list[str] = [p for p in parts[:3] if p.isdigit()]
+		return "p:" + ":".join(pet) if pet else ""
+	if not parts or not parts[0].isdigit():
+		return f"i:{fallback_id}" if fallback_id else ""
+	if kind == "keystone":
+		return f"i:{parts[0]}"
+	count: int = int(parts[12]) if len(parts) > 12 and parts[12].isdigit() else 0
+	bonuses: list[str] = [b for b in parts[13:13 + count] if b.isdigit()]
+	if bonuses:
+		ordered: list[str] = sorted(bonuses, key=int)
+		return f"i:{parts[0]}::{len(ordered)}:" + ":".join(ordered)
+	return f"i:{parts[0]}"
 
 
 def _parse_minute_log(text: Any) -> list[tuple[int, int]]:
@@ -1011,19 +1354,42 @@ class TsmData(object):
 		self._save_time: int = int(time.time())
 		self.future_clamped: int = 0
 		self._name_counts: Optional[dict[str, int]] = None
+		# Optional sources (DataStore, Syndicator) and their reconciliation.
+		self.source_files: list[SvFileInfo] = []
+		self.source_status: list[SourceStatus] = []
+		self.char_obs: list[CharObservation] = []
+		self.holding_sets: list[HoldingSet] = []
+		self.tsm_holding_keys: dict[tuple[str, str, str], str] = {}
+		self.warbank_log_updated: dict[str, int] = {}
+		self.tsm_warbank_accounts: set[str] = set()
+		self.alt_warbank_money: dict[str, tuple[str, int]] = {}
+		self.auction_obs: list[Auction] = []
+		self.auctions: list[Auction] = []
+		self.char_lists: dict[str, list[tuple[str, str, str, str, Optional[int], list[Any]]]] = {"mail": [], "currency": []}
+		self.mails: list[Mail] = []
+		self.currencies: list[CurrencyHolding] = []
+		self.recipes: list[KnownRecipe] = []
+		self.currency_names: dict[int, str] = {}
+		self.tsm_expiring_auction: dict[tuple[str, str], int] = {}
+		self.tsm_expiring_mail: dict[tuple[str, str], int] = {}
+		self.realm_parent: dict[str, str] = {}
+		self.realm_names: dict[str, str] = {}
+		self.reconcile_stats: dict[tuple[str, str], int] = {}
 
 	# ------------------------------------------------------------------ load
 
 	def load_account(self, account: str, path: Path) -> None:
 		"""Parse one account's TradeSkillMaster.lua and merge it in."""
 		stat: os.stat_result = path.stat()
-		self.files.append(SvFileInfo(account, path, stat.st_size, stat.st_mtime))
+		info: SvFileInfo = SvFileInfo(account, path, stat.st_size, stat.st_mtime)
+		self.files.append(info)
+		self.source_files.append(info)
 		parsed: dict[str, Any] = parse_lua_file(path)
 		db: dict[Any, Any] = lua_dict(parsed.get("TradeSkillMasterDB"))
 		if not db:
 			Log.warn(f"{path}: no TradeSkillMasterDB table; skipping account {account}")
 			return
-		self.accounts.append(account)
+		self.add_account(account)
 		sync_owner: dict[Any, Any] = lua_dict(db.get("_syncOwner"))
 		sync_account: dict[Any, Any] = lua_dict(db.get("_syncAccountKey"))
 		seen_txns: set[tuple[Any, ...]] = {self._txn_key(t) for t in self.txns}
@@ -1069,9 +1435,13 @@ class TsmData(object):
 			if existing.account != account and owned:
 				existing.account = account
 			return existing
-		char: Character = Character(key=scope_key, name=name, faction=faction, realm=realm, account=account)
+		char: Character = Character(key=scope_key, name=name, faction=faction, realm=realm, account=account, sources=["tsm"])
 		self.characters[scope_key] = char
 		return char
+
+	def add_account(self, account: str) -> None:
+		if account not in self.accounts:
+			self.accounts.append(account)
 
 	def _load_char_value(self, account: str, scope_key: str, name: str, value: Any, sync_owner: dict[Any, Any], sync_account: dict[Any, Any]) -> None:
 		char: Optional[Character] = self._char(account, scope_key, sync_owner, sync_account)
@@ -1079,6 +1449,7 @@ class TsmData(object):
 			return
 		if name == "money" and isinstance(value, (int, float)):
 			char.money = int(value)
+			char.money_source = "tsm"
 		elif name == "classKey" and isinstance(value, str):
 			char.class_key = value
 		elif name == "playerProfessions":
@@ -1089,7 +1460,10 @@ class TsmData(object):
 			char.gold_log_updated = int(value)
 		elif name.endswith("Quantity"):
 			# bagQuantity, bankQuantity, mailQuantity, auctionQuantity, ...
-			location: str = name[: -len("Quantity")]
+			raw_location: str = name[: -len("Quantity")]
+			location: str = TSM_LOCATION_PLACES.get(raw_location, raw_location)
+			# An empty table still says "nothing there": remember it was present.
+			self.tsm_holding_keys[(char.name, char.realm, location)] = account
 			self.holdings = [h for h in self.holdings if not (h.owner == char.name and h.realm == char.realm and h.location == location)]
 			for item, qty in lua_dict(value).items():
 				if isinstance(item, str) and isinstance(qty, (int, float)) and qty > 0:
@@ -1159,10 +1533,17 @@ class TsmData(object):
 		bits: list[str] = faction_realm.split(" - ", 1)
 		faction: str = bits[0] if len(bits) == 2 else ""
 		realm: str = bits[1] if len(bits) == 2 else faction_realm
-		if name == "guildVaults":
+		if name in ("expiringAuction", "expiringMail"):
+			# {character name: epoch of its first expiring auction/mail}.
+			target: dict[tuple[str, str], int] = self.tsm_expiring_auction if name == "expiringAuction" else self.tsm_expiring_mail
+			for char_name, when in lua_dict(value).items():
+				if isinstance(char_name, str) and isinstance(when, (int, float)) and when > 0:
+					target[(char_name.lower(), realm)] = int(when)
+		elif name == "guildVaults":
 			for guild, items in lua_dict(value).items():
 				owner: str = f"Guild: {guild}"
 				self.guild_realm[str(guild)] = realm
+				self.tsm_holding_keys[(owner, realm, "guild")] = account
 				self.holdings = [h for h in self.holdings if not (h.owner == owner and h.realm == realm)]
 				for item, qty in lua_dict(items).items():
 					if isinstance(item, str) and isinstance(qty, (int, float)) and qty > 0:
@@ -1182,7 +1563,10 @@ class TsmData(object):
 			self.warbank_money[account] = int(value)
 		elif name == "warbankGoldLog":
 			self.warbank_log[account] = _parse_minute_log(value)
+		elif name == "warbankGoldLogLastUpdate" and isinstance(value, (int, float)):
+			self.warbank_log_updated[account] = int(value)
 		elif name == "warbankQuantity":
+			self.tsm_warbank_accounts.add(account)
 			self.holdings = [h for h in self.holdings if not (h.owner == "Warbank" and h.account == account)]
 			for item, qty in lua_dict(value).items():
 				if isinstance(item, str) and isinstance(qty, (int, float)) and qty > 0:
@@ -1263,8 +1647,231 @@ class TsmData(object):
 			if base not in self.items_by_base or base == item:
 				self.items_by_base[base] = info
 
+	# ------------------------------------------------------------ reconcile
+
+	def link_realms(self, first: str, second: str) -> None:
+		"""Record that two realms are connected (they share an AH and guilds)."""
+		if not first or not second:
+			return
+		root_a: str = self.realm_root(first)
+		root_b: str = self.realm_root(second)
+		if root_a != root_b:
+			# Keep the alphabetically first name as the root so it is stable.
+			low, high = sorted((root_a, root_b))
+			self.realm_parent[high] = low
+
+	def realm_root(self, realm: str) -> str:
+		"""Canonical name of a realm's connected group (the realm itself if unknown)."""
+		seen: int = 0
+		while realm in self.realm_parent and seen < 64:
+			realm = self.realm_parent[realm]
+			seen += 1
+		return realm
+
+	def char_ref(self, name: str, realm: str) -> Optional[Character]:
+		"""Find a character by name and realm (case-insensitive name)."""
+		lowered: str = name.lower()
+		for char in self.characters.values():
+			if char.realm == realm and char.name.lower() == lowered:
+				return char
+		return None
+
+	def merge_characters(self) -> None:
+		"""
+		Fold DataStore/Syndicator character observations into the TSM
+		characters (matched on name + realm), creating characters TSM never
+		saw. Descriptive fields fill gaps in priority order (TSM, DataStore,
+		Syndicator); gold goes through pick_freshest() with TSM dated by its
+		gold log's last update and DataStore by its own lastUpdate.
+		"""
+		index: dict[tuple[str, str], Character] = {(c.name.lower(), c.realm): c for c in self.characters.values()}
+		observations: list[CharObservation] = sorted(self.char_obs, key=lambda o: SOURCE_PRIORITY.get(o.source, 99))
+		faction_hint: dict[tuple[str, str], str] = {}
+		for obs in observations:
+			if obs.faction:
+				faction_hint.setdefault((obs.name.lower(), obs.realm), obs.faction)
+		money: dict[str, list[tuple[str, Optional[int], Any]]] = {}
+		for char in self.characters.values():
+			if char.money_source == "tsm":
+				money[char.key] = [("tsm", char.gold_log_updated or None, char.money)]
+			if char.gold_log_updated:
+				char.last_seen = max(char.last_seen or 0, char.gold_log_updated)
+		for obs in observations:
+			ident: tuple[str, str] = (obs.name.lower(), obs.realm)
+			char: Optional[Character] = index.get(ident)
+			if char is None:
+				faction: str = faction_hint.get(ident) or "Unknown"
+				char = Character(key=f"{obs.name} - {faction} - {obs.realm}", name=obs.name, faction=faction, realm=obs.realm, account=obs.account)
+				self.characters[char.key] = char
+				index[ident] = char
+			if obs.source not in char.sources:
+				char.sources.append(obs.source)
+			char.class_key = char.class_key or obs.class_key
+			char.race = char.race or obs.race
+			char.level = char.level if char.level else obs.level
+			char.played = char.played if char.played else obs.played
+			char.zone = char.zone or obs.zone
+			char.guild = char.guild or obs.guild
+			if obs.last_seen:
+				char.last_seen = max(char.last_seen or 0, obs.last_seen)
+			if obs.money is not None:
+				money.setdefault(char.key, []).append((obs.source, obs.updated_at, obs.money))
+		for key, candidates in money.items():
+			winner: Optional[tuple[str, Optional[int], Any]] = pick_freshest(candidates)
+			if winner is not None:
+				char = self.characters[key]
+				char.money_source, char.money_at, char.money = winner[0], winner[1], int(winner[2])
+		for account, (source, amount) in self.alt_warbank_money.items():
+			if account not in self.warbank_money:
+				self.warbank_money[account] = amount
+
+	def _set_key(self, owner: str, realm: str, group: str, account: str) -> tuple[str, ...]:
+		"""Identity of an owner's place group across sources (guilds span connected realms)."""
+		if group == "guild":
+			return ("guild", owner.lower(), self.realm_root(realm))
+		if group == "warbank":
+			return ("warbank", account.lower())
+		return ("char", owner.lower(), realm, group)
+
+	def reconcile_holdings(self) -> None:
+		"""
+		Pick one source per owner and place group and keep only its holdings.
+
+		TSM's holdings become sets too: a character's sets are dated by its
+		gold log's last update (TSM's best "last seen"), the warband bank by
+		warbankGoldLogLastUpdate, and guild vaults are undated. DataStore
+		dates containers, mail and auctions with their own lastUpdate /
+		lastAuctionsScan and guild tabs with ClientTime; its warband bank and
+		everything from Syndicator are undated. pick_freshest() decides.
+
+		One guild seen from several connected realms appears once per realm
+		in TSM (one copy per realm visited): those copies collapse to the one
+		with the most distinct items before sources compete.
+		"""
+		tsm_sets: dict[tuple[str, str, str], HoldingSet] = {}
+		for (owner, realm, location), account in self.tsm_holding_keys.items():
+			group: str = PLACE_GROUPS.get(location, "other")
+			key: tuple[str, str, str] = (owner, realm, group)
+			if key not in tsm_sets:
+				tsm_sets[key] = HoldingSet("tsm", account, owner, realm, "", group, self._tsm_set_time(owner, realm, group, account))
+		for account in self.tsm_warbank_accounts:
+			tsm_sets[("Warbank", f"@{account}", "warbank")] = HoldingSet("tsm", account, "Warbank", "", "", "warbank", self.warbank_log_updated.get(account))
+		for holding in self.holdings:
+			group = PLACE_GROUPS.get(holding.location, "other")
+			key = (holding.owner, f"@{holding.account}" if group == "warbank" else holding.realm, group)
+			if key not in tsm_sets:
+				tsm_sets[key] = HoldingSet("tsm", holding.account, holding.owner, holding.realm, holding.faction, group, self._tsm_set_time(holding.owner, holding.realm, group, holding.account))
+			tsm_sets[key].holdings.append(holding)
+
+		contenders: dict[tuple[str, ...], dict[str, list[HoldingSet]]] = {}
+		for hset in list(tsm_sets.values()) + self.holding_sets:
+			contenders.setdefault(self._set_key(hset.owner, hset.realm, hset.group, hset.account), {}).setdefault(hset.source, []).append(hset)
+
+		chosen: list[Holding] = []
+		for key, by_source in contenders.items():
+			candidates: list[tuple[str, Optional[int], Any]] = []
+			for source, sets in by_source.items():
+				best: HoldingSet = max(sets, key=lambda s: (len({h.item for h in s.holdings}), sum(h.qty for h in s.holdings), s.updated_at or 0))
+				candidates.append((source, best.updated_at, best))
+			winner: Optional[tuple[str, Optional[int], Any]] = pick_freshest(candidates)
+			if winner is None:
+				continue
+			won: HoldingSet = winner[2]
+			group_name: str = key[0] if key[0] != "char" else key[3]
+			self.reconcile_stats[(group_name, won.source)] = self.reconcile_stats.get((group_name, won.source), 0) + 1
+			char: Optional[Character] = self.char_ref(won.owner, won.realm) if key[0] == "char" else None
+			# Slot-level sources list a stack per slot; keep one row per item and place like TSM.
+			merged: dict[tuple[str, str], Holding] = {}
+			for holding in won.holdings:
+				existing: Optional[Holding] = merged.get((holding.location, holding.item))
+				if existing is None:
+					merged[(holding.location, holding.item)] = holding
+				else:
+					existing.qty += holding.qty
+			for holding in merged.values():
+				holding.source = won.source
+				holding.updated_at = won.updated_at
+				if char is not None and not holding.faction:
+					holding.faction = char.faction
+				chosen.append(holding)
+		self.holdings = chosen
+
+	def _tsm_set_time(self, owner: str, realm: str, group: str, account: str) -> Optional[int]:
+		if group == "warbank":
+			return self.warbank_log_updated.get(account)
+		if group == "guild":
+			return None
+		char: Optional[Character] = self.char_ref(owner, realm)
+		if char is None:
+			return None
+		return char.gold_log_updated or None
+
+	def join_auctions(self) -> None:
+		"""
+		Join auction observations on the auction id: DataStore brings the
+		buyout, bid, quantity and its time-left math; Syndicator the item
+		link and an absolute expiry. Auctions only one source knows are
+		kept as they are (Syndicator keeps expired auctions DataStore has
+		already dropped; those are exactly the ones waiting in the mail).
+		"""
+		by_id: dict[int, Auction] = {}
+		loose: list[Auction] = []
+		for obs in sorted(self.auction_obs, key=lambda a: SOURCE_PRIORITY.get(a.sources[0] if a.sources else "", 99)):
+			if not obs.auction_id:
+				loose.append(obs)
+				continue
+			current: Optional[Auction] = by_id.get(obs.auction_id)
+			if current is None:
+				by_id[obs.auction_id] = obs
+				continue
+			if obs.link and not current.link:
+				current.link = obs.link
+				current.item = obs.item or current.item
+			if current.buyout is None:
+				current.buyout = obs.buyout
+			if not current.bid:
+				current.bid = obs.bid
+			if obs.expires_at is not None and "syndicator" in obs.sources:
+				current.expires_at = obs.expires_at
+			elif current.expires_at is None:
+				current.expires_at = obs.expires_at
+			current.scanned_at = max(current.scanned_at or 0, obs.scanned_at or 0) or None
+			for source in obs.sources:
+				if source not in current.sources:
+					current.sources.append(source)
+		self.auctions = list(by_id.values()) + loose
+		self.auctions.sort(key=lambda a: (a.expires_at is None, a.expires_at or 0, a.realm, a.char))
+
+	def pick_char_lists(self, kind: str) -> list[Any]:
+		"""
+		Per character, keep one source's list of mail or currencies (they
+		cannot be merged row by row: neither carries a shared id). The
+		choice follows pick_freshest(); DataStore is dated, Syndicator not.
+		"""
+		grouped: dict[tuple[str, str], list[tuple[str, Optional[int], Any]]] = {}
+		for source, account, char, realm, stamp, rows in self.char_lists.get(kind, []):
+			grouped.setdefault((char.lower(), realm), []).append((source, stamp, rows))
+		result: list[Any] = []
+		for candidates in grouped.values():
+			winner: Optional[tuple[str, Optional[int], Any]] = pick_freshest(candidates)
+			if winner is not None:
+				result.extend(winner[2])
+		return result
+
 	def finish(self) -> None:
-		"""Post-load fixups: own-name index, internal-transfer flags, sort."""
+		"""
+		Post-load fixups: merge the optional sources (characters, then
+		holdings, auctions, mail and currencies), then the own-name index,
+		internal-transfer flags and sort.
+		"""
+		self.merge_characters()
+		self.reconcile_holdings()
+		self.join_auctions()
+		self.mails = self.pick_char_lists("mail")
+		self.mails.sort(key=lambda m: (m.expires_at is None, m.expires_at or 0))
+		self.currencies = self.pick_char_lists("currency")
+		for holding in self.currencies:
+			holding.name = holding.name or self.currency_names.get(holding.currency_id, "")
 		for char in self.characters.values():
 			self.own_names.add(char.name.lower())
 			self.own_names.add(f"{char.name}-{char.realm.replace(' ', '')}".lower())
@@ -1362,6 +1969,613 @@ class TsmData(object):
 		if exact:
 			return sorted(set(exact))
 		return sorted(set(partial), key=lambda b: (len(self.item_name(b)), self.item_name(b)))
+
+
+# ============================================================================
+# Optional sources: Altoholic DataStore and Syndicator
+# ============================================================================
+
+# Unexpected shapes inside an otherwise parseable file: warn, skip the part.
+READER_ERRORS: tuple[type[BaseException], ...] = (TsmctlError, TypeError, ValueError, AttributeError, KeyError, IndexError, RecursionError)
+
+
+def ds_by_id(value: Any) -> dict[int, Any]:
+	"""A DataStore per-character array as {character id: entry}, skipping nil slots."""
+	return {k: v for k, v in lua_dict(value).items() if isinstance(k, int) and v is not None}
+
+
+def ds_unpack_slot(packed: int, force_legacy: bool = False) -> tuple[int, int]:
+	"""
+	(item id, count) from a packed DataStore slot. The current format keeps
+	the count in bits 0-15 and the item id above; DataStore 10.2.013 used
+	only 10 bits for the count. DataStore tells them apart by bits 13-15
+	(zero in the 16-bit format, item id bits in the old one) and so do we.
+	Void storage was never migrated and always uses 10 bits.
+	"""
+	legacy: bool = force_legacy or ((packed >> 13) & 7) != 0
+	shift: int = 10 if legacy else 16
+	return packed >> shift, packed & ((1 << shift) - 1)
+
+
+def ds_bag_place(bag_id: int) -> str:
+	"""
+	Place for a DataStore character container id: 0-5 are the backpack,
+	bags and reagent bag, 6-12 the character bank tabs (bags before 11.2),
+	-1 the old main bank, -3/-7 the reagent bank, -5/-6 void storage and -2
+	the classic keyring.
+	"""
+	if 0 <= bag_id <= 5 or bag_id == -2:
+		return "bag"
+	if 6 <= bag_id <= 12 or bag_id == -1:
+		return "bank"
+	if bag_id in (-3, -7):
+		return "reagent_bank"
+	if bag_id in (-5, -6):
+		return "void"
+	return "other"
+
+
+def ds_slots(container: Any, force_legacy: bool = False) -> Iterable[tuple[str, int, str]]:
+	"""Yield (item string, count, link) for every filled slot of a DataStore container."""
+	if not isinstance(container, dict):
+		return
+	links: dict[Any, Any] = lua_dict(container.get("links"))
+	for slot, packed in lua_dict(container.get("items")).items():
+		if not isinstance(packed, int) or packed <= 0:
+			continue
+		item_id, count = ds_unpack_slot(packed, force_legacy)
+		link: Any = links.get(slot)
+		link_text: str = link if isinstance(link, str) else ""
+		# Battle pets store their icon id in place of an item id; the link is right.
+		item: str = item_string_from_link(link_text, item_id)
+		if item:
+			yield item, max(count, 1), link_text
+
+
+class DataStoreReader(object):
+	"""
+	Reads one account's Altoholic DataStore SavedVariables.
+
+	DataStore keys characters by a small integer from DataStore.lua's
+	DataStore_CharacterIDs.List ("Default.<Realm>.<Name>"), and every
+	module stores per-character tables as arrays indexed by that id (a
+	sparse array is written with explicit [n] = keys). Guilds work the
+	same way through DataStore_GuildIDs. Without DataStore.lua nothing can
+	be attributed, so the account's DataStore data is skipped.
+
+	Each module file is optional: a missing or unparseable one is a
+	warning and the rest still load.
+	"""
+
+	def __init__(self, data: TsmData, account: str, files: dict[str, Path]):
+		self.data: TsmData = data
+		self.account: str = account
+		self.files: dict[str, Path] = files
+		self.chars: dict[int, tuple[str, str]] = {}
+		self.guilds: dict[int, tuple[str, str]] = {}
+		self.char_guild: dict[int, int] = {}
+		self.notes: list[str] = []
+		self.newest: int = 0
+
+	def _parse(self, name: str) -> Optional[dict[str, Any]]:
+		path: Optional[Path] = self.files.get(name)
+		if path is None:
+			self.notes.append(f"{name} missing")
+			Log.warn(f"account {self.account}: {name} not found; DataStore data from it is unavailable")
+			return None
+		stat: os.stat_result = path.stat()
+		self.data.source_files.append(SvFileInfo(self.account, path, stat.st_size, stat.st_mtime, "datastore"))
+		try:
+			return parse_lua_file(path)
+		except READER_ERRORS as exc:
+			self.notes.append(f"{name} unreadable")
+			Log.warn(f"{exc}; skipping it")
+			return None
+
+	def _stamp(self, value: Any) -> Optional[int]:
+		if isinstance(value, (int, float)) and value > 0:
+			self.newest = max(self.newest, int(value))
+			return int(value)
+		return None
+
+	def _run(self, name: str, step: Callable[[dict[str, Any]], None]) -> None:
+		"""Parse one module file and hand it to its loader; never raise."""
+		parsed: Optional[dict[str, Any]] = self._parse(name)
+		if parsed is None:
+			return
+		try:
+			step(parsed)
+		except READER_ERRORS as exc:
+			self.notes.append(f"{name}: unexpected structure")
+			Log.warn(f"{self.files[name]}: unexpected structure ({type(exc).__name__}: {exc}); skipped")
+
+	def load(self) -> SourceStatus:
+		status: SourceStatus = SourceStatus(self.account, "datastore", "used", files=len(self.files))
+		status.size = sum(p.stat().st_size for p in self.files.values())
+		status.file_mtime = max((p.stat().st_mtime for p in self.files.values()), default=None)
+		core: Optional[dict[str, Any]] = self._parse("DataStore.lua")
+		if core is None:
+			status.state = "error"
+			status.note = "DataStore.lua missing or unreadable: character ids cannot be resolved"
+			return status
+		try:
+			self._load_core(core)
+		except READER_ERRORS as exc:
+			Log.warn(f"{self.files['DataStore.lua']}: unexpected structure ({exc}); skipping DataStore for account {self.account}")
+			status.state = "error"
+			status.note = "DataStore.lua has an unexpected structure"
+			return status
+		self.data.add_account(self.account)
+		for name, step in (
+			("DataStore_Characters.lua", self._load_characters),
+			("DataStore_Containers.lua", self._load_containers),
+			("DataStore_Auctions.lua", self._load_auctions),
+			("DataStore_Mails.lua", self._load_mails),
+			("DataStore_Currencies.lua", self._load_currencies),
+			("DataStore_Crafts.lua", self._load_crafts),
+		):
+			self._run(name, step)
+		status.data_time = self.newest or None
+		status.note = "; ".join(self.notes)
+		return status
+
+	# --------------------------------------------------------------- modules
+
+	def _load_core(self, core: dict[str, Any]) -> None:
+		"""Character and guild ids, connected realms and realm names."""
+		for index, key in enumerate(lua_list(lua_dict(core.get("DataStore_CharacterIDs")).get("List")), 1):
+			parts: list[str] = key.split(".", 2) if isinstance(key, str) else []
+			if len(parts) == 3:
+				self.chars[index] = (parts[2], parts[1])
+		for index, key in enumerate(lua_list(lua_dict(core.get("DataStore_GuildIDs")).get("List")), 1):
+			parts = key.split(".", 2) if isinstance(key, str) else []
+			if len(parts) == 3:
+				self.guilds[index] = (parts[2], parts[1])
+		for char_id, guild_id in ds_by_id(core.get("DataStore_CharacterGuilds")).items():
+			if isinstance(guild_id, int):
+				self.char_guild[char_id] = guild_id
+		for realm, other in lua_dict(core.get("DataStore_ConnectedRealms")).items():
+			if isinstance(realm, str) and isinstance(other, str):
+				self.data.link_realms(realm, other)
+		for short, full in lua_dict(core.get("DataStore_RealmNames")).items():
+			if isinstance(short, str) and isinstance(full, str):
+				self.data.realm_names.setdefault(short, full)
+
+	def _load_characters(self, parsed: dict[str, Any]) -> None:
+		"""
+		DataStore_Characters_Info[id]: name, money (copper), played,
+		lastUpdate, lastLogoutTimestamp, zone and BaseInfo, packed as
+		bits 0-6 level, 7-10 class id, 11-17 race id, 18-19 gender.
+		"""
+		for char_id, entry in ds_by_id(parsed.get("DataStore_Characters_Info")).items():
+			if char_id not in self.chars or not isinstance(entry, dict):
+				continue
+			name, realm = self.chars[char_id]
+			base: int = int(entry.get("BaseInfo") or 0)
+			race_id: int = (base >> 11) & 0x7F
+			race, faction = RACE_INFO.get(race_id, (f"race {race_id}" if race_id else "", ""))
+			guild_id: Optional[int] = self.char_guild.get(char_id)
+			updated: Optional[int] = self._stamp(entry.get("lastUpdate"))
+			logout: Optional[int] = self._stamp(entry.get("lastLogoutTimestamp"))
+			money: Any = entry.get("money")
+			self.data.char_obs.append(CharObservation(
+				source="datastore", account=self.account, name=name, realm=realm, updated_at=updated,
+				money=int(money) if isinstance(money, (int, float)) else None, faction=faction,
+				class_key=DS_CLASS_TOKENS.get((base >> 7) & 0xF, ""), race=race, level=(base & 0x7F) or None,
+				played=int(entry["played"]) if isinstance(entry.get("played"), (int, float)) else None,
+				last_seen=max(updated or 0, logout or 0) or None, zone=str(entry.get("zone") or ""),
+				guild=self.guilds[guild_id][0] if guild_id in self.guilds else "",
+			))
+
+	def _owner_set(self, char_id: int, group: str, stamp: Optional[int]) -> HoldingSet:
+		name, realm = self.chars[char_id]
+		hset: HoldingSet = HoldingSet("datastore", self.account, name, realm, "", group, stamp)
+		self.data.holding_sets.append(hset)
+		return hset
+
+	def _add(self, hset: HoldingSet, place: str, item: str, qty: int) -> None:
+		hset.holdings.append(Holding(self.account, hset.realm, hset.faction, hset.owner, place, item, qty, "datastore", hset.updated_at))
+
+	def _load_containers(self, parsed: dict[str, Any]) -> None:
+		"""
+		Character bags and bank, void storage, the warband bank and guild
+		banks. A character's bank only counts once DataStore has seen it
+		open (bankInfo is set then); before that its empty tables would
+		wrongly claim the bank is empty.
+		"""
+		void_tabs: dict[int, Any] = ds_by_id(parsed.get("DataStore_Containers_VoidStorage"))
+		reagents: dict[int, Any] = ds_by_id(parsed.get("DataStore_Containers_Reagents"))
+		for char_id, entry in ds_by_id(parsed.get("DataStore_Containers_Characters")).items():
+			if char_id not in self.chars or not isinstance(entry, dict):
+				continue
+			stamp: Optional[int] = self._stamp(entry.get("lastUpdate"))
+			sets: dict[str, HoldingSet] = {"bag": self._owner_set(char_id, "bag", stamp)}
+			if entry.get("bankInfo") is not None:
+				sets["bank"] = self._owner_set(char_id, "bank", stamp)
+			for bag_id, container in lua_dict(entry.get("Containers")).items():
+				if not isinstance(bag_id, int):
+					continue
+				place: str = ds_bag_place(bag_id)
+				group: str = PLACE_GROUPS.get(place, "other")
+				for item, qty, _ in ds_slots(container):
+					if group not in sets:
+						sets[group] = self._owner_set(char_id, group, stamp)
+					self._add(sets[group], place, item, qty)
+			for tab in lua_dict(void_tabs.get(char_id)).values():
+				for item, qty, _ in ds_slots(tab, force_legacy=True):
+					if "void" not in sets:
+						sets["void"] = self._owner_set(char_id, "void", stamp)
+					self._add(sets["void"], "void", item, qty)
+			for item, qty, _ in ds_slots(reagents.get(char_id)):
+				if "bank" not in sets:
+					sets["bank"] = self._owner_set(char_id, "bank", stamp)
+				self._add(sets["bank"], "reagent_bank", item, qty)
+		self._load_warbank(parsed.get("DataStore_Containers_Warbank"))
+		self._load_guilds(parsed.get("DataStore_Containers_Guilds"))
+
+	def _load_warbank(self, value: Any) -> None:
+		"""Warband bank tabs (bag ids 12-16); DataStore keeps no timestamp for them."""
+		tabs: dict[Any, Any] = lua_dict(value)
+		if not tabs:
+			return
+		hset: HoldingSet = HoldingSet("datastore", self.account, "Warbank", "", "", "warbank", None)
+		for tab in tabs.values():
+			for item, qty, _ in ds_slots(tab):
+				self._add(hset, "warbank", item, qty)
+		self.data.holding_sets.append(hset)
+
+	def _load_guilds(self, value: Any) -> None:
+		"""
+		Guild bank tabs, each stamped with ClientTime when it was last seen.
+		A guild on connected realms is recorded once per realm a member
+		visited it from; per tab the freshest copy wins, so the merged bank
+		is as current as the newest visit to each tab.
+		"""
+		merged: dict[tuple[str, str], dict[Any, tuple[int, str, Any, str]]] = {}
+		for guild_id, entry in ds_by_id(value).items():
+			if guild_id not in self.guilds or not isinstance(entry, dict):
+				continue
+			guild, realm = self.guilds[guild_id]
+			key: tuple[str, str] = (guild.lower(), self.data.realm_root(realm))
+			tabs: dict[Any, tuple[int, str, Any, str]] = merged.setdefault(key, {})
+			for tab_id, tab in lua_dict(entry.get("Tabs")).items():
+				if not isinstance(tab, dict):
+					continue
+				seen: int = self._stamp(tab.get("ClientTime")) or 0
+				if tab_id not in tabs or seen > tabs[tab_id][0]:
+					tabs[tab_id] = (seen, realm, tab, guild)
+		for tabs in merged.values():
+			if not tabs:
+				continue
+			newest: tuple[int, str, Any, str] = max(tabs.values(), key=lambda t: t[0])
+			hset: HoldingSet = HoldingSet("datastore", self.account, f"Guild: {newest[3]}", newest[1], "", "guild", newest[0] or None)
+			for _, _, tab, _ in tabs.values():
+				for item, qty, _ in ds_slots(tab):
+					self._add(hset, "guild", item, qty)
+			self.data.holding_sets.append(hset)
+
+	def _load_auctions(self, parsed: dict[str, Any]) -> None:
+		"""
+		DataStore_Auctions_AuctionsList[id] holds one string per auction,
+		"AHZone|itemID|quantity|bidder|bidAmount|buyoutAmount|timeLeftSeconds|auctionID",
+		as of DataStore_Auctions_Characters[id].lastAuctionsScan. Sold
+		auctions are left out by DataStore (they are in the mail).
+		"""
+		chars: dict[int, Any] = ds_by_id(parsed.get("DataStore_Auctions_Characters"))
+		lists: dict[int, Any] = ds_by_id(parsed.get("DataStore_Auctions_AuctionsList"))
+		classic_left: dict[int, int] = {1: 1800, 2: 7200, 3: 43200, 4: 172800}
+		for char_id in sorted(set(chars) | set(lists)):
+			if char_id not in self.chars:
+				continue
+			name, realm = self.chars[char_id]
+			info: dict[Any, Any] = lua_dict(chars.get(char_id))
+			scanned: Optional[int] = self._stamp(info.get("lastAuctionsScan") or info.get("lastUpdate"))
+			if scanned is None and char_id not in lists:
+				continue
+			hset: HoldingSet = self._owner_set(char_id, "auction", scanned)
+			for raw in lua_list(lists.get(char_id)):
+				fields: list[str] = str(raw).split("|")
+				if len(fields) < 7 or not fields[1].isdigit():
+					continue
+				left: int = _to_int(fields[6])
+				if 0 < left <= 4:
+					left = classic_left[left]
+				qty: int = max(_to_int(fields[2]), 1)
+				item: str = f"i:{fields[1]}"
+				self.data.auction_obs.append(Auction(
+					account=self.account, char=name, realm=realm, item=item, qty=qty,
+					auction_id=_to_int(fields[7]) if len(fields) > 7 else 0,
+					buyout=_to_int(fields[5]) or None, bid=_to_int(fields[4]),
+					expires_at=scanned + left if scanned is not None and left > 0 else None,
+					scanned_at=scanned, ah_zone=_to_int(fields[0]), sources=["datastore"],
+				))
+				self._add(hset, "auction", item, qty)
+
+	def _load_mails(self, parsed: dict[str, Any]) -> None:
+		"""
+		DataStore_Mails_Characters[id].Mails: one entry per attachment
+		(itemID, count, link) plus one per money/letter, each with
+		lastCheck and daysLeft, so expiry = lastCheck + daysLeft days.
+		MailCache holds mail alts sent that the recipient has not seen.
+		"""
+		for char_id, entry in ds_by_id(parsed.get("DataStore_Mails_Characters")).items():
+			if char_id not in self.chars or not isinstance(entry, dict):
+				continue
+			name, realm = self.chars[char_id]
+			stamp: Optional[int] = self._stamp(entry.get("lastUpdate"))
+			hset: HoldingSet = self._owner_set(char_id, "mail", stamp)
+			rows: list[Mail] = []
+			for cached, mails in ((False, entry.get("Mails")), (True, entry.get("MailCache"))):
+				for raw in lua_list(mails):
+					if not isinstance(raw, dict):
+						continue
+					checked: Optional[int] = int(raw["lastCheck"]) if isinstance(raw.get("lastCheck"), (int, float)) else None
+					days: Any = raw.get("daysLeft")
+					link: str = raw.get("link") if isinstance(raw.get("link"), str) else ""
+					item_id: Any = raw.get("itemID")
+					item: str = item_string_from_link(link, int(item_id) if isinstance(item_id, (int, float)) else None) if (link or item_id) else ""
+					qty: int = int(raw.get("count") or 1) if item else 0
+					mail: Mail = Mail(
+						account=self.account, char=name, realm=realm, sender=str(raw.get("sender") or ""),
+						subject=str(raw.get("subject") or ""), money=int(raw.get("money") or 0), item=item, link=link, qty=qty,
+						expires_at=int(checked + float(days) * SECONDS_PER_DAY) if checked is not None and isinstance(days, (int, float)) else None,
+						returned=bool(raw.get("returned")), from_cache=cached, checked_at=checked, source="datastore",
+					)
+					rows.append(mail)
+					if item:
+						self._add(hset, "mail", item, qty)
+			self.data.char_lists["mail"].append(("datastore", self.account, name, realm, stamp, rows))
+
+	def _load_currencies(self, parsed: dict[str, Any]) -> None:
+		"""
+		DataStore_Currencies_Characters[id].Totals[currencyID] packs the
+		quantity in bits 0-19 and what was earned this week above;
+		DataStore_Currencies_Max[currencyID] packs the cap and weekly cap
+		the same way. Names are only in Characters[id].Currencies, a list
+		packed as bits 0-7 header, 8-17 index into Catalog.List, 18+ count,
+		with no currency id, so ids get names by matching counts across
+		every character (see resolve_currency_names()).
+		"""
+		catalog: list[Any] = lua_list(lua_dict(parsed.get("DataStore_Currencies_Catalog")).get("List"))
+		maxima: dict[Any, Any] = lua_dict(parsed.get("DataStore_Currencies_Max"))
+		chars: dict[int, Any] = {k: v for k, v in ds_by_id(parsed.get("DataStore_Currencies_Characters")).items() if k in self.chars and isinstance(v, dict)}
+		named: list[tuple[dict[int, int], list[tuple[str, int]]]] = []
+		for entry in chars.values():
+			totals: dict[int, int] = {int(k): int(v) & 0xFFFFF for k, v in lua_dict(entry.get("Totals")).items() if isinstance(k, int) and isinstance(v, (int, float))}
+			listed: list[tuple[str, int]] = []
+			for packed in lua_list(entry.get("Currencies")):
+				if isinstance(packed, int):
+					index: int = (packed >> 8) & 0x3FF
+					if 1 <= index <= len(catalog) and isinstance(catalog[index - 1], str):
+						listed.append((catalog[index - 1], packed >> 18))
+			named.append((totals, listed))
+		names: dict[int, str] = resolve_currency_names(named)
+		for currency_id, currency_name in names.items():
+			self.data.currency_names.setdefault(currency_id, currency_name)
+		for char_id, entry in chars.items():
+			name, realm = self.chars[char_id]
+			stamp: Optional[int] = self._stamp(entry.get("lastUpdate"))
+			rows: list[CurrencyHolding] = []
+			for currency_id, packed in lua_dict(entry.get("Totals")).items():
+				if not isinstance(currency_id, int) or not isinstance(packed, (int, float)):
+					continue
+				cap: Any = maxima.get(currency_id)
+				rows.append(CurrencyHolding(
+					account=self.account, char=name, realm=realm, currency_id=currency_id,
+					name=names.get(currency_id, ""), qty=int(packed) & 0xFFFFF, earned_this_week=int(packed) >> 20,
+					max_qty=(int(cap) & 0xFFFFF) or None if isinstance(cap, (int, float)) else None,
+					max_weekly=(int(cap) >> 20) or None if isinstance(cap, (int, float)) else None,
+					updated_at=stamp, source="datastore",
+				))
+			self.data.char_lists["currency"].append(("datastore", self.account, name, realm, stamp, rows))
+
+	def _load_crafts(self, parsed: dict[str, Any]) -> None:
+		"""
+		DataStore_Crafts_Characters[id].Professions: per profession (a list
+		of tables with Name, or a table keyed by name) Crafts maps a recipe
+		sub-category id to packed recipes: bits 0-1 difficulty colour, bit
+		2 learned, 3-4 rank, 5-6 ranks in total, 7+ recipe (spell) id.
+		"""
+		categories: dict[Any, Any] = lua_dict(parsed.get("DataStore_Crafts_RecipeCategories"))
+		for char_id, entry in ds_by_id(parsed.get("DataStore_Crafts_Characters")).items():
+			if char_id not in self.chars or not isinstance(entry, dict):
+				continue
+			name, realm = self.chars[char_id]
+			self._stamp(entry.get("lastUpdate"))
+			professions: Any = entry.get("Professions")
+			pairs: list[tuple[str, Any]] = []
+			if isinstance(professions, list):
+				pairs = [(str(p.get("Name") or ""), p) for p in professions if isinstance(p, dict)]
+			else:
+				pairs = [(str(k), v) for k, v in lua_dict(professions).items() if isinstance(v, dict)]
+			for profession, info in pairs:
+				for category_id, recipes in lua_dict(info.get("Crafts")).items():
+					for packed in lua_list(recipes):
+						if not isinstance(packed, int) or packed <= 0:
+							continue
+						self.data.recipes.append(KnownRecipe(
+							account=self.account, char=name, realm=realm, profession=profession or str(info.get("Name") or ""),
+							recipe_id=packed >> 7, category_id=int(category_id) if isinstance(category_id, int) else 0,
+							category=str(categories.get(category_id) or ""), learned=bool(packed & 4),
+							rank=(packed >> 3) & 3, max_rank=(packed >> 5) & 3, difficulty=packed & 3, source="datastore",
+						))
+
+
+def resolve_currency_names(characters: list[tuple[dict[int, int], list[tuple[str, int]]]]) -> dict[int, str]:
+	"""
+	Name currency ids from DataStore's id-less name lists. For each name,
+	the candidate ids are those whose quantity equals the listed count on
+	every character that lists it with a count; a name left with exactly
+	one candidate claims that id, which then leaves every other name's
+	candidates, until nothing changes. Zero counts say nothing (many ids
+	hold 0) and are skipped, so a currency nobody holds stays unnamed.
+	"""
+	candidates: dict[str, set[int]] = {}
+	for totals, listed in characters:
+		by_qty: dict[int, set[int]] = {}
+		for currency_id, qty in totals.items():
+			by_qty.setdefault(qty, set()).add(currency_id)
+		for name, count in listed:
+			if count <= 0 or count not in by_qty:
+				continue
+			found: set[int] = by_qty[count]
+			current: Optional[set[int]] = candidates.get(name)
+			narrowed: set[int] = found if current is None else (current & found)
+			# A contradiction means the name lists a currency without totals; keep what we had.
+			candidates[name] = narrowed or (current if current is not None else found)
+	names: dict[int, str] = {}
+	changed: bool = True
+	while changed:
+		changed = False
+		for name, ids in candidates.items():
+			free: set[int] = ids - set(names)
+			if len(free) == 1 and name not in names.values():
+				names[free.pop()] = name
+				changed = True
+	return names
+
+
+def syn_slots(value: Any, depth: int = 0) -> Iterable[dict[Any, Any]]:
+	"""Every Syndicator item slot (a table with itemID) under value, in any nesting."""
+	if depth > 6:
+		return
+	if isinstance(value, dict):
+		if "itemID" in value:
+			yield value
+			return
+		children: Iterable[Any] = value.values()
+	elif isinstance(value, list):
+		children = value
+	else:
+		return
+	for child in children:
+		yield from syn_slots(child, depth + 1)
+
+
+class SyndicatorReader(object):
+	"""
+	Reads one account's Syndicator.lua (the data addon behind Baganator).
+
+	SYNDICATOR_DATA.Characters is keyed "Name-RealmNormalized"; each has
+	details (character, realm, faction, race, className, guild), money,
+	bags/bank/bankTabs/void slots, mail items and auctions with an item
+	link and an absolute expirationTime, and currencies {id: quantity}.
+	Warband[1] is the warband bank and Guilds the guild banks. Nothing in
+	it is timestamped, so it only wins where no dated source has the data.
+	"""
+
+	def __init__(self, data: TsmData, account: str, path: Path):
+		self.data: TsmData = data
+		self.account: str = account
+		self.path: Path = path
+
+	def load(self) -> SourceStatus:
+		stat: os.stat_result = self.path.stat()
+		status: SourceStatus = SourceStatus(self.account, "syndicator", "used", 1, stat.st_size, stat.st_mtime)
+		self.data.source_files.append(SvFileInfo(self.account, self.path, stat.st_size, stat.st_mtime, "syndicator"))
+		try:
+			root: dict[Any, Any] = lua_dict(parse_lua_file(self.path).get("SYNDICATOR_DATA"))
+			if not root:
+				raise TsmctlError(f"{self.path}: no SYNDICATOR_DATA table")
+			self._load(root)
+		except READER_ERRORS as exc:
+			Log.warn(f"{exc}; skipping Syndicator for account {self.account}")
+			status.state = "error"
+			status.note = str(exc)[:120]
+			return status
+		self.data.add_account(self.account)
+		status.note = "no timestamps: used only where TSM and DataStore have nothing"
+		return status
+
+	def _realm(self, normalized: str) -> str:
+		return self.data.realm_names.get(normalized, normalized)
+
+	def _load(self, root: dict[Any, Any]) -> None:
+		characters: dict[Any, Any] = lua_dict(root.get("Characters"))
+		for entry in characters.values():
+			details: dict[Any, Any] = lua_dict(lua_dict(entry).get("details"))
+			if isinstance(details.get("realmNormalized"), str) and isinstance(details.get("realm"), str):
+				self.data.realm_names.setdefault(details["realmNormalized"], details["realm"])
+		for key, entry in characters.items():
+			if isinstance(entry, dict):
+				self._load_character(str(key), entry)
+		warband: list[Any] = lua_list(root.get("Warband"))
+		if warband and isinstance(warband[0], dict):
+			bank: dict[Any, Any] = warband[0]
+			if isinstance(bank.get("money"), (int, float)):
+				self.data.alt_warbank_money[self.account] = ("syndicator", int(bank["money"]))
+			self._set("Warbank", "", "", "warbank", [("warbank", s) for s in syn_slots(bank.get("bank"))])
+		for key, guild in lua_dict(root.get("Guilds")).items():
+			if not isinstance(guild, dict):
+				continue
+			details = lua_dict(guild.get("details"))
+			name: str = str(details.get("guild") or str(key).rsplit("-", 1)[0])
+			realm: str = self._realm(str(details.get("realm") or str(key).rsplit("-", 1)[-1]))
+			self._set(f"Guild: {name}", realm, str(details.get("faction") or ""), "guild", [("guild", s) for s in syn_slots(guild.get("bank"))])
+
+	def _set(self, owner: str, realm: str, faction: str, group: str, slots: list[tuple[str, dict[Any, Any]]]) -> None:
+		hset: HoldingSet = HoldingSet("syndicator", self.account, owner, realm, faction, group, None)
+		for place, slot in slots:
+			item: str = item_string_from_link(slot.get("itemLink"), _to_int(str(slot.get("itemID") or 0)) or None)
+			qty: int = _to_int(str(slot.get("itemCount") or 1)) or 1
+			if item:
+				hset.holdings.append(Holding(self.account, realm, faction, owner, place, item, qty, "syndicator", None))
+		self.data.holding_sets.append(hset)
+
+	def _load_character(self, key: str, entry: dict[Any, Any]) -> None:
+		details: dict[Any, Any] = lua_dict(entry.get("details"))
+		name: str = str(details.get("character") or key.rsplit("-", 1)[0])
+		realm: str = str(details.get("realm") or self._realm(key.rsplit("-", 1)[-1]))
+		faction: str = str(details.get("faction") or "")
+		guild_full: str = str(details.get("guild") or "")
+		guild: str = guild_full.rsplit("-", 1)[0] if "-" in guild_full else guild_full
+		if "-" in guild_full:
+			# The guild's realm is its home realm: evidence the two are connected.
+			self.data.link_realms(realm, self._realm(guild_full.rsplit("-", 1)[1]))
+		money: Any = entry.get("money")
+		self.data.char_obs.append(CharObservation(
+			source="syndicator", account=self.account, name=name, realm=realm,
+			money=int(money) if isinstance(money, (int, float)) else None, faction=faction,
+			class_key=str(details.get("className") or ""), race=str(details.get("race") or ""), guild=guild,
+		))
+		if "bags" in entry:
+			self._set(name, realm, faction, "bag", [("bag", s) for s in syn_slots(entry.get("bags"))])
+		bank_slots: list[tuple[str, dict[Any, Any]]] = [("bank", s) for s in syn_slots(entry.get("bank"))] + [("bank", s) for s in syn_slots(entry.get("bankTabs"))]
+		if bank_slots:
+			self._set(name, realm, faction, "bank", bank_slots)
+		void_slots: list[tuple[str, dict[Any, Any]]] = [("void", s) for s in syn_slots(entry.get("void"))]
+		if void_slots:
+			self._set(name, realm, faction, "void", void_slots)
+		if "auctions" in entry:
+			slots: list[dict[Any, Any]] = list(syn_slots(entry.get("auctions")))
+			self._set(name, realm, faction, "auction", [("auction", s) for s in slots])
+			for slot in slots:
+				link: str = str(slot.get("itemLink") or "")
+				self.data.auction_obs.append(Auction(
+					account=self.account, char=name, realm=realm,
+					item=item_string_from_link(link, _to_int(str(slot.get("itemID") or 0)) or None),
+					qty=_to_int(str(slot.get("itemCount") or 1)) or 1, auction_id=_to_int(str(slot.get("auctionID") or 0)),
+					link=link, expires_at=_to_int(str(slot.get("expirationTime") or 0)) or None, sources=["syndicator"],
+				))
+		if "mail" in entry:
+			slots = list(syn_slots(entry.get("mail")))
+			self._set(name, realm, faction, "mail", [("mail", s) for s in slots])
+			rows: list[Mail] = []
+			for slot in slots:
+				link = str(slot.get("itemLink") or "")
+				rows.append(Mail(
+					account=self.account, char=name, realm=realm,
+					item=item_string_from_link(link, _to_int(str(slot.get("itemID") or 0)) or None), link=link,
+					qty=_to_int(str(slot.get("itemCount") or 1)) or 1,
+					expires_at=_to_int(str(slot.get("expirationTime") or 0)) or None, source="syndicator",
+				))
+			self.data.char_lists["mail"].append(("syndicator", self.account, name, realm, None, rows))
+		if "currencies" in entry:
+			currencies: list[CurrencyHolding] = [
+				CurrencyHolding(account=self.account, char=name, realm=realm, currency_id=int(cid), name="", qty=int(qty), source="syndicator")
+				for cid, qty in lua_dict(entry.get("currencies")).items() if isinstance(cid, int) and isinstance(qty, (int, float))
+			]
+			self.data.char_lists["currency"].append(("syndicator", self.account, name, realm, None, currencies))
 
 
 # ============================================================================
@@ -1874,6 +3088,32 @@ def fmt_age(seconds: float) -> str:
 	return f"{seconds / SECONDS_PER_DAY:.1f}d"
 
 
+DURATION_RE: re.Pattern[str] = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?)?\s*$", re.I)
+DURATION_UNITS: dict[str, int] = {"s": 1, "m": 60, "h": 3600, "d": SECONDS_PER_DAY, "w": 7 * SECONDS_PER_DAY}
+
+
+def parse_duration(text: str, default_unit: str = "h") -> int:
+	"""
+	Parse a length of time into seconds: 90s, 45m (minutes, unlike
+	--since where m is months), 6h, 3d, 2w, 1.5d. A bare number uses
+	default_unit.
+	"""
+	match: Optional[re.Match[str]] = DURATION_RE.match(str(text))
+	if match is None:
+		raise TsmctlError(f"cannot parse duration {text!r} (try 30m, 6h, 3d, 2w)")
+	unit: str = (match.group(2) or default_unit)[0].lower()
+	return int(float(match.group(1)) * DURATION_UNITS[unit])
+
+
+def fmt_left(seconds: Optional[float]) -> str:
+	"""Time until (or, negative, since) a moment: 3.5h, 2.1d, 5.0h ago."""
+	if seconds is None:
+		return "-"
+	if seconds < 0:
+		return f"{fmt_age(-seconds)} ago"
+	return fmt_age(seconds)
+
+
 def iso_now() -> str:
 	return datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -1964,7 +3204,8 @@ def fmt_money(copper: Optional[float], style: str) -> str:
 class Column(object):
 	"""
 	A table column. kind drives formatting: str, int, num, rate, money,
-	pct, time, date, item. signed colours money/pct red/green in text.
+	pct, time, date, dur (seconds until/since; raw seconds in machine
+	formats), item. signed colours money/pct red/green in text.
 	wide columns only show with -o wide (and always in csv/tsv/json/org).
 	"""
 
@@ -1978,7 +3219,7 @@ class Column(object):
 
 	@property
 	def numeric(self) -> bool:
-		return self.kind in ("int", "num", "rate", "money", "pct")
+		return self.kind in ("int", "num", "rate", "money", "pct", "dur")
 
 
 class Table(object):
@@ -2110,6 +3351,8 @@ class Renderer(object):
 			return fmt_time(value)
 		if kind == "date":
 			return fmt_date(value)
+		if kind == "dur":
+			return fmt_left(value)
 		if kind == "item":
 			return self.item_label(str(value))
 		return str(value)
@@ -2127,6 +3370,8 @@ class Renderer(object):
 			return datetime.fromtimestamp(value).astimezone().isoformat() if value else None
 		if kind == "pct":
 			return round(float(value), 6)
+		if kind == "dur":
+			return int(value)
 		return value
 
 	def paint(self, text: str, value: Any, column: Optional[Column]) -> str:
@@ -2435,6 +3680,16 @@ class Filters(object):
 			return False
 		return True
 
+	def owner_ok(self, account: str, char: str, realm: str) -> bool:
+		"""Account/realm/character filter for per-character rows (auctions, mail...)."""
+		if self.accounts is not None and account not in self.accounts:
+			return False
+		if self.realms is not None and realm not in self.realms:
+			return False
+		if self.chars is not None and char.lower() not in self.chars:
+			return False
+		return True
+
 	def char_ok(self, char: Character) -> bool:
 		if self.accounts is not None and char.account not in self.accounts:
 			return False
@@ -2707,21 +3962,66 @@ class Context(object):
 		return self._data
 
 	def _load(self) -> TsmData:
+		"""
+		Load every selected source for every account folder, then merge.
+		Each source is optional per account: a source that is absent is
+		recorded in the status (and warned about only when it was asked
+		for by name); a DataStore or Syndicator file that cannot be parsed
+		is a warning. A TSM file that cannot be parsed is still an error
+		when TSM is the only source the account has.
+		"""
 		self.source.prepare()
 		data: TsmData = TsmData()
-		files: list[tuple[str, Path]] = self.source.sv_files()
-		if not files:
-			raise TsmctlError(f"no TradeSkillMaster.lua SavedVariables under {self.source.root / 'WTF' / 'Account'}")
+		all_files: dict[str, dict[str, Path]] = self.source.account_files()
+		if not all_files:
+			raise TsmctlError(f"no TradeSkillMaster, DataStore or Syndicator SavedVariables under {self.source.root / 'WTF' / 'Account'}")
 		wanted: Optional[set[str]] = {a.lower() for a in self.settings.accounts} if self.settings.accounts else None
-		for account, path in files:
-			if wanted is not None and account.lower() not in wanted:
-				continue
-			data.load_account(account, path)
-		if wanted is not None and not data.accounts:
-			raise TsmctlError(f"no data for account(s) {', '.join(self.settings.accounts)}; found {', '.join(a for a, _ in files)}")
+		accounts: list[str] = [a for a in all_files if wanted is None or a.lower() in wanted]
+		if not accounts:
+			raise TsmctlError(f"no data for account(s) {', '.join(self.settings.accounts)}; found {', '.join(all_files)}")
+		explicit: bool = bool(self.settings.data_sources)
+		selected: list[str] = self.settings.data_sources or list(SOURCE_NAMES)
+		for account in accounts:
+			files: dict[str, Path] = all_files[account]
+			for source in SOURCE_NAMES:
+				present: dict[str, Path] = {n: files[n] for n in SOURCE_FILES[source] if n in files}
+				if source not in selected:
+					if present:
+						data.source_status.append(SourceStatus(account, source, "not selected", len(present), sum(p.stat().st_size for p in present.values()), max(p.stat().st_mtime for p in present.values())))
+					continue
+				if not present:
+					data.source_status.append(SourceStatus(account, source, "missing"))
+					if explicit:
+						Log.warn(f"account {account}: no {source} SavedVariables found")
+					continue
+				if source == "tsm":
+					data.source_status.append(self._load_tsm(data, account, present["TradeSkillMaster.lua"], others=any(n in files for other in selected if other != "tsm" for n in SOURCE_FILES[other])))
+				elif source == "datastore":
+					data.source_status.append(DataStoreReader(data, account, present).load())
+				else:
+					data.source_status.append(SyndicatorReader(data, account, present["Syndicator.lua"]).load())
+		if not data.accounts:
+			raise TsmctlError(f"no usable data from {', '.join(selected)} for account(s) {', '.join(accounts)}")
 		data.finish()
 		data.appdata_path = self.source.appdata_file()
 		return data
+
+	@staticmethod
+	def _load_tsm(data: TsmData, account: str, path: Path, others: bool) -> SourceStatus:
+		stat: os.stat_result = path.stat()
+		status: SourceStatus = SourceStatus(account, "tsm", "used", 1, stat.st_size, stat.st_mtime)
+		try:
+			data.load_account(account, path)
+		except TsmctlError as exc:
+			if not others:
+				raise
+			Log.warn(f"{exc}; skipping TSM for account {account}")
+			status.state = "error"
+			status.note = str(exc)[:120]
+			return status
+		stamps: list[int] = [c.gold_log_updated for c in data.characters.values() if c.account == account and c.gold_log_updated]
+		status.data_time = max(stamps) if stamps else None
+		return status
 
 	def market(self, required: bool = True) -> Optional[Market]:
 		"""Load AppData.lua on first use."""
@@ -2967,17 +4267,20 @@ def get_sources() -> Doc:
 def get_accounts(ctx: Context) -> Doc:
 	data: TsmData = ctx.data
 	rows: list[dict[str, Any]] = []
-	for info in data.files:
-		chars: list[Character] = [c for c in data.characters.values() if c.account == info.account]
-		txns: int = sum(1 for t in data.txns if t.account == info.account)
+	for account in data.accounts:
+		chars: list[Character] = [c for c in data.characters.values() if c.account == account]
+		txns: int = sum(1 for t in data.txns if t.account == account)
+		files: list[SvFileInfo] = [f for f in data.source_files if f.account == account]
 		rows.append({
-			"account": info.account, "chars": len(chars), "gold": sum(c.money for c in chars) + data.warbank_money.get(info.account, 0),
-			"txns": txns, "saved": info.mtime, "size": info.size,
+			"account": account, "chars": len(chars), "gold": sum(c.money for c in chars) + data.warbank_money.get(account, 0),
+			"txns": txns, "saved": max((f.mtime for f in files), default=None), "size": sum(f.size for f in files),
+			"sources": ", ".join(s.source for s in data.source_status if s.account == account and s.state == "used"),
 		})
 	doc: Doc = Doc("Accounts", "get_accounts")
 	table: Table = Table([
 		Column("account", "Account"), Column("chars", "Chars", "int"), money_col("gold", "Gold (incl. warbank)"),
-		Column("txns", "Ledger rows", "int"), Column("saved", "SV saved", "time"), Column("size", "Bytes", "int", wide=True),
+		Column("txns", "Ledger rows", "int"), Column("saved", "SV saved", "time"), Column("sources", "Sources"),
+		Column("size", "Bytes", "int", wide=True),
 	], rows)
 	doc.section("Accounts").table(table)
 	apply_main(ctx, doc, table)
@@ -3025,15 +4328,17 @@ def get_characters(ctx: Context) -> Doc:
 			continue
 		profs: list[str] = [f"{n} {lua_dict(p).get('level', '?')}" for n, p in sorted(char.professions.items()) if isinstance(p, dict) and not p.get("isSecondary")]
 		rows.append({
-			"name": char.name, "realm": char.realm, "faction": char.faction, "class": class_name(char.class_key),
-			"gold": char.money, "inventory": values.get((char.name, char.realm)), "professions": ", ".join(profs),
-			"guild": char.guild, "account": char.account,
+			"name": char.name, "realm": char.realm, "faction": char.faction, "class": class_name(char.class_key) if char.class_key else None,
+			"level": char.level, "race": char.race or None, "gold": char.money, "inventory": values.get((char.name, char.realm)),
+			"professions": ", ".join(profs), "guild": char.guild, "seen": char.last_seen, "played": char.played, "zone": char.zone or None,
+			"account": char.account,
 		})
 	doc: Doc = Doc("Characters", "get_characters")
 	table: Table = Table([
-		Column("name", "Character"), Column("realm", "Realm"), Column("class", "Class"), money_col("gold", "Gold"),
-		money_col("inventory", "Inventory value"), Column("professions", "Professions", max_width=34),
-		Column("guild", "Guild", wide=True), Column("faction", "Faction", wide=True), Column("account", "Account", wide=True),
+		Column("name", "Character"), Column("realm", "Realm"), Column("level", "Lvl", "int"), Column("class", "Class"),
+		Column("race", "Race", wide=True), money_col("gold", "Gold"), money_col("inventory", "Inventory value"),
+		Column("professions", "Professions", max_width=34), Column("seen", "Last seen", "date"), Column("played", "Played", "dur", wide=True),
+		Column("zone", "Zone", wide=True), Column("guild", "Guild", wide=True), Column("faction", "Faction", wide=True), Column("account", "Account", wide=True),
 	], rows, totals={"name": "TOTAL", "gold": sum(r["gold"] for r in rows), "inventory": sum(r["inventory"] or 0 for r in rows)})
 	doc.section("Characters").table(table)
 	apply_main(ctx, doc, table, default_sort="gold")
@@ -3968,7 +5273,7 @@ def describe_char(ctx: Context, query: str) -> Doc:
 	lowered: str = query.lower()
 	matches: list[Character] = [c for c in data.characters.values() if c.name.lower() == lowered or c.key.lower() == lowered or f"{c.name}-{c.realm}".lower() == lowered]
 	if not matches:
-		matches = [c for c in data.characters.values() if c.name.lower().startswith(lowered)]
+		matches = [c for c in data.characters.values() if c.name.lower().startswith(lowered) or f"{c.name}-{c.realm}".lower().startswith(lowered)]
 	if not matches:
 		raise TsmctlError(f"no character matches {query!r}")
 	if len(matches) > 1:
@@ -4072,12 +5377,35 @@ def cmd_status(ctx: Context) -> Doc:
 		("Realms", ", ".join(data.realms()), "str"),
 		("Item cache entries", len(data.items), "int"),
 		("TSM groups", len(data.group_paths), "int"),
+		("Posted auctions", len(data.auctions), "int"),
+		("Mail entries", len(data.mails), "int"),
+		("Currency balances", len(data.currencies), "int"),
+		("Known recipes", sum(1 for r in data.recipes if r.learned), "int"),
 	])
-	files: list[dict[str, Any]] = [{"file": f"{f.account}/SavedVariables/{f.path.name}", "size": f.size, "modified": f.mtime, "age": fmt_age(ctx.now - f.mtime)} for f in data.files]
+	# Which sources were found and used per account, and how fresh each is.
+	source_rows: list[dict[str, Any]] = [{
+		"account": s.account, "source": s.source, "state": s.state, "files": s.files or None, "size": s.size or None,
+		"saved": s.file_mtime, "data": s.data_time, "age": fmt_age(ctx.now - s.data_time) if s.data_time else (fmt_age(ctx.now - s.file_mtime) if s.file_mtime else "-"),
+		"note": s.note,
+	} for s in data.source_status]
+	sources_section: Section = doc.section("Sources", level=2)
+	sources_section.kv([("Selected", ", ".join(ctx.settings.data_sources) or "all present", "str")])
+	sources_section.table(Table([
+		Column("account", "Account"), Column("source", "Source"), Column("state", "State"), Column("files", "Files", "int"),
+		Column("size", "Bytes", "int", wide=True), Column("saved", "File saved", "time"), Column("data", "Data as of", "time"),
+		Column("age", "Age"), Column("note", "Note", max_width=50),
+	], source_rows))
+	sources_section.text("Data as of is the newest timestamp inside the data (TSM: a character's gold log update; DataStore: its lastUpdate stamps); Syndicator has none, so its age is the file's.")
+	if data.reconcile_stats:
+		reconcile_rows: list[dict[str, Any]] = [{"group": group, "source": source, "owners": count} for (group, source), count in sorted(data.reconcile_stats.items())]
+		reconcile_section: Section = doc.section("Reconciliation (holdings)", level=2)
+		reconcile_section.table(Table([Column("group", "Place"), Column("source", "Taken from"), Column("owners", "Owners", "int")], reconcile_rows))
+		reconcile_section.text(f"Per owner and place the freshest dated source wins; within {RECONCILE_TIE_SECONDS // 60} minutes TSM beats DataStore beats Syndicator, and undated copies only win when nothing is dated.")
+	files: list[dict[str, Any]] = [{"file": f"{f.account}/SavedVariables/{f.path.name}", "source": f.source, "size": f.size, "modified": f.mtime, "age": fmt_age(ctx.now - f.mtime)} for f in data.source_files]
 	if data.appdata_path is not None:
 		stat: os.stat_result = data.appdata_path.stat()
-		files.append({"file": APPDATA_REL, "size": stat.st_size, "modified": stat.st_mtime, "age": fmt_age(ctx.now - stat.st_mtime)})
-	doc.section("Files", level=2).table(Table([Column("file", "File"), Column("size", "Bytes", "int"), Column("modified", "Modified", "time"), Column("age", "Age")], files))
+		files.append({"file": APPDATA_REL, "source": "tsm app", "size": stat.st_size, "modified": stat.st_mtime, "age": fmt_age(ctx.now - stat.st_mtime)})
+	doc.section("Files", level=2).table(Table([Column("file", "File"), Column("source", "Source"), Column("size", "Bytes", "int"), Column("modified", "Modified", "time"), Column("age", "Age")], files))
 	counts: dict[str, int] = {}
 	latest: dict[str, int] = {}
 	for txn in data.txns:
@@ -4096,7 +5424,7 @@ def cmd_status(ctx: Context) -> Doc:
 		market_section.table(Table([Column("where", "Realm/region"), Column("tag", "Dataset"), Column("items", "Items", "int"), Column("downloaded", "Downloaded", "time"), Column("age", "Age")], market_rows))
 	# Warnings worth acting on.
 	warnings: list[str] = []
-	newest_sv: float = max((f.mtime for f in data.files), default=0)
+	newest_sv: float = max((f.mtime for f in data.source_files), default=0)
 	if newest_sv and ctx.now - newest_sv > SECONDS_PER_DAY:
 		warnings.append(f"SavedVariables are {fmt_age(ctx.now - newest_sv)} old; WoW only writes them on logout or /reload.")
 	if market is not None and market.app_sync and ctx.now - market.app_sync > 6 * 3600:
@@ -4149,6 +5477,10 @@ flavor: _retail_
 # accounts:
 #   - ZAKMANN
 
+# SavedVariables to read: tsm, datastore (Altoholic), syndicator (Baganator).
+# Default: every one present. TSM is optional too.
+# sources: [tsm, datastore, syndicator]
+
 # Realm used for account-wide items (warbank) and deals when --realm is absent.
 # realm: Thorium Brotherhood
 
@@ -4186,8 +5518,8 @@ def cmd_config(ctx: Context) -> Doc:
 	settings: Settings = ctx.settings
 	doc: Doc = Doc("tsmctl config", "config")
 	rows: list[dict[str, Any]] = []
-	for name in ("host", "wow_dir", "flavor", "cache_dir", "accounts", "realm", "price_source", "market_source", "sell_source", "ah_cut", "notes_dir", "report_dir", "money", "color", "author", "categories"):
-		value: Any = getattr(settings, name)
+	for name in ("host", "wow_dir", "flavor", "cache_dir", "accounts", "sources", "realm", "price_source", "market_source", "sell_source", "ah_cut", "notes_dir", "report_dir", "money", "color", "author", "categories"):
+		value: Any = getattr(settings, "data_sources" if name == "sources" else name)
 		if name == "ah_cut":
 			value = f"{value * 100:g}%"
 		elif isinstance(value, list):
@@ -4530,7 +5862,7 @@ def _register_in_index(ctx: Context, path: Path, node_id: str, title: str) -> No
 
 EPILOG: str = """\
 commands:
-  status                       data sources, freshness and warnings
+  status                       data sources (TSM, DataStore, Syndicator), freshness and warnings
   get <resource> [query]       list things; resources:
                                  accounts realms chars gold gold-history
                                  sales buys income expenses expired cancelled ledger
@@ -4555,6 +5887,7 @@ output:
 
 examples:
   tsmctl status
+  tsmctl --sources tsm,datastore get chars
   tsmctl report
   tsmctl report --since 7d --save
   tsmctl report --period last-month --deals -o org
@@ -4585,6 +5918,10 @@ time values (--since/--until): 12h 7d 2w 3m 1y today yesterday week month ytd al
 price expressions: sources (tsmctl get sources) combined with min() max() avg() first() check(),
   + - * /, N%, and money like 10g or 1g50s, e.g. "first(dbmarket, 80% dbregionmarketavg)".
 
+data sources: TradeSkillMaster.lua (TSM), Altoholic's DataStore*.lua and Syndicator.lua, each
+  optional and detected per account; --sources or `sources:` picks some. Where they overlap
+  the freshest dated copy wins, with TSM > DataStore > Syndicator within 5 minutes.
+
 read-only: tsmctl never writes to the WoW/TSM files. Remote hosts are only asked to
   run find and tar c; only --save writes, and only into the notes repo or the path given.
 """
@@ -4604,6 +5941,7 @@ def add_common_options(parser: argparse.ArgumentParser, suppress: bool) -> None:
 	group.add_argument("--wow-dir", default=d(None), metavar="DIR", help="World of Warcraft directory (~ = that host's $HOME)")
 	group.add_argument("--flavor", default=d(None), metavar="NAME", help="game flavor dir: _retail_ (default), _classic_, _classic_era_ ...")
 	group.add_argument("--account", action="append", default=d(None), metavar="NAME", help="only these WoW account folders (repeatable, comma-separated)")
+	group.add_argument("--sources", action="append", default=d(None), metavar="LIST", help="SavedVariables to read: tsm, datastore, syndicator or all (default: every one present)")
 	group.add_argument("--cache-dir", default=d(None), metavar="DIR", help=f"cache for remote copies (default {DEFAULT_CACHE_DIR})")
 	group.add_argument("--offline", action="store_true", default=d(False), help="use cached remote data without contacting the host")
 	group.add_argument("--refresh", action="store_true", default=d(False), help="re-copy every remote file even if unchanged")
@@ -4644,7 +5982,7 @@ def add_common_options(parser: argparse.ArgumentParser, suppress: bool) -> None:
 def build_parser() -> argparse.ArgumentParser:
 	parser: argparse.ArgumentParser = argparse.ArgumentParser(
 		prog=PROG,
-		description="Read-only, kubectl-style CLI for TradeSkillMaster data: ledger, gold, inventory, market and business reports.",
+		description="Read-only, kubectl-style CLI for TradeSkillMaster (plus Altoholic DataStore and Syndicator) data: ledger, gold, inventory, auctions, mail, market and business reports.",
 		formatter_class=argparse.RawDescriptionHelpFormatter,
 		epilog=EPILOG,
 	)
@@ -4668,7 +6006,7 @@ def build_parser() -> argparse.ArgumentParser:
 	get.add_argument("resource", help="accounts, realms, chars, gold, gold-history, sales, buys, income, expenses, expired, cancelled, ledger, inventory, auctions, groups, prices, professions, items, sources")
 	get.add_argument("query", nargs="?", help="optional item filter (name, id, i:ID) for ledger/inventory/prices")
 	get.add_argument("--by", metavar="KEY", help="gold-history: day|week|month; inventory: item|char|location|realm|group")
-	get.add_argument("--location", action="append", metavar="LOC", help="inventory locations: bag, bank, mail, auction, warbank, guild")
+	get.add_argument("--location", action="append", metavar="LOC", help="inventory places: bag, bank, reagent_bank, void, mail, auction, warbank, guild")
 	get.add_argument("--min-value", metavar="MONEY", help="inventory: hide rows worth less than this (e.g. 500g)")
 
 	describe: argparse.ArgumentParser = sub("describe", "describe one item, character, realm or TSM group", cmd_describe, aliases=["desc"])
@@ -4718,7 +6056,7 @@ def build_parser() -> argparse.ArgumentParser:
 def normalize_args(args: argparse.Namespace) -> None:
 	"""Fill SUPPRESSed defaults and derive the effective output format."""
 	defaults: dict[str, Any] = {
-		"host": None, "local": False, "wow_dir": None, "flavor": None, "account": None, "cache_dir": None,
+		"host": None, "local": False, "wow_dir": None, "flavor": None, "account": None, "sources": None, "cache_dir": None,
 		"offline": False, "refresh": False, "config": None, "no_config": False, "realm": None, "char": None,
 		"item": None, "group": None, "source": None, "since": None, "until": None, "period": None,
 		"include_internal": False, "variants": False, "output": None, "save": None, "force": False,

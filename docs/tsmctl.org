@@ -1,14 +1,16 @@
 #+title: tsmctl - read-only TradeSkillMaster CLI
-#+description: How tsmctl reads TSM SavedVariables and AppData to run WoW gold-making like a business: ledger, P&L, flips, stock, market scans and org reports.
+#+description: How tsmctl reads TSM, Altoholic DataStore and Syndicator SavedVariables plus TSM AppData to run WoW gold-making like a business: ledger, P&L, flips, stock, auctions, mail, what needs a login, market scans and org reports.
 #+authors: Zach Podbielniak
 #+categories: dotfiles, wow, tsm
 #+created: 2026-10-03T16:30:00-04:00
-#+updated: 2026-10-04T09:00:00-04:00
-#+version: 2
+#+updated: 2026-10-04T17:00:00-04:00
+#+version: 3
 
 * Overview
 
 ~tsmctl~ (=bin/scripts/tsmctl=) is a kubectl-style command line for the data TradeSkillMaster leaves on disk. It answers business questions: what made money, what is dead stock, how much capital is tied up in flips, what the whole operation is worth, and what is cheap on the auction house right now. It is a single Python file using only the standard library (Python 3.12+).
+
+It also reads Altoholic's DataStore and Syndicator (the data addon behind Baganator) when they are installed. They add what TSM does not keep: every posted auction with its price and time left, mail with its expiry, character level, race and played time, void storage, currencies and known recipes. All three sources are optional and detected per account; TSM is no longer required.
 
 It is *read-only* on the WoW side. It never writes to SavedVariables or AppData. When the WoW install is on another machine, it runs only ~find~ and ~tar c~ there over ssh and mirrors the files into a local cache. The only thing it ever writes is the report you ask for with ~--save~.
 
@@ -39,10 +41,10 @@ TSM stores keys as =scope@scopeKey@section@name=:
 
 | Scope | Key example                       | What tsmctl uses                                                                 |
 |-------+-----------------------------------+----------------------------------------------------------------------------------|
-| =s@=  | =Drgold - Alliance - Thorium ...= | per character: =money=, =classKey=, =playerProfessions=, =goldLog=, =*Quantity= |
+| =s@=  | =Drgold - Alliance - Thorium ...= | per character: =money=, =classKey=, =playerProfessions=, =goldLog=, =goldLogLastUpdate=, =*Quantity= |
 | =r@=  | =Thorium Brotherhood=             | per realm ledger: =csvSales=, =csvBuys=, =csvIncome=, =csvExpense=, =csvExpired=, =csvCancelled= |
-| =f@=  | =Alliance - Thorium Brotherhood=  | =guildVaults=, =guildGoldLog=, =characterGuilds=                                 |
-| =g@=  | (global)                          | =warbankMoney=, =warbankQuantity=, =warbankGoldLog=, =vendorItems=               |
+| =f@=  | =Alliance - Thorium Brotherhood=  | =guildVaults=, =guildGoldLog=, =characterGuilds=, =expiringAuction=, =expiringMail= |
+| =g@=  | (global)                          | =warbankMoney=, =warbankQuantity=, =warbankGoldLog=, =warbankGoldLogLastUpdate=, =vendorItems= |
 | =p@=  | =Default= (profile)               | =userData items= and =groups= (TSM groups)                                      |
 
 The file also holds =TSMItemInfoDB=, TSM's item cache: names and item strings joined with =\x02=, plus a packed 24-character record per item (item level, vendor sell, max stack, class, quality, expansion...) in a little-endian base-64 alphabet. tsmctl decodes it for names, quality and vendor prices.
@@ -56,6 +58,63 @@ The file also holds =TSMItemInfoDB=, TSM's item cache: names and item strings jo
 - Expired/cancelled rows: =itemString,stackSize,quantity,player,time=.
 - Mail-based records are dated =now + (daysLeft - 30) days=. Mail with a long expiry (WoW Token sales) lands in the future; tsmctl re-dates anything after the file's save time to the save time and warns.
 - Retail gold logs are =minute,copper= rounded to 1,000g, so gold history is coarse.
+
+** Altoholic DataStore: =WTF/Account/<account>/SavedVariables/DataStore*.lua= (optional)
+
+Altoholic stores its data through the DataStore family of addons. tsmctl reads seven files per account: =DataStore.lua=, =DataStore_Characters.lua=, =DataStore_Auctions.lua=, =DataStore_Mails.lua=, =DataStore_Containers.lua=, =DataStore_Currencies.lua= and =DataStore_Crafts.lua=. The files are CRLF Lua like any SavedVariables.
+
+DataStore keys every character by a small integer: =DataStore_CharacterIDs.List= in =DataStore.lua= is ="Default.<Realm>.<Name>"= in id order, and each module stores its per-character tables as arrays indexed by that id (sparse arrays are written with explicit =[n] = ...= keys). Guilds work the same through =DataStore_GuildIDs=, and =DataStore_CharacterGuilds[id]= is the character's guild id. Without =DataStore.lua= nothing can be attributed, so that account's DataStore data is skipped with a warning. =DataStore_ConnectedRealms= says which realms are connected, which matters for guild banks (below).
+
+| File                         | Table                                         | What tsmctl uses                                                                                                                                             |
+|------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =DataStore_Characters.lua=   | =DataStore_Characters_Info[id]=                | =money= (copper), =played=, =lastUpdate=, =lastLogoutTimestamp=, =zone=, =BaseInfo= packed as bits 0-6 level, 7-10 class id, 11-17 race id, 18-19 gender      |
+| =DataStore_Auctions.lua=     | =DataStore_Auctions_AuctionsList[id]=          | one pipe-separated string per auction (format below the table)                                                                                               |
+|                              | =DataStore_Auctions_Characters[id]=            | =lastAuctionsScan=: expiry is =lastAuctionsScan + timeLeftSeconds=                                                                                             |
+| =DataStore_Mails.lua=        | =DataStore_Mails_Characters[id].Mails=         | one entry per attachment (=itemID=, =count=, =link=) and one per money/letter, each with =sender=, =subject=, =money=, =returned=, =lastCheck=, =daysLeft= |
+|                              | =...MailCache=                                 | mail an alt sent that the recipient has not seen yet (30 days from sending)                                                                                    |
+| =DataStore_Containers.lua=   | =DataStore_Containers_Characters[id].Containers[bagID]= | =items[slot]= = count + (itemID << 16), =links[slot]=                                                                                               |
+|                              | =DataStore_Containers_Warbank[tab]=            | warband bank tabs (bag ids 12-16), same packing, no timestamp                                                                                                |
+|                              | =DataStore_Containers_Guilds[guild id].Tabs=   | guild bank tabs, each with =ClientTime= (when it was last seen)                                                                                               |
+|                              | =DataStore_Containers_VoidStorage[id]=         | void storage, always the old 10-bit count                                                                                                                    |
+| =DataStore_Currencies.lua=   | =DataStore_Currencies_Characters[id].Totals=   | =[currencyID]= = quantity + (earned this week << 20); caps in =DataStore_Currencies_Max=                                                                       |
+| =DataStore_Crafts.lua=       | =DataStore_Crafts_Characters[id].Professions=  | =Crafts[category]= lists packed recipes: bits 0-1 difficulty, 2 learned, 3-4 rank, 5-6 ranks, 7+ recipe (spell) id; category names in =..._RecipeCategories= |
+
+An auction string is =AHZone|itemID|quantity|bidder|bidAmount|buyoutAmount|timeLeftSeconds|auctionID=, for example =0|112294|3||0|3005100|86392|1637379826=.
+
+Details that are easy to get wrong:
+
+- Container bag ids: 0-4 bags and 5 the reagent bag (place =bag=), 6-11 the character bank tabs (6-12 bank bags before 11.2) and -1 the old main bank (=bank=), -3/-7 the reagent bank (=reagent_bank=), -5/-6 void storage (=void=), -2 the classic keyring (=bag=).
+- Slot counts moved from 10 to 16 bits in DataStore 10.2.013 and old characters still have the 10-bit form. DataStore tells them apart by bits 13-15 (zero in the 16-bit form) and so does tsmctl.
+- Battle pets in bags store their icon id where the item id goes; tsmctl takes the pet from the link instead (=p:species:level:quality=).
+- A character's bank only counts once DataStore has seen it open (=bankInfo= is set then); until then its empty bank tables would wrongly say the bank is empty.
+- =buyoutAmount= is a unit price: it is =C_AuctionHouse='s owned-auction buyout, which Auctionator also multiplies by the quantity for its totals. Sold auctions are not listed (they are in the mail).
+- Currency names are stored without ids: =Characters[id].Currencies= is a list packed as bits 0-7 header, 8-17 index into =Catalog.List=, 18+ count. tsmctl names an id when the listed count pins it down on every character that lists it; a currency nobody holds stays unnamed.
+- Recipe names and result items are not stored, only recipe (spell) ids; ~get recipes~ links each one on Wowhead.
+- No faction is stored: it comes from the race (Pandaren id 24 is neutral), unless TSM or Syndicator says.
+
+** Syndicator: =WTF/Account/<account>/SavedVariables/Syndicator.lua= (optional)
+
+=SYNDICATOR_DATA.Characters= is keyed ="Name-RealmNormalized"=. Each character has =details= (=character=, =realm=, =faction=, =race=, =className=, =guild= as ="Guild-HomeRealm"=), =money=, =bags=, =bank=/=bankTabs=, =void=, =mail= (items with an absolute =expirationTime=), =auctions= (=itemID=, =itemCount=, =itemLink=, =expirationTime= epoch, =auctionID=) and =currencies= (={id = quantity}=). =Warband[1]= is the warband bank (=money=, =bank=) and =Guilds= the guild banks. Nothing in it carries a timestamp, so it only wins where no dated source has the data. Its guild key names the guild's home realm, which tsmctl also takes as evidence that two realms are connected.
+
+** Reconciliation: which copy wins
+
+Where sources overlap, one rule decides, per character gold, per owner and place group of holdings, and per character mail list and currency list:
+
+1. The freshest dated copy wins.
+2. Copies within 5 minutes of the freshest count as the same moment (one logout stamps TSM and DataStore a minute or two apart) and the priority TSM, then DataStore, then Syndicator breaks the tie.
+3. Undated copies only win when nothing is dated, again by that priority.
+
+The timestamps: TSM has none on its quantity tables, so a character's TSM data is dated by its gold log's last update (=goldLogLastUpdate=, TSM's best "last seen"), the warband bank by =warbankGoldLogLastUpdate=, and guild vaults are undated. DataStore dates character data by its =lastUpdate=, auctions by =lastAuctionsScan=, mail by the mailbox =lastUpdate= and guild tabs by =ClientTime=; its warband bank is undated. Syndicator is undated.
+
+Holdings are compared per place group, not per place, because TSM's bag count includes the reagent bag and its bank count the reagent bank: the groups are bag, bank (bank and reagent bank), void, mail, auction, warbank and guild. The winner's holdings replace every other source's for that owner and group. Slot-level sources are summed per item and place.
+
+Guild banks: TSM keeps one guild vault per faction and realm, so a guild seen from two connected realms is stored (and was counted) twice. Guild sets are therefore matched on the guild name and the connected-realm group. DataStore's copies of one guild are merged tab by tab, each tab from the copy that saw it last; TSM's copies collapse to the one with the most distinct items. Before this, a guild visited from two connected realms was counted twice in inventory and net worth.
+
+Auctions are joined on the auction id: DataStore brings the buyout, bid, quantity and its time-left expiry, Syndicator the item link and an absolute expiry (which wins). Auctions only one source knows are kept: Syndicator keeps expired auctions that DataStore already dropped, and those are exactly the ones waiting in the mailbox.
+
+Characters are matched on name and realm. Level, race, played time, zone and last seen come from DataStore; a character TSM never saw is created from DataStore or Syndicator. Last seen is the latest of TSM's gold log update and DataStore's =lastUpdate= / =lastLogoutTimestamp=.
+
+~status~ shows which source won how many owner/place groups. ~--sources~ (or =sources:= in the config, or =TSMCTL_SOURCES=) restricts reading to some sources, which also shows what each one says on its own.
 
 ** AppData: =Interface/AddOns/TradeSkillMaster_AppHelper/AppData.lua=
 
@@ -79,7 +138,7 @@ All commands accept the common options (data source, filters, output) before or 
 
 ** status
 
-Data source (local or ssh + cache), file ages, ledger row counts and latest record per kind, every AppData dataset with its download age, and warnings: stale SavedVariables, a TSM app that has not synced for 6h+, trimmed accounting, realms with no market data.
+Data source (local or ssh + cache), counts of characters, auctions, mail, currency balances and recipes, a Sources table (per account and source: used, missing, not selected or error, files, when the file was saved, "data as of" from the newest timestamp inside the data, and notes), how many owner/place groups each source won in reconciliation, every file with its source and age, ledger row counts and latest record per kind, every AppData dataset with its download age, and warnings: stale SavedVariables, a TSM app that has not synced for 6h+, trimmed accounting, realms with no market data, and every warning raised while loading (a missing or unreadable DataStore module, a corrupt Syndicator file).
 
 ** get <resource> [query]
 
@@ -104,7 +163,7 @@ The optional ~query~ filters ledger, inventory and prices by item (name substrin
 ** describe item|char|realm|group <name>
 
 - item: identity (quality, ilvl, class, vendor prices, TSM group), AuctionDB prices per realm plus region stats, your history (units, revenue, avg/min/max sale, cost, profit, sell-through), holdings by owner and location, recent transactions, and what each unit nets today at your average cost.
-- char: class, guild, gold, inventory value, P&L for the window, professions, most valuable holdings, recent transactions.
+- char: class, guild, gold, inventory value, P&L for the window, professions, most valuable holdings, recent transactions. ~Name-Realm~ may be shortened to a unique prefix (=Drgold-Thor=).
 - realm: characters and gold, market snapshot age and size, P&L.
 - group: per-item performance for a TSM group and its subgroups.
 
@@ -176,6 +235,7 @@ The business on one page, default window 30 days:
 | ~--wow-dir DIR~       | WoW root; =~/...= means that host's home                             |
 | ~--flavor NAME~       | =_retail_= (default), =_classic_=, =_classic_era_=...               |
 | ~--account NAME~      | only these WoW account folders                                      |
+| ~--sources LIST~      | read only these: =tsm=, =datastore= (alias =altoholic=), =syndicator= (alias =baganator=), or =all= (default: every one present) |
 | ~--offline~           | use the cache without contacting the host                           |
 | ~--refresh~           | re-copy every remote file                                           |
 | ~--cache-dir DIR~     | remote mirror location (default =~/.cache/tsmctl=)                   |
@@ -249,6 +309,7 @@ If the file is inside =notes_dir= and its directory has a =00_index.org=, tsmctl
 | =wow_dir=      | =TSMCTL_WOW_DIR=, =TSM_WOW_DIR= | Steam Proton prefix path used by ~tsm-app~           |
 | =flavor=       | =TSMCTL_FLAVOR=        | =_retail_=                                                    |
 | =accounts=     | =TSMCTL_ACCOUNTS=      | all                                                           |
+| =sources=      | =TSMCTL_SOURCES=       | all present (=tsm=, =datastore=, =syndicator=)                |
 | =realm=        | =TSMCTL_REALM=         | the realm with the most sales                                |
 | =price_source= | =TSMCTL_PRICE_SOURCE=  | =check(dbregionsaleavg, min(dbmarket, dbregionsaleavg), vendorsell)= |
 | =market_source= | =TSMCTL_MARKET_SOURCE= | =first(dbmarket, dbregionmarketavg, vendorsell)=             |
@@ -265,16 +326,19 @@ If the file is inside =notes_dir= and its directory has a =00_index.org=, tsmctl
 
 * Remote mirroring
 
-1. One ssh call lists =WTF/Account/*/SavedVariables/TradeSkillMaster.lua= and =AppData.lua= with =find -printf '%T@ %s %p'=.
-2. Files whose mtime or size differ from =~/.cache/tsmctl/hosts/<host>/manifest_retail_.json= (or are missing) are streamed with one =tar cf -= call and unpacked with Python's =tarfile=. Only regular files with exactly the requested names are accepted. Each file is written to a =.part= file and renamed, and keeps the remote mtime.
+1. One ssh call lists, under =WTF/Account/*/SavedVariables/=, exactly these names with =find -type f \( -name ... \) -printf '%T@ %s %p'=: =TradeSkillMaster.lua=, =DataStore.lua=, =DataStore_Characters.lua=, =DataStore_Auctions.lua=, =DataStore_Mails.lua=, =DataStore_Containers.lua=, =DataStore_Currencies.lua=, =DataStore_Crafts.lua= and =Syndicator.lua=, plus =AppData.lua=. Any other name in the reply is ignored. Every source is mirrored whatever ~--sources~ says, so switching sources never needs a re-copy.
+2. Files whose mtime or size differ from =~/.cache/tsmctl/hosts/<host>/manifest_retail_.json= (or are missing) are streamed with one =tar cf -= call and unpacked with Python's =tarfile=. Only regular files with exactly the requested names are accepted; anything else in the stream (another name, a symlink, a directory) is skipped, and a requested file that does not arrive as a regular file fails the sync. Each file is written to a =.part= file and renamed, and keeps the remote mtime.
 3. Files that vanished remotely are removed from the cache.
 
-A first sync is about 16 MB; later runs only copy what changed (usually AppData every hour and SavedVariables after a logout).
+A first sync is about 18 MB (DataStore adds a few hundred KB and Syndicator about 1 MB); later runs only copy what changed (usually AppData every hour and SavedVariables after a logout).
 
 * Limitations
 
 - SavedVariables only change on logout or ~/reload~; the AH ledger and holdings trail a live session.
-- =auctionQuantity= is what was posted at the last logout, not what is posted now.
+- =auctionQuantity= is what was posted at the last logout, not what is posted now. DataStore's auction list is as of the last AH visit; an auction whose expiry has passed has either sold or come back by mail, and nothing on disk says which until the mailbox is opened.
+- Neither DataStore nor Syndicator records cash-on-delivery amounts, so the =cod= field of mail is 0 unless known.
+- DataStore keeps no timestamp for the warband bank and Syndicator keeps none at all, so they only win where no dated source has the data.
+- TSM's =expiringAuction= is each character's first expiry as TSM last saw it and can be stale; it is used only for characters without DataStore or Syndicator auction data.
 - TSM does not record AH deposits, so expiries cost more than the ledger shows.
 - Crafting costs are not modelled: crafted items sold have no cost basis. Converting one item into another (opening Card of Omens, for example) shows as a buy of one item and sales of others; use ~pnl --item A --item B~ to see such a venture as one P&L.
 - Gold history resolution is 1,000g on retail.
@@ -283,6 +347,8 @@ A first sync is about 16 MB; later runs only copy what changed (usually AppData 
 * Tests
 
 =tests/scripts/test_tsmctl.py= (stdlib ~unittest~) builds a synthetic two-account install with an AppData file and checks the Lua parser, item-cache decoding, base-32 and x1000 scaling, price expressions, dedupe of synced rows, future-date clamping, internal-transfer exclusion, flips/sell-through math, valuation, deals, every command in every output format, clean errors, roam-node saving with stable IDs and index linking, and that the WoW files are byte-for-byte unchanged afterwards.
+
+A second synthetic install has TSM, DataStore and Syndicator for one account, written the way the client writes them (CRLF, positional nils, sparse arrays with explicit index keys, packed values, a legacy 10-bit slot, a battle pet). It checks the decoders (item links, slots, currency naming), the reconciliation rule and each place it applies (gold, bags, bank, warbank, a guild on two connected realms, auctions, mail, currencies), the auction join on the auction id, ~--sources~ through the option and =TSMCTL_SOURCES=, the commands in all six output formats with every source present, and that missing or corrupt optional files only warn. A third install has DataStore only, with corrupt files. The ssh mirror is tested with a fake ssh: it must list every source's file names and refuse anything else in the listing or the tar stream, including a symlink under a requested name.
 
 #+begin_src bash
 python3 tests/scripts/test_tsmctl.py
