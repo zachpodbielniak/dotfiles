@@ -1,0 +1,289 @@
+#+title: tsmctl - read-only TradeSkillMaster CLI
+#+description: How tsmctl reads TSM SavedVariables and AppData to run WoW gold-making like a business: ledger, P&L, flips, stock, market scans and org reports.
+#+authors: Zach Podbielniak
+#+categories: dotfiles, wow, tsm
+#+created: 2026-10-03T16:30:00-04:00
+#+updated: 2026-10-04T09:00:00-04:00
+#+version: 2
+
+* Overview
+
+~tsmctl~ (=bin/scripts/tsmctl=) is a kubectl-style command line for the data TradeSkillMaster leaves on disk. It answers business questions: what made money, what is dead stock, how much capital is tied up in flips, what the whole operation is worth, and what is cheap on the auction house right now. It is a single Python file using only the standard library (Python 3.12+).
+
+It is *read-only* on the WoW side. It never writes to SavedVariables or AppData. When the WoW install is on another machine, it runs only ~find~ and ~tar c~ there over ssh and mirrors the files into a local cache. The only thing it ever writes is the report you ask for with ~--save~.
+
+Everything goes to stdout by default. ~--save~ writes an org file into the notes repo (or a path you give) and links it from that directory's =00_index.org=.
+
+* Quick start
+
+#+begin_src bash
+tsmctl status                       # where the data came from, how fresh, warnings
+tsmctl report                       # last 30 days of the business on one page
+tsmctl report --since 7d --save     # same, written to the notes repo as org
+tsmctl pnl --by day --since 14d     # daily profit & loss
+tsmctl flips --open                 # stock bought and not yet sold
+tsmctl sellthrough --max-rate 20    # items that keep expiring
+tsmctl deals --realm "Moon Guard"   # buy candidates from the last realm scan
+tsmctl describe item "Card of Omens"
+#+end_src
+
+The dotfiles ship =.config/tsmctl/config.yaml= with ~host: mob-zach~. On mob-zach itself that host name is recognised as the local machine and the install is read directly; everywhere else it is read over ssh.
+
+* Data sources
+
+** SavedVariables: =WTF/Account/<account>/SavedVariables/TradeSkillMaster.lua=
+
+One file per WoW account folder. tsmctl reads every account and merges them (or only ~--account~ ones). WoW only writes this file on logout or ~/reload~, so it trails a live session.
+
+TSM stores keys as =scope@scopeKey@section@name=:
+
+| Scope | Key example                       | What tsmctl uses                                                                 |
+|-------+-----------------------------------+----------------------------------------------------------------------------------|
+| =s@=  | =Drgold - Alliance - Thorium ...= | per character: =money=, =classKey=, =playerProfessions=, =goldLog=, =*Quantity= |
+| =r@=  | =Thorium Brotherhood=             | per realm ledger: =csvSales=, =csvBuys=, =csvIncome=, =csvExpense=, =csvExpired=, =csvCancelled= |
+| =f@=  | =Alliance - Thorium Brotherhood=  | =guildVaults=, =guildGoldLog=, =characterGuilds=                                 |
+| =g@=  | (global)                          | =warbankMoney=, =warbankQuantity=, =warbankGoldLog=, =vendorItems=               |
+| =p@=  | =Default= (profile)               | =userData items= and =groups= (TSM groups)                                      |
+
+The file also holds =TSMItemInfoDB=, TSM's item cache: names and item strings joined with =\x02=, plus a packed 24-character record per item (item level, vendor sell, max stack, class, quality, expansion...) in a little-endian base-64 alphabet. tsmctl decodes it for names, quality and vendor prices.
+
+*** Ledger semantics (verified against the TSM addon source)
+
+- Sales and buys: =itemString,stackSize,quantity,price,otherPlayer,player,time,source=. =price= is *per item*, =quantity= is the total units (TSM merges identical records within 5 minutes and adds to =quantity=).
+- AH sale prices are recorded *after* the 5% AH cut: TSM stores =(bid - ahcut) / quantity=. Purchases are what you paid.
+- =source= is =Auction=, =Vendor=, =Trade= or =COD=.
+- Income/expense rows: =type,amount,otherPlayer,player,time= (=Postage=, =Repair Bill=, =Money Transfer=...).
+- Expired/cancelled rows: =itemString,stackSize,quantity,player,time=.
+- Mail-based records are dated =now + (daysLeft - 30) days=. Mail with a long expiry (WoW Token sales) lands in the future; tsmctl re-dates anything after the file's save time to the save time and warns.
+- Retail gold logs are =minute,copper= rounded to 1,000g, so gold history is coarse.
+
+** AppData: =Interface/AddOns/TradeSkillMaster_AppHelper/AppData.lua=
+
+Written by the TSM desktop app (~tsm-app~). It is a series of ~LoadData("TAG","realm-or-region",[[return {downloadTime=...,fields={...},data={{item,v1,v2},...}}]])~ calls. Values are base-32 integers; a bare number item is =i:<id>=.
+
+| Tag                                     | Scope                | Fields                                                   |
+|-----------------------------------------+----------------------+----------------------------------------------------------|
+| =AUCTIONDB_NON_COMMODITY_DATA=          | realm                | minBuyout, numAuctions, marketValueRecent                |
+| =AUCTIONDB_NON_COMMODITY_SCAN_STAT=     | realm                | marketValue                                              |
+| =AUCTIONDB_NON_COMMODITY_HISTORICAL=    | realm                | historical                                               |
+| =AUCTIONDB_COMMODITY_*=                 | region (stackables)  | same fields, apply to every realm                        |
+| =AUCTIONDB_REGION_STAT=                 | region               | regionMarketValue                                        |
+| =AUCTIONDB_REGION_SALE=                 | region               | regionSale, regionSoldPerDay, regionSalePercent (both x1000) |
+| =AUCTIONDB_REGION_HISTORICAL=           | region               | regionHistorical                                         |
+
+Realm lookups try the realm's own data, then the region commodity data; item lookups try the exact item string, then the base item. Realms not in the TSM app's realm list have no realm data (=tsmctl status= lists them).
+
+* Commands
+
+All commands accept the common options (data source, filters, output) before or after the command name.
+
+** status
+
+Data source (local or ssh + cache), file ages, ledger row counts and latest record per kind, every AppData dataset with its download age, and warnings: stale SavedVariables, a TSM app that has not synced for 6h+, trimmed accounting, realms with no market data.
+
+** get <resource> [query]
+
+| Resource                                               | Shows                                                                         |
+|--------------------------------------------------------+-------------------------------------------------------------------------------|
+| =accounts=                                             | account folders, characters, gold, ledger rows, save time                     |
+| =realms=                                               | per realm: characters, gold, all-time sales, market data freshness            |
+| =chars=                                                | characters with class, gold, inventory value, professions                     |
+| =gold=                                                 | gold per character, warbank and guild bank (last guild log), with share        |
+| =gold-history=                                         | total gold over time from TSM gold logs (~--by day/week/month~)              |
+| =sales= =buys= =income= =expenses= =expired= =cancelled= | the ledger, newest first (50 rows by default; ~-n 0~ for all)              |
+| =ledger=                                               | every kind merged, with a signed amount                                       |
+| =inventory= / =auctions=                               | holdings valued at the price source (~--by item/char/location/realm/group~, ~--location~, ~--min-value~) |
+| =groups=                                               | TSM groups with held value, revenue and profit                                |
+| =prices <item>=                                        | every AuctionDB source per realm for an item                                  |
+| =professions=                                          | profession skill per character                                                |
+| =items <text>=                                         | same as ~search~                                                              |
+| =sources=                                              | the price sources usable in expressions                                       |
+
+The optional ~query~ filters ledger, inventory and prices by item (name substring, id, =i:ID= or Wowhead URL).
+
+** describe item|char|realm|group <name>
+
+- item: identity (quality, ilvl, class, vendor prices, TSM group), AuctionDB prices per realm plus region stats, your history (units, revenue, avg/min/max sale, cost, profit, sell-through), holdings by owner and location, recent transactions, and what each unit nets today at your average cost.
+- char: class, guild, gold, inventory value, P&L for the window, professions, most valuable holdings, recent transactions.
+- realm: characters and gold, market snapshot age and size, P&L.
+- group: per-item performance for a TSM group and its subgroups.
+
+** search <text>
+
+Item lookup against the TSM item cache, with value, units you sold, units you hold and TSM group.
+
+** pnl
+
+Cash-basis profit and loss: AH sales (net of cut), vendor sales, trade/COD, other income, purchases, expenses, net. ~--by day|week|month|year|realm|char|source|group|item|none~. Time buckets also show a running cumulative net. Default window 30 days.
+
+Cash basis means a week of heavy buying shows as a loss even if the stock is worth more than you paid; ~flips~ and ~networth~ show the other side.
+
+** top items|chars|buyers|sellers
+
+- items ~--by profit|revenue|sold|roi|margin|velocity|expired|spent|sales~: per-item performance. Profit matches units sold against average purchase cost; items never bought (farmed, crafted) have no cost basis, so profit equals revenue.
+- chars: P&L per character.
+- buyers: who buys from you (customers). sellers: who you buy from (suppliers). Vendor rows are excluded.
+
+** flips
+
+For every item bought in the window: units bought and average cost, units sold *since the first purchase* and average sale, realized profit and ROI, open units, unrealized P/L at the price source after the AH cut, and a status: =CLOSED=, =SELLING=, =OPEN= (nothing sold yet), =STALE= (still holding, no activity for 7 days) or =LOSING= (selling below cost). The summary shows capital still tied up. ~--open~ keeps only open positions; ~--min-spent~ hides small ones.
+
+** sellthrough
+
+Per item AH outcomes (sold, expired, cancelled) and sell-through = sold / (sold + expired + cancelled), with the region sale rate and a verdict: =healthy= (50%+), =vendor it= (market after cut is at or below vendor price), =dead market: stop posting= (under 15% and the region barely sells it), =overpriced: lower or wait= (under 15% but the region sells it), =slow: watch=. ~--min-listings~ (default 3), ~--max-rate~ (percent).
+
+** networth
+
+Liquid gold (characters, warbank, guild banks from the last guild gold log) plus goods (bags, bank, mail, warbank, guild vaults) plus posted auctions, valued two ways side by side:
+
+- *Minimum*: =price_source= (default =check(dbregionsaleavg, min(dbmarket, dbregionsaleavg), vendorsell)=). This is what goods actually sell for region-wide, capped at the realm market, or vendor price if they never sell. Treat it as the floor.
+- *Market*: =market_source= (default =first(dbmarket, dbregionmarketavg, vendorsell)=). This is what goods are listed at. It is inflated by items that almost never sell, so the summary also shows the market-minus-minimum gap and how much of it comes from items with no region sales at all.
+
+Each view is shown gross and after the AH cut. ~--valuation both|min|market~ (default both), ~--by realm|char|location~. With both, the table shows holdings and totals for each view, and ~-o wide~ adds the goods/on-AH split. Unpriced holdings (soulbound, never on the AH) count as zero and are reported.
+
+** deals
+
+Scans one realm's last AuctionDB snapshot. An item qualifies when its buy price (~--buy-source~, default =dbminbuyout=) is at most ~--max-pct~ (70) percent of the sell reference (~--sell-source~, default =first(dbregionsaleavg, dbmarket)=), the net profit per unit after the cut is at least ~--min-profit~ (10g), and the region sale rate is at least ~--min-sale-rate~ (0.05). Ranked by EV per listing = net profit x region sale rate. ~--commodities~ adds region-wide stackables, ~--no-pets~ skips battle pets, ~--max-buy~ caps the price. The snapshot is the TSM app's last scan, not the live AH; check in game before buying.
+
+** report
+
+The business on one page, default window 30 days:
+
+1. Summary: revenue split, purchases, expenses, net cash flow (total and per day), realized flip profit, AH sell-through, gold change from the gold log, liquid gold, net worth both minimum and market, and highlights (best earners, items sold below cost, dead stock).
+2. P&L by day (14 days or less), week (120 days or less) or month.
+3. Top products by profit.
+4. Flips: spent, realized, capital tied up, unrealized.
+5. Dead and slow stock.
+6. Top holdings by value (minimum valuation).
+7. Gold by character.
+8. Deals, with ~--deals~.
+9. Method notes.
+
+~--top N~ sets rows per section; ~--sections summary,pnl,...~ picks sections.
+
+** paths, config
+
+~paths~ prints resolved locations including the default report file. ~config~ shows each effective setting and where it came from (cli, env, config, default); ~config sample~ prints a commented config.
+
+* Options
+
+** Data source
+
+| Option                | Meaning                                                              |
+|-----------------------+----------------------------------------------------------------------|
+| ~--host HOST~         | read the install on HOST over ssh (BatchMode, 10s connect timeout)  |
+| ~--local~             | ignore the configured host                                          |
+| ~--wow-dir DIR~       | WoW root; =~/...= means that host's home                             |
+| ~--flavor NAME~       | =_retail_= (default), =_classic_=, =_classic_era_=...               |
+| ~--account NAME~      | only these WoW account folders                                      |
+| ~--offline~           | use the cache without contacting the host                           |
+| ~--refresh~           | re-copy every remote file                                           |
+| ~--cache-dir DIR~     | remote mirror location (default =~/.cache/tsmctl=)                   |
+| ~--config~, ~--no-config~ | pick or ignore the config file                                   |
+
+If the host cannot be reached and a cache exists, tsmctl warns and uses the cache.
+
+** Filters
+
+| Option                   | Meaning                                                                    |
+|--------------------------+----------------------------------------------------------------------------|
+| ~--realm~                | realm names, case-insensitive, unique prefix is enough (repeatable)        |
+| ~--char~                 | character names (repeatable)                                               |
+| ~--item~                 | id, =i:ID=, Wowhead URL or name substring (repeatable; a substring can match many) |
+| ~--group~                | TSM group path, e.g. ="Reagents / Profs > Fish"=, matches subgroups too    |
+| ~--source~               | ledger source: auction, vendor, trade, cod, or a money type               |
+| ~--since~, ~--until~     | window bounds (~--until~ is exclusive)                                     |
+| ~--period~               | named window: today, yesterday, week, month, ytd, last-week, last-month, last-year |
+| ~--include-internal~     | keep trades, COD and mail between your own characters                      |
+| ~--variants~             | keep item variants (ilvl/bonus ids) apart; default groups by base item     |
+
+Time values: =12h= =7d= =2w= =3m= =1y=, =today=, =yesterday=, =week= (since Monday), =month=, =ytd=, =all=, =2026-09-01=, =2026-09-01T18:00=, or an epoch.
+
+Internal transfers are detected by matching the other party against every character tsmctl knows (=Name= and =Name-Realm=).
+
+** Output
+
+| Option              | Meaning                                                                      |
+|---------------------+------------------------------------------------------------------------------|
+| ~-o FMT~            | =text= (default), =wide= (extra columns), =org=, =csv=, =tsv=, =json=       |
+| ~--save [PATH]~     | write to a file instead of stdout; put it after the command                 |
+| ~--force~           | let ~--save~ overwrite a file tsmctl did not write                          |
+| ~--no-index~        | do not link the saved file from =00_index.org=                              |
+| ~-n N~              | rows in the main table (0 = all)                                            |
+| ~--sort COL~, ~--reverse~ | sort the main table; numbers sort high-first                          |
+| ~--money g/gsc/copper~ | =1,234.56g=, =1,234g 56s 00c= or raw copper                              |
+| ~--price-source EXPR~ | minimum valuation expression (used everywhere)                           |
+| ~--market-source EXPR~ | market valuation expression (networth and report only)                  |
+| ~--ah-cut PCT~      | AH cut used for net figures (default 5)                                     |
+| ~--color~, ~--no-links~, ~--ids~, ~-v~, ~-q~ | colour, plain names in org, show item strings, logging |
+
+Machine formats keep raw values: money columns become =<column>_copper= integers, item columns gain =<column>_name=, times are ISO 8601 and percentages are ratios. JSON is ~{title, generated, generator, sections: [{title, values, tables, notes}]}~.
+
+* Price expressions
+
+A safe subset of TSM custom prices. Sources (~tsmctl get sources~): =dbminbuyout=, =dbmarket=, =dbrecent=, =dbhistorical=, =dbnumauctions=, =dbregionmarketavg=, =dbregionhistorical=, =dbregionsaleavg=, =dbregionsalerate=, =dbregionsoldperday=, =vendorsell=, =vendorbuy=, and your own =avgsell=, =avgbuy=, =minsell=, =maxsell=, =minbuy=, =maxbuy=.
+
+Functions: =min=, =max=, =avg= (ignore missing values), =first= (first present value), =check(cond, then, else)= (=then= when =cond= is present and positive). Operators =+ - * /=, =N%= prefix, money literals =10g=, =50s=, =1g50s=. Missing values propagate through arithmetic.
+
+The default (minimum) valuation is =check(dbregionsaleavg, min(dbmarket, dbregionsaleavg), vendorsell)=; the market valuation (=market_source=) is only used for the market net worth. Items that sell somewhere in the region are valued at the lower of the realm market and the region sale average. Items that never sell region-wide are valued at vendor price. Using =dbmarket= alone valued a stack of 4,000 grey Mammoth Cutters at 16M gold and a single unsold sash at 5M, because both only have troll listings.
+
+* Saving to the notes repo
+
+~--save~ with no path writes to =report_dir= (default =~/Documents/notes/02_areas/personal/wow/accounting=):
+
+- ~report~ -> =<YYYYMMDD>_tsm_report.org=
+- any other command -> =<YYYYMMDD>_tsm_<command>.org= (for example =20261003_tsm_pnl.org=)
+- ~-o csv/tsv/json/text~ with ~--save~ writes that format with a matching extension
+
+Org files are proper roam nodes: a =:PROPERTIES:= drawer with a fresh UUID, the standard =#+title/description/authors/categories/created/updated/version= headers, and =#+generator: tsmctl=. Regenerating the same day keeps the =:ID:= and =#+created:=, and bumps the minor version. tsmctl refuses to overwrite an org file it did not generate unless ~--force~.
+
+If the file is inside =notes_dir= and its directory has a =00_index.org=, tsmctl adds =- [[id:...][title]]= once. It goes under a =* Reports= heading if there is one, otherwise into the first list of id links, and the list stays sorted. The write is atomic (temporary file + rename).
+
+* Configuration
+
+=~/.config/tsmctl/config.yaml= (=tsmctl config sample= prints a commented copy). It is a flat YAML subset: =key: value=, inline =[a, b]= lists and =- item= block lists. Precedence: command line, then environment, then config, then built-in default.
+
+| Key            | Environment            | Default                                                       |
+|----------------+------------------------+---------------------------------------------------------------|
+| =host=         | =TSMCTL_HOST=          | (local)                                                       |
+| =wow_dir=      | =TSMCTL_WOW_DIR=, =TSM_WOW_DIR= | Steam Proton prefix path used by ~tsm-app~           |
+| =flavor=       | =TSMCTL_FLAVOR=        | =_retail_=                                                    |
+| =accounts=     | =TSMCTL_ACCOUNTS=      | all                                                           |
+| =realm=        | =TSMCTL_REALM=         | the realm with the most sales                                |
+| =price_source= | =TSMCTL_PRICE_SOURCE=  | =check(dbregionsaleavg, min(dbmarket, dbregionsaleavg), vendorsell)= |
+| =market_source= | =TSMCTL_MARKET_SOURCE= | =first(dbmarket, dbregionmarketavg, vendorsell)=             |
+| =sell_source=  | =TSMCTL_SELL_SOURCE=   | =first(dbregionsaleavg, dbmarket)=                            |
+| =ah_cut=       | =TSMCTL_AH_CUT=        | 5                                                             |
+| =notes_dir=    | =TSMCTL_NOTES_DIR=     | =~/Documents/notes=                                           |
+| =report_dir=   | =TSMCTL_REPORT_DIR=    | =~/Documents/notes/02_areas/personal/wow/accounting=          |
+| =money=        | =TSMCTL_MONEY=         | =g=                                                           |
+| =color=        | =TSMCTL_COLOR=         | =auto= (=NO_COLOR= honoured)                                  |
+| =author=       | =TSMCTL_AUTHOR=        | Zach Podbielniak                                              |
+| =categories=   | =TSMCTL_CATEGORIES=    | =wow, gold farming, tsm, accounting=                          |
+| =cache_dir=    | =TSMCTL_CACHE_DIR=     | =~/.cache/tsmctl=                                             |
+| =ssh_options=  |                        | none (list of extra ssh arguments)                           |
+
+* Remote mirroring
+
+1. One ssh call lists =WTF/Account/*/SavedVariables/TradeSkillMaster.lua= and =AppData.lua= with =find -printf '%T@ %s %p'=.
+2. Files whose mtime or size differ from =~/.cache/tsmctl/hosts/<host>/manifest_retail_.json= (or are missing) are streamed with one =tar cf -= call and unpacked with Python's =tarfile=. Only regular files with exactly the requested names are accepted. Each file is written to a =.part= file and renamed, and keeps the remote mtime.
+3. Files that vanished remotely are removed from the cache.
+
+A first sync is about 16 MB; later runs only copy what changed (usually AppData every hour and SavedVariables after a logout).
+
+* Limitations
+
+- SavedVariables only change on logout or ~/reload~; the AH ledger and holdings trail a live session.
+- =auctionQuantity= is what was posted at the last logout, not what is posted now.
+- TSM does not record AH deposits, so expiries cost more than the ledger shows.
+- Crafting costs are not modelled: crafted items sold have no cost basis. Converting one item into another (opening Card of Omens, for example) shows as a buy of one item and sales of others; use ~pnl --item A --item B~ to see such a venture as one P&L.
+- Gold history resolution is 1,000g on retail.
+- Market data is the TSM app's last download (realm scans hourly, region stats daily).
+
+* Tests
+
+=tests/scripts/test_tsmctl.py= (stdlib ~unittest~) builds a synthetic two-account install with an AppData file and checks the Lua parser, item-cache decoding, base-32 and x1000 scaling, price expressions, dedupe of synced rows, future-date clamping, internal-transfer exclusion, flips/sell-through math, valuation, deals, every command in every output format, clean errors, roam-node saving with stable IDs and index linking, and that the WoW files are byte-for-byte unchanged afterwards.
+
+#+begin_src bash
+python3 tests/scripts/test_tsmctl.py
+#+end_src
