@@ -1469,7 +1469,7 @@ class FakeVenture(object):
 
 
 class VenturePushTests(unittest.TestCase):
-	"""`tsmctl venture push|status` against a fake server."""
+	"""`tsmctl venture push|status|install-units` against a fake server."""
 
 	TOKEN: str = "vt_test_0123456789abcdef"
 
@@ -1596,6 +1596,34 @@ class VenturePushTests(unittest.TestCase):
 		health: dict[str, Any] = next(r for r in self.fake.requests if r["path"] == "/api/v1/health")
 		self.assertNotIn("Authorization", health["headers"], "health needs no credentials and gets none")
 		self.assertNotIn(self.TOKEN, proc.stdout)
+
+	def test_install_units(self) -> None:
+		cmd: list[str] = [sys.executable, str(SCRIPT), "--no-config", "--local", "--wow-dir", str(self.wow), "venture", "install-units"]
+		proc: subprocess.CompletedProcess[str] = subprocess.run(cmd, capture_output=True, text=True, env=self.env, timeout=60)
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		watched: list[str] = [l.split("=", 1)[1] for l in proc.stdout.splitlines() if l.startswith("PathChanged=")]
+		sv: Path = self.wow / "_retail_" / "WTF" / "Account" / "MAIN" / "SavedVariables"
+		self.assertEqual(sorted(watched), sorted(str(p) for p in sv.iterdir()), "every SavedVariables file tsmctl reads, by absolute path")
+		self.assertIn("Unit=tsmctl-venture-push.service", proc.stdout)
+		self.assertIn("ExecStart=%h/bin/scripts/tsmctl -q venture push --settle 20s --if-changed --wait", proc.stdout)
+		self.assertIn("OnUnitActiveSec=30min", proc.stdout)
+		self.assertIn("systemctl --user enable --now", proc.stderr, "the commands are printed, never run")
+		self.assertFalse((self.home / "config" / "systemd").exists(), "printing writes nothing")
+		# The units shipped in the dotfiles are exactly what the generator prints.
+		for name in ("tsmctl-venture-push.service", "tsmctl-venture-push.timer"):
+			shipped: str = (ROOT / ".config" / "systemd" / "user" / name).read_text(encoding="utf-8")
+			self.assertIn(shipped, proc.stdout, name)
+		written: subprocess.CompletedProcess[str] = subprocess.run(cmd + ["--write"], capture_output=True, text=True, env=self.env, timeout=60)
+		self.assertEqual(written.returncode, 0, written.stderr)
+		units: Path = self.home / "config" / "systemd" / "user"
+		self.assertEqual(sorted(p.name for p in units.iterdir()), ["tsmctl-venture-push.path", "tsmctl-venture-push.service", "tsmctl-venture-push.timer"])
+		(units / "tsmctl-venture-push.service").unlink()
+		(units / "tsmctl-venture-push.service").symlink_to(ROOT / ".config" / "systemd" / "user" / "tsmctl-venture-push.service")
+		again: subprocess.CompletedProcess[str] = subprocess.run(cmd + ["--write", "-o", "json"], capture_output=True, text=True, env=self.env, timeout=60)
+		results: dict[str, str] = {r["unit"]: r["result"] for r in json.loads(again.stdout)["sections"][0]["tables"][0]["rows"]}
+		self.assertIn("symlink", results["tsmctl-venture-push.service"], "a stowed unit is never written through")
+		self.assertIn("already exists", results["tsmctl-venture-push.timer"])
+		self.assertTrue(results["tsmctl-venture-push.path"].startswith("written"), "the generated path unit is refreshed")
 
 
 @unittest.skipUnless(os.environ.get("TSMCTL_TEST_VENTURE_URL"), "set TSMCTL_TEST_VENTURE_URL, TSMCTL_TEST_VENTURE_SOURCE and TSMCTL_TEST_VENTURE_TOKEN_FILE to push to a real VENTURE")
