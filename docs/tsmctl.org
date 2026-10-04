@@ -3,8 +3,8 @@
 #+authors: Zach Podbielniak
 #+categories: dotfiles, wow, tsm
 #+created: 2026-10-03T16:30:00-04:00
-#+updated: 2026-10-04T17:00:00-04:00
-#+version: 3
+#+updated: 2026-10-04T18:30:00-04:00
+#+version: 4
 
 * Overview
 
@@ -12,9 +12,11 @@
 
 It also reads Altoholic's DataStore and Syndicator (the data addon behind Baganator) when they are installed. They add what TSM does not keep: every posted auction with its price and time left, mail with its expiry, character level, race and played time, void storage, currencies and known recipes. With them ~tsmctl attention~ tells you which characters on which realms need a login, and why. All three sources are optional and detected per account; TSM is no longer required.
 
-It is *read-only* on the WoW side. It never writes to SavedVariables or AppData. When the WoW install is on another machine, it runs only ~find~ and ~tar c~ there over ssh and mirrors the files into a local cache. The only thing it ever writes is the report you ask for with ~--save~.
+It is *read-only* on the WoW side. It never writes to SavedVariables or AppData. When the WoW install is on another machine, it runs only ~find~ and ~tar c~ there over ssh and mirrors the files into a local cache. Besides its cache, it only writes what you ask for: a report with ~--save~, an export with ~export --file~; ~venture push~ keeps a lock and the last pushed body's hash under the cache.
 
 Everything goes to stdout by default. ~--save~ writes an org file into the notes repo (or a path you give) and links it from that directory's =00_index.org=.
+
+It also feeds VENTURE (the ERP/CRM in =~/source/projects/venture=): ~tsmctl export --format venture~ writes everything it knows as VENTURE's JSON-lines protocol, and ~tsmctl venture push~ sends that to a VENTURE data source. See [[*VENTURE][VENTURE]].
 
 * Quick start
 
@@ -28,6 +30,8 @@ tsmctl report --since 7d --save     # same, written to the notes repo as org
 tsmctl pnl --by day --since 14d     # daily profit & loss
 tsmctl flips --open                 # stock bought and not yet sold
 tsmctl sellthrough --max-rate 20    # items that keep expiring
+tsmctl export --check               # what a VENTURE push would carry, checked against the contract
+tsmctl venture push --wait          # push it to the configured VENTURE data source
 tsmctl deals --realm "Moon Guard"   # buy candidates from the last realm scan
 tsmctl describe item "Card of Omens"
 #+end_src
@@ -239,6 +243,14 @@ The business on one page, default window 30 days:
 
 ~--top N~ sets rows per section; ~--sections summary,pnl,...~ picks sections.
 
+** export --format venture
+
+The whole dataset as VENTURE JSON lines, on stdout or ~--file PATH~ (mode 0600, written to =PATH.part= and renamed). ~--check~ writes nothing and prints counts per message type, what was left out and why, and the result of checking every line against the contract. ~--market scope|all|none~ picks the AuctionDB figures, ~--currency~ the data source's currency, ~--since~/~--until~ narrow the ledger, ~--include-internal~ keeps transfers between your own characters. The format is in [[*VENTURE][VENTURE]].
+
+** venture push|status
+
+~push~ exports and POSTs to the configured data source; ~status~ shows the settings, the server's health and the source's newest runs. See [[*VENTURE][VENTURE]].
+
 ** paths, config
 
 ~paths~ prints resolved locations including the default report file. ~config~ shows each effective setting and where it came from (cli, env, config, default); ~config sample~ prints a commented config.
@@ -318,6 +330,125 @@ Org files are proper roam nodes: a =:PROPERTIES:= drawer with a fresh UUID, the 
 
 If the file is inside =notes_dir= and its directory has a =00_index.org=, tsmctl adds =- [[id:...][title]]= once. It goes under a =* Reports= heading if there is one, otherwise into the first list of id links, and the list stays sorted. The write is atomic (temporary file + rename).
 
+* VENTURE
+
+VENTURE keeps an operator's side of a market in a data source's series store: accounts (characters, a warband bank, guild banks), their balances over time, holdings by place, their own listings (positions), mail waiting to be collected (inbound) and an external ledger. tsmctl is the producer for World of Warcraft. The contract is VENTURE's =docs/plugins.org= ("The JSON-lines protocol") and =docs/market-data.org= ("Operator accounts"); this chapter says how tsmctl fills it.
+
+** In VENTURE first
+
+- A currency =GOLD= with exponent 4 (100 copper to the silver, 100 silver to the gold), e.g. ~venturectl create currency code=GOLD name=Gold kind=virtual exponent=4~. Every amount is written as gold with at most four places, so the source's currency must have an exponent of at least 4.
+- A data source with provider =push= and that currency: ~venturectl create data_source name="WoW (tsmctl)" provider=push enabled=true currency=GOLD venue_namespace=wow-realm instrument_namespace=wow-item~. The namespaces are the data source's settings, not members of any line.
+- An API token with the editor role in the source's organization.
+
+** The stream
+
+One JSON object per line, UTF-8, no header line (protocol 1 has none; the version lives in an exec manifest, not in a push). The order is fixed, and the same files always make the same bytes:
+
+1. =venue= lines: each realm (key: the realm slug, lower case, apostrophes dropped, spaces to =-=; =kind: realm=, =group=: the region), plus =commodities-<region>= and =region-<region>= when AuctionDB figures are included.
+2. =instrument= lines for every item and currency referenced below, plain items before their variants.
+3. =account= lines.
+4. Per account: its =account_snapshot=, then =balance=, =holding=, =position= and =inbound= lines.
+5. =txn= lines, oldest first.
+6. Per market venue: a =snapshot=, then its =stat= lines.
+
+Money is a decimal string of gold (=27249501812= copper is ="2724950.1812"=), times are UTC with a =Z=, counts are integers. Strings are cut to 512 bytes on a character boundary.
+
+** Instrument keys
+
+Keys follow the Blizzard plugin's format, so VENTURE can join tsmctl's rows with the Blizzard auction feed:
+
+| TSM item string                     | Key                 | Notes                                                       |
+|-------------------------------------+---------------------+-------------------------------------------------------------|
+| =i:2770=                            | =2770=              | a plain item                                                |
+| =i:9944::3:6655:1692:1692=          | =9944:b1692,6655=   | bonus ids sorted ascending, repeats dropped; parent =9944=  |
+| =i:133358::2:7756:13828:1:9:70=     | =133358:b7756,13828= | TSM's modifier pairs are not in the key; kept as =tsm_modifiers= ="9=70"= |
+| =i:1420::i13=                       | =1420=              | TSM's level-only form; the level kept as =tsm_levels= ="13"=  |
+| =p:1720:25:3=                       | =82800:p1720=       | a caged pet; parent =82800= (Pet Cage)                      |
+
+Items read from links (DataStore, Syndicator) are first turned into the same item strings, so a link's bonus ids land in the same key. Two things cannot match the Blizzard key exactly: a pet's breed is in neither TSM's strings nor a battlepet link, so a pet key has no =.<breed>=; and TSM keeps only the bonus ids it considers relevant, so a TSM ledger row can name fewer bonuses than the Blizzard key for the same auction. Game currencies are instruments =currency:<id>= of kind =other=.
+
+An instrument line carries =name=, =kind: item=, =category= (the item class), =parent= for a variant, and attrs =item_id=, =vendor_sell= (copper), =quality= (Blizzard's type string, =EPIC=), =item_level=, =pet_species_id=, =tsm_levels= and =tsm_modifiers=.
+
+** Accounts
+
+| Account          | Key                          | kind        | From                                                           |
+|------------------+------------------------------+-------------+----------------------------------------------------------------|
+| a character      | =<Name>-<Realm>=             | =character= | every source; attrs class, level, race, faction, guild, played_seconds, login_account, zone |
+| a warband bank   | =warbank:<login account>=    | =shared=    | TSM's warband money and items, DataStore, Syndicator           |
+| a guild bank     | =guild:<Guild>-<Realm>=      | =guild=     | TSM's guild vaults, DataStore, Syndicator; the realm is the guild's home realm when Syndicator knows it (a guild on connected realms is seen from each), else the realm the winning copy was read on |
+
+=last_seen= is a character's latest login or logout time from any source. =balance= lines carry a character's gold (the reconciled copy), the warband bank's gold and a guild's gold from TSM's guild gold log, each dated by its source when it has a date.
+
+** What a snapshot covers
+
+An =account_snapshot= tells VENTURE "these kinds of this account, as of =at=, are all of them"; rows of a covered kind that the stream does not restate are deleted. So a kind is covered only when some source actually read it for that account, even when it is empty:
+
+| Kind        | Covered when                                                                                                  |
+|-------------+---------------------------------------------------------------------------------------------------------------|
+| =holdings=  | TSM has a quantity table for the owner, or DataStore/Syndicator has any container set or currency list for it |
+| =positions= | DataStore scanned the character's auctions, or Syndicator has its auction list (TSM keeps no auction ids)      |
+| =inbound=   | DataStore or Syndicator has the character's mailbox (an empty mailbox that was read is covered, and empties it in VENTURE) |
+| =balances=  | the account's gold is known                                                                                   |
+
+A TSM-only character is therefore restated for holdings and balances only, and VENTURE keeps whatever positions and mail an earlier, richer export sent. =at= is when WoW last wrote the files the account came from (their newest mtime; the remote mirror keeps the remote mtimes). An export of older files -- a stale mirror on another machine -- is older, and VENTURE skips it instead of rolling the account back. Push with the same ~--sources~ every time: switching DataStore off makes the next push restate holdings without the places only DataStore knew.
+
+** Holdings, positions, inbound
+
+- *Holdings* are the reconciled holdings (see [[*Reconciliation: which copy wins][Reconciliation]]), one line per account, place and instrument (two item strings naming one key are summed), plus currencies at place =currency=. Places are the contract's: =bag=, =bank=, =reagent_bank=, =void=, =mail=, =auction=, =warbank=, =guild=, =other=.
+- *Positions* are posted auctions: =id= is the auction id, =venue= the realm slug, =price= the per-unit buyout, =bid= the per-unit bid when there is one, =expires_at= the expiry. VENTURE requires a buyout and an expiry, so an auction with no known buyout (Syndicator-only, typically one that has already expired and is in the mail) or no expiry is left out and counted, never sent with an invented price; it is still a holding at place =auction=. Expired auctions still listed are sent: they are what "collect" means.
+- *Inbound* is one line per mail entry with money, an item or cash on delivery (DataStore already keeps one entry per attachment); bare letters are left out. The id hashes the character, sender, subject, the time the mailbox was read, the expiry, the item, its count and the money, plus an occurrence number for identical entries. It is stable until the mailbox is read again, when the snapshot restates the mailbox under new ids.
+
+** The ledger
+
+Each TSM ledger row is a =txn=: =sale=, =buy=, =income=, =expense=, =expired= or =cancelled=. Sales are after the AH cut, as TSM stores them; =amount= is unit price times quantity for sales and buys, the amount for income and expense, and absent for expired and cancelled rows. =counterparty= is TSM's other party, =source= its source (Auction, Vendor, Trade, COD) or money type (Postage, Repair Bill).
+
+The id is =tsm-= and the first 32 hex digits of SHA-256 over realm, kind, TSM's own time, player, other party, item, stack size, price, source and an occurrence number (rows of one CSV identical apart from the quantity, counted in file order). Never the quantity: TSM merges a later identical sale into an existing row by growing its quantity, and VENTURE updates the row with the same id. The same row in two accounts' files (TSM account sync) is one row, with the larger quantity. A row TSM dated in the future (mail expiry math) is dated at the file's save time, so its =at= moves when the file is saved again; its id does not.
+
+Internal transfers (trades and mail between your own characters) are left out unless ~--include-internal~: protocol 1 has no member to mark them, they are not business income or expense, and a txn once stored is never removed. ~--since~/~--until~ narrow the ledger only; everything else is always complete.
+
+** AuctionDB
+
+One =snapshot= per venue, dated with the venue's AppData download time, then a =stat= per instrument:
+
+| Venue                    | Figures                                                                                       |
+|--------------------------+-----------------------------------------------------------------------------------------------|
+| each realm               | =min= (min buyout), =market= (market value), =historical=, =listings= (auction count)          |
+| =commodities-<region>=   | the same for the region-wide commodity market (shared by every realm since 9.2.7)            |
+| =region-<region>=        | =market= (region market value), =historical= (region historical), =sale_avg=, =sale_rate= (0-1), =sold_per_day= |
+
+~--market scope~ (the default) sends only items you hold, post, get by mail or ever traded, plus every item in a TSM group, and marks each snapshot =complete: false=: it is a sample, and a complete snapshot would mark everything it left out as sold out. ~--market all~ sends everything AppData has (tens of megabytes) with =complete: true=; ~--market none~ sends no market data. VENTURE ignores a snapshot it has already applied (same venue, same time), so a push between two TSM app downloads adds nothing to the history.
+
+** Push
+
+~tsmctl venture push~ takes a lock (=~/.cache/tsmctl/venture/push.lock=, so overlapping triggers run one after another), waits for the files to settle with ~--settle 20s~ (local installs only: WoW writes every addon's file one after another on logout), exports into a spooled buffer while checking every line against the contract (an export that breaks it is never sent), and POSTs it to =/api/v1/feeds/<source>/push= with =Content-Type: application/x-ndjson=. ~--wait~ adds =?wait=1=: VENTURE answers when the run is written (up to 120 s) and tsmctl prints the run -- status, rows written, refusals and its notes. ~--organization ID~ adds =organization_id=. ~--if-changed~ skips the request when the body is byte-for-byte what was last accepted for this server, source and organization (=~/.cache/tsmctl/venture/last-push-*.sha256=, written only after a push VENTURE took).
+
+It works wherever tsmctl does: on mob-zach it reads the local install; elsewhere it reads the ssh mirror as every other command does.
+
+| Exit | Meaning                                                                            |
+|------+------------------------------------------------------------------------------------|
+| 0    | pushed (queued, or with ~--wait~ a run that ended =ok=), or nothing changed            |
+| 1    | a local error: settings, token, unreadable data, an export that breaks the contract  |
+| 2    | a usage error                                                                      |
+| 3    | the server could not be reached (connection, DNS, TLS)                             |
+| 4    | VENTURE refused the push: an HTTP error (401, 403, 404, 409 not a push source or switched off, 413, 415) or a redirect |
+| 5    | ~--wait~: the run failed (a line broke the protocol; nothing of it was stored)      |
+| 6    | ~--wait~: the run was partial, or not finished within VENTURE's wait               |
+
+~tsmctl venture status~ prints the settings (never the token, only where it came from), =GET /api/v1/health= (no credentials sent) and the source's newest runs from =GET /api/v1/feeds/<source>/runs= (~--runs N~). Exit 3 when the server cannot be reached.
+
+** The API token
+
+- It is read from =$TSMCTL_VENTURE_TOKEN=, else from the token file (=venture_token_file=, default =~/.config/tsmctl/venture-token= when it exists), else from venturectl's =$VENTURE_TOKEN=. There is no command-line option for it: argv is readable by every user through =/proc=.
+- The file must be a regular file owned by you with no group or other permission bits (~chmod 600~); anything looser is refused before anything is sent. Its first line is the token.
+- Both variables are removed from tsmctl's environment once read, so the ssh child of a remote read never inherits them.
+- It goes only in the =Authorization: Bearer= header. Plain =http://= is refused unless the server is this machine (=localhost=, =127.0.0.0/8=, =::1=) or ~--allow-http~ is given; TLS certificates are verified against the system store; redirects are refused rather than followed, because a redirect would carry the header to a host the response chose.
+
+#+begin_src bash
+install -m 600 /dev/null ~/.config/tsmctl/venture-token
+$EDITOR ~/.config/tsmctl/venture-token   # paste the token
+tsmctl venture status
+#+end_src
+
 * Configuration
 
 =~/.config/tsmctl/config.yaml= (=tsmctl config sample= prints a commented copy). It is a flat YAML subset: =key: value=, inline =[a, b]= lists and =- item= block lists. Precedence: command line, then environment, then config, then built-in default.
@@ -342,6 +473,13 @@ If the file is inside =notes_dir= and its directory has a =00_index.org=, tsmctl
 | =categories=   | =TSMCTL_CATEGORIES=    | =wow, gold farming, tsm, accounting=                          |
 | =cache_dir=    | =TSMCTL_CACHE_DIR=     | =~/.cache/tsmctl=                                             |
 | =ssh_options=  |                        | none (list of extra ssh arguments)                           |
+| =region=       | =TSMCTL_REGION=        | AppData's region, else =us= (the VENTURE export's venue group) |
+| =venture_url=  | =TSMCTL_VENTURE_URL=   | none; ~--url~                                                 |
+| =venture_source= | =TSMCTL_VENTURE_SOURCE= | none; ~venture --source ID~ (the push data source's id)    |
+| =venture_organization= | =TSMCTL_VENTURE_ORGANIZATION= | the token's; ~--organization~                       |
+| =venture_token_file= | =TSMCTL_VENTURE_TOKEN_FILE= | =~/.config/tsmctl/venture-token= (must be 0600)       |
+| =venture_currency= | =TSMCTL_VENTURE_CURRENCY= | =GOLD=; ~--currency~ (exponent 4 in VENTURE)             |
+| =venture_market= | =TSMCTL_VENTURE_MARKET= | =scope=; ~--market~ (=scope=, =all=, =none=)               |
 
 * Remote mirroring
 
@@ -362,12 +500,22 @@ A first sync is about 18 MB (DataStore adds a few hundred KB and Syndicator abou
 - Crafting costs are not modelled: crafted items sold have no cost basis. Converting one item into another (opening Card of Omens, for example) shows as a buy of one item and sales of others; use ~pnl --item A --item B~ to see such a venture as one P&L.
 - Gold history resolution is 1,000g on retail.
 - Market data is the TSM app's last download (realm scans hourly, region stats daily).
+- VENTURE export: pet keys have no breed and TSM ledger rows can carry fewer bonus ids than Blizzard's key (see [[*Instrument keys][Instrument keys]]); auctions without a known buyout are not sent as positions; internal transfers need ~--include-internal~ and cannot be taken back once pushed; inbound ids change when a mailbox is read again.
 
 * Tests
 
 =tests/scripts/test_tsmctl.py= (stdlib ~unittest~) builds a synthetic two-account install with an AppData file and checks the Lua parser, item-cache decoding, base-32 and x1000 scaling, price expressions, dedupe of synced rows, future-date clamping, internal-transfer exclusion, flips/sell-through math, valuation, deals, every command in every output format, clean errors, roam-node saving with stable IDs and index linking, and that the WoW files are byte-for-byte unchanged afterwards.
 
 A second synthetic install has TSM, DataStore and Syndicator for one account, written the way the client writes them (CRLF, positional nils, sparse arrays with explicit index keys, packed values, a legacy 10-bit slot, a battle pet). It checks the decoders (item links, slots, currency naming), the reconciliation rule and each place it applies (gold, bags, bank, warbank, a guild on two connected realms, auctions, mail, currencies), the auction join on the auction id, ~--sources~ through the option and =TSMCTL_SOURCES=, ~attention~'s order and thresholds, every new command in all six output formats, and that missing or corrupt optional files only warn. A third install has DataStore only, with corrupt files. The ssh mirror is tested with a fake ssh: it must list every source's file names and refuse anything else in the listing or the tar stream, including a symlink under a requested name.
+
+The VENTURE tests check every exported line against an independent reading of the contract written in the test (required members per kind, unknown members absent on the account kinds, decimal strings with at most four places, zoned times, integer counts, flat attrs, txn rules per kind, one snapshot per account ahead of its rows, unique ids), the Blizzard key mapping (plain, unsorted and repeated bonuses, modifiers and TSM's level-only form dropped, pets), that coverage is never claimed without detail data (a TSM-only character, ~--sources tsm~), that the same files give the same bytes, that txn ids survive a TSM merge that grows a quantity (and a merge only one account's copy saw), the market scope, ~--check~ and the 0600 ~--file~. ~venture push~ is tested against a stdlib =http.server= stand-in: the Authorization header and content type, the token never in any process's command line nor printed, ~--wait~, ~--if-changed~, every exit code, a refused redirect, plain http refused, the token file's permission check and source order, and the lock; ~venture status~ sends no credentials to the health check.
+
+An optional test pushes both synthetic installs to a running VENTURE and requires runs that end =ok= with nothing refused. Point it at a scratch instance (the fixture's accounts and ledger are written into the source) with a push data source whose currency is GOLD with exponent 4:
+
+#+begin_src bash
+TSMCTL_TEST_VENTURE_URL=http://127.0.0.1:8748 TSMCTL_TEST_VENTURE_SOURCE=2 \
+TSMCTL_TEST_VENTURE_TOKEN_FILE=/path/to/token python3 tests/scripts/test_tsmctl.py -k VentureIntegration
+#+end_src
 
 #+begin_src bash
 python3 tests/scripts/test_tsmctl.py

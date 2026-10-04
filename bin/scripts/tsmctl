@@ -44,14 +44,18 @@ The WoW install can be local, or on another machine reached over ssh. Remote
 data is pulled with `find` and `tar c` only (read-only on the remote) into a
 local cache, and only re-copied when a file's mtime or size changes.
 
-Everything prints to stdout. Nothing is written anywhere unless --save is
-given, which writes an org-mode report into the notes repo (or a given path).
+Everything prints to stdout. Besides its cache, nothing is written unless
+asked for: --save writes an org-mode report into the notes repo (or a given
+path), `export --file` an export. `export --format venture` and `venture push` feed VENTURE (see the
+VENTURE section); push sends to the configured server over HTTPS.
 
 Only the Python standard library is used.
 """
 
 import argparse
 import csv
+import fcntl
+import hashlib
 import io
 import json
 import os
@@ -59,13 +63,18 @@ import re
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -153,6 +162,13 @@ SV_FILE_NAMES: tuple[str, ...] = tuple(name for names in SOURCE_FILES.values() f
 # a couple of minutes apart.
 RECONCILE_TIE_SECONDS: int = 300
 SOURCE_PRIORITY: dict[str, int] = {"tsm": 0, "datastore": 1, "syndicator": 2}
+
+# VENTURE export and push (see the VENTURE section further down).
+DEFAULT_VENTURE_CURRENCY: str = "GOLD"
+DEFAULT_VENTURE_MARKET: str = "scope"
+VENTURE_MARKET_MODES: tuple[str, ...] = ("scope", "all", "none")
+DEFAULT_REGION: str = "us"
+DEFAULT_VENTURE_TOKEN_FILE: Path = XDG_CONFIG_HOME / "tsmctl" / "venture-token"
 
 # `attention` defaults.
 DEFAULT_AUCTION_WINDOW: str = "12h"
@@ -623,6 +639,15 @@ class Settings(object):
 	# empty means every one that is present. `sources` above is unrelated:
 	# it records where each setting's value came from.
 	data_sources: list[str] = field(default_factory=list)
+	# The game region ("us", "eu"...): the VENTURE export's venue group.
+	region: str = ""
+	# Where `tsmctl venture push` sends the export (see the VENTURE section).
+	venture_url: str = ""
+	venture_source: str = ""
+	venture_organization: str = ""
+	venture_token_file: str = ""
+	venture_currency: str = DEFAULT_VENTURE_CURRENCY
+	venture_market: str = DEFAULT_VENTURE_MARKET
 
 
 def _config_layer(args: argparse.Namespace) -> tuple[dict[str, Any], Optional[Path]]:
@@ -699,6 +724,23 @@ def build_settings(args: argparse.Namespace) -> Settings:
 	settings.color = str(pick("color", getattr(args, "color", None), ("TSMCTL_COLOR",), "auto"))
 	settings.author = str(pick("author", None, ("TSMCTL_AUTHOR",), DEFAULT_AUTHOR))
 	settings.categories = str(pick("categories", None, ("TSMCTL_CATEGORIES",), DEFAULT_CATEGORIES))
+	settings.region = str(pick("region", None, ("TSMCTL_REGION",), "") or "").strip().lower()
+	if settings.region and not re.fullmatch(r"[a-z]{2,8}", settings.region):
+		raise TsmctlError(f"region must be a short region code such as us or eu (got {settings.region!r})")
+	settings.venture_url = str(pick("venture_url", getattr(args, "url", None), ("TSMCTL_VENTURE_URL",), "") or "").strip()
+	settings.venture_source = str(pick("venture_source", getattr(args, "venture_source_id", None), ("TSMCTL_VENTURE_SOURCE",), "") or "").strip()
+	settings.venture_organization = str(pick("venture_organization", getattr(args, "organization", None), ("TSMCTL_VENTURE_ORGANIZATION",), "") or "").strip()
+	settings.venture_token_file = str(pick("venture_token_file", None, ("TSMCTL_VENTURE_TOKEN_FILE",), "") or "").strip()
+	settings.venture_currency = str(pick("venture_currency", getattr(args, "currency", None), ("TSMCTL_VENTURE_CURRENCY",), DEFAULT_VENTURE_CURRENCY)).strip().upper()
+	if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,14}", settings.venture_currency):
+		raise TsmctlError(f"venture_currency must be a currency code such as GOLD (got {settings.venture_currency!r})")
+	settings.venture_market = str(pick("venture_market", getattr(args, "market", None), ("TSMCTL_VENTURE_MARKET",), DEFAULT_VENTURE_MARKET)).strip().lower()
+	if settings.venture_market not in VENTURE_MARKET_MODES:
+		raise TsmctlError(f"market scope must be one of {', '.join(VENTURE_MARKET_MODES)} (got {settings.venture_market!r})")
+	for name in ("venture_source", "venture_organization"):
+		value: str = getattr(settings, name)
+		if value and not (value.isdigit() and int(value) > 0):
+			raise TsmctlError(f"{name} must be a positive id number (got {value!r})")
 	return settings
 
 
@@ -1017,6 +1059,12 @@ class Txn(object):
 	One accounting record. For sale/buy, `price` is per item and `qty` the
 	total units; for income/expense, `price` is the amount and `qty` is 1;
 	for expire/cancel, `price` is 0.
+
+	`raw_time` is the time exactly as TSM stored it (`time` may have been
+	clamped to the save time, see _load_realm_value()), and `occurrence`
+	counts earlier rows of the same CSV that are identical apart from the
+	quantity. Together they make `identity`, which is what the VENTURE
+	export's stable ledger id is built from.
 	"""
 
 	kind: str
@@ -1031,10 +1079,23 @@ class Txn(object):
 	price: int = 0
 	source: str = ""
 	internal: bool = False
+	raw_time: int = 0
+	occurrence: int = 0
 
 	@property
 	def total(self) -> int:
 		return self.price * self.qty
+
+	@property
+	def identity(self) -> tuple[Any, ...]:
+		"""
+		What makes a ledger row the same row in every export and in every
+		account's copy of it: realm, kind, TSM's own time, player, other
+		party, item, stack size, price, source and occurrence. Never the
+		quantity: TSM merges a later identical sale into an existing row by
+		growing its quantity, and the row must keep its identity when it does.
+		"""
+		return (self.realm, self.kind, self.raw_time, self.player, self.other, self.item, self.stack, self.price, self.source, self.occurrence)
 
 
 @dataclass(slots=True)
@@ -1375,6 +1436,8 @@ class TsmData(object):
 		self.currencies: list[CurrencyHolding] = []
 		self.recipes: list[KnownRecipe] = []
 		self.currency_names: dict[int, str] = {}
+		self.guild_homes: dict[str, set[str]] = {}
+		self._txn_index: dict[tuple[Any, ...], Txn] = {}
 		self.tsm_expiring_auction: dict[tuple[str, str], int] = {}
 		self.tsm_expiring_mail: dict[tuple[str, str], int] = {}
 		self.realm_parent: dict[str, str] = {}
@@ -1397,7 +1460,6 @@ class TsmData(object):
 		self.add_account(account)
 		sync_owner: dict[Any, Any] = lua_dict(db.get("_syncOwner"))
 		sync_account: dict[Any, Any] = lua_dict(db.get("_syncAccountKey"))
-		seen_txns: set[tuple[Any, ...]] = {self._txn_key(t) for t in self.txns}
 		self._save_time = int(stat.st_mtime)
 
 		for raw_key, value in db.items():
@@ -1410,7 +1472,7 @@ class TsmData(object):
 			if scope == "s" and section == "internalData":
 				self._load_char_value(account, scope_key, name, value, sync_owner, sync_account)
 			elif scope == "r" and section == "internalData":
-				self._load_realm_value(account, scope_key, name, value, seen_txns)
+				self._load_realm_value(account, scope_key, name, value)
 			elif scope == "f" and section == "internalData":
 				self._load_faction_value(account, scope_key, name, value)
 			elif scope == "g" and section == "internalData":
@@ -1474,11 +1536,7 @@ class TsmData(object):
 				if isinstance(item, str) and isinstance(qty, (int, float)) and qty > 0:
 					self.holdings.append(Holding(account, char.realm, char.faction, char.name, location, item, int(qty)))
 
-	@staticmethod
-	def _txn_key(t: Txn) -> tuple[Any, ...]:
-		return (t.kind, t.realm, t.time, t.player, t.other, t.item, t.stack, t.qty, t.price, t.source)
-
-	def _load_realm_value(self, account: str, realm: str, name: str, value: Any, seen: set[tuple[Any, ...]]) -> None:
+	def _load_realm_value(self, account: str, realm: str, name: str, value: Any) -> None:
 		if name == "accountingTrimmed":
 			for what, when in lua_dict(value).items():
 				if when:
@@ -1490,6 +1548,9 @@ class TsmData(object):
 		lines: list[str] = value.split("\n")
 		header: list[str] = lines[0].split(",")
 		bad: int = 0
+		# Rows of this CSV identical apart from the quantity, counted in file
+		# order: the n-th such row is occurrence n (see Txn.identity).
+		occurrences: dict[tuple[Any, ...], int] = {}
 		for line in lines[1:]:
 			if not line:
 				continue
@@ -1520,10 +1581,18 @@ class TsmData(object):
 					stack=_to_int(row.get("stackSize", "0")), qty=_to_int(row.get("quantity", "0")),
 					source="Auction",
 				)
-			key: tuple[Any, ...] = self._txn_key(txn)
-			if key in seen:
+			txn.raw_time = txn.time
+			base: tuple[Any, ...] = (txn.realm, txn.kind, txn.raw_time, txn.player, txn.other, txn.item, txn.stack, txn.price, txn.source)
+			txn.occurrence = occurrences.get(base, 0)
+			occurrences[base] = txn.occurrence + 1
+			# The same row in another account's copy (TSM account sync) is
+			# one row. When one copy saw a later merge its quantity is the
+			# larger, so that one is kept rather than both being counted.
+			existing: Optional[Txn] = self._txn_index.get(txn.identity)
+			if existing is not None:
+				existing.qty = max(existing.qty, txn.qty)
 				continue
-			seen.add(key)
+			self._txn_index[txn.identity] = txn
 			# TSM dates mail-based records as now + (daysLeft - 30) days, which
 			# lands in the future for mail with long expiry (WoW Token sales).
 			# Nothing can happen after the file was saved, so clamp to that.
@@ -2516,6 +2585,9 @@ class SyndicatorReader(object):
 			details = lua_dict(guild.get("details"))
 			name: str = str(details.get("guild") or str(key).rsplit("-", 1)[0])
 			realm: str = self._realm(str(details.get("realm") or str(key).rsplit("-", 1)[-1]))
+			# Syndicator keys a guild by its home realm: the VENTURE export
+			# names a guild bank account after it (see venture_guild_realm()).
+			self.data.guild_homes.setdefault(name.lower(), set()).add(realm)
 			self._set(f"Guild: {name}", realm, str(details.get("faction") or ""), "guild", [("guild", s) for s in syn_slots(guild.get("bank"))])
 
 	def _set(self, owner: str, realm: str, faction: str, group: str, slots: list[tuple[str, dict[Any, Any]]]) -> None:
@@ -3959,6 +4031,8 @@ class Context(object):
 		self._pricer: Optional[Pricer] = None
 		self._filters: Optional[Filters] = None
 		self.now: int = int(time.time())
+		# What main() exits with after rendering (venture push sets it).
+		self.exit_code: int = 0
 
 	@property
 	def data(self) -> TsmData:
@@ -5909,6 +5983,21 @@ money: g
 # ssh_options:
 #   - -J
 #   - bastion
+
+# Game region, the VENTURE export's venue group (default: AppData's, else us).
+# region: us
+
+# `tsmctl venture push`: the VENTURE server, the push data source's id (its
+# provider is push, its currency GOLD with exponent 4) and the organization.
+# The API token is read from $TSMCTL_VENTURE_TOKEN or this file (chmod 600),
+# never from the command line.
+# venture_url: https://venture.example
+# venture_source: 12
+# venture_organization: 1
+# venture_token_file: ~/.config/tsmctl/venture-token
+# venture_currency: GOLD
+# AuctionDB figures in the export: scope (what you hold/post/trade + groups), all, none.
+# venture_market: scope
 """
 
 
@@ -5922,7 +6011,7 @@ def cmd_config(ctx: Context) -> Doc:
 	settings: Settings = ctx.settings
 	doc: Doc = Doc("tsmctl config", "config")
 	rows: list[dict[str, Any]] = []
-	for name in ("host", "wow_dir", "flavor", "cache_dir", "accounts", "sources", "realm", "price_source", "market_source", "sell_source", "ah_cut", "notes_dir", "report_dir", "money", "color", "author", "categories"):
+	for name in ("host", "wow_dir", "flavor", "cache_dir", "accounts", "sources", "realm", "price_source", "market_source", "sell_source", "ah_cut", "notes_dir", "report_dir", "money", "color", "author", "categories", "region", "venture_url", "venture_source", "venture_organization", "venture_token_file", "venture_currency", "venture_market"):
 		value: Any = getattr(settings, "data_sources" if name == "sources" else name)
 		if name == "ah_cut":
 			value = f"{value * 100:g}%"
@@ -6261,6 +6350,1555 @@ def _register_in_index(ctx: Context, path: Path, node_id: str, title: str) -> No
 
 
 # ============================================================================
+# VENTURE: export to its JSON-lines protocol (version 1) and push it
+# ============================================================================
+#
+# VENTURE (an ERP/CRM with a market-data store) reads the operator's side of
+# the auction house -- characters, gold, holdings, posted auctions, mail and
+# the TSM ledger -- as JSON lines. The contract lives in VENTURE's
+# docs/plugins.org ("The JSON-lines protocol") and docs/market-data.org
+# ("Operator accounts"); this section is the producer. In short:
+#
+#   * one JSON object per line, each with a "type"; there is NO header line;
+#   * money is a decimal string in the data source's currency (gold, exponent
+#     4: 27249501812 copper is "2724950.1812"), never a JSON number;
+#   * times are ISO 8601 with a zone; counts are JSON integers;
+#   * the account kinds (account, account_snapshot, balance, holding,
+#     position, inbound, txn) refuse unknown members;
+#   * an account_snapshot says "these kinds of this account, as of `at`, are
+#     all of them": rows of a covered kind that are not restated are removed.
+#     So a kind is only covered when this export actually knows it.
+
+VENTURE_PLACES: frozenset[str] = frozenset((
+	"bag", "bank", "reagent_bank", "warbank", "guild", "mail", "auction", "void", "equipped", "currency", "other",
+))
+VENTURE_TXN_KINDS: dict[str, str] = {
+	"sale": "sale", "buy": "buy", "income": "income", "expense": "expense", "expire": "expired", "cancel": "cancelled",
+}
+VENTURE_ACCOUNT_KINDS: tuple[str, ...] = ("character", "shared", "guild", "other")
+VENTURE_COVERS: tuple[str, ...] = ("holdings", "positions", "inbound", "balances")
+# Blizzard's quality "type" strings: the Blizzard plugin writes these into the
+# same attribute, so both sources describe an item the same way.
+VENTURE_QUALITY_TYPES: dict[int, str] = {
+	0: "POOR", 1: "COMMON", 2: "UNCOMMON", 3: "RARE", 4: "EPIC", 5: "LEGENDARY", 6: "ARTIFACT", 7: "HEIRLOOM", 8: "WOW_TOKEN",
+}
+# A caged battle pet is item 82800 (Pet Cage); the species says which pet.
+VENTURE_PET_CAGE: str = "82800"
+VENTURE_MAX_KEY: int = 512
+VENTURE_MAX_DECIMAL: int = 40
+VENTURE_MAX_ATTRS: int = 64
+VENTURE_MAX_ATTRS_BYTES: int = 8192
+# Copper per gold is 10^4: every amount is written with at most four places.
+VENTURE_MONEY_PLACES: int = 4
+VENTURE_PUSH_TIMEOUT: int = 60
+VENTURE_WAIT_TIMEOUT: int = 150
+DEFAULT_VENTURE_LOCK_TIMEOUT: int = 1800
+DEFAULT_VENTURE_SETTLE_LIMIT: int = 900
+
+# AppData fields -> stat members, per kind of venue. The value is
+# (member, how to write it): money (copper -> gold decimal), count (an
+# integer) or milli (TSM's x1000 fixed point, as a decimal).
+VENTURE_REALM_FIELDS: dict[str, tuple[str, str]] = {
+	"minBuyout": ("min", "money"), "marketValue": ("market", "money"),
+	"historical": ("historical", "money"), "numAuctions": ("listings", "count"),
+}
+VENTURE_REGION_FIELDS: dict[str, tuple[str, str]] = {
+	"regionMarketValue": ("market", "money"), "regionHistorical": ("historical", "money"),
+	"regionSale": ("sale_avg", "money"), "regionSalePercent": ("sale_rate", "milli"),
+	"regionSoldPerDay": ("sold_per_day", "milli"),
+}
+
+# Exit codes of `tsmctl venture push` and `status` (documented in --help and
+# docs/tsmctl.org). 1 is every local error, 2 argparse's usage error.
+EXIT_UNREACHABLE: int = 3
+EXIT_REFUSED: int = 4
+EXIT_RUN_FAILED: int = 5
+EXIT_RUN_UNCONFIRMED: int = 6
+
+
+def venture_money(copper: int) -> str:
+	"""
+	Copper as gold in the protocol's decimal grammar: whole gold, then up
+	to four places with trailing zeros dropped. 27249501812 -> "2724950.1812",
+	1000000 -> "100", 50 -> "0.005". Negative amounts have no spelling in
+	protocol 1 (every member is unsigned); the caller must not pass one.
+	"""
+	if copper < 0:
+		raise ValueError(f"negative amount {copper}")
+	whole, frac = divmod(int(copper), COPPER_PER_GOLD)
+	if not frac:
+		return str(whole)
+	return f"{whole}.{frac:0{VENTURE_MONEY_PLACES}d}".rstrip("0")
+
+
+def venture_milli(value: int) -> str:
+	"""TSM's x1000 fixed point (sale rate, sold per day) as an exact decimal: 300 -> "0.3"."""
+	whole, frac = divmod(int(value), 1000)
+	if not frac:
+		return str(whole)
+	return f"{whole}.{frac:03d}".rstrip("0")
+
+
+def venture_time(epoch: float) -> str:
+	"""Unix seconds as ISO 8601 in UTC with an explicit zone ("2026-10-04T18:53:54Z")."""
+	return datetime.fromtimestamp(int(epoch), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def venture_clip(text: str, limit: int = VENTURE_MAX_KEY) -> str:
+	"""At most `limit` bytes of UTF-8, cut on a character boundary (keys and names are capped at 512)."""
+	data: bytes = text.encode("utf-8")
+	if len(data) <= limit:
+		return text
+	return data[:limit].decode("utf-8", "ignore")
+
+
+def realm_slug(realm: str) -> str:
+	"""
+	A realm's venue key: lower case, apostrophes dropped, runs of spaces
+	to one hyphen ("Mal'Ganis" -> "malganis", "Area 52" -> "area-52").
+	"""
+	text: str = realm.strip().lower().replace("'", "").replace("’", "")
+	return re.sub(r"\s+", "-", text)
+
+
+def venture_id(prefix: str, parts: tuple[Any, ...]) -> str:
+	"""A short stable id: prefix + the first 32 hex digits of SHA-256 over the parts as JSON."""
+	digest: str = hashlib.sha256(json.dumps(list(parts), ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+	return f"{prefix}-{digest[:32]}"
+
+
+@dataclass(slots=True)
+class VentureKey(object):
+	"""
+	An item string mapped to the Blizzard plugin's instrument key format,
+	so VENTURE can join tsmctl's rows with the Blizzard auction feed:
+
+	    <itemId>                      a plain item
+	    <itemId>:b<bonus>,<bonus>...  bonus ids sorted ascending, repeats dropped
+	    82800:p<species>              a caged battle pet
+
+	`parent` is the plain item a variant belongs to. What TSM adds that
+	Blizzard's key does not carry -- its level-only form (i:ID::i13) and its
+	modifier pairs (i:ID::1:6416:1:9:57 -> type 9 = 57) -- is kept in `level`
+	and `modifiers` for the instrument's attrs. A pet's breed is not in TSM's
+	strings nor in a battlepet link, so a pet key has no ".<breed>" part.
+	"""
+
+	key: str
+	item_id: int
+	parent: str = ""
+	level: str = ""
+	modifiers: str = ""
+	species: int = 0
+
+
+def venture_item_key(item: str) -> Optional[VentureKey]:
+	"""
+	Map a TSM-style item string to a VentureKey; None for a string that
+	names no item. Handles i:ID, i:ID::n:b1..bn[:m:t1:v1..], i:ID::iLEVEL and
+	p:species[:level:quality | :iLEVEL]. parts[2] is the random-enchant slot,
+	empty on retail and ignored.
+	"""
+	parts: list[str] = (item or "").split(":")
+	if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
+		return None
+	if parts[0] == "p":
+		species: int = int(parts[1])
+		return VentureKey(key=f"{VENTURE_PET_CAGE}:p{species}", item_id=int(VENTURE_PET_CAGE), parent=VENTURE_PET_CAGE, species=species)
+	if parts[0] != "i":
+		return None
+	item_id: int = int(parts[1])
+	rest: list[str] = parts[3:]
+	bonuses: list[int] = []
+	level: str = ""
+	modifiers: list[str] = []
+	if rest and rest[0] and not rest[0].isdigit():
+		# TSM's level-only form: "i:1420::i13".
+		level = rest[0][1:] if rest[0].startswith("i") else rest[0]
+	elif rest and rest[0].isdigit():
+		count: int = int(rest[0])
+		bonuses = [int(b) for b in rest[1:1 + count] if b.isdigit()]
+		tail: list[str] = rest[1 + count:]
+		if tail and tail[0].isdigit():
+			pairs: list[str] = tail[1:1 + 2 * int(tail[0])]
+			modifiers = [f"{pairs[i]}={pairs[i + 1]}" for i in range(0, len(pairs) - 1, 2)]
+		elif tail and tail[0]:
+			level = tail[0][1:] if tail[0].startswith("i") else tail[0]
+	unique: list[int] = sorted(set(bonuses))
+	if unique:
+		return VentureKey(key=f"{item_id}:b" + ",".join(str(b) for b in unique), item_id=item_id, parent=str(item_id), level=level, modifiers=";".join(modifiers))
+	return VentureKey(key=str(item_id), item_id=item_id, level=level, modifiers=";".join(modifiers))
+
+
+def venture_join_capped(values: Iterable[str], limit: int = VENTURE_MAX_KEY) -> str:
+	"""Sorted distinct values joined with "," and cut to the attrs value cap (whole values only)."""
+	out: str = ""
+	for value in sorted(set(v for v in values if v)):
+		candidate: str = f"{out},{value}" if out else value
+		if len(candidate.encode("utf-8")) > limit:
+			break
+		out = candidate
+	return out
+
+
+@dataclass
+class VenturePlan(object):
+	"""
+	Everything one VENTURE account gets in an export: its description, the
+	logins (WoW account folders) its data came from, which kinds this export
+	knows completely, and the rows of each kind.
+	"""
+
+	key: str
+	line: dict[str, Any]
+	logins: set[str] = field(default_factory=set)
+	covers: set[str] = field(default_factory=set)
+	balances: list[dict[str, Any]] = field(default_factory=list)
+	holdings: dict[tuple[str, str], list[int]] = field(default_factory=dict)
+	positions: list[dict[str, Any]] = field(default_factory=list)
+	inbound: list[dict[str, Any]] = field(default_factory=list)
+
+
+class VentureExport(object):
+	"""
+	Builds the JSON-lines stream for VENTURE from a loaded Context. The
+	order is fixed and deterministic -- the same files always make the same
+	bytes, which is what lets `venture push --if-changed` skip a push:
+
+	  1. venue lines (realms, plus region-<r> and commodities-<r> with market data)
+	  2. instrument lines for every item and currency referenced below
+	  3. account lines (characters, warband banks, guild banks)
+	  4. per account: account_snapshot, balances, holdings, positions, inbound
+	  5. txn lines (the TSM ledger), oldest first
+	  6. per market venue: snapshot, then its stat lines
+
+	Lines are produced one at a time (lines()), so writing a large market
+	scope never builds the whole stream in memory.
+	"""
+
+	def __init__(self, ctx: Context, currency: str, market_mode: str, include_internal: bool, since: Optional[int], until: Optional[int]):
+		self.ctx: Context = ctx
+		self.data: TsmData = ctx.data
+		self.currency: str = currency
+		self.market_mode: str = market_mode
+		self.include_internal: bool = include_internal
+		self.since: Optional[int] = since
+		self.until: Optional[int] = until
+		self.market: Optional[Market] = ctx.market(required=False) if market_mode != "none" else None
+		region: str = ctx.settings.region or (self.market.region.lower() if self.market is not None and self.market.region else "") or DEFAULT_REGION
+		self.region: str = region
+		# What was left out and why, for the summary and --check.
+		self.skipped: dict[str, int] = {}
+		self.plans: dict[str, VenturePlan] = {}
+		self.venues: dict[str, dict[str, Any]] = {}
+		self.item_keys: dict[str, set[str]] = {}
+		self.currencies: dict[int, str] = {}
+		self.txns: list[dict[str, Any]] = []
+		self.market_venues: list[tuple[str, int, dict[str, str], list[Dataset], dict[str, tuple[str, str]]]] = []
+		self._login_mtime: dict[str, int] = {}
+		self._char_keys: dict[tuple[str, str], str] = {}
+		self._built: bool = False
+
+	# ------------------------------------------------------------ helpers
+
+	def _skip(self, reason: str) -> None:
+		self.skipped[reason] = self.skipped.get(reason, 0) + 1
+
+	def _key(self, item: str) -> Optional[str]:
+		"""Instrument key for an item string, remembering the string for the instrument line."""
+		mapped: Optional[VentureKey] = venture_item_key(item)
+		if mapped is None:
+			return None
+		self.item_keys.setdefault(mapped.key, set()).add(item)
+		return mapped.key
+
+	def _venue(self, realm: str) -> str:
+		slug: str = realm_slug(realm)
+		if slug and slug not in self.venues:
+			self.venues[slug] = {"type": "venue", "key": venture_clip(slug), "name": venture_clip(realm), "kind": "realm", "group": self.region, "currency": self.currency}
+		return slug
+
+	def _char_key(self, name: str, realm: str) -> str:
+		"""A character's account key, "<Name>-<Realm>", spelt as the character record spells the name."""
+		cached: Optional[str] = self._char_keys.get((name, realm))
+		if cached is None:
+			char: Optional[Character] = self.data.char_ref(name, realm)
+			cached = venture_clip(f"{char.name if char else name}-{realm}")
+			self._char_keys[(name, realm)] = cached
+		return cached
+
+	def _guild_realm(self, guild: str, realm: str) -> str:
+		"""
+		The realm a guild bank account is named after. A guild on connected
+		realms is seen from each realm a member visited it from; Syndicator
+		knows its home realm, which is used when it is on the same connected
+		group. Otherwise the realm the winning copy was read on.
+		"""
+		root: str = self.data.realm_root(realm)
+		homes: list[str] = sorted(h for h in self.data.guild_homes.get(guild.lower(), set()) if self.data.realm_root(h) == root)
+		return homes[0] if homes else realm
+
+	def _guild_key(self, guild: str, realm: str) -> str:
+		return venture_clip(f"guild:{guild}-{self._guild_realm(guild, realm)}")
+
+	def _owner_key(self, owner: str, realm: str, login: str) -> str:
+		"""Account key for a holding owner: a character, "Warbank" or "Guild: <name>"."""
+		if owner == "Warbank":
+			return venture_clip(f"warbank:{login}")
+		if owner.startswith("Guild: "):
+			return self._guild_key(owner[len("Guild: "):], realm)
+		return self._char_key(owner, realm)
+
+	def _plan(self, key: str, login: str, line: Optional[dict[str, Any]] = None) -> VenturePlan:
+		plan: Optional[VenturePlan] = self.plans.get(key)
+		if plan is None:
+			plan = VenturePlan(key=key, line=line or {"type": "account", "key": key, "kind": "other"})
+			self.plans[key] = plan
+		elif line is not None and len(plan.line) <= 3:
+			# A bare account made by an earlier row gets its description.
+			plan.line = line
+		if login:
+			plan.logins.add(login)
+		return plan
+
+	# --------------------------------------------------------------- build
+
+	def build(self) -> None:
+		"""Work out every account, row and venue; market stats stay lazy."""
+		if self._built:
+			return
+		self._built = True
+		for info in self.data.source_files:
+			self._login_mtime[info.account] = max(self._login_mtime.get(info.account, 0), int(info.mtime))
+		self._build_accounts()
+		self._build_coverage()
+		self._build_holdings()
+		self._build_positions()
+		self._build_inbound()
+		self._build_txns()
+		self._build_market()
+
+	def _build_accounts(self) -> None:
+		"""Characters, warband banks and guild banks, with their balances."""
+		data: TsmData = self.data
+		for char in sorted(data.characters.values(), key=lambda c: (c.realm, c.name)):
+			key: str = venture_clip(f"{char.name}-{char.realm}")
+			line: dict[str, Any] = {"type": "account", "key": key, "name": venture_clip(char.name), "kind": "character"}
+			if char.realm:
+				line["group"] = venture_clip(char.realm)
+				line["venue"] = self._venue(char.realm)
+			if char.last_seen:
+				line["last_seen"] = venture_time(char.last_seen)
+			attrs: dict[str, Any] = {
+				"class": char.class_key, "level": char.level, "race": char.race,
+				"faction": char.faction if char.faction != "Unknown" else "", "guild": char.guild,
+				"played_seconds": char.played, "login_account": char.account, "zone": char.zone,
+			}
+			line["attrs"] = {k: (venture_clip(v) if isinstance(v, str) else v) for k, v in attrs.items() if v not in (None, "", 0)}
+			plan: VenturePlan = self._plan(key, char.account, line)
+			if char.money_source:
+				plan.covers.add("balances")
+				balance: dict[str, Any] = {"type": "balance", "account": key, "currency": self.currency, "amount": venture_money(max(char.money, 0))}
+				if char.money_at:
+					balance["at"] = venture_time(char.money_at)
+				plan.balances.append(balance)
+		# Warband banks: one per WoW login account that has one.
+		logins: set[str] = set(data.warbank_money) | set(data.tsm_warbank_accounts)
+		logins.update(h.account for h in data.holding_sets if h.group == "warbank")
+		for login in sorted(logins):
+			key = venture_clip(f"warbank:{login}")
+			line = {"type": "account", "key": key, "name": venture_clip(f"Warband bank ({login})"), "kind": "shared", "attrs": {"login_account": venture_clip(login)}}
+			if data.warbank_log_updated.get(login):
+				line["last_seen"] = venture_time(data.warbank_log_updated[login])
+			plan = self._plan(key, login, line)
+			if login in data.warbank_money:
+				plan.covers.add("balances")
+				balance = {"type": "balance", "account": key, "currency": self.currency, "amount": venture_money(max(data.warbank_money[login], 0))}
+				if data.warbank_log_updated.get(login):
+					balance["at"] = venture_time(data.warbank_log_updated[login])
+				plan.balances.append(balance)
+		# Guild banks: whoever saw them (TSM, DataStore, Syndicator).
+		guilds: dict[str, tuple[str, str, str]] = {}
+		for (owner, realm, _location), login in data.tsm_holding_keys.items():
+			if owner.startswith("Guild: "):
+				guilds.setdefault(self._guild_key(owner[7:], realm), (owner[7:], realm, login))
+		for hset in data.holding_sets:
+			if hset.group == "guild" and hset.owner.startswith("Guild: "):
+				guilds.setdefault(self._guild_key(hset.owner[7:], hset.realm), (hset.owner[7:], hset.realm, hset.account))
+		for key, (guild, realm, login) in sorted(guilds.items()):
+			home: str = self._guild_realm(guild, realm)
+			line = {"type": "account", "key": key, "name": venture_clip(guild), "kind": "guild"}
+			if home:
+				line["group"] = venture_clip(home)
+				line["venue"] = self._venue(home)
+			self._plan(key, login, line)
+		# A guild's gold, from TSM's guild gold log ("<guild> (<realm>)"): its newest point.
+		newest: dict[str, tuple[int, int]] = {}
+		for label, log in data.guild_logs.items():
+			match: Optional[re.Match[str]] = re.fullmatch(r"(.*) \((.*)\)", label)
+			if match is None or not log:
+				continue
+			key = self._guild_key(match.group(1), match.group(2))
+			if key in self.plans and (key not in newest or log[-1][0] > newest[key][0]):
+				newest[key] = log[-1]
+		for key, (when, copper) in newest.items():
+			plan = self.plans[key]
+			plan.covers.add("balances")
+			plan.balances.append({"type": "balance", "account": key, "currency": self.currency, "amount": venture_money(max(copper, 0)), "at": venture_time(when)})
+
+	def _build_coverage(self) -> None:
+		"""
+		Which kinds each account is restated for. A kind is covered only
+		when some source actually describes it for that account, even as
+		empty: TSM's per-location quantity tables, any DataStore/Syndicator
+		container set or currency list for holdings; a DataStore auction scan
+		or Syndicator auction list for positions (TSM keeps no auction ids);
+		a DataStore or Syndicator mailbox for inbound. Claiming a kind nobody
+		read would make VENTURE delete what an earlier export said.
+		"""
+		data: TsmData = self.data
+		for (owner, realm, _location), login in data.tsm_holding_keys.items():
+			self._plan(self._owner_key(owner, realm, login), login).covers.add("holdings")
+		for login in data.tsm_warbank_accounts:
+			self._plan(venture_clip(f"warbank:{login}"), login).covers.add("holdings")
+		for hset in data.holding_sets:
+			plan: VenturePlan = self._plan(self._owner_key(hset.owner, hset.realm, hset.account), hset.account)
+			plan.covers.add("holdings")
+			if hset.group == "auction" and hset.source in ("datastore", "syndicator"):
+				plan.covers.add("positions")
+		for source, login, char, realm, _stamp, _rows in data.char_lists.get("currency", []):
+			self._plan(self._char_key(char, realm), login).covers.add("holdings")
+		for source, login, char, realm, _stamp, _rows in data.char_lists.get("mail", []):
+			self._plan(self._char_key(char, realm), login).covers.add("inbound")
+
+	def _build_holdings(self) -> None:
+		"""Reconciled holdings (one row per account, place and instrument) plus currencies."""
+		for holding in self.data.holdings:
+			if holding.qty <= 0:
+				continue
+			key: Optional[str] = self._key(holding.item)
+			if key is None:
+				self._skip("holding: item string not understood")
+				continue
+			place: str = holding.location if holding.location in VENTURE_PLACES else "other"
+			plan: VenturePlan = self._plan(self._owner_key(holding.owner, holding.realm, holding.account), holding.account)
+			# Two item strings can name one instrument (a level-only TSM
+			# string and the plain item): one line, summed.
+			row: list[int] = plan.holdings.setdefault((place, key), [0, 0])
+			row[0] += holding.qty
+			row[1] = max(row[1], int(holding.updated_at or 0))
+		for currency in self.data.currencies:
+			if currency.qty <= 0:
+				continue
+			key = f"currency:{currency.currency_id}"
+			self.currencies[currency.currency_id] = currency.name or self.currencies.get(currency.currency_id, "")
+			plan = self._plan(self._char_key(currency.char, currency.realm), currency.account)
+			row = plan.holdings.setdefault(("currency", key), [0, 0])
+			row[0] += currency.qty
+			row[1] = max(row[1], int(currency.updated_at or 0))
+
+	def _build_positions(self) -> None:
+		"""
+		Posted auctions. VENTURE requires a per-unit buyout and an expiry,
+		and keys a listing by its auction id; an auction missing any of the
+		three (a bid-only or Syndicator-only auction has no buyout we know)
+		is left out and counted, never sent with an invented price. It still
+		counts as a holding at place "auction".
+		"""
+		seen: set[int] = set()
+		for auction in sorted(self.data.auctions, key=lambda a: a.auction_id):
+			if not auction.auction_id:
+				self._skip("position: no auction id")
+				continue
+			if auction.auction_id in seen:
+				continue
+			if not auction.realm:
+				self._skip("position: no realm")
+				continue
+			if auction.buyout is None:
+				self._skip("position: buyout unknown (Syndicator-only or bid-only auction)")
+				continue
+			if auction.expires_at is None:
+				self._skip("position: expiry unknown")
+				continue
+			key: Optional[str] = self._key(auction.item)
+			if key is None:
+				self._skip("position: item string not understood")
+				continue
+			seen.add(auction.auction_id)
+			account: str = self._char_key(auction.char, auction.realm)
+			row: dict[str, Any] = {
+				"type": "position", "account": account, "venue": self._venue(auction.realm), "id": str(auction.auction_id),
+				"instrument": key, "quantity": max(auction.qty, 1), "price": venture_money(max(auction.buyout, 0)),
+				"expires_at": venture_time(auction.expires_at),
+			}
+			if auction.bid_each:
+				row["bid"] = venture_money(auction.bid_each)
+			self._plan(account, auction.account).positions.append(row)
+
+	def _build_inbound(self) -> None:
+		"""
+		Mail with money, an item or cash on delivery: one line per entry
+		(DataStore already keeps one entry per attachment). The id is built
+		from the character, sender, subject, when the mailbox was read, the
+		expiry, the item and its count, money and an occurrence number for
+		identical entries -- stable for as long as the mailbox is not read
+		again; a new read restates the mailbox under new ids.
+		"""
+		counts: dict[tuple[Any, ...], int] = {}
+		for mail in sorted(self.data.mails, key=lambda m: (m.realm, m.char, m.expires_at or 0, m.sender, m.subject, m.item, m.qty, m.money)):
+			if mail.money <= 0 and not mail.item and mail.cod <= 0:
+				continue
+			account: str = self._char_key(mail.char, mail.realm)
+			ident: tuple[Any, ...] = (account, mail.sender, mail.subject, mail.checked_at, mail.expires_at, mail.item, mail.qty, mail.money, mail.cod)
+			occurrence: int = counts.get(ident, 0)
+			counts[ident] = occurrence + 1
+			row: dict[str, Any] = {"type": "inbound", "account": account, "id": venture_id("mail", ident + (occurrence,))}
+			if mail.sender:
+				row["sender"] = venture_clip(mail.sender)
+			if mail.subject:
+				row["subject"] = venture_clip(mail.subject)
+			if mail.money > 0:
+				row["money"] = venture_money(mail.money)
+			if mail.item:
+				key: Optional[str] = self._key(mail.item)
+				if key is not None:
+					row["instrument"] = key
+					row["quantity"] = max(mail.qty, 1)
+				else:
+					self._skip("inbound: item string not understood")
+			if mail.expires_at:
+				row["expires_at"] = venture_time(mail.expires_at)
+			row["returned"] = bool(mail.returned)
+			if mail.cod > 0:
+				row["cod"] = venture_money(mail.cod)
+			if not any(k in row for k in ("money", "instrument", "cod")):
+				self._skip("inbound: nothing to collect")
+				continue
+			self._plan(account, mail.account).inbound.append(row)
+
+	def _build_txns(self) -> None:
+		"""
+		The TSM ledger as txn lines. Internal transfers (trades and mail
+		between your own characters) carry no member saying so in protocol
+		1, so they are left out unless --include-internal: they are not
+		business income or expense, and once sent they cannot be taken back.
+		"""
+		for txn in self.data.txns:
+			if txn.internal and not self.include_internal:
+				self._skip("txn: internal transfer (use --include-internal)")
+				continue
+			if (self.since is not None and txn.time < self.since) or (self.until is not None and txn.time >= self.until):
+				continue
+			kind: Optional[str] = VENTURE_TXN_KINDS.get(txn.kind)
+			if kind is None or not txn.player:
+				self._skip("txn: no kind or no character")
+				continue
+			row: dict[str, Any] = {
+				"type": "txn", "id": venture_id("tsm", txn.identity), "account": self._char_key(txn.player, txn.realm),
+				"venue": self._venue(txn.realm), "kind": kind,
+			}
+			if kind in ("sale", "buy", "expired", "cancelled"):
+				key: Optional[str] = self._key(txn.item)
+				if key is None or txn.qty <= 0:
+					self._skip(f"txn: {kind} without an item or a quantity")
+					continue
+				row["instrument"] = key
+				row["quantity"] = txn.qty
+				if kind in ("sale", "buy"):
+					if txn.price < 0:
+						self._skip("txn: negative price")
+						continue
+					row["unit_price"] = venture_money(txn.price)
+					row["amount"] = venture_money(txn.price * txn.qty)
+			else:
+				if txn.price < 0:
+					self._skip("txn: negative amount")
+					continue
+				row["amount"] = venture_money(txn.price)
+			if txn.other:
+				row["counterparty"] = venture_clip(txn.other)
+			if txn.source:
+				row["source"] = venture_clip(txn.source)
+			row["at"] = venture_time(txn.time)
+			self.txns.append(row)
+		self.txns.sort(key=lambda r: (r["at"], r["id"]))
+
+	def _scope(self) -> Optional[set[str]]:
+		"""
+		Base items whose market figures are exported: what you hold, post,
+		get by mail or ever traded, plus everything in a TSM group. None
+		means every item (--market all).
+		"""
+		if self.market_mode == "all":
+			return None
+		data: TsmData = self.data
+		items: set[str] = {item_base(h.item) for h in data.holdings}
+		items.update(item_base(a.item) for a in data.auctions)
+		items.update(item_base(m.item) for m in data.mails if m.item)
+		items.update(item_base(t.item) for t in data.txns if t.item)
+		items.update(item_base(i) for i in data.groups)
+		items.discard("")
+		return items
+
+	def _build_market(self) -> None:
+		"""
+		AuctionDB as one snapshot per venue: each realm, the region-wide
+		commodity market ("commodities-<region>", which every realm shares
+		since 9.2.7) and the region's own figures ("region-<region>"). Per
+		venue only the item keys are worked out here; the stat lines are
+		made while writing.
+		"""
+		market: Optional[Market] = self.market
+		if market is None:
+			return
+		scope: Optional[set[str]] = self._scope()
+		venues: list[tuple[str, str, str, list[Dataset], dict[str, tuple[str, str]]]] = []
+		for realm in market.realm_names():
+			venues.append((self._venue(realm), realm, "realm", market.realm_sets.get(realm, []), VENTURE_REALM_FIELDS))
+		if market.commodity_sets:
+			key: str = f"commodities-{self.region}"
+			self.venues[key] = {"type": "venue", "key": key, "name": f"{self.region.upper()} commodities", "kind": "commodity_market", "group": self.region, "currency": self.currency}
+			venues.append((key, key, "commodity_market", market.commodity_sets, VENTURE_REALM_FIELDS))
+		if market.region_sets:
+			key = f"region-{self.region}"
+			self.venues[key] = {"type": "venue", "key": key, "name": f"{self.region.upper()} region", "kind": "region", "group": self.region, "currency": self.currency}
+			venues.append((key, key, "region", market.region_sets, VENTURE_REGION_FIELDS))
+		for venue, _name, _kind, sets, fields in venues:
+			taken: int = max((d.download_time for d in sets), default=0) or int(market.app_sync or 0)
+			if not taken:
+				self._skip("market: a venue with no download time")
+				continue
+			# Several AppData strings can name one instrument (i:1420 and
+			# i:1420::i13): one stat line per instrument, read from the
+			# plain item's row when there is one, else the first string.
+			chosen: dict[str, str] = {}
+			for dataset in sets:
+				if not any(f in fields for f in dataset.fields):
+					continue
+				for item in dataset.rows:
+					if scope is not None and item_base(item) not in scope:
+						continue
+					mapped: Optional[VentureKey] = venture_item_key(item)
+					if mapped is None:
+						continue
+					current: Optional[str] = chosen.get(mapped.key)
+					if current is None or (item == item_base(item)) > (current == item_base(current)) or ((item == item_base(item)) == (current == item_base(current)) and item < current):
+						chosen[mapped.key] = item
+			for key, item in chosen.items():
+				self.item_keys.setdefault(key, set()).add(item)
+			self.market_venues.append((venue, taken, chosen, sets, fields))
+
+	# --------------------------------------------------------------- lines
+
+	def _instrument_lines(self) -> list[dict[str, Any]]:
+		"""
+		One instrument line per key, plain items before their variants. The
+		name, category and attrs come from TSM's item cache; parents of
+		variants get a line of their own as the Blizzard plugin writes them.
+		"""
+		data: TsmData = self.data
+		mapped: dict[str, VentureKey] = {}
+		strings: dict[str, list[str]] = {}
+		for key, items in self.item_keys.items():
+			for item in sorted(items):
+				found: Optional[VentureKey] = venture_item_key(item)
+				if found is None:
+					continue
+				mapped.setdefault(key, found)
+				strings.setdefault(key, []).append(item)
+		for key, found in list(mapped.items()):
+			if found.parent and found.parent not in mapped:
+				mapped[found.parent] = VentureKey(key=found.parent, item_id=int(found.parent))
+				strings.setdefault(found.parent, [])
+
+		def info_for(key: str, items: list[str]) -> Optional[ItemInfo]:
+			# The plain string first: its cache entry is the item itself.
+			for item in sorted(items, key=lambda i: (i != item_base(i), i)):
+				info: Optional[ItemInfo] = data.item_info(item)
+				if info is not None:
+					return info
+			return data.item_info(f"i:{key}") if key.isdigit() else None
+
+		lines: list[dict[str, Any]] = []
+		for key in sorted(mapped, key=lambda k: (mapped[k].item_id, k)):
+			found = mapped[key]
+			items: list[str] = strings.get(key, [])
+			info: Optional[ItemInfo] = info_for(key, items)
+			line: dict[str, Any] = {"type": "instrument", "key": key, "kind": "item"}
+			if info is not None and info.name:
+				line["name"] = venture_clip(info.name)
+			elif key == VENTURE_PET_CAGE:
+				line["name"] = "Pet Cage"
+			if info is not None and info.class_id in ITEM_CLASS_NAMES:
+				line["category"] = ITEM_CLASS_NAMES[info.class_id]
+			if found.parent:
+				line["parent"] = found.parent
+			attrs: dict[str, Any] = {"item_id": found.item_id}
+			if found.species:
+				attrs["pet_species_id"] = found.species
+			if info is not None:
+				if info.vendor_sell >= 0:
+					attrs["vendor_sell"] = info.vendor_sell
+				if info.quality in VENTURE_QUALITY_TYPES:
+					attrs["quality"] = VENTURE_QUALITY_TYPES[info.quality]
+				if info.item_level > 0:
+					attrs["item_level"] = info.item_level
+			variants: list[VentureKey] = [v for v in (venture_item_key(i) for i in items) if v is not None]
+			levels: str = venture_join_capped(v.level for v in variants)
+			modifiers: str = venture_join_capped(v.modifiers for v in variants)
+			if levels:
+				attrs["tsm_levels"] = levels
+			if modifiers:
+				attrs["tsm_modifiers"] = modifiers
+			line["attrs"] = attrs
+			lines.append(line)
+		for currency_id in sorted(self.currencies):
+			line = {"type": "instrument", "key": f"currency:{currency_id}", "kind": "other", "category": "Currency", "attrs": {"currency_id": currency_id}}
+			if self.currencies[currency_id]:
+				line["name"] = venture_clip(self.currencies[currency_id])
+			lines.append(line)
+		return lines
+
+	def _account_lines(self) -> Iterable[dict[str, Any]]:
+		"""Account descriptions, then each account's snapshot and rows."""
+		for key in sorted(self.plans):
+			yield self.plans[key].line
+		for key in sorted(self.plans):
+			plan: VenturePlan = self.plans[key]
+			covers: list[str] = [c for c in VENTURE_COVERS if c in plan.covers]
+			if covers:
+				# "As of" is when WoW last wrote the files this account came
+				# from: an export of older files (a stale mirror) is then older
+				# and VENTURE skips it instead of rolling the account back.
+				at: int = max((self._login_mtime.get(login, 0) for login in plan.logins), default=0) or int(time.time())
+				yield {"type": "account_snapshot", "account": key, "at": venture_time(at), "covers": covers}
+			yield from plan.balances
+			for (place, instrument), (qty, stamp) in sorted(plan.holdings.items()):
+				row: dict[str, Any] = {"type": "holding", "account": key, "place": place, "instrument": instrument, "quantity": qty}
+				if stamp:
+					row["at"] = venture_time(stamp)
+				yield row
+			yield from sorted(plan.positions, key=lambda r: r["id"])
+			yield from sorted(plan.inbound, key=lambda r: r["id"])
+
+	def _market_lines(self) -> Iterable[dict[str, Any]]:
+		"""
+		Per venue a snapshot, then a stat per instrument in scope. A scoped
+		export says complete: false -- it is a sample, and a complete
+		snapshot would mark every item it left out as sold out. --market all
+		sends everything AuctionDB has and says complete: true.
+		"""
+		for venue, taken, chosen, sets, fields in sorted(self.market_venues, key=lambda v: v[0]):
+			yield {"type": "snapshot", "venue": venue, "taken_at": venture_time(taken), "complete": self.market_mode == "all"}
+			for key in sorted(chosen, key=lambda k: (venture_item_key(chosen[k]).item_id, k)):  # type: ignore[union-attr]
+				item: str = chosen[key]
+				row: dict[str, Any] = {"type": "stat", "venue": venue, "instrument": key}
+				for dataset in sets:
+					for field_name in dataset.fields:
+						spec: Optional[tuple[str, str]] = fields.get(field_name)
+						if spec is None or spec[0] in row:
+							continue
+						value: Optional[int] = dataset.get(item, field_name)
+						if value is None:
+							continue
+						member, how = spec
+						if how == "money":
+							row[member] = venture_money(value)
+						elif how == "count":
+							row[member] = int(value)
+						elif member == "sale_rate":
+							row[member] = venture_milli(min(value, 1000))
+						else:
+							row[member] = venture_milli(value)
+				if len(row) > 3:
+					yield row
+
+	def lines(self) -> Iterable[dict[str, Any]]:
+		self.build()
+		yield from (self.venues[k] for k in sorted(self.venues))
+		yield from self._instrument_lines()
+		yield from self._account_lines()
+		yield from self.txns
+		yield from self._market_lines()
+
+	def write(self, out: Any, check: Optional["VentureCheck"] = None) -> int:
+		"""
+		Write the stream as UTF-8 bytes to `out` (a binary file object), one
+		line at a time, feeding each line to `check` when given. Returns the
+		number of bytes written.
+		"""
+		written: int = 0
+		for number, line in enumerate(self.lines(), 1):
+			text: str = json.dumps(line, ensure_ascii=False, separators=(",", ":"))
+			if check is not None:
+				check.line(number, text)
+			data: bytes = text.encode("utf-8") + b"\n"
+			out.write(data)
+			written += len(data)
+		if check is not None:
+			check.finish()
+		return written
+
+
+# ----------------------------------------------------------------- contract
+
+VENTURE_DECIMAL_RE: re.Pattern[str] = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+VENTURE_TIME_RE: re.Pattern[str] = re.compile(r"^(\d{4})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+VENTURE_CURRENCY_RE: re.Pattern[str] = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,14}$")
+# Members each account kind may carry: anything else is refused by VENTURE.
+VENTURE_STRICT_MEMBERS: dict[str, frozenset[str]] = {
+	"account": frozenset(("type", "key", "name", "kind", "group", "venue", "last_seen", "attrs")),
+	"account_snapshot": frozenset(("type", "account", "at", "covers")),
+	"balance": frozenset(("type", "account", "currency", "amount", "at")),
+	"holding": frozenset(("type", "account", "place", "instrument", "quantity", "at")),
+	"position": frozenset(("type", "account", "venue", "id", "instrument", "quantity", "price", "bid", "expires_at", "posted_at")),
+	"inbound": frozenset(("type", "account", "id", "sender", "subject", "money", "instrument", "quantity", "expires_at", "returned", "cod")),
+	"txn": frozenset(("type", "id", "account", "venue", "kind", "instrument", "quantity", "unit_price", "amount", "counterparty", "source", "at")),
+}
+VENTURE_KNOWN_TYPES: frozenset[str] = frozenset(VENTURE_STRICT_MEMBERS) | frozenset((
+	"venue", "instrument", "snapshot", "listing", "stat", "quote", "entry", "record", "cursor", "not_modified", "log", "error", "result",
+))
+# Which kind a row restates, for the snapshot-before-rows rule.
+VENTURE_ROW_COVER: dict[str, str] = {"balance": "balances", "holding": "holdings", "position": "positions", "inbound": "inbound"}
+
+
+class VentureCheck(object):
+	"""
+	A cheap re-parse of an export against VENTURE's protocol-1 rules (the
+	ones src/plugin/venture-jsonl.c and the feed batch enforce): known
+	types, strict members on the account kinds, required members, decimal
+	grammar and the currency's four places, integer counts, zoned times,
+	key lengths, flat attrs, txn rules per kind, one snapshot per account
+	ahead of its rows, the balance currency, and unique ids per stream.
+	"""
+
+	def __init__(self, currency: str):
+		self.currency: str = currency.upper()
+		self.counts: dict[str, int] = {}
+		self.problems: list[str] = []
+		self.snapshotted: set[str] = set()
+		self.rows_seen: dict[str, set[str]] = {}
+		self.ids: dict[str, set[str]] = {"position": set(), "inbound": set(), "txn": set()}
+
+	def _bad(self, number: int, kind: str, text: str) -> None:
+		if len(self.problems) < 200:
+			self.problems.append(f"line {number}: {kind}: {text}")
+		elif len(self.problems) == 200:
+			self.problems.append("... more problems not listed")
+
+	def _string(self, number: int, kind: str, obj: dict[str, Any], name: str, required: bool) -> None:
+		value: Any = obj.get(name)
+		if value is None:
+			if required:
+				self._bad(number, kind, f"{name} is required")
+			return
+		if not isinstance(value, str) or not value:
+			self._bad(number, kind, f"{name} must be a non-empty string")
+		elif len(value.encode("utf-8")) > VENTURE_MAX_KEY:
+			self._bad(number, kind, f"{name} is longer than {VENTURE_MAX_KEY} bytes")
+
+	def _decimal(self, number: int, kind: str, obj: dict[str, Any], name: str, required: bool, money: bool = True) -> None:
+		value: Any = obj.get(name)
+		if value is None:
+			if required:
+				self._bad(number, kind, f"{name} is required")
+			return
+		if not isinstance(value, str) or not VENTURE_DECIMAL_RE.match(value) or len(value) > VENTURE_MAX_DECIMAL:
+			self._bad(number, kind, f"{name} must be a decimal string")
+		elif money and "." in value and len(value.split(".", 1)[1]) > VENTURE_MONEY_PLACES:
+			self._bad(number, kind, f"{name} has more than {VENTURE_MONEY_PLACES} decimal places")
+
+	def _int(self, number: int, kind: str, obj: dict[str, Any], name: str, required: bool, minimum: int) -> None:
+		value: Any = obj.get(name)
+		if value is None:
+			if required:
+				self._bad(number, kind, f"{name} is required")
+			return
+		if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+			self._bad(number, kind, f"{name} must be an integer of at least {minimum}")
+
+	def _time(self, number: int, kind: str, obj: dict[str, Any], name: str, required: bool) -> None:
+		value: Any = obj.get(name)
+		if value is None:
+			if required:
+				self._bad(number, kind, f"{name} is required")
+			return
+		match: Optional[re.Match[str]] = VENTURE_TIME_RE.match(value) if isinstance(value, str) else None
+		if match is None:
+			self._bad(number, kind, f"{name} must be an ISO 8601 time with a zone")
+		elif int(match.group(1)) < 1970:
+			self._bad(number, kind, f"{name} is before 1970")
+
+	def _choice(self, number: int, kind: str, obj: dict[str, Any], name: str, choices: Iterable[str]) -> None:
+		if obj.get(name) not in tuple(choices):
+			self._bad(number, kind, f"{name} must be one of {', '.join(choices)}")
+
+	def _attrs(self, number: int, kind: str, obj: dict[str, Any]) -> None:
+		attrs: Any = obj.get("attrs")
+		if attrs is None:
+			return
+		if not isinstance(attrs, dict):
+			self._bad(number, kind, "attrs must be an object")
+			return
+		if kind != "account":
+			return
+		if len(attrs) > VENTURE_MAX_ATTRS:
+			self._bad(number, kind, f"attrs has more than {VENTURE_MAX_ATTRS} members")
+		for name, value in attrs.items():
+			if len(name.encode("utf-8")) > VENTURE_MAX_KEY:
+				self._bad(number, kind, "attrs has a member name that is too long")
+			if isinstance(value, (dict, list)):
+				self._bad(number, kind, "attrs must hold only strings, numbers, booleans and nulls")
+			elif isinstance(value, str) and len(value.encode("utf-8")) > VENTURE_MAX_KEY:
+				self._bad(number, kind, "attrs has a value that is too long")
+		if len(json.dumps(attrs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > VENTURE_MAX_ATTRS_BYTES:
+			self._bad(number, kind, f"attrs is longer than {VENTURE_MAX_ATTRS_BYTES} bytes")
+
+	def _pair(self, number: int, kind: str, obj: dict[str, Any], required: bool) -> None:
+		self._string(number, kind, obj, "instrument", required)
+		self._int(number, kind, obj, "quantity", required, 1)
+		if ("instrument" in obj) != ("quantity" in obj):
+			self._bad(number, kind, "instrument and quantity travel together")
+
+	def line(self, number: int, text: str) -> None:
+		if not text.strip():
+			return
+		try:
+			obj: Any = json.loads(text)
+		except ValueError:
+			self._bad(number, "?", "not JSON")
+			return
+		if not isinstance(obj, dict):
+			self._bad(number, "?", "not a JSON object")
+			return
+		# null is absent everywhere.
+		obj = {k: v for k, v in obj.items() if v is not None}
+		kind: Any = obj.get("type")
+		if not isinstance(kind, str) or kind not in VENTURE_KNOWN_TYPES:
+			self._bad(number, str(kind), "unknown or missing type (there is no header line in protocol 1)")
+			return
+		self.counts[kind] = self.counts.get(kind, 0) + 1
+		strict: Optional[frozenset[str]] = VENTURE_STRICT_MEMBERS.get(kind)
+		if strict is not None:
+			for name in obj:
+				if name not in strict:
+					self._bad(number, kind, f"unknown member {name!r}")
+		getattr(self, f"_check_{kind}", lambda n, o: None)(number, obj)
+
+	def _check_venue(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "venue", obj, "key", True)
+		for name in ("name", "kind", "group"):
+			self._string(number, "venue", obj, name, False)
+		if "currency" in obj and not VENTURE_CURRENCY_RE.match(str(obj["currency"])):
+			self._bad(number, "venue", "currency is not a currency code")
+		self._attrs(number, "venue", obj)
+
+	def _check_instrument(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "instrument", obj, "key", True)
+		for name in ("name", "kind", "category", "parent"):
+			self._string(number, "instrument", obj, name, False)
+		self._attrs(number, "instrument", obj)
+
+	def _check_snapshot(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "snapshot", obj, "venue", True)
+		self._time(number, "snapshot", obj, "taken_at", True)
+		if "complete" in obj and not isinstance(obj["complete"], bool):
+			self._bad(number, "snapshot", "complete must be a boolean")
+
+	def _check_stat(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "stat", obj, "venue", True)
+		self._string(number, "stat", obj, "instrument", True)
+		figures: int = 0
+		for name in ("min", "market", "mean", "median", "sale_avg", "historical"):
+			self._decimal(number, "stat", obj, name, False)
+			figures += name in obj
+		for name in ("quantity", "listings", "sold"):
+			self._int(number, "stat", obj, name, False, 0)
+			figures += name in obj
+		for name in ("sale_rate", "sold_per_day"):
+			self._decimal(number, "stat", obj, name, False, money=False)
+			figures += name in obj
+		if "sale_rate" in obj and isinstance(obj["sale_rate"], str) and VENTURE_DECIMAL_RE.match(obj["sale_rate"]) and float(obj["sale_rate"]) > 1.0:
+			self._bad(number, "stat", "sale_rate must be from 0 to 1")
+		if not figures:
+			self._bad(number, "stat", "carries no figure")
+
+	def _row_account(self, number: int, kind: str, obj: dict[str, Any]) -> None:
+		"""Remember that an account had a row of this kind (a later snapshot covering it is refused)."""
+		cover: Optional[str] = VENTURE_ROW_COVER.get(kind)
+		account: Any = obj.get("account")
+		if cover is not None and isinstance(account, str):
+			self.rows_seen.setdefault(account, set()).add(cover)
+
+	def _check_account(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "account", obj, "key", True)
+		self._choice(number, "account", obj, "kind", VENTURE_ACCOUNT_KINDS)
+		for name in ("name", "group", "venue"):
+			self._string(number, "account", obj, name, False)
+		self._time(number, "account", obj, "last_seen", False)
+		self._attrs(number, "account", obj)
+
+	def _check_account_snapshot(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "account_snapshot", obj, "account", True)
+		self._time(number, "account_snapshot", obj, "at", True)
+		covers: Any = obj.get("covers")
+		if not isinstance(covers, list) or not covers or len(set(map(str, covers))) != len(covers) or any(c not in VENTURE_COVERS for c in covers):
+			self._bad(number, "account_snapshot", "covers must be a non-empty list of distinct holdings, positions, inbound, balances")
+			return
+		account: str = str(obj.get("account"))
+		if account in self.snapshotted:
+			self._bad(number, "account_snapshot", f"a second snapshot of {account!r}")
+		self.snapshotted.add(account)
+		late: set[str] = self.rows_seen.get(account, set()) & set(covers)
+		if late:
+			self._bad(number, "account_snapshot", f"comes after {account!r}'s {', '.join(sorted(late))} rows")
+
+	def _check_balance(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "balance", obj, "account", True)
+		if str(obj.get("currency", "")).upper() != self.currency:
+			self._bad(number, "balance", f"currency must be the data source's ({self.currency})")
+		self._decimal(number, "balance", obj, "amount", True)
+		self._time(number, "balance", obj, "at", False)
+		self._row_account(number, "balance", obj)
+
+	def _check_holding(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "holding", obj, "account", True)
+		self._choice(number, "holding", obj, "place", sorted(VENTURE_PLACES))
+		self._string(number, "holding", obj, "instrument", True)
+		self._int(number, "holding", obj, "quantity", True, 0)
+		self._time(number, "holding", obj, "at", False)
+		self._row_account(number, "holding", obj)
+
+	def _unique(self, number: int, kind: str, obj: dict[str, Any]) -> None:
+		ident: Any = obj.get("id")
+		if isinstance(ident, str):
+			if ident in self.ids[kind]:
+				self._bad(number, kind, f"id {ident!r} repeated in one stream")
+			self.ids[kind].add(ident)
+
+	def _check_position(self, number: int, obj: dict[str, Any]) -> None:
+		for name in ("account", "venue", "id", "instrument"):
+			self._string(number, "position", obj, name, True)
+		self._int(number, "position", obj, "quantity", True, 1)
+		self._decimal(number, "position", obj, "price", True)
+		self._decimal(number, "position", obj, "bid", False)
+		self._time(number, "position", obj, "expires_at", True)
+		self._time(number, "position", obj, "posted_at", False)
+		self._unique(number, "position", obj)
+		self._row_account(number, "position", obj)
+
+	def _check_inbound(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "inbound", obj, "account", True)
+		self._string(number, "inbound", obj, "id", True)
+		self._string(number, "inbound", obj, "sender", False)
+		self._string(number, "inbound", obj, "subject", False)
+		self._decimal(number, "inbound", obj, "money", False)
+		self._decimal(number, "inbound", obj, "cod", False)
+		self._pair(number, "inbound", obj, False)
+		self._time(number, "inbound", obj, "expires_at", False)
+		if "returned" in obj and not isinstance(obj["returned"], bool):
+			self._bad(number, "inbound", "returned must be a boolean")
+		if not any(name in obj for name in ("money", "instrument", "cod")):
+			self._bad(number, "inbound", "carries nothing to collect")
+		self._unique(number, "inbound", obj)
+		self._row_account(number, "inbound", obj)
+
+	def _check_txn(self, number: int, obj: dict[str, Any]) -> None:
+		self._string(number, "txn", obj, "id", True)
+		self._string(number, "txn", obj, "account", True)
+		self._string(number, "txn", obj, "venue", False)
+		self._choice(number, "txn", obj, "kind", tuple(VENTURE_TXN_KINDS.values()))
+		self._decimal(number, "txn", obj, "unit_price", False)
+		self._decimal(number, "txn", obj, "amount", False)
+		self._string(number, "txn", obj, "counterparty", False)
+		self._string(number, "txn", obj, "source", False)
+		self._time(number, "txn", obj, "at", True)
+		kind: Any = obj.get("kind")
+		self._pair(number, "txn", obj, kind in ("sale", "buy", "expired", "cancelled"))
+		if kind in ("expired", "cancelled"):
+			for name in ("amount", "unit_price"):
+				if name in obj and str(obj[name]).strip("0.") != "":
+					self._bad(number, "txn", f"{kind} carries no money ({name})")
+		elif "amount" not in obj:
+			self._bad(number, "txn", "amount is required")
+		self._unique(number, "txn", obj)
+
+	def finish(self) -> None:
+		"""Nothing to check at the end today; kept so callers can treat the stream as closed."""
+
+	@property
+	def ok(self) -> bool:
+		return not self.problems
+
+
+# ----------------------------------------------------------------- export
+
+def venture_export_from_context(ctx: Context) -> VentureExport:
+	"""An exporter from the command line and settings (currency, market scope, internal, --since/--until)."""
+	args: argparse.Namespace = ctx.args
+	since: Optional[int] = parse_when(args.since) if getattr(args, "since", None) else None
+	until: Optional[int] = parse_when(args.until) if getattr(args, "until", None) else None
+	return VentureExport(ctx, ctx.settings.venture_currency, ctx.settings.venture_market, bool(getattr(args, "include_internal", False)), since, until)
+
+
+def venture_summary(doc: Doc, exporter: VentureExport, check: VentureCheck, size: int) -> Section:
+	"""Counts per message type, what was left out, and the check's verdict."""
+	section: Section = doc.section("Export")
+	section.kv([
+		("Lines", sum(check.counts.values()), "int"),
+		("Bytes", size, "int"),
+		("Currency", exporter.currency, "str"),
+		("Market", exporter.market_mode + (" (no AppData.lua: none sent)" if exporter.market is None and exporter.market_mode != "none" else ""), "str"),
+		("Region", exporter.region, "str"),
+		("Contract check", "ok" if check.ok else f"{len(check.problems)} problem(s)", "str"),
+	])
+	table: Table = Table([Column("type", "Type"), Column("lines", "Lines", "int")], [{"type": k, "lines": v} for k, v in sorted(check.counts.items())])
+	section.table(table)
+	doc.main = table
+	if exporter.skipped:
+		section.table(Table([Column("reason", "Left out"), Column("count", "Count", "int")], [{"reason": k, "count": v} for k, v in sorted(exporter.skipped.items())], title="Left out"))
+	for problem in check.problems:
+		section.text(f"- {problem}")
+	return section
+
+
+def cmd_export(ctx: Context) -> Optional[Doc]:
+	"""
+	`tsmctl export --format venture`: the whole dataset as VENTURE JSON
+	lines on stdout (or --file PATH, written 0600 and renamed into place).
+	--check writes nothing and reports counts and contract problems instead.
+	"""
+	args: argparse.Namespace = ctx.args
+	fmt: str = (getattr(args, "format", None) or "venture").lower()
+	if fmt != "venture":
+		raise TsmctlError(f"unknown export format {fmt!r}; the only format is venture")
+	exporter: VentureExport = venture_export_from_context(ctx)
+	check: VentureCheck = VentureCheck(exporter.currency)
+	if getattr(args, "check", False):
+		with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as buffer:
+			size: int = exporter.write(buffer, check)
+		doc: Doc = Doc("tsmctl export --check", "export_check")
+		venture_summary(doc, exporter, check, size)
+		if not check.ok:
+			ctx.exit_code = 1
+		return doc
+	target: str = getattr(args, "file", None) or "-"
+	if target == "-":
+		exporter.write(sys.stdout.buffer, check)
+		sys.stdout.buffer.flush()
+	else:
+		path: Path = Path(target).expanduser()
+		tmp: Path = path.with_name(path.name + ".part")
+		handle: int = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+		with os.fdopen(handle, "wb") as out:
+			size = exporter.write(out, check)
+		os.replace(tmp, path)
+		Log.info(f"wrote {size} bytes to {path}")
+	for reason, count in sorted(exporter.skipped.items()):
+		Log.info(f"left out {count}: {reason}")
+	if not check.ok:
+		for problem in check.problems[:20]:
+			print(f"{PROG}: contract: {problem}", file=sys.stderr)
+		raise TsmctlError(f"the export breaks VENTURE's protocol in {len(check.problems)} place(s); this is a tsmctl bug")
+	return None
+
+
+# ------------------------------------------------------------------- push
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+	"""Refuse redirects: one would carry the Authorization header to a host the response chose."""
+
+	def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+		return None
+
+
+def venture_base_url(url: str, allow_http: bool) -> str:
+	"""
+	Check and normalise the server's base URL. HTTPS always; plain HTTP only
+	to this machine (localhost, 127.0.0.0/8, ::1) or with --allow-http,
+	because the API token travels in a header. No credentials, query or
+	fragment in it.
+	"""
+	if not url:
+		raise TsmctlError("no VENTURE server: give --url, $TSMCTL_VENTURE_URL or venture_url in the config")
+	parts: urllib.parse.SplitResult = urllib.parse.urlsplit(url)
+	if parts.scheme not in ("http", "https") or not parts.hostname:
+		raise TsmctlError(f"venture_url must be an http(s) address, got {url!r}")
+	if parts.username or parts.password or parts.query or parts.fragment:
+		raise TsmctlError("venture_url must not carry credentials, a query or a fragment")
+	loopback: bool = parts.hostname in ("localhost", "::1") or parts.hostname.startswith("127.")
+	if parts.scheme == "http" and not loopback and not allow_http:
+		raise TsmctlError(f"refusing to send the API token over plain http to {parts.hostname}; use https (or --allow-http on a network you trust)")
+	return url.rstrip("/")
+
+
+def venture_token(settings: Settings, required: bool = True) -> tuple[Optional[str], str]:
+	"""
+	The API token and where it came from, in this order: $TSMCTL_VENTURE_TOKEN,
+	the token file (venture_token_file, else ~/.config/tsmctl/venture-token
+	when it exists), then venturectl's $VENTURE_TOKEN. Never a command-line
+	argument: argv is readable by every user through /proc. The file must be
+	a regular file owned by you with no group or other permissions (0600);
+	anything looser is refused. Both variables are removed from this
+	process's environment once read, so no child (ssh) inherits them.
+	"""
+	from_env: Optional[str] = os.environ.pop("TSMCTL_VENTURE_TOKEN", None)
+	venturectl_env: Optional[str] = os.environ.pop("VENTURE_TOKEN", None)
+	token: Optional[str] = None
+	where: str = ""
+	if from_env:
+		token, where = from_env, "$TSMCTL_VENTURE_TOKEN"
+	else:
+		configured: bool = bool(settings.venture_token_file)
+		path: Path = Path(settings.venture_token_file).expanduser() if configured else DEFAULT_VENTURE_TOKEN_FILE
+		if configured or path.exists():
+			try:
+				info: os.stat_result = os.stat(path)
+			except OSError as exc:
+				raise TsmctlError(f"cannot read the VENTURE token file {path}: {exc.strerror}") from exc
+			if not (info.st_mode & 0o170000 == 0o100000):
+				raise TsmctlError(f"the VENTURE token file {path} is not a regular file")
+			if info.st_uid != os.getuid() or info.st_mode & 0o077:
+				raise TsmctlError(f"the VENTURE token file {path} must be yours and private: chmod 600 {shlex.quote(str(path))}")
+			try:
+				token = path.read_text(encoding="utf-8").strip().splitlines()[0].strip() if path.stat().st_size else ""
+			except (OSError, IndexError, UnicodeDecodeError) as exc:
+				raise TsmctlError(f"cannot read the VENTURE token file {path}") from exc
+			where = f"file {path}"
+		elif venturectl_env:
+			token, where = venturectl_env, "$VENTURE_TOKEN"
+	if token and not re.fullmatch(r"[\x21-\x7e]+", token):
+		raise TsmctlError(f"the VENTURE token from {where} is not a single printable word")
+	if not token:
+		if required:
+			raise TsmctlError(f"no VENTURE API token: set $TSMCTL_VENTURE_TOKEN or put it in {DEFAULT_VENTURE_TOKEN_FILE} (chmod 600)")
+		return None, "none"
+	return token, where
+
+
+class VentureClient(object):
+	"""
+	A minimal HTTP client for VENTURE's API: urllib only, TLS verified with
+	the system's CA store, no redirects, the token in an Authorization
+	header and nowhere else.
+	"""
+
+	def __init__(self, base_url: str, token: Optional[str], timeout: int):
+		self.base_url: str = base_url
+		self.token: Optional[str] = token
+		self.timeout: int = timeout
+		self.opener: urllib.request.OpenerDirector = urllib.request.build_opener(
+			_NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+		)
+
+	def request(self, method: str, path: str, query: Optional[dict[str, str]] = None, body: Any = None, length: int = 0, content_type: str = "", auth: bool = True) -> tuple[int, Any]:
+		"""
+		One request; returns (HTTP status, decoded JSON or None). An HTTP
+		error status is returned, not raised; a connection failure raises
+		TsmctlError with the exit code set by the caller.
+		"""
+		url: str = self.base_url + path + (("?" + urllib.parse.urlencode(query)) if query else "")
+		request: urllib.request.Request = urllib.request.Request(url, data=body, method=method)
+		request.add_header("Accept", "application/json")
+		request.add_header("User-Agent", f"{PROG}/{VERSION}")
+		if body is not None:
+			request.add_header("Content-Type", content_type)
+			request.add_header("Content-Length", str(length))
+		if auth and self.token:
+			request.add_header("Authorization", f"Bearer {self.token}")
+		try:
+			with self.opener.open(request, timeout=self.timeout) as response:
+				return response.status, self._decode(response.read())
+		except urllib.error.HTTPError as exc:
+			return exc.code, self._decode(exc.read() if exc.fp is not None else b"")
+		except (urllib.error.URLError, OSError) as exc:
+			reason: Any = getattr(exc, "reason", exc)
+			raise VentureUnreachable(f"cannot reach {self.base_url}: {reason}") from exc
+
+	@staticmethod
+	def _decode(raw: bytes) -> Any:
+		try:
+			return json.loads(raw.decode("utf-8")) if raw else None
+		except (UnicodeDecodeError, ValueError):
+			return {"error": raw[:300].decode("utf-8", "replace")}
+
+
+class VentureUnreachable(TsmctlError):
+	"""The server could not be reached at all (exit 3)."""
+
+	exit_code: int = EXIT_UNREACHABLE
+
+
+def venture_error_text(status: int, payload: Any) -> str:
+	"""The message out of VENTURE's error body ({"error": {...}} or {"error": "..."}), else the status."""
+	if isinstance(payload, dict):
+		error: Any = payload.get("error")
+		if isinstance(error, dict):
+			return str(error.get("message") or error.get("code") or status)
+		if error:
+			return str(error)
+		if payload.get("message"):
+			return str(payload["message"])
+	return f"HTTP {status}"
+
+
+def venture_watch_files(ctx: Context) -> list[Path]:
+	"""The SavedVariables files a push depends on, for --settle (local installs only)."""
+	files: list[Path] = []
+	for names in ctx.source.account_files().values():
+		files.extend(path for _name, path in sorted(names.items()))
+	return files
+
+
+def venture_settle(paths: list[Path], quiet: int, limit: int = DEFAULT_VENTURE_SETTLE_LIMIT) -> None:
+	"""
+	Wait until none of `paths` has changed for `quiet` seconds. WoW writes
+	every addon's SavedVariables one after another on logout or /reload; a
+	push started on the first write would read the rest half-written or
+	stale. A file written a moment ago counts as a change at its mtime.
+	Gives up waiting (and goes ahead) after `limit` seconds.
+	"""
+	if quiet <= 0 or not paths:
+		return
+
+	def fingerprint() -> tuple[tuple[str, int, int], ...]:
+		out: list[tuple[str, int, int]] = []
+		for path in paths:
+			try:
+				info: os.stat_result = path.stat()
+				out.append((str(path), info.st_mtime_ns, info.st_size))
+			except OSError:
+				out.append((str(path), -1, -1))
+		return tuple(out)
+
+	started: float = time.monotonic()
+	last: tuple[tuple[str, int, int], ...] = fingerprint()
+	newest: float = max((m / 1e9 for _p, m, _s in last if m > 0), default=0.0)
+	changed_at: float = started - max(0.0, time.time() - newest)
+	while True:
+		now: float = time.monotonic()
+		if now - changed_at >= quiet:
+			return
+		if now - started >= limit:
+			Log.warn(f"files still changing after {limit}s; pushing anyway")
+			return
+		time.sleep(min(1.0, quiet - (now - changed_at)))
+		current: tuple[tuple[str, int, int], ...] = fingerprint()
+		if current != last:
+			last = current
+			changed_at = time.monotonic()
+			Log.info("SavedVariables changed; waiting for them to settle")
+
+
+def venture_lock(path: Path, timeout: int) -> Any:
+	"""
+	Take an exclusive lock so overlapping triggers (the path unit, the
+	timer, a push by hand) run one after another instead of side by side.
+	Waits up to `timeout` seconds; the caller keeps the returned file open.
+	"""
+	path.parent.mkdir(parents=True, exist_ok=True)
+	handle: Any = open(path, "a+", encoding="utf-8")
+	deadline: float = time.monotonic() + max(timeout, 0)
+	while True:
+		try:
+			fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+			return handle
+		except BlockingIOError:
+			if time.monotonic() >= deadline:
+				handle.close()
+				raise TsmctlError(f"another push still holds {path} after {timeout}s")
+			time.sleep(1.0)
+
+
+def venture_state_path(settings: Settings, base_url: str) -> Path:
+	"""Where --if-changed remembers the last body pushed to this server, source and organization."""
+	tag: str = hashlib.sha256(f"{base_url}|{settings.venture_source}|{settings.venture_organization}".encode("utf-8")).hexdigest()[:16]
+	return settings.cache_dir / "venture" / f"last-push-{tag}.sha256"
+
+
+def venture_run_section(doc: Doc, run: Any) -> None:
+	"""The run VENTURE recorded for a push (`--wait`)."""
+	if not isinstance(run, dict):
+		doc.section("Run").text("the run was not recorded (VENTURE kept no run record for it)")
+		return
+	section: Section = doc.section("Run")
+	pairs: list[tuple[str, Any, str]] = []
+	for key, label, kind in (("id", "Run", "int"), ("status", "Status", "str"), ("trigger", "Trigger", "str"), ("started_at", "Started", "str"), ("finished_at", "Finished", "str"), ("rows", "Rows written", "int"), ("new_instruments", "New instruments", "int"), ("refused", "Refused", "int"), ("error", "Error", "str")):
+		if run.get(key) not in (None, ""):
+			pairs.append((label, run[key], kind))
+	section.kv(pairs)
+	for note in str(run.get("notes") or "").splitlines():
+		if note.strip():
+			section.text(f"- {note.strip()}")
+
+
+def cmd_venture(ctx: Context) -> Optional[Doc]:
+	action: str = (ctx.args.action or "").lower()
+	if action == "push":
+		return venture_push(ctx)
+	if action == "status":
+		return venture_status(ctx)
+	raise TsmctlError("venture takes: push or status")
+
+
+def venture_push(ctx: Context) -> Doc:
+	"""
+	`tsmctl venture push`: export and POST it to /api/v1/feeds/<source>/push.
+	Steps: lock, settle (local installs), export into a spooled buffer while
+	checking it against the contract, skip when --if-changed and the body is
+	what was last pushed, POST (with ?wait=1 on --wait), report the answer.
+	"""
+	args: argparse.Namespace = ctx.args
+	settings: Settings = ctx.settings
+	base_url: str = venture_base_url(settings.venture_url, bool(getattr(args, "allow_http", False)))
+	if not settings.venture_source:
+		raise TsmctlError("no data source: give --source ID, $TSMCTL_VENTURE_SOURCE or venture_source in the config")
+	token, where = venture_token(settings)
+	lock: Any = venture_lock(settings.cache_dir / "venture" / "push.lock", int(getattr(args, "lock_timeout", None) or DEFAULT_VENTURE_LOCK_TIMEOUT))
+	try:
+		settle: int = parse_duration(args.settle, "s") if getattr(args, "settle", None) else 0
+		if settle:
+			if ctx.source.remote:
+				Log.info("--settle only applies to a local install; reading the remote mirror now")
+			else:
+				venture_settle(venture_watch_files(ctx), settle)
+		exporter: VentureExport = venture_export_from_context(ctx)
+		check: VentureCheck = VentureCheck(exporter.currency)
+		doc: Doc = Doc("tsmctl venture push", "venture_push")
+		with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as buffer:
+			size: int = exporter.write(buffer, check)
+			if not check.ok:
+				venture_summary(doc, exporter, check, size)
+				raise TsmctlError(f"not pushing: the export breaks VENTURE's protocol in {len(check.problems)} place(s) (see `tsmctl export --check`)")
+			buffer.seek(0)
+			digest: Any = hashlib.sha256()
+			for chunk in iter(lambda: buffer.read(1 << 20), b""):
+				digest.update(chunk)
+			body_sha: str = digest.hexdigest()
+			state: Path = venture_state_path(settings, base_url)
+			if getattr(args, "if_changed", False):
+				try:
+					previous: str = state.read_text(encoding="utf-8").strip()
+				except OSError:
+					previous = ""
+				if previous == body_sha:
+					doc.section("Push").kv([("Server", base_url, "str"), ("Source", settings.venture_source, "str"), ("Result", "unchanged since the last push; nothing sent", "str")])
+					return doc
+			buffer.seek(0)
+			query: dict[str, str] = {}
+			if getattr(args, "wait", False):
+				query["wait"] = "1"
+			if settings.venture_organization:
+				query["organization_id"] = settings.venture_organization
+			client: VentureClient = VentureClient(base_url, token, VENTURE_WAIT_TIMEOUT if query.get("wait") else VENTURE_PUSH_TIMEOUT)
+			status, payload = client.request("POST", f"/api/v1/feeds/{settings.venture_source}/push", query, buffer, size, "application/x-ndjson")
+		section: Section = doc.section("Push")
+		pairs: list[tuple[str, Any, str]] = [
+			("Server", base_url, "str"), ("Source", settings.venture_source, "str"), ("Token", where, "str"),
+			("Lines", sum(check.counts.values()), "int"), ("Bytes", size, "int"), ("HTTP status", status, "int"),
+		]
+		if status >= 300:
+			pairs.append(("Refused", venture_error_text(status, payload), "str"))
+			section.kv(pairs)
+			ctx.exit_code = EXIT_REFUSED
+			print(f"{PROG}: error: VENTURE refused the push (HTTP {status}): {venture_error_text(status, payload)}", file=sys.stderr)
+			return doc
+		payload = payload if isinstance(payload, dict) else {}
+		pairs.append(("Answer", str(payload.get("status") or "?"), "str"))
+		pairs.append(("Push id", str(payload.get("push_id") or "-"), "str"))
+		if payload.get("note"):
+			pairs.append(("Note", str(payload["note"]), "str"))
+		section.kv(pairs)
+		for reason, count in sorted(exporter.skipped.items()):
+			section.text(f"- left out {count}: {reason}")
+		if getattr(args, "wait", False):
+			if payload.get("status") != "finished":
+				ctx.exit_code = EXIT_RUN_UNCONFIRMED
+			else:
+				run: Any = payload.get("run")
+				venture_run_section(doc, run)
+				run_status: str = str(run.get("status")) if isinstance(run, dict) else ""
+				if run_status == "failed":
+					ctx.exit_code = EXIT_RUN_FAILED
+				elif run_status != "ok":
+					ctx.exit_code = EXIT_RUN_UNCONFIRMED
+		# Remembered for --if-changed only once VENTURE took it: a refused,
+		# failed or unconfirmed push is sent again next time.
+		if ctx.exit_code == 0:
+			state.parent.mkdir(parents=True, exist_ok=True)
+			state.write_text(body_sha + "\n", encoding="utf-8")
+		return doc
+	finally:
+		lock.close()
+
+
+def venture_status(ctx: Context) -> Doc:
+	"""
+	`tsmctl venture status`: the push settings (never the token itself), the
+	server's health (GET /api/v1/health, no credentials) and the source's
+	newest runs (GET /api/v1/feeds/<source>/runs).
+	"""
+	args: argparse.Namespace = ctx.args
+	settings: Settings = ctx.settings
+	doc: Doc = Doc("tsmctl venture status", "venture_status")
+	token, where = venture_token(settings, required=False)
+	settings_section: Section = doc.section("Settings")
+	settings_section.kv([
+		("Server", settings.venture_url or "(not set)", "str"),
+		("Data source", settings.venture_source or "(not set)", "str"),
+		("Organization", settings.venture_organization or "(the token's default)", "str"),
+		("Currency", settings.venture_currency, "str"),
+		("Market scope", settings.venture_market, "str"),
+		("Token", where, "str"),
+	])
+	if not settings.venture_url:
+		return doc
+	base_url: str = venture_base_url(settings.venture_url, bool(getattr(args, "allow_http", False)))
+	client: VentureClient = VentureClient(base_url, token, VENTURE_PUSH_TIMEOUT)
+	try:
+		status, health = client.request("GET", "/api/v1/health", auth=False)
+	except VentureUnreachable as exc:
+		doc.section("Server").kv([("Reachable", "no", "str"), ("Error", str(exc), "str")])
+		ctx.exit_code = EXIT_UNREACHABLE
+		return doc
+	server_pairs: list[tuple[str, Any, str]] = [("Reachable", "yes" if status == 200 else f"HTTP {status}", "str")]
+	if isinstance(health, dict):
+		for key in ("status", "version"):
+			if health.get(key) is not None:
+				server_pairs.append((key.title(), str(health[key]), "str"))
+	doc.section("Server").kv(server_pairs)
+	state: Path = venture_state_path(settings, base_url)
+	if state.exists():
+		doc.sections[-1].kv([("Last push from here", fmt_time(state.stat().st_mtime), "str")])
+	if not settings.venture_source or token is None:
+		return doc
+	query: dict[str, str] = {"count": str(max(1, min(int(getattr(args, "runs", None) or 10), 500)))}
+	if settings.venture_organization:
+		query["organization_id"] = settings.venture_organization
+	status, payload = client.request("GET", f"/api/v1/feeds/{settings.venture_source}/runs", query)
+	if status != 200:
+		doc.section("Runs").text(f"cannot list runs: {venture_error_text(status, payload)}")
+		ctx.exit_code = EXIT_REFUSED
+		return doc
+	rows: list[dict[str, Any]] = []
+	for run in (payload.get("runs") if isinstance(payload, dict) else None) or []:
+		if isinstance(run, dict):
+			rows.append({
+				"id": run.get("id"), "trigger": run.get("trigger"), "status": run.get("status"),
+				"started": run.get("started_at"), "rows": run.get("rows"), "refused": run.get("refused"),
+				"error": (str(run.get("error") or "")[:120]) or None,
+			})
+	table: Table = Table([
+		Column("id", "Run", "int"), Column("trigger", "Trigger"), Column("status", "Status"), Column("started", "Started"),
+		Column("rows", "Rows", "int"), Column("refused", "Refused", "int"), Column("error", "Error", max_width=60),
+	], rows, title="Newest runs", empty="no runs yet")
+	doc.section("Runs").table(table)
+	doc.main = table
+	return doc
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -6283,6 +7921,8 @@ commands:
   networth                     gold + goods + posted auctions (--by realm|char|location)
   deals                        scan a realm's last AuctionDB snapshot for buys
   report                       the whole business: summary, P&L, products, flips, stock, gold
+  export --format venture      everything as VENTURE JSON lines (--file PATH, --check, --market)
+  venture push|status          push the export to a VENTURE data source, show its runs
   paths | config [view|sample] where things are and the effective settings
 
 output:
@@ -6324,6 +7964,12 @@ examples:
   tsmctl deals --realm "Moon Guard" --max-pct 60 --min-profit 100g --min-sale-rate 0.1
   tsmctl get prices 113355 --realm thorium
   tsmctl --host mob-zach --refresh status
+  tsmctl export --format venture > wow.jsonl
+  tsmctl export --check
+  tsmctl export --since 7d --market none --file /tmp/ledger.jsonl
+  tsmctl venture push --url https://venture.example --source 12 --wait
+  tsmctl venture push --settle 20s --if-changed
+  tsmctl venture status
   tsmctl -o json get chars | yq -P '.sections[0].tables[0].rows'
 
 time values (--since/--until): 12h 7d 2w 3m 1y today yesterday week month ytd all,
@@ -6338,8 +7984,14 @@ data sources: TradeSkillMaster.lua (TSM), Altoholic's DataStore*.lua and Syndica
   optional and detected per account; --sources or `sources:` picks some. Where they overlap
   the freshest dated copy wins, with TSM > DataStore > Syndicator within 5 minutes.
 
+venture: the API token comes from $TSMCTL_VENTURE_TOKEN, the token file (venture_token_file,
+  default ~/.config/tsmctl/venture-token, must be chmod 600) or $VENTURE_TOKEN -- never argv.
+  venture exit codes: 0 ok, 1 local error, 2 usage, 3 server unreachable, 4 push refused
+  (HTTP error), 5 --wait: the run failed, 6 --wait: the run was partial or not confirmed.
+
 read-only: tsmctl never writes to the WoW/TSM files. Remote hosts are only asked to
-  run find and tar c; only --save writes, and only into the notes repo or the path given.
+  run find and tar c; besides the cache, only --save and export --file write,
+  and only where they say.
 """
 
 
@@ -6393,6 +8045,12 @@ def add_common_options(parser: argparse.ArgumentParser, suppress: bool) -> None:
 	out.add_argument("--ids", action="store_true", default=d(False), help="show item strings next to names")
 	out.add_argument("-v", "--verbose", action="count", default=d(0), help="more logging to stderr (-vv for debug)")
 	out.add_argument("-q", "--quiet", action="store_true", default=d(False), help="suppress warnings")
+
+
+def add_venture_options(parser: argparse.ArgumentParser) -> None:
+	"""Options shared by `export` and `venture`."""
+	parser.add_argument("--currency", metavar="CODE", help=f"the VENTURE data source's currency, exponent 4 (default {DEFAULT_VENTURE_CURRENCY}; config venture_currency)")
+	parser.add_argument("--market", metavar="SCOPE", help="AuctionDB figures to include: scope (default: items you hold, post, mail or traded, and TSM group items), all, none")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6470,6 +8128,50 @@ def build_parser() -> argparse.ArgumentParser:
 	attention.add_argument("--mail-expiring", metavar="DURATION", help=f"mail expiring within this is urgent (default {DEFAULT_MAIL_WINDOW}; bare number = days)")
 	attention.add_argument("--stale", metavar="DURATION", help=f"characters not seen for longer than this (default {DEFAULT_STALE_AFTER}; bare number = days)")
 
+	export: argparse.ArgumentParser = sub("export", "everything as VENTURE JSON lines (stdout, or --file)", cmd_export)
+	export.add_argument("--format", default="venture", metavar="FMT", help="output format; venture (the only one: VENTURE's JSON-lines protocol 1)")
+	export.add_argument("--file", metavar="PATH", help="write to PATH (mode 0600, replaced atomically) instead of stdout; - is stdout")
+	export.add_argument("--check", action="store_true", help="write nothing; validate the export against VENTURE's contract and report counts per type")
+	add_venture_options(export)
+
+	venture: argparse.ArgumentParser = sub("venture", "push to a VENTURE server or show its state", cmd_venture)
+	venture.add_argument("action", help="push or status")
+	venture.add_argument("--url", metavar="URL", help="VENTURE server, e.g. https://venture.example (config venture_url, $TSMCTL_VENTURE_URL)")
+	venture.add_argument("--organization", metavar="ID", help="organization id the data source belongs to (config venture_organization)")
+	venture.add_argument("--wait", action="store_true", help="push: wait (up to 120 s) for VENTURE to apply it and print the run")
+	venture.add_argument("--settle", metavar="DURATION", help="push: first wait until the SavedVariables have not changed for this long (20s)")
+	venture.add_argument("--if-changed", action="store_true", help="push: send nothing when the export is byte-for-byte the last one pushed")
+	venture.add_argument("--lock-timeout", type=int, metavar="SECONDS", help=f"push: how long to wait for another push to finish (default {DEFAULT_VENTURE_LOCK_TIMEOUT})")
+	venture.add_argument("--allow-http", action="store_true", help="allow a plain-http server that is not this machine (the token would cross the network unencrypted)")
+	venture.add_argument("--runs", type=int, metavar="N", help="status: how many recent runs to list (default 10)")
+	add_venture_options(venture)
+	venture.epilog = """\
+actions:
+  push            export and POST to /api/v1/feeds/<source>/push (application/x-ndjson)
+  status          settings, server health and the data source's newest runs
+
+here --source ID is the VENTURE data source (provider push, currency GOLD with
+exponent 4), not the ledger-source filter it is for other commands.
+
+token: $TSMCTL_VENTURE_TOKEN, else the token file (venture_token_file, default
+~/.config/tsmctl/venture-token, chmod 600), else $VENTURE_TOKEN. Never argv.
+
+exit codes: 0 ok, 1 local error, 2 usage, 3 server unreachable, 4 refused (HTTP
+error), 5 --wait: the run failed, 6 --wait: the run was partial or not confirmed.
+
+examples:
+  tsmctl venture push --url https://venture.example --source 12 --wait
+  tsmctl venture push --settle 20s --if-changed --wait
+  tsmctl venture status --runs 5
+"""
+	export.epilog = """\
+examples:
+  tsmctl export --format venture > wow.jsonl
+  tsmctl export --check
+  tsmctl export --since 7d --market none --file /tmp/ledger.jsonl
+  tsmctl export --market all --currency GOLD | gzip > full.jsonl.gz
+"""
+
 	report: argparse.ArgumentParser = sub("report", "full business report", cmd_report)
 	report.add_argument("--top", type=int, metavar="N", help="rows per section (default 15)")
 	report.add_argument("--sections", action="append", metavar="LIST", help=f"only these sections: {', '.join(REPORT_SECTIONS)}")
@@ -6486,6 +8188,7 @@ def normalize_args(args: argparse.Namespace) -> None:
 		"include_internal": False, "variants": False, "output": None, "save": None, "force": False,
 		"no_index": False, "limit": None, "sort": None, "reverse": False, "money": None, "price_source": None, "market_source": None,
 		"ah_cut": None, "color": None, "no_links": False, "ids": False, "verbose": 0, "quiet": False,
+		"url": None, "organization": None, "currency": None, "market": None,
 	}
 	for key, value in defaults.items():
 		if not hasattr(args, key):
@@ -6499,6 +8202,11 @@ def normalize_args(args: argparse.Namespace) -> None:
 	args.output_format = output
 	args.wide = wide
 	args.default_realm = None
+	# `--source` is the ledger-source filter everywhere else; for `venture`
+	# it is the VENTURE data source id (the contract's `--source ID`).
+	args.venture_source_id = None
+	if getattr(args, "command", None) == "venture" and args.source:
+		args.venture_source_id = str(args.source[-1])
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -6516,7 +8224,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 		Log.quiet = bool(args.quiet)
 		settings: Settings = build_settings(args)
 		ctx: Context = Context(args, settings)
-		doc: Doc = args.func(ctx)
+		doc: Optional[Doc] = args.func(ctx)
+		if doc is None:
+			# The command wrote its own output (export).
+			return ctx.exit_code
 
 		# Render. Colour only for text on a terminal unless forced.
 		color: bool = settings.color == "always" or (settings.color == "auto" and args.output_format == "text" and args.save is None and sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
@@ -6533,10 +8244,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 		else:
 			sys.stdout.write(body)
 			sys.stdout.flush()
-		return 0
+		return ctx.exit_code
 	except TsmctlError as exc:
 		print(f"{PROG}: error: {exc}", file=sys.stderr)
-		return 1
+		return int(getattr(exc, "exit_code", 1))
 	except BrokenPipeError:
 		# Output piped into head/less that exited early.
 		devnull: int = os.open(os.devnull, os.O_WRONLY)

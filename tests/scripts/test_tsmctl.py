@@ -23,15 +23,20 @@ network or user data required.
 """
 
 import hashlib
+import http.server
 import importlib.machinery
 import io
 import importlib.util
 import json
 import os
+import re
+import shutil
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1039,6 +1044,586 @@ class OptionalSourceCliTests(unittest.TestCase):
 	def test_zz_wow_files_untouched(self) -> None:
 		self.assertEqual(tree_digest(self.wow), self.digests["wow"], "tsmctl must never modify SavedVariables")
 		self.assertEqual(tree_digest(self.edge), self.digests["edge"], "tsmctl must never modify SavedVariables")
+
+
+# ============================================================================
+# VENTURE: export contract, stable ids, push, units
+# ============================================================================
+
+DECIMAL_RE: Any = re.compile(r"^[0-9]+(\.[0-9]{1,4})?$")
+ZONED_RE: Any = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+STRICT: dict[str, set[str]] = {
+	"account": {"type", "key", "name", "kind", "group", "venue", "last_seen", "attrs"},
+	"account_snapshot": {"type", "account", "at", "covers"},
+	"balance": {"type", "account", "currency", "amount", "at"},
+	"holding": {"type", "account", "place", "instrument", "quantity", "at"},
+	"position": {"type", "account", "venue", "id", "instrument", "quantity", "price", "bid", "expires_at", "posted_at"},
+	"inbound": {"type", "account", "id", "sender", "subject", "money", "instrument", "quantity", "expires_at", "returned", "cod"},
+	"txn": {"type", "id", "account", "venue", "kind", "instrument", "quantity", "unit_price", "amount", "counterparty", "source", "at"},
+}
+REQUIRED: dict[str, set[str]] = {
+	"venue": {"key"}, "instrument": {"key"}, "snapshot": {"venue", "taken_at"}, "stat": {"venue", "instrument"},
+	"account": {"key", "kind"}, "account_snapshot": {"account", "at", "covers"}, "balance": {"account", "currency", "amount"},
+	"holding": {"account", "place", "instrument", "quantity"},
+	"position": {"account", "venue", "id", "instrument", "quantity", "price", "expires_at"},
+	"inbound": {"account", "id"}, "txn": {"id", "account", "kind", "at"},
+}
+MONEY_MEMBERS: set[str] = {"amount", "price", "bid", "money", "cod", "unit_price", "min", "market", "mean", "median", "sale_avg", "historical"}
+TIME_MEMBERS: set[str] = {"at", "last_seen", "expires_at", "posted_at", "taken_at"}
+PLACES: set[str] = {"bag", "bank", "reagent_bank", "warbank", "guild", "mail", "auction", "void", "equipped", "currency", "other"}
+COVER_OF: dict[str, str] = {"balance": "balances", "holding": "holdings", "position": "positions", "inbound": "inbound"}
+
+
+def contract_problems(text: str, currency: str = "GOLD") -> list[str]:
+	"""
+	An independent reading of VENTURE's protocol-1 rules (docs/plugins.org,
+	src/plugin/venture-jsonl.c and the feed batch), so the export is checked
+	by something other than tsmctl's own checker. Returns the problems.
+	"""
+	problems: list[str] = []
+	snapshotted: set[str] = set()
+	rows_before: dict[str, set[str]] = {}
+	ids: dict[str, set[str]] = {}
+	for number, line in enumerate(text.splitlines(), 1):
+		obj: dict[str, Any] = json.loads(line)
+		kind: str = obj.get("type", "")
+		where: str = f"line {number} ({kind})"
+		if kind not in REQUIRED:
+			problems.append(f"{where}: unexpected type")
+			continue
+		if kind in STRICT and set(obj) - STRICT[kind]:
+			problems.append(f"{where}: unknown members {sorted(set(obj) - STRICT[kind])}")
+		missing: set[str] = REQUIRED[kind] - set(obj)
+		if missing:
+			problems.append(f"{where}: missing {sorted(missing)}")
+		for name, value in obj.items():
+			if name in MONEY_MEMBERS and not (isinstance(value, str) and DECIMAL_RE.match(value)):
+				problems.append(f"{where}: {name} is not a decimal string with at most 4 places: {value!r}")
+			if name in TIME_MEMBERS and not (isinstance(value, str) and ZONED_RE.match(value)):
+				problems.append(f"{where}: {name} is not a zoned time: {value!r}")
+			if name in ("quantity", "listings") and (isinstance(value, bool) or not isinstance(value, int)):
+				problems.append(f"{where}: {name} is not an integer")
+			if isinstance(value, str) and len(value.encode("utf-8")) > 512:
+				problems.append(f"{where}: {name} longer than 512 bytes")
+		if kind == "account":
+			if obj.get("kind") not in ("character", "shared", "guild", "other"):
+				problems.append(f"{where}: bad account kind")
+			attrs: Any = obj.get("attrs", {})
+			if not isinstance(attrs, dict) or any(isinstance(v, (dict, list)) for v in attrs.values()) or len(attrs) > 64:
+				problems.append(f"{where}: attrs not a flat object")
+		elif kind == "account_snapshot":
+			account: str = obj["account"]
+			covers: list[str] = obj["covers"]
+			if not covers or len(set(covers)) != len(covers) or set(covers) - {"holdings", "positions", "inbound", "balances"}:
+				problems.append(f"{where}: bad covers {covers}")
+			if account in snapshotted:
+				problems.append(f"{where}: second snapshot for {account}")
+			if rows_before.get(account, set()) & set(covers):
+				problems.append(f"{where}: snapshot after the rows it covers")
+			snapshotted.add(account)
+		elif kind in COVER_OF:
+			rows_before.setdefault(obj["account"], set()).add(COVER_OF[kind])
+			if kind == "balance" and obj["currency"].upper() != currency:
+				problems.append(f"{where}: balance in {obj['currency']}")
+			if kind == "holding" and (obj["place"] not in PLACES or obj["quantity"] < 0):
+				problems.append(f"{where}: bad place or quantity")
+			if kind == "position" and obj["quantity"] < 1:
+				problems.append(f"{where}: position quantity below 1")
+			if kind == "inbound":
+				if not ({"money", "instrument", "cod"} & set(obj)):
+					problems.append(f"{where}: nothing to collect")
+				if ("instrument" in obj) != ("quantity" in obj):
+					problems.append(f"{where}: instrument without quantity")
+				if "returned" in obj and not isinstance(obj["returned"], bool):
+					problems.append(f"{where}: returned not a boolean")
+		elif kind == "txn":
+			goods: bool = obj["kind"] in ("sale", "buy", "expired", "cancelled")
+			if obj["kind"] not in ("sale", "buy", "income", "expense", "expired", "cancelled"):
+				problems.append(f"{where}: bad txn kind")
+			if goods and not ({"instrument", "quantity"} <= set(obj)):
+				problems.append(f"{where}: {obj['kind']} without instrument and quantity")
+			if obj["kind"] in ("expired", "cancelled") and ({"amount", "unit_price"} & set(obj)):
+				problems.append(f"{where}: {obj['kind']} carries money")
+			if obj["kind"] in ("sale", "buy", "income", "expense") and "amount" not in obj:
+				problems.append(f"{where}: no amount")
+		elif kind == "stat":
+			figures: set[str] = {"min", "market", "mean", "median", "sale_avg", "historical", "quantity", "listings", "sold", "sale_rate", "sold_per_day"}
+			if not (figures & set(obj)):
+				problems.append(f"{where}: stat without a figure")
+			if "sale_rate" in obj and not (DECIMAL_RE.match(obj["sale_rate"]) and float(obj["sale_rate"]) <= 1):
+				problems.append(f"{where}: sale_rate out of 0..1")
+		elif kind == "snapshot" and not isinstance(obj.get("complete", False), bool):
+			problems.append(f"{where}: complete not a boolean")
+		if kind in ("position", "inbound", "txn"):
+			seen: set[str] = ids.setdefault(kind, set())
+			if obj.get("id") in seen:
+				problems.append(f"{where}: repeated id")
+			seen.add(obj.get("id"))
+	return problems
+
+
+def parse_lines(text: str) -> list[dict[str, Any]]:
+	return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+class VentureUnitTests(unittest.TestCase):
+	"""Key mapping, money and slugs."""
+
+	def test_blizzard_key_mapping(self) -> None:
+		key: Any = tsmctl.venture_item_key
+		self.assertEqual(key("i:2770").key, "2770", "a plain item is its id")
+		mapped: Any = key("i:9944::3:6655:1692:1692")
+		self.assertEqual((mapped.key, mapped.parent), ("9944:b1692,6655", "9944"), "bonuses sorted ascending, repeats dropped, parent is the plain item")
+		self.assertEqual(key("i:133358::2:7756:13828:1:9:70").key, "133358:b7756,13828", "TSM modifier pairs never reach the key")
+		self.assertEqual(key("i:133358::2:7756:13828:1:9:70").modifiers, "9=70")
+		level: Any = key("i:1420::i13")
+		self.assertEqual((level.key, level.level), ("1420", "13"), "TSM's level-only form drops to the plain item, the level kept for attrs")
+		pet: Any = key("p:1720:25:3")
+		self.assertEqual((pet.key, pet.parent, pet.species), ("82800:p1720", "82800", 1720))
+		self.assertEqual(key("p:1720:i1").key, "82800:p1720")
+		for bad in ("", "x:1", "i:", "i:abc", "i:0"):
+			self.assertIsNone(key(bad), bad)
+
+	def test_money_and_ratios(self) -> None:
+		self.assertEqual(tsmctl.venture_money(27249501812), "2724950.1812")
+		self.assertEqual(tsmctl.venture_money(1000000), "100")
+		self.assertEqual(tsmctl.venture_money(50), "0.005")
+		self.assertEqual(tsmctl.venture_money(0), "0")
+		with self.assertRaises(ValueError):
+			tsmctl.venture_money(-1)
+		self.assertEqual(tsmctl.venture_milli(300), "0.3")
+		self.assertEqual(tsmctl.venture_milli(5500), "5.5")
+		self.assertEqual(tsmctl.venture_milli(1000), "1")
+		self.assertEqual(tsmctl.venture_time(0), "1970-01-01T00:00:00Z")
+
+	def test_realm_slug(self) -> None:
+		self.assertEqual(tsmctl.realm_slug("Thorium Brotherhood"), "thorium-brotherhood")
+		self.assertEqual(tsmctl.realm_slug("Mal'Ganis"), "malganis")
+		self.assertEqual(tsmctl.realm_slug("Area 52"), "area-52")
+
+	def test_txn_identity_ignores_quantity(self) -> None:
+		a: Any = tsmctl.Txn(kind="sale", realm="R", account="A", time=5, player="P", item="i:1", stack=1, qty=3, price=10, raw_time=5)
+		b: Any = tsmctl.Txn(kind="sale", realm="R", account="B", time=9, player="P", item="i:1", stack=1, qty=7, price=10, raw_time=5)
+		self.assertEqual(a.identity, b.identity, "quantity, account and the clamped time are not part of a row's identity")
+		self.assertNotEqual(a.identity, tsmctl.Txn(kind="sale", realm="R", account="A", time=5, player="P", item="i:1", stack=1, qty=3, price=10, raw_time=5, occurrence=1).identity)
+
+	def test_settle_waits_for_quiet(self) -> None:
+		with tempfile.TemporaryDirectory(prefix="tsmctl-settle-") as temp:
+			path: Path = Path(temp) / "TradeSkillMaster.lua"
+			path.write_text("x", encoding="utf-8")
+			old: float = time.time() - 600
+			os.utime(path, (old, old))
+			started: float = time.monotonic()
+			tsmctl.venture_settle([path], 5)
+			self.assertLess(time.monotonic() - started, 1.0, "files untouched for ten minutes are already settled")
+			os.utime(path, None)
+			started = time.monotonic()
+			tsmctl.venture_settle([path], 1)
+			self.assertGreaterEqual(time.monotonic() - started, 0.9, "a file written just now is waited on")
+
+	def test_contract_check_catches_breakage(self) -> None:
+		"""tsmctl's own checker refuses what VENTURE refuses (it gates every push)."""
+		check: Any = tsmctl.VentureCheck("GOLD")
+		lines: list[str] = [
+			'{"protocol":1}',
+			'{"type":"holding","account":"A","place":"bag","instrument":"1","quantity":1}',
+			'{"type":"account_snapshot","account":"A","at":"2026-10-04T00:00:00Z","covers":["holdings"]}',
+			'{"type":"account_snapshot","account":"A","at":"2026-10-04T00:00:00Z","covers":["balances"]}',
+			'{"type":"balance","account":"A","currency":"USD","amount":"1.23456"}',
+			'{"type":"position","account":"A","venue":"v","id":"1","instrument":"1","quantity":1,"price":12.5,"expiry":"2026-10-04T00:00:00Z"}',
+			'{"type":"txn","id":"t","account":"A","kind":"expired","instrument":"1","quantity":1,"amount":"5","at":"2026-10-04 00:00"}',
+			'{"type":"inbound","account":"A","id":"m","sender":"x"}',
+		]
+		for number, line in enumerate(lines, 1):
+			check.line(number, line)
+		text: str = "\n".join(check.problems)
+		for expected in ("line 1", "comes after", "second snapshot", "currency must be", "more than 4 decimal", "unknown member 'expiry'", "price must be a decimal", "expires_at is required", "carries no money", "with a zone", "nothing to collect"):
+			self.assertIn(expected, text)
+
+
+class VentureExportTests(unittest.TestCase):
+	"""`tsmctl export --format venture` against both synthetic installs."""
+
+	@classmethod
+	def setUpClass(cls) -> None:
+		cls.temp: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(prefix="tsmctl-venture-")
+		cls.base: Path = Path(cls.temp.name)
+		cls.ops: Path = cls.base / "ops"
+		cls.tsm: Path = cls.base / "tsm"
+		write_ops_fixture(cls.ops)
+		write_fixture(cls.tsm)
+		cls.digests: dict[str, str] = {"ops": tree_digest(cls.ops), "tsm": tree_digest(cls.tsm)}
+		cls.env: dict[str, str] = {**os.environ, "HOME": str(cls.base), "XDG_CACHE_HOME": str(cls.base / "cache"), "XDG_CONFIG_HOME": str(cls.base / "config"), "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+		for name in ("TSMCTL_HOST", "TSMCTL_CONFIG", "TSMCTL_WOW_DIR", "TSM_WOW_DIR", "TSMCTL_REALM", "TSMCTL_SOURCES", "TSMCTL_VENTURE_TOKEN", "VENTURE_TOKEN", "TSMCTL_VENTURE_URL", "TSMCTL_VENTURE_SOURCE"):
+			cls.env.pop(name, None)
+
+	@classmethod
+	def tearDownClass(cls) -> None:
+		cls.temp.cleanup()
+
+	def run_cli(self, wow: Path, *args: str, check: bool = True, env: Any = None) -> subprocess.CompletedProcess[str]:
+		cmd: list[str] = [sys.executable, str(SCRIPT), "--no-config", "--local", "--wow-dir", str(wow), *args]
+		proc: subprocess.CompletedProcess[str] = subprocess.run(cmd, capture_output=True, text=True, env=env or self.env, timeout=120)
+		if check:
+			self.assertEqual(proc.returncode, 0, msg=f"{args}: {proc.stderr}")
+			self.assertNotIn("Traceback", proc.stderr)
+		return proc
+
+	def export(self, wow: Path, *args: str) -> str:
+		return self.run_cli(wow, "-q", "export", "--format", "venture", *args).stdout
+
+	def test_every_line_meets_the_contract(self) -> None:
+		for wow, extra in ((self.ops, ()), (self.tsm, ()), (self.tsm, ("--market", "all")), (self.ops, ("--include-internal",))):
+			with self.subTest(wow=wow.name, extra=extra):
+				text: str = self.export(wow, *extra)
+				self.assertTrue(text.endswith("\n"))
+				self.assertEqual(contract_problems(text), [])
+				self.assertNotIn('"protocol"', text.splitlines()[0], "protocol 1 has no header line")
+
+	def test_ops_export_content(self) -> None:
+		lines: list[dict[str, Any]] = parse_lines(self.export(self.ops))
+		accounts: dict[str, dict[str, Any]] = {l["key"]: l for l in lines if l["type"] == "account"}
+		self.assertIn("Alpha-Testrealm", accounts)
+		alpha: dict[str, Any] = accounts["Alpha-Testrealm"]
+		self.assertEqual((alpha["kind"], alpha["venue"], alpha["group"]), ("character", "testrealm", "Testrealm"))
+		self.assertEqual((alpha["attrs"]["level"], alpha["attrs"]["login_account"], alpha["attrs"]["played_seconds"]), (80, "MAIN", 360000))
+		self.assertEqual(accounts["warbank:MAIN"]["kind"], "shared")
+		guilds: list[str] = [k for k, v in accounts.items() if v["kind"] == "guild"]
+		self.assertEqual(guilds, ["guild:Guildies-Testrealm"], "one guild seen from two connected realms is one account, named after its home realm")
+		balances: dict[str, str] = {l["account"]: l["amount"] for l in lines if l["type"] == "balance"}
+		self.assertEqual(balances["Alpha-Testrealm"], "1500", "15,000,000 copper is 1500 gold")
+		self.assertEqual(balances["warbank:MAIN"], "100")
+		positions: dict[str, dict[str, Any]] = {l["id"]: l for l in lines if l["type"] == "position"}
+		self.assertEqual(set(positions), {"111", "222", "333"}, "#444 is Syndicator-only and has no known buyout: left out, not invented")
+		self.assertEqual((positions["111"]["price"], positions["111"]["quantity"], positions["111"]["instrument"]), ("3", 2, "1001:b1692,6655"))
+		self.assertEqual(positions["222"]["bid"], "0.5")
+		inbound: list[dict[str, Any]] = [l for l in lines if l["type"] == "inbound"]
+		self.assertEqual({(l.get("money"), l.get("instrument"), l.get("quantity")) for l in inbound if l["account"] == "Alpha-Testrealm"}, {
+			("100", None, None), (None, "1002", 4), (None, "1001", 1),
+		}, "one line per item or money entry; the bare letter is left out")
+		self.assertEqual(len([l for l in inbound if l["account"] == "Alpha-Testrealm"]), 3)
+		holdings: dict[tuple[str, str, str], int] = {(l["account"], l["place"], l["instrument"]): l["quantity"] for l in lines if l["type"] == "holding"}
+		self.assertEqual(holdings[("Alpha-Testrealm", "currency", "currency:2032")], 1805)
+		self.assertEqual(holdings[("Alpha-Testrealm", "reagent_bank", "1005")], 1)
+		self.assertEqual(holdings[("Alpha-Testrealm", "bag", "82800:p1720")], 1)
+		instruments: dict[str, dict[str, Any]] = {l["key"]: l for l in lines if l["type"] == "instrument"}
+		self.assertEqual(instruments["currency:2032"]["name"], "Trader's Tender")
+		self.assertEqual(instruments["1001"]["attrs"]["vendor_sell"], 5000)
+		self.assertEqual(instruments["1001:b1692,6655"]["parent"], "1001")
+		order: list[str] = [l["key"] for l in lines if l["type"] == "instrument"]
+		self.assertLess(order.index("1001"), order.index("1001:b1692,6655"), "a plain item comes before its variants")
+
+	def test_coverage_is_only_claimed_with_detail_data(self) -> None:
+		def covers(text: str) -> dict[str, list[str]]:
+			return {l["account"]: l["covers"] for l in parse_lines(text) if l["type"] == "account_snapshot"}
+
+		full: dict[str, list[str]] = covers(self.export(self.ops))
+		self.assertEqual(full["Alpha-Testrealm"], ["holdings", "positions", "inbound", "balances"])
+		self.assertEqual(full["Beta-Testrealm"], ["holdings", "balances"], "Beta is TSM-only: no auction ids, no mailbox")
+		self.assertEqual(full["Delta-Linkedrealm"], ["holdings", "inbound", "balances"], "an empty mailbox that was read is still covered")
+		self.assertEqual(full["Gamma-Testrealm"], ["balances"])
+		self.assertEqual(full["Epsilon-Linkedrealm"], ["holdings", "positions", "inbound", "balances"])
+		tsm_only: dict[str, list[str]] = covers(self.export(self.ops, "--sources", "tsm"))
+		for account, kinds in tsm_only.items():
+			self.assertNotIn("positions", kinds, account)
+			self.assertNotIn("inbound", kinds, account)
+		lines: list[dict[str, Any]] = parse_lines(self.export(self.ops, "--sources", "tsm"))
+		self.assertFalse([l for l in lines if l["type"] in ("position", "inbound")])
+
+	def test_snapshot_at_is_the_files_time(self) -> None:
+		"""An export of older files must be older, so VENTURE skips it instead of rolling back."""
+		lines: list[dict[str, Any]] = parse_lines(self.export(self.ops))
+		newest: float = max(p.stat().st_mtime for p in (self.ops / "_retail_" / "WTF" / "Account" / "MAIN" / "SavedVariables").iterdir())
+		at: str = next(l["at"] for l in lines if l["type"] == "account_snapshot" and l["account"] == "Alpha-Testrealm")
+		self.assertEqual(at, tsmctl.venture_time(newest))
+
+	def test_ledger_lines_and_internal_transfers(self) -> None:
+		lines: list[dict[str, Any]] = parse_lines(self.export(self.tsm))
+		txns: list[dict[str, Any]] = [l for l in lines if l["type"] == "txn"]
+		self.assertEqual(sorted(t["kind"] for t in txns), ["buy", "expense", "expired", "sale", "sale", "sale"], "postage and the 500g to an alt are internal")
+		widget: dict[str, Any] = next(t for t in txns if t["kind"] == "sale" and t["instrument"] == "1001")
+		self.assertEqual((widget["quantity"], widget["unit_price"], widget["amount"], widget["counterparty"], widget["source"], widget["venue"]), (6, "2", "12", "Buyerone", "Auction", "testrealm"))
+		self.assertEqual(sum(1 for t in txns if t["kind"] == "sale" and t.get("instrument") == "1001"), 1, "account TWO's synced copy of the row is one row")
+		expired: dict[str, Any] = next(t for t in txns if t["kind"] == "expired")
+		self.assertNotIn("amount", expired)
+		internal: list[dict[str, Any]] = [l for l in parse_lines(self.export(self.tsm, "--include-internal")) if l["type"] == "txn"]
+		self.assertEqual(len(internal), len(txns) + 2)
+		recent: list[dict[str, Any]] = [l for l in parse_lines(self.export(self.tsm, "--since", "2h")) if l["type"] == "txn"]
+		self.assertLess(len(recent), len(txns))
+		self.assertTrue(recent)
+
+	def test_market_scope_and_stats(self) -> None:
+		lines: list[dict[str, Any]] = parse_lines(self.export(self.tsm))
+		stats: dict[tuple[str, str], dict[str, Any]] = {(l["venue"], l["instrument"]): l for l in lines if l["type"] == "stat"}
+		self.assertEqual(stats[("testrealm", "1001")]["min"], "1.5")
+		self.assertEqual(stats[("testrealm", "1001")]["market"], "2.5")
+		self.assertEqual(stats[("testrealm", "1001")]["listings"], 3)
+		region: dict[str, Any] = stats[("region-us", "1001")]
+		self.assertEqual((region["sale_avg"], region["sale_rate"], region["sold_per_day"], region["market"]), ("2.2", "0.3", "5.5", "2.4"))
+		self.assertNotIn(("testrealm", "1004"), stats, "an item nobody holds or traded is out of the default scope")
+		snapshots: list[dict[str, Any]] = [l for l in lines if l["type"] == "snapshot"]
+		self.assertTrue(snapshots and not any(s["complete"] for s in snapshots), "a scoped snapshot is a sample")
+		every: list[dict[str, Any]] = parse_lines(self.export(self.tsm, "--market", "all"))
+		self.assertIn(("testrealm", "1004"), {(l["venue"], l["instrument"]) for l in every if l["type"] == "stat"})
+		self.assertTrue(all(l["complete"] for l in every if l["type"] == "snapshot"))
+		none: list[dict[str, Any]] = parse_lines(self.export(self.tsm, "--market", "none"))
+		self.assertFalse([l for l in none if l["type"] in ("snapshot", "stat")])
+		venues: dict[str, dict[str, Any]] = {l["key"]: l for l in lines if l["type"] == "venue"}
+		self.assertEqual((venues["testrealm"]["group"], venues["region-us"]["group"]), ("us", "us"))
+
+	def test_deterministic_and_stable_ids(self) -> None:
+		first: str = self.export(self.tsm)
+		self.assertEqual(first, self.export(self.tsm), "the same files make the same bytes")
+
+	def test_txn_ids_survive_a_merge_that_grows_quantity(self) -> None:
+		with tempfile.TemporaryDirectory(prefix="tsmctl-merge-") as temp:
+			wow: Path = Path(temp) / "wow"
+			shutil.copytree(self.tsm, wow)
+			before: dict[str, dict[str, Any]] = {l["id"]: l for l in parse_lines(self.export(wow)) if l["type"] == "txn"}
+			# TSM merges a later identical sale into the row: quantity 6 -> 9.
+			for account in ("ONE", "TWO#1"):
+				path: Path = wow / "_retail_" / "WTF" / "Account" / account / "SavedVariables" / "TradeSkillMaster.lua"
+				text: str = path.read_text(encoding="utf-8")
+				path.write_text(text.replace("i:1001,3,6,20000,Buyerone", "i:1001,3,9,20000,Buyerone"), encoding="utf-8")
+			after: dict[str, dict[str, Any]] = {l["id"]: l for l in parse_lines(self.export(wow)) if l["type"] == "txn"}
+			self.assertEqual(set(before), set(after), "no id changes when a quantity grows")
+			# The row TSM dated in the future is dated at the file's save
+			# time, which the edit moved; its id stays. Compare the rest.
+			changed: list[str] = [i for i in before if {k: v for k, v in before[i].items() if k != "at"} != {k: v for k, v in after[i].items() if k != "at"}]
+			self.assertEqual(len(changed), 1)
+			self.assertEqual((before[changed[0]]["quantity"], after[changed[0]]["quantity"], after[changed[0]]["amount"]), (6, 9, "18"))
+			# Only one account's copy saw the merge: still one row, the larger.
+			path = wow / "_retail_" / "WTF" / "Account" / "TWO#1" / "SavedVariables" / "TradeSkillMaster.lua"
+			path.write_text(path.read_text(encoding="utf-8").replace("i:1001,3,9,20000,Buyerone", "i:1001,3,6,20000,Buyerone"), encoding="utf-8")
+			mixed: list[dict[str, Any]] = [l for l in parse_lines(self.export(wow)) if l["type"] == "txn" and l["id"] == changed[0]]
+			self.assertEqual([l["quantity"] for l in mixed], [9])
+
+	def test_check_mode_and_file_output(self) -> None:
+		doc: dict[str, Any] = json.loads(self.run_cli(self.ops, "-q", "-o", "json", "export", "--check").stdout)
+		values: dict[str, Any] = doc["sections"][0]["values"]
+		self.assertEqual(values["Contract check"], "ok")
+		counts: dict[str, int] = {r["type"]: r["lines"] for r in doc["sections"][0]["tables"][0]["rows"]}
+		self.assertEqual(counts["position"], 3)
+		target: Path = self.base / "out.jsonl"
+		self.run_cli(self.ops, "-q", "export", "--file", str(target))
+		self.assertEqual(target.stat().st_mode & 0o777, 0o600, "an export is private data")
+		self.assertEqual(contract_problems(target.read_text(encoding="utf-8")), [])
+		bad: subprocess.CompletedProcess[str] = self.run_cli(self.ops, "export", "--format", "csv", check=False)
+		self.assertEqual(bad.returncode, 1)
+
+	def test_zz_wow_files_untouched(self) -> None:
+		self.assertEqual(tree_digest(self.ops), self.digests["ops"])
+		self.assertEqual(tree_digest(self.tsm), self.digests["tsm"])
+
+
+class FakeVenture(object):
+	"""
+	A stand-in for VENTURE's push and runs endpoints on 127.0.0.1, recording
+	every request. `answers` maps a path prefix to (status, JSON body, extra
+	headers). While a request is in flight it scans every process's command
+	line for the token, which must never be there.
+	"""
+
+	def __init__(self, token: str):
+		self.token: str = token
+		self.requests: list[dict[str, Any]] = []
+		self.answers: dict[str, tuple[int, Any, dict[str, str]]] = {}
+		fake: FakeVenture = self
+
+		class Handler(http.server.BaseHTTPRequestHandler):
+			def log_message(self, *args: Any) -> None:
+				pass
+
+			def handle_any(self) -> None:
+				length: int = int(self.headers.get("Content-Length") or 0)
+				body: bytes = self.rfile.read(length) if length else b""
+				leaked: bool = False
+				for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+					try:
+						if fake.token.encode() in cmdline.read_bytes():
+							leaked = True
+					except OSError:
+						continue
+				fake.requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers), "body": body, "leaked": leaked})
+				status, payload, headers = next((v for k, v in fake.answers.items() if self.path.startswith(k)), (404, {"error": {"message": "no such route"}}, {}))
+				data: bytes = json.dumps(payload).encode()
+				self.send_response(status)
+				self.send_header("Content-Type", "application/json")
+				self.send_header("Content-Length", str(len(data)))
+				for name, value in headers.items():
+					self.send_header(name, value)
+				self.end_headers()
+				self.wfile.write(data)
+
+			do_GET = handle_any
+			do_POST = handle_any
+
+		self.server: http.server.ThreadingHTTPServer = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+		self.url: str = f"http://127.0.0.1:{self.server.server_address[1]}"
+		self.thread: threading.Thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+		self.thread.start()
+
+	def close(self) -> None:
+		self.server.shutdown()
+		self.server.server_close()
+
+
+class VenturePushTests(unittest.TestCase):
+	"""`tsmctl venture push|status` against a fake server."""
+
+	TOKEN: str = "vt_test_0123456789abcdef"
+
+	@classmethod
+	def setUpClass(cls) -> None:
+		cls.temp: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(prefix="tsmctl-push-")
+		cls.base: Path = Path(cls.temp.name)
+		cls.wow: Path = cls.base / "wow"
+		write_ops_fixture(cls.wow)
+
+	@classmethod
+	def tearDownClass(cls) -> None:
+		cls.temp.cleanup()
+
+	def setUp(self) -> None:
+		self.fake: FakeVenture = FakeVenture(self.TOKEN)
+		self.home: Path = Path(tempfile.mkdtemp(prefix="home-", dir=self.base))
+		self.env: dict[str, str] = {**os.environ, "HOME": str(self.home), "XDG_CACHE_HOME": str(self.home / "cache"), "XDG_CONFIG_HOME": str(self.home / "config"), "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1", "TSMCTL_VENTURE_TOKEN": self.TOKEN}
+		for name in ("TSMCTL_HOST", "TSMCTL_CONFIG", "TSMCTL_WOW_DIR", "TSM_WOW_DIR", "TSMCTL_SOURCES", "VENTURE_TOKEN", "TSMCTL_VENTURE_URL", "TSMCTL_VENTURE_SOURCE", "TSMCTL_VENTURE_TOKEN_FILE"):
+			self.env.pop(name, None)
+
+	def tearDown(self) -> None:
+		self.fake.close()
+
+	def push(self, *args: str, env: Any = None, url: Any = None) -> subprocess.CompletedProcess[str]:
+		cmd: list[str] = [sys.executable, str(SCRIPT), "--no-config", "--local", "--wow-dir", str(self.wow), "-q", "venture", "push", "--url", url or self.fake.url, "--source", "7", *args]
+		self.assertNotIn(self.TOKEN, " ".join(cmd))
+		return subprocess.run(cmd, capture_output=True, text=True, env=env or self.env, timeout=120)
+
+	def test_push_with_wait(self) -> None:
+		self.fake.answers["/api/v1/feeds/7/push"] = (200, {"status": "finished", "data_source_id": 7, "push_id": "p-1", "run": {"id": 3, "status": "ok", "trigger": "push", "rows": 42, "refused": 0, "notes": "push: accounts 6 (6 new)"}}, {})
+		proc: subprocess.CompletedProcess[str] = self.push("--wait", "--organization", "2")
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		self.assertIn("accounts 6 (6 new)", proc.stdout)
+		self.assertEqual(len(self.fake.requests), 1)
+		request: dict[str, Any] = self.fake.requests[0]
+		self.assertEqual(request["method"], "POST")
+		self.assertEqual(request["path"], "/api/v1/feeds/7/push?wait=1&organization_id=2")
+		self.assertEqual(request["headers"]["Authorization"], f"Bearer {self.TOKEN}")
+		self.assertEqual(request["headers"]["Content-Type"], "application/x-ndjson")
+		self.assertFalse(request["leaked"], "the token was visible in a process's command line")
+		self.assertEqual(contract_problems(request["body"].decode("utf-8")), [])
+		self.assertNotIn(self.TOKEN, proc.stdout + proc.stderr, "the token is never printed")
+
+	def test_push_queued_and_if_changed(self) -> None:
+		self.fake.answers["/api/v1/feeds/7/push"] = (202, {"status": "queued", "data_source_id": 7, "push_id": "p-2"}, {})
+		first: subprocess.CompletedProcess[str] = self.push("--if-changed")
+		self.assertEqual(first.returncode, 0, first.stderr)
+		self.assertIn("queued", first.stdout)
+		self.assertNotIn("wait", self.fake.requests[0]["path"])
+		second: subprocess.CompletedProcess[str] = self.push("--if-changed")
+		self.assertEqual(second.returncode, 0, second.stderr)
+		self.assertIn("unchanged", second.stdout)
+		self.assertEqual(len(self.fake.requests), 1, "an unchanged export is not sent again")
+
+	def test_exit_codes(self) -> None:
+		self.fake.answers["/api/v1/feeds/7/push"] = (409, {"error": {"code": "conflict", "message": "The source's provider is not push"}}, {})
+		refused: subprocess.CompletedProcess[str] = self.push()
+		self.assertEqual(refused.returncode, 4)
+		self.assertIn("provider is not push", refused.stderr)
+		self.fake.answers["/api/v1/feeds/7/push"] = (200, {"status": "finished", "push_id": "p", "run": {"id": 4, "status": "failed", "error": "push: Line 3: bad"}}, {})
+		self.assertEqual(self.push("--wait").returncode, 5)
+		self.fake.answers["/api/v1/feeds/7/push"] = (200, {"status": "finished", "push_id": "p", "run": {"id": 5, "status": "partial"}}, {})
+		self.assertEqual(self.push("--wait").returncode, 6)
+		self.fake.answers["/api/v1/feeds/7/push"] = (302, {}, {"Location": "http://127.0.0.2:9/steal"})
+		count: int = len(self.fake.requests)
+		self.assertEqual(self.push().returncode, 4, "a redirect is refused, not followed with the token")
+		self.assertEqual(len(self.fake.requests), count + 1)
+		closed: socket.socket = socket.socket()
+		closed.bind(("127.0.0.1", 0))
+		port: int = closed.getsockname()[1]
+		closed.close()
+		self.assertEqual(self.push(url=f"http://127.0.0.1:{port}").returncode, 3)
+		plain: subprocess.CompletedProcess[str] = self.push(url="http://venture.example.invalid")
+		self.assertEqual(plain.returncode, 1)
+		self.assertIn("plain http", plain.stderr)
+
+	def test_token_sources_and_file_permissions(self) -> None:
+		self.fake.answers["/api/v1/feeds/7/push"] = (202, {"status": "queued", "push_id": "p"}, {})
+		env: dict[str, str] = dict(self.env)
+		env.pop("TSMCTL_VENTURE_TOKEN")
+		missing: subprocess.CompletedProcess[str] = self.push(env=env)
+		self.assertEqual(missing.returncode, 1)
+		self.assertIn("no VENTURE API token", missing.stderr)
+		token_file: Path = self.home / "config" / "tsmctl" / "venture-token"
+		token_file.parent.mkdir(parents=True)
+		token_file.write_text(self.TOKEN + "\n", encoding="utf-8")
+		token_file.chmod(0o644)
+		loose: subprocess.CompletedProcess[str] = self.push(env=env)
+		self.assertEqual(loose.returncode, 1)
+		self.assertIn("chmod 600", loose.stderr)
+		self.assertEqual(self.fake.requests, [], "nothing is sent with a token from a readable file")
+		token_file.chmod(0o600)
+		ok: subprocess.CompletedProcess[str] = self.push(env=env)
+		self.assertEqual(ok.returncode, 0, ok.stderr)
+		self.assertEqual(self.fake.requests[-1]["headers"]["Authorization"], f"Bearer {self.TOKEN}")
+		venturectl_env: dict[str, str] = {**env, "VENTURE_TOKEN": "vt_other_token_value"}
+		token_file.unlink()
+		self.assertEqual(self.push(env=venturectl_env).returncode, 0)
+		self.assertEqual(self.fake.requests[-1]["headers"]["Authorization"], "Bearer vt_other_token_value", "venturectl's VENTURE_TOKEN is the last resort")
+
+	def test_lock_serialises_pushes(self) -> None:
+		self.fake.answers["/api/v1/feeds/7/push"] = (202, {"status": "queued", "push_id": "p"}, {})
+		holder: Any = tsmctl.venture_lock(self.home / "cache" / "tsmctl" / "venture" / "push.lock", 0)
+		try:
+			busy: subprocess.CompletedProcess[str] = self.push("--lock-timeout", "1")
+			self.assertEqual(busy.returncode, 1)
+			self.assertIn("holds", busy.stderr)
+		finally:
+			holder.close()
+		self.assertEqual(self.push("--lock-timeout", "1").returncode, 0)
+
+	def test_status(self) -> None:
+		self.fake.answers["/api/v1/health"] = (200, {"status": "ok", "version": "0.6.0"}, {})
+		self.fake.answers["/api/v1/feeds/7/runs"] = (200, {"data_source_id": 7, "runs": [{"id": 9, "trigger": "push", "status": "ok", "started_at": "2026-10-04T18:00:00Z", "rows": 12, "refused": 0}]}, {})
+		cmd: list[str] = [sys.executable, str(SCRIPT), "--no-config", "-o", "json", "venture", "status", "--url", self.fake.url, "--source", "7"]
+		proc: subprocess.CompletedProcess[str] = subprocess.run(cmd, capture_output=True, text=True, env=self.env, timeout=60)
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		doc: dict[str, Any] = json.loads(proc.stdout)
+		sections: dict[str, Any] = {s["title"]: s for s in doc["sections"]}
+		self.assertEqual(sections["Settings"]["values"]["Token"], "$TSMCTL_VENTURE_TOKEN")
+		self.assertEqual(sections["Server"]["values"]["Version"], "0.6.0")
+		self.assertEqual(sections["Runs"]["tables"][0]["rows"][0]["id"], 9)
+		health: dict[str, Any] = next(r for r in self.fake.requests if r["path"] == "/api/v1/health")
+		self.assertNotIn("Authorization", health["headers"], "health needs no credentials and gets none")
+		self.assertNotIn(self.TOKEN, proc.stdout)
+
+
+@unittest.skipUnless(os.environ.get("TSMCTL_TEST_VENTURE_URL"), "set TSMCTL_TEST_VENTURE_URL, TSMCTL_TEST_VENTURE_SOURCE and TSMCTL_TEST_VENTURE_TOKEN_FILE to push to a real VENTURE")
+class VentureIntegrationTests(unittest.TestCase):
+	"""
+	Optional: push the synthetic fixture to a running VENTURE (a scratch one:
+	the fixture's accounts and ledger are written into the source) and
+	require a clean run. The source must have provider push and currency
+	GOLD with exponent 4.
+	"""
+
+	def test_real_push(self) -> None:
+		with tempfile.TemporaryDirectory(prefix="tsmctl-real-") as temp:
+			env: dict[str, str] = {**os.environ, "HOME": temp, "XDG_CACHE_HOME": str(Path(temp) / "cache"), "NO_COLOR": "1", "TSMCTL_VENTURE_TOKEN_FILE": os.environ["TSMCTL_TEST_VENTURE_TOKEN_FILE"]}
+			env.pop("TSMCTL_VENTURE_TOKEN", None)
+			env.pop("VENTURE_TOKEN", None)
+			# The operations fixture (accounts, auctions, mail), then the TSM
+			# one (ledger, AuctionDB) with every option that adds lines.
+			for name, writer, extra in (("ops", write_ops_fixture, []), ("tsm", write_fixture, ["--include-internal", "--market", "all"])):
+				with self.subTest(fixture=name):
+					wow: Path = Path(temp) / name
+					writer(wow)
+					cmd: list[str] = [sys.executable, str(SCRIPT), "--no-config", "--local", "--wow-dir", str(wow), "-q", "-o", "json", "venture", "push", "--wait",
+						"--url", os.environ["TSMCTL_TEST_VENTURE_URL"], "--source", os.environ["TSMCTL_TEST_VENTURE_SOURCE"], *extra]
+					proc: subprocess.CompletedProcess[str] = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
+					self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+					run: dict[str, Any] = next(s for s in json.loads(proc.stdout)["sections"] if s["title"] == "Run")["values"]
+					self.assertEqual((run["Status"], run["Refused"]), ("ok", 0))
 
 
 if __name__ == "__main__":
