@@ -1546,6 +1546,29 @@ class LoginSettingsTests(unittest.TestCase):
 		self.assertEqual(single.hosts, [], "--host names one install and the hosts list is not read")
 
 
+class DefaultLoginLabelTests(unittest.TestCase):
+	"""A Battle.net licence folder (<number>#<n>) is labelled WoW<n>, as the launcher shows it."""
+
+	def test_default_labels(self) -> None:
+		label: Any = tsmctl.default_login_label
+		self.assertEqual(label("53141745#1"), "WoW1", "licence 1 of a Battle.net account is WoW1")
+		self.assertEqual(label("53141745#2", ["53141745#1", "53141745#2"]), "WoW2", "licences of one Battle.net account differ by number")
+		self.assertEqual(label("ZAKMANN"), "ZAKMANN", "a legacy account name is its own label")
+		self.assertEqual(label("ALT#1"), "ALT#1", "only <number>#<n> is a Battle.net licence folder")
+		self.assertEqual(label("laptop-53141745#1"), "laptop-WoW1", "a hosts prefix stays in front")
+		self.assertEqual(label("53141745#01"), "WoW1", "the licence number is read as a number")
+		self.assertEqual(label("11111111#1", ["11111111#1", "22222222#1"]), "WoW1 (11111111)", "two Battle.net accounts' WoW1 carry their account numbers")
+		self.assertEqual(label("", ["x"]), "", "no folder, no label")
+
+	def test_configured_label_wins(self) -> None:
+		data: Any = tsmctl.TsmData()
+		data.configure_logins({"53141745#1": "Alt"}, {}, "per_account")
+		data.all_folders = ["ZAKMANN", "53141745#1", "99999999#2"]
+		self.assertEqual(data.login_label("53141745#1"), "Alt", "account_labels overrides the default")
+		self.assertEqual(data.login_label("99999999#2"), "WoW2")
+		self.assertEqual(data.login_label("ZAKMANN"), "ZAKMANN")
+
+
 class LoginExportTests(unittest.TestCase):
 	"""Two account folders end to end: login lines, warbands, grouping by login."""
 
@@ -1587,6 +1610,20 @@ class LoginExportTests(unittest.TestCase):
 
 	def doc(self, wow: Path, config: str, *args: str) -> dict[str, Any]:
 		return json.loads(self.run_cli(wow, config, "-q", "-o", "json", *args).stdout)
+
+	def test_battlenet_folder_defaults_to_wow_n(self) -> None:
+		wow: Path = self.base / "bnet"
+		if not wow.exists():
+			shutil.copytree(self.fresh, wow)
+			accounts: Path = wow / "_retail_" / "WTF" / "Account"
+			(accounts / "ALT#1").rename(accounts / "12345678#1")
+		lines: list[dict[str, Any]] = self.export(wow, "")
+		names: dict[str, str] = {l["key"]: l["name"] for l in lines if l["type"] == "login"}
+		self.assertEqual(names, {"12345678#1": "WoW1", "MAIN": "MAIN"}, "a licence folder is named WoW<n> unless account_labels says otherwise")
+		chars: dict[str, Any] = self.doc(wow, "", "--login", "wow1", "get", "chars")
+		rows: list[dict[str, Any]] = chars["sections"][0]["tables"][0]["rows"]
+		self.assertTrue(rows, "--login takes the default label")
+		self.assertEqual({r.get("login") for r in rows}, {"WoW1"}, "only that login's characters, shown by its label")
 
 	def test_login_lines_and_account_logins(self) -> None:
 		lines: list[dict[str, Any]] = self.export(self.fresh, self.LABELS)
