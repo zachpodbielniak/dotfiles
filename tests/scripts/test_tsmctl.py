@@ -1053,7 +1053,8 @@ class OptionalSourceCliTests(unittest.TestCase):
 DECIMAL_RE: Any = re.compile(r"^[0-9]+(\.[0-9]{1,4})?$")
 ZONED_RE: Any = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
 STRICT: dict[str, set[str]] = {
-	"account": {"type", "key", "name", "kind", "group", "venue", "last_seen", "attrs"},
+	"login": {"type", "key", "name", "kind", "group", "attrs"},
+	"account": {"type", "key", "name", "kind", "group", "venue", "last_seen", "login", "attrs"},
 	"account_snapshot": {"type", "account", "at", "covers"},
 	"balance": {"type", "account", "currency", "amount", "at"},
 	"holding": {"type", "account", "place", "instrument", "quantity", "at"},
@@ -1062,7 +1063,7 @@ STRICT: dict[str, set[str]] = {
 	"txn": {"type", "id", "account", "venue", "kind", "instrument", "quantity", "unit_price", "amount", "counterparty", "source", "at"},
 }
 REQUIRED: dict[str, set[str]] = {
-	"venue": {"key"}, "instrument": {"key"}, "snapshot": {"venue", "taken_at"}, "stat": {"venue", "instrument"},
+	"venue": {"key"}, "instrument": {"key"}, "snapshot": {"venue", "taken_at"}, "stat": {"venue", "instrument"}, "login": {"key"},
 	"account": {"key", "kind"}, "account_snapshot": {"account", "at", "covers"}, "balance": {"account", "currency", "amount"},
 	"holding": {"account", "place", "instrument", "quantity"},
 	"position": {"account", "venue", "id", "instrument", "quantity", "price", "expires_at"},
@@ -1084,6 +1085,7 @@ def contract_problems(text: str, currency: str = "GOLD") -> list[str]:
 	snapshotted: set[str] = set()
 	rows_before: dict[str, set[str]] = {}
 	ids: dict[str, set[str]] = {}
+	logins: set[str] = set()
 	for number, line in enumerate(text.splitlines(), 1):
 		obj: dict[str, Any] = json.loads(line)
 		kind: str = obj.get("type", "")
@@ -1105,9 +1107,20 @@ def contract_problems(text: str, currency: str = "GOLD") -> list[str]:
 				problems.append(f"{where}: {name} is not an integer")
 			if isinstance(value, str) and len(value.encode("utf-8")) > 512:
 				problems.append(f"{where}: {name} longer than 512 bytes")
-		if kind == "account":
+		if kind == "login":
+			if obj.get("kind", "other") not in ("game_account", "platform_account", "other"):
+				problems.append(f"{where}: bad login kind")
+			attrs = obj.get("attrs", {})
+			if not isinstance(attrs, dict) or any(isinstance(v, (dict, list)) for v in attrs.values()) or len(attrs) > 64:
+				problems.append(f"{where}: login attrs not a flat object")
+			if obj["key"] in logins:
+				problems.append(f"{where}: login {obj['key']} twice")
+			logins.add(obj["key"])
+		elif kind == "account":
 			if obj.get("kind") not in ("character", "shared", "guild", "other"):
 				problems.append(f"{where}: bad account kind")
+			if "login" in obj and not (isinstance(obj["login"], str) and obj["login"]):
+				problems.append(f"{where}: login is not a key")
 			attrs: Any = obj.get("attrs", {})
 			if not isinstance(attrs, dict) or any(isinstance(v, (dict, list)) for v in attrs.values()) or len(attrs) > 64:
 				problems.append(f"{where}: attrs not a flat object")
@@ -1414,6 +1427,311 @@ class VentureExportTests(unittest.TestCase):
 	def test_zz_wow_files_untouched(self) -> None:
 		self.assertEqual(tree_digest(self.ops), self.digests["ops"])
 		self.assertEqual(tree_digest(self.tsm), self.digests["tsm"])
+
+
+# ============================================================================
+# More than one login: labels, Battle.net groups, warbands, hosts
+# ============================================================================
+
+def write_tsm_folder(sv: Path, chars: list[tuple[str, str, int]], warband: dict[str, Any], sales: list[tuple[str, str, int]], expiring: dict[str, int], mtime: float) -> None:
+	"""
+	One folder's TradeSkillMaster.lua: characters (name, realm, copper) on
+	the Alliance, a warband copy {money, stamp, items} (an empty items dict
+	is a bank TSM saw empty), Widget sales per (character, realm, units) and
+	TSM's own first-expiry times (auctions). The file is dated `mtime`.
+	"""
+	sv.mkdir(parents=True, exist_ok=True)
+	lines: list[str] = ["TradeSkillMasterDB = {"]
+	realms: dict[str, list[str]] = {}
+	for name, realm, copper in chars:
+		lines.append(f'["s@{name} - Alliance - {realm}@internalData@money"] = {copper},')
+		lines.append(f'["s@{name} - Alliance - {realm}@internalData@classKey"] = "WARRIOR",')
+		lines.append(f'["s@{name} - Alliance - {realm}@internalData@goldLogLastUpdate"] = {NOW - 3600},')
+		lines.append(f'["s@{name} - Alliance - {realm}@internalData@bagQuantity"] = {{ ["i:1001"] = 2, }},')
+	for name, realm, units in sales:
+		realms.setdefault(realm, []).append(f"i:1001,1,{units},20000,Buyer,{name},{NOW - 7200},Auction")
+	for realm, rows in realms.items():
+		csv: str = "itemString,stackSize,quantity,price,otherPlayer,player,time,source\n" + "\n".join(rows)
+		lines.append(f'["r@{realm}@internalData@csvSales"] = {lua_quote(csv)},')
+	for key, when in expiring.items():
+		name, realm = key.split("-", 1)
+		lines.append(f'["f@Alliance - {realm}@internalData@expiringAuction"] = {{ ["{name}"] = {when}, }},')
+	if warband:
+		lines.append(f'["g@ @internalData@warbankMoney"] = {warband["money"]},')
+		lines.append(f'["g@ @internalData@warbankGoldLogLastUpdate"] = {warband["stamp"]},')
+		lines.append(f'["g@ @internalData@warbankGoldLog"] = {lua_quote("minute,copper" + chr(10) + str(warband["stamp"] // 60) + "," + str(warband["money"]))},')
+		lines.append('["g@ @internalData@warbankQuantity"] = {' + "".join(f' ["{item}"] = {qty},' for item, qty in warband["items"].items()) + " },")
+	lines += ["}", "TSMItemInfoDB = {", f'["names"] = {lua_quote(chr(2).join(["Widget", "Junk"]))},', f'["itemStrings"] = {lua_quote(chr(2).join(["i:1001", "i:1002"]))},', f'["data"] = {lua_quote(iteminfo_record(10, 5000, 20, 2, 7) + iteminfo_record(1, 25000, 1, 0, 15))},', "}", ""]
+	path: Path = sv / "TradeSkillMaster.lua"
+	path.write_text("\r\n".join(lines), encoding="utf-8")
+	os.utime(path, (mtime, mtime))
+
+
+def write_logins_fixture(base: Path, alt_warband: dict[str, Any]) -> None:
+	"""
+	Two logins on one machine, as on the operator's own:
+	  * MAIN: Alpha and Beta on Testrealm, a warband copy holding 3 Junk and
+	    100g dated two hours ago, an auction of Alpha's expiring in an hour;
+	    its file was written an hour ago.
+	  * ALT#1: Zed on Otherrealm, with the warband copy given (fresher or
+	    staler, full or empty) and an auction expiring in 30 minutes; its
+	    file was written two days ago.
+	"""
+	account: Path = base / "_retail_" / "WTF" / "Account"
+	write_tsm_folder(account / "MAIN" / "SavedVariables", [("Alpha", "Testrealm", 50000000), ("Beta", "Testrealm", 10000)],
+		{"money": 1000000, "stamp": NOW - 7200, "items": {"i:1002": 3}}, [("Alpha", "Testrealm", 4)], {"Alpha-Testrealm": NOW + 3600}, NOW - 3600)
+	write_tsm_folder(account / "ALT#1" / "SavedVariables", [("Zed", "Otherrealm", 2000000)],
+		alt_warband, [("Zed", "Otherrealm", 1)], {"Zed-Otherrealm": NOW + 1800}, NOW - 2 * 86400)
+
+
+class LoginSettingsTests(unittest.TestCase):
+	"""The new config keys: parsing and refusals, without data."""
+
+	def settings(self, text: str, *argv: str) -> Any:
+		with tempfile.TemporaryDirectory(prefix="tsmctl-cfg-") as temp:
+			path: Path = Path(temp) / "config.yaml"
+			path.write_text(text, encoding="utf-8")
+			args: Any = tsmctl.build_parser().parse_args(["--config", str(path), "-q", *argv, "status"])
+			tsmctl.normalize_args(args)
+			return tsmctl.build_settings(args)
+
+	def test_nested_yaml(self) -> None:
+		parsed: dict[str, Any] = tsmctl.SimpleYaml.parse(
+			'account_labels:\n  ZAKMANN: Main\n  12345678#1: Alt  # a comment\n  "x: y": Q\n'
+			'battlenet_groups:\n  bnet-main: [ZAKMANN, "12345678#1"]\n  other:\n    - A\nhosts:\n  - host: mob-zach\n    accounts:\n      - ZAKMANN\n'
+			'  - host: laptop\n    prefix: lap-\nssh_options:\n- -J\n- bastion:22\nempty:\nventure_url: https://v.example\n', "t")
+		self.assertEqual(parsed["account_labels"], {"ZAKMANN": "Main", "12345678#1": "Alt", "x: y": "Q"}, "mapping keys are kept as written, '#' inside a key is no comment")
+		self.assertEqual(parsed["battlenet_groups"], {"bnet-main": ["ZAKMANN", "12345678#1"], "other": ["A"]})
+		self.assertEqual(parsed["hosts"], [{"host": "mob-zach", "accounts": ["ZAKMANN"]}, {"host": "laptop", "prefix": "lap-"}])
+		self.assertEqual((parsed["ssh_options"], parsed["empty"], parsed["venture_url"]), (["-J", "bastion:22"], [], "https://v.example"), "flat keys parse as before")
+		for bad in ("a:\n  b: 1\n   c: 2\n", "  x: 1\n", "a:\n  - x\n    y\n", "a:\n  b: 1\n  b: 2\n"):
+			with self.assertRaises(tsmctl.TsmctlError, msg=bad):
+				tsmctl.SimpleYaml.parse(bad, "bad")
+
+	def test_sample_config_documents_and_parses_the_new_keys(self) -> None:
+		"""Uncommenting the sample's examples gives a config tsmctl accepts."""
+		block: list[str] = []
+		keep: bool = False
+		for line in tsmctl.SAMPLE_CONFIG.splitlines():
+			if re.match(r"^# (account_labels|battlenet_groups|warband|hosts):", line):
+				keep = True
+				block.append(line[2:])
+			elif keep and line.startswith("#   "):
+				block.append(line[2:])
+			else:
+				keep = False
+		settings: Any = self.settings("\n".join(block) + "\n")
+		self.assertEqual(settings.account_labels, {"ZAKMANN": "Main", "12345678#1": "Alt"})
+		self.assertEqual(settings.battlenet_groups, {"bnet-main": ["ZAKMANN", "12345678#1"]})
+		self.assertEqual(settings.warband, "per_account")
+		self.assertEqual([(h.host, h.prefix, h.accounts) for h in settings.hosts], [("mob-zach", "", ["ZAKMANN", "12345678#1"]), ("laptop", "laptop-", [])])
+		self.assertIn("account_labels", (ROOT / ".config" / "tsmctl" / "config.yaml").read_text(encoding="utf-8"), "the shipped config documents the keys too")
+
+	def test_refusals_and_login_names(self) -> None:
+		for text, message in (
+			("battlenet_groups:\n  a: [X]\n  b: [x]\n", "in both"),
+			("battlenet_groups:\n  a: []\n", "lists no account folders"),
+			("warband: pooled\n", "warband must be one of"),
+			("account_labels: Main\n", "must be a mapping"),
+			("hosts:\n  - host: a\n    wowdir: /x\n", "unknown key"),
+			("hosts:\n  - host: a\n    prefix: 'b c'\n", "prefix must be"),
+		):
+			with self.subTest(text=text), self.assertRaises(tsmctl.TsmctlError) as caught:
+				self.settings(text)
+			self.assertIn(message, str(caught.exception))
+		settings: Any = self.settings("account_labels:\n  MAIN: Main\n  ALT#1: Alt\nbattlenet_groups:\n  bnet: [MAIN, ALT#1]\n", "--login", "alt")
+		self.assertEqual(settings.accounts, ["ALT#1"], "--login takes a label, case-insensitively")
+		self.assertEqual(tsmctl.resolve_login_names(settings, ["bnet", "MAIN", "OTHER"]), ["MAIN", "ALT#1", "OTHER"], "a group means its folders; anything else is a folder")
+		single: Any = self.settings("hosts:\n  - host: a\n  - host: b\n", "--host", "c")
+		self.assertEqual(single.hosts, [], "--host names one install and the hosts list is not read")
+
+
+class LoginExportTests(unittest.TestCase):
+	"""Two account folders end to end: login lines, warbands, grouping by login."""
+
+	LABELS: str = "account_labels:\n  MAIN: Main\n  ALT#1: Alt\nbattlenet_groups:\n  bnet: [MAIN, ALT#1]\n"
+
+	@classmethod
+	def setUpClass(cls) -> None:
+		cls.temp: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(prefix="tsmctl-logins-")
+		cls.base: Path = Path(cls.temp.name)
+		# ALT's copy of the warband is the fresher one (a minute old): 200g and 5 Widgets.
+		cls.fresh: Path = cls.base / "fresh"
+		write_logins_fixture(cls.fresh, {"money": 2000000, "stamp": NOW - 60, "items": {"i:1001": 5}})
+		# ALT's warband was seen, and it is empty: no gold, no items.
+		cls.empty: Path = cls.base / "empty"
+		write_logins_fixture(cls.empty, {"money": 0, "stamp": NOW - 5 * 86400, "items": {}})
+		cls.digests: dict[str, str] = {"fresh": tree_digest(cls.fresh), "empty": tree_digest(cls.empty)}
+		cls.env: dict[str, str] = {**os.environ, "HOME": str(cls.base), "XDG_CACHE_HOME": str(cls.base / "cache"), "XDG_CONFIG_HOME": str(cls.base / "config"), "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+		for name in ("TSMCTL_HOST", "TSMCTL_CONFIG", "TSMCTL_WOW_DIR", "TSM_WOW_DIR", "TSMCTL_REALM", "TSMCTL_SOURCES", "TSMCTL_ACCOUNTS"):
+			cls.env.pop(name, None)
+
+	@classmethod
+	def tearDownClass(cls) -> None:
+		cls.temp.cleanup()
+
+	def run_cli(self, wow: Path, config: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+		path: Path = self.base / f"config-{abs(hash(config))}.yaml"
+		path.write_text(config, encoding="utf-8")
+		cmd: list[str] = [sys.executable, str(SCRIPT), "--config", str(path), "--local", "--wow-dir", str(wow), *args]
+		proc: subprocess.CompletedProcess[str] = subprocess.run(cmd, capture_output=True, text=True, env=self.env, timeout=120)
+		if check:
+			self.assertEqual(proc.returncode, 0, msg=f"{args}: {proc.stderr}")
+			self.assertNotIn("Traceback", proc.stderr)
+		return proc
+
+	def export(self, wow: Path, config: str, *args: str) -> list[dict[str, Any]]:
+		text: str = self.run_cli(wow, config, "-q", *args, "export", "--market", "none").stdout
+		self.assertEqual(contract_problems(text), [], "every line, login lines included, meets the contract")
+		return parse_lines(text)
+
+	def doc(self, wow: Path, config: str, *args: str) -> dict[str, Any]:
+		return json.loads(self.run_cli(wow, config, "-q", "-o", "json", *args).stdout)
+
+	def test_login_lines_and_account_logins(self) -> None:
+		lines: list[dict[str, Any]] = self.export(self.fresh, self.LABELS)
+		logins: list[dict[str, Any]] = [l for l in lines if l["type"] == "login"]
+		self.assertEqual(logins, [
+			{"type": "login", "key": "ALT#1", "name": "Alt", "kind": "game_account", "group": "bnet", "attrs": {"region": "us"}},
+			{"type": "login", "key": "MAIN", "name": "Main", "kind": "game_account", "group": "bnet", "attrs": {"region": "us"}},
+		], "one line per folder: the folder is the key, the label the name, the Battle.net group the group")
+		first_account: int = next(i for i, l in enumerate(lines) if l["type"] == "account")
+		self.assertLess(max(i for i, l in enumerate(lines) if l["type"] == "login"), first_account, "logins come before the accounts naming them")
+		accounts: dict[str, dict[str, Any]] = {l["key"]: l for l in lines if l["type"] == "account"}
+		self.assertEqual((accounts["Zed-Otherrealm"]["login"], accounts["Zed-Otherrealm"]["attrs"]["login_account"]), ("ALT#1", "ALT#1"), "login is sent, and attrs.login_account still is for older servers")
+		self.assertEqual(accounts["Alpha-Testrealm"]["login"], "MAIN")
+		self.assertEqual((accounts["warbank:MAIN"]["login"], accounts["warbank:MAIN"]["name"]), ("MAIN", "Warband bank (Main)"), "per account (the default) each folder keeps its own warband")
+		self.assertEqual(accounts["warbank:ALT#1"]["login"], "ALT#1")
+		bare: list[dict[str, Any]] = [l for l in self.export(self.fresh, "") if l["type"] == "login"]
+		self.assertEqual([(l["key"], l["name"], "group" in l) for l in bare], [("ALT#1", "ALT#1", False), ("MAIN", "MAIN", False)], "without labels a login is named by its folder")
+		# For a VENTURE older than logins: neither the lines nor the member, so its strict account kind accepts the push.
+		for args, config in ((("--no-logins",), self.LABELS), ((), self.LABELS + "venture_logins: false\n")):
+			old: list[dict[str, Any]] = parse_lines(self.run_cli(self.fresh, config, "-q", "export", "--market", "none", *args).stdout)
+			self.assertFalse([l for l in old if l["type"] == "login" or "login" in l], args)
+			self.assertEqual(next(l for l in old if l.get("key") == "Zed-Otherrealm")["attrs"]["login_account"], "ALT#1")
+		check: subprocess.CompletedProcess[str] = self.run_cli(self.fresh, self.LABELS, "-q", "-o", "json", "export", "--check")
+		counts: dict[str, int] = {r["type"]: r["lines"] for r in json.loads(check.stdout)["sections"][0]["tables"][0]["rows"]}
+		self.assertEqual(counts["login"], 2, "export --check validates and counts login lines")
+
+	def test_checker_validates_login_lines(self) -> None:
+		check: Any = tsmctl.VentureCheck("GOLD")
+		for number, line in enumerate([
+			'{"type":"login","key":"A","kind":"game_account","attrs":{"region":"us"}}',
+			'{"type":"login","key":"A","kind":"wow"}',
+			'{"type":"login","name":"x","attrs":{"nested":{"no":1}}}',
+			'{"type":"login","key":"B","password":"x"}',
+			'{"type":"account","key":"c","kind":"character","login":""}',
+			'{"type":"account","key":"d","kind":"character","login":"UNKNOWN"}',
+		], 1):
+			check.line(number, line)
+		text: str = "\n".join(check.problems)
+		for expected in ("line 2: login: login 'A' described twice", "line 2: login: kind must be one of", "line 3: login: key is required", "line 3: login: attrs must hold only", "line 4: login: unknown member 'password'", "line 5: account: login must be a non-empty string"):
+			self.assertIn(expected, text)
+		self.assertNotIn("line 6", text, "an account may name a login VENTURE already knows")
+
+	def test_empty_warband_is_covered_not_missing(self) -> None:
+		"""A warband seen empty is restated as empty with a zero balance; it never looks like an unread one."""
+		lines: list[dict[str, Any]] = self.export(self.empty, self.LABELS)
+		snapshot: dict[str, Any] = next(l for l in lines if l["type"] == "account_snapshot" and l["account"] == "warbank:ALT#1")
+		self.assertEqual(snapshot["covers"], ["holdings", "balances"])
+		self.assertEqual([l["amount"] for l in lines if l["type"] == "balance" and l["account"] == "warbank:ALT#1"], ["0"])
+		self.assertFalse([l for l in lines if l["type"] == "holding" and l["account"] == "warbank:ALT#1"], "covered and empty: no rows, so VENTURE clears what it had")
+
+	def test_shared_warband_takes_the_freshest_copy(self) -> None:
+		config: str = self.LABELS + "warband: shared\n"
+		lines: list[dict[str, Any]] = self.export(self.fresh, config)
+		accounts: dict[str, dict[str, Any]] = {l["key"]: l for l in lines if l["type"] == "account"}
+		self.assertNotIn("warbank:MAIN", accounts)
+		self.assertNotIn("warbank:ALT#1", accounts)
+		band: dict[str, Any] = accounts["warbank:bnet"]
+		self.assertEqual((band["kind"], "login" in band, band["attrs"]), ("shared", False, {"login_group": "bnet", "login_accounts": "ALT#1,MAIN"}), "one account for the group, no single login")
+		self.assertEqual([l["amount"] for l in lines if l["type"] == "balance" and l["account"] == "warbank:bnet"], ["200"], "ALT's copy is a minute old: its 200g, not 100g and never 300g")
+		held: dict[str, int] = {l["instrument"]: l["quantity"] for l in lines if l["type"] == "holding" and l["account"] == "warbank:bnet"}
+		self.assertEqual(held, {"1001": 5}, "the freshest copy's contents alone; MAIN's 3 Junk are an older view of the same bank")
+		self.assertEqual(sum(1 for l in lines if l["type"] == "account_snapshot" and l["account"] == "warbank:bnet"), 1)
+		# The other way round: ALT's empty copy is five days old, MAIN's two hours.
+		older: list[dict[str, Any]] = self.export(self.empty, config)
+		self.assertEqual([l["amount"] for l in older if l["type"] == "balance" and l["account"] == "warbank:bnet"], ["100"])
+		self.assertEqual({l["instrument"]: l["quantity"] for l in older if l["type"] == "holding" and l["account"] == "warbank:bnet"}, {"1002": 3})
+		# The commands count the shared bank once too.
+		gold: list[dict[str, Any]] = self.doc(self.fresh, config, "get", "gold")["sections"][0]["tables"][0]["rows"]
+		self.assertEqual([(r["kind"], r["gold_copper"]) for r in gold if r["owner"] == "Warbank"], [("warbank (shared)", 2000000)])
+		worth: dict[str, int] = {r["key"]: r["gold_copper"] for r in self.doc(self.fresh, config, "networth", "--by", "login")["sections"][0]["tables"][0]["rows"]}
+		self.assertEqual(worth, {"Main": 50010000, "Alt": 2000000, "bnet (shared warband)": 2000000})
+		accounts_rows: list[dict[str, Any]] = self.doc(self.fresh, config, "get", "accounts")["sections"][0]["tables"][0]["rows"]
+		self.assertEqual(sorted((r["login"], r["gold_copper"]) for r in accounts_rows), [("Alt", 2000000), ("Main", 50010000), ("bnet", 2000000)], "a member's gold leaves out the shared bank; it has its own row")
+		# Per account (the default) the same files give two warbands, each its own.
+		per: list[dict[str, Any]] = self.export(self.fresh, self.LABELS)
+		self.assertEqual(sorted((l["account"], l["amount"]) for l in per if l["type"] == "balance" and l["account"].startswith("warbank:")), [("warbank:ALT#1", "200"), ("warbank:MAIN", "100")])
+
+	def test_shared_warband_needs_every_login(self) -> None:
+		"""With one sharing login filtered out the shared bank is left out whole, never restated from a partial view."""
+		config: str = self.LABELS + "warband: shared\n"
+		lines: list[dict[str, Any]] = self.export(self.fresh, config, "--login", "Main")
+		self.assertFalse([l for l in lines if l.get("key") == "warbank:bnet" or l.get("account") == "warbank:bnet"])
+		self.assertEqual([l["key"] for l in lines if l["type"] == "login"], ["MAIN"])
+		doc: dict[str, Any] = self.doc(self.fresh, config, "--login", "Main", "export", "--check")
+		left: list[dict[str, Any]] = doc["sections"][0]["tables"][1]["rows"]
+		self.assertIn("warband: shared bank bnet (not read: ALT#1)", [r["reason"] for r in left])
+
+	def test_group_name_must_not_be_a_folder(self) -> None:
+		proc: subprocess.CompletedProcess[str] = self.run_cli(self.fresh, "battlenet_groups:\n  MAIN: [ALT#1]\nwarband: shared\n", "get", "gold", check=False)
+		self.assertEqual(proc.returncode, 1)
+		self.assertIn("rename the group", proc.stderr)
+
+	def test_grouping_by_login(self) -> None:
+		chars: dict[str, Any] = self.doc(self.fresh, self.LABELS, "get", "chars", "--by", "login")
+		rows: list[dict[str, Any]] = chars["sections"][0]["tables"][0]["rows"]
+		self.assertEqual([(r["login"], r["name"]) for r in rows], [("Alt", "Zed"), ("Main", "Alpha"), ("Main", "Beta")], "login first, then the richest")
+		summary: list[dict[str, Any]] = next(s for s in chars["sections"] if s["title"] == "By login")["tables"][0]["rows"]
+		self.assertEqual([(r["login"], r["chars"], r["gold_copper"]) for r in summary], [("Alt", 1, 2000000), ("Main", 2, 50010000)])
+		attention: dict[str, Any] = self.doc(self.fresh, self.LABELS, "attention")
+		notes: list[str] = attention["sections"][0]["notes"]
+		self.assertTrue(notes[0].startswith("- log into Alt → Otherrealm: Zed (auctions expiring)"), notes)
+		self.assertTrue(notes[1].startswith("- log into Main → Testrealm: Alpha (auctions expiring)"), notes)
+		by_login: list[dict[str, Any]] = self.doc(self.fresh, self.LABELS, "attention", "--by", "login")["sections"][0]["tables"][0]["rows"]
+		self.assertEqual([r["login"] for r in by_login], ["Alt", "Main"])
+		pnl: dict[str, int] = {r["bucket"]: r["revenue_copper"] for r in self.doc(self.fresh, self.LABELS, "pnl", "--by", "login", "--since", "7d")["sections"][1]["tables"][0]["rows"]}
+		self.assertEqual(pnl, {"Alt": 20000, "Main": 80000})
+		only_alt: list[dict[str, Any]] = self.doc(self.fresh, self.LABELS, "--login", "alt", "get", "chars")["sections"][0]["tables"][0]["rows"]
+		self.assertEqual([r["name"] for r in only_alt], ["Zed"], "--login takes a label")
+		both: list[dict[str, Any]] = self.doc(self.fresh, self.LABELS, "--login", "bnet", "get", "chars")["sections"][0]["tables"][0]["rows"]
+		self.assertEqual(len(both), 3, "and a Battle.net group means all of its folders")
+		self.assertEqual(self.run_cli(self.fresh, self.LABELS, "get", "chars", "--by", "realm", check=False).returncode, 1)
+
+	def test_hosts_merge_and_refuse_collisions(self) -> None:
+		"""hosts: reads several installs; a folder name on two of them needs a prefix."""
+		other: Path = self.base / "other"
+		write_tsm_folder(other / "_retail_" / "WTF" / "Account" / "MAIN" / "SavedVariables", [("Yan", "Testrealm", 30000)], {}, [], {}, NOW - 600)
+		hosts: str = f"hosts:\n  - host: localhost\n    wow_dir: \"{self.fresh}\"\n  - host: localhost\n    wow_dir: \"{other}\"\n"
+		path: Path = self.base / "hosts.yaml"
+		cmd: list[str] = [sys.executable, str(SCRIPT), "--config", str(path), "-q", "-o", "json"]
+		path.write_text(hosts, encoding="utf-8")
+		clash: subprocess.CompletedProcess[str] = subprocess.run(cmd + ["get", "chars"], capture_output=True, text=True, env=self.env, timeout=120)
+		self.assertEqual(clash.returncode, 1)
+		self.assertIn("give one hosts entry a prefix", clash.stderr)
+		path.write_text(hosts + "    prefix: laptop-\naccount_labels:\n  laptop-MAIN: Laptop\n", encoding="utf-8")
+		merged: subprocess.CompletedProcess[str] = subprocess.run(cmd + ["get", "chars"], capture_output=True, text=True, env=self.env, timeout=120)
+		self.assertEqual(merged.returncode, 0, merged.stderr)
+		rows: list[dict[str, Any]] = json.loads(merged.stdout)["sections"][0]["tables"][0]["rows"]
+		self.assertEqual(sorted((r["name"], r["account"], r["login"]) for r in rows), [("Alpha", "MAIN", "MAIN"), ("Beta", "MAIN", "MAIN"), ("Yan", "laptop-MAIN", "Laptop"), ("Zed", "ALT#1", "ALT#1")])
+		export: subprocess.CompletedProcess[str] = subprocess.run(cmd[:-2] + ["export", "--market", "none"], capture_output=True, text=True, env=self.env, timeout=120)
+		self.assertEqual(contract_problems(export.stdout), [])
+		self.assertEqual(sorted(l["key"] for l in parse_lines(export.stdout) if l["type"] == "login"), ["ALT#1", "MAIN", "laptop-MAIN"])
+		status: dict[str, Any] = json.loads(subprocess.run(cmd + ["status"], capture_output=True, text=True, env=self.env, timeout=120).stdout)
+		hosts_rows: list[dict[str, Any]] = next(s for s in status["sections"] if s["title"] == "Hosts")["tables"][0]["rows"]
+		self.assertEqual([r["prefix"] for r in hosts_rows], ["", "laptop-"])
+		# One machine that cannot be read is skipped with a warning, not fatal.
+		path.write_text(hosts.replace(str(other), str(self.base / "gone")), encoding="utf-8")
+		partial: subprocess.CompletedProcess[str] = subprocess.run([sys.executable, str(SCRIPT), "--config", str(path), "-o", "json", "get", "chars"], capture_output=True, text=True, env=self.env, timeout=120)
+		self.assertEqual(partial.returncode, 0, partial.stderr)
+		self.assertIn("WoW directory not found", partial.stderr)
+		single: subprocess.CompletedProcess[str] = subprocess.run(cmd + ["--local", "--wow-dir", str(other), "get", "chars"], capture_output=True, text=True, env=self.env, timeout=120)
+		self.assertEqual([r["name"] for r in json.loads(single.stdout)["sections"][0]["tables"][0]["rows"]], ["Yan"], "--wow-dir names one install")
+
+	def test_zz_wow_files_untouched(self) -> None:
+		self.assertEqual(tree_digest(self.fresh), self.digests["fresh"])
+		self.assertEqual(tree_digest(self.empty), self.digests["empty"])
 
 
 class FakeVenture(object):
