@@ -2116,6 +2116,18 @@ class CraftTests(unittest.TestCase):
 		self.assertIn("Created", proc.stdout)
 		self.assertNotIn(self.TOKEN, proc.stdout + proc.stderr)
 
+	def test_recipes_result_sentence(self) -> None:
+		text: str = "Read 4 recipes: 2 created, 0 updated, 1 unchanged, 1 skipped. Skipped: recipes[2] (spell 3): reagents must be a list of 1 to 32 reagents. Done: every recipe supplied has been read."
+		totals, reasons = tsmctl.venture_recipes_result(text)
+		self.assertEqual(totals, {"read": 4, "created": 2, "updated": 0, "unchanged": 1, "skipped": 1})
+		self.assertEqual(reasons, ["recipes[2] (spell 3): reagents must be a list of 1 to 32 reagents."])
+		self.assertEqual(tsmctl.venture_recipes_result("something else"), ({}, ["something else"]))
+		self.fake.answers["/api/v1/data_source/9/actions/import_recipes"] = (200, {"id": 9, "result": text}, {})
+		proc: subprocess.CompletedProcess[str] = self.run_cli("-o", "json", "venture", "recipes", "--url", self.fake.url, "--recipe-source", "9")
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		sent: dict[str, Any] = next(x for x in json.loads(proc.stdout)["sections"] if x["title"] == "Recipes sent")
+		self.assertEqual((sent["values"]["Created"], sent["values"]["Skipped"]), (2, 1))
+
 	def test_push_sends_recipes_only_when_changed(self) -> None:
 		self.fake.answers["/api/v1/feeds/7/push"] = (202, {"status": "queued", "push_id": "p"}, {})
 		self.fake.answers["/api/v1/data_source/9/actions/import_recipes"] = (200, {"result": {"created": 2}}, {})
