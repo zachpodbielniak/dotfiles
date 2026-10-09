@@ -1554,6 +1554,66 @@ class KnownRecipe(object):
 	difficulty: int = 0
 	name: str = ""
 	source: str = ""
+	# The expansion tier the recipe's category belongs to ("Khaz Algar"),
+	# from DataStore's per-tier category lists; "" when unknown.
+	expansion: str = ""
+
+
+# A profession's skill line per expansion, as the game names its tiers
+# ("Khaz Algar Tailoring", "Pandaren Plans", "Food of the Broken Isles",
+# "Old World Recipes"): the first keyword found names the expansion. A tier
+# that names none is Classic when it is the bare profession's ("Tailoring
+# Patterns", "Mining"), else kept as the game wrote it.
+EXPANSIONS: tuple[str, ...] = (
+	"Classic", "Outland", "Northrend", "Cataclysm", "Pandaria", "Draenor", "Legion",
+	"Kul Tiras", "Shadowlands", "Dragon Isles", "Khaz Algar", "Midnight",
+)
+EXPANSION_KEYWORDS: tuple[tuple[str, str], ...] = (
+	("midnight", "Midnight"), ("khaz algar", "Khaz Algar"), ("dragon isles", "Dragon Isles"),
+	("shadowlands", "Shadowlands"), ("kul tiran", "Kul Tiras"), ("zandalari", "Kul Tiras"),
+	("broken isles", "Legion"), ("legion", "Legion"), ("draenor", "Draenor"), ("pandaren", "Pandaria"),
+	("pandaria", "Pandaria"), ("cataclysm", "Cataclysm"), ("northrend", "Northrend"), ("outland", "Outland"),
+	("old world", "Classic"),
+)
+
+
+PROFESSION_NAMES: tuple[str, ...] = (
+	"Alchemy", "Blacksmithing", "Enchanting", "Engineering", "Herbalism", "Inscription", "Jewelcrafting",
+	"Leatherworking", "Mining", "Skinning", "Tailoring", "Cooking", "Fishing", "Archaeology",
+)
+
+
+def tier_is_foreign(tier: str, profession: str) -> bool:
+	"""True when a tier's name names another profession and not this one (DataStore misfiles them)."""
+	folded: str = tier.lower()
+	if profession.lower() in folded:
+		return False
+	return any(other.lower() in folded for other in PROFESSION_NAMES if other.lower() != profession.lower())
+
+
+def expansion_label(tier: str, profession: str) -> str:
+	"""The expansion a profession tier's name stands for (see EXPANSION_KEYWORDS)."""
+	folded: str = tier.lower()
+	for keyword, label in EXPANSION_KEYWORDS:
+		if keyword in folded:
+			return label
+	if not folded or folded.split()[0] == profession.lower().split()[0] or folded == profession.lower():
+		return "Classic"
+	return tier
+
+
+def expansion_order(label: str) -> int:
+	return EXPANSIONS.index(label) if label in EXPANSIONS else len(EXPANSIONS)
+
+
+@dataclass(slots=True)
+class ProfessionTier(object):
+	"""One expansion's skill line of a character's profession (DataStore's CategoryInfo)."""
+
+	expansion: str
+	rank: int
+	max_rank: int
+	tier: str = ""
 
 
 @dataclass(slots=True)
@@ -1791,6 +1851,8 @@ class TsmData(object):
 		self.currencies: list[CurrencyHolding] = []
 		self.recipes: list[KnownRecipe] = []
 		self.crafts: dict[int, TsmCraft] = {}
+		# (character, realm) -> profession -> its skill per expansion, oldest first.
+		self.profession_tiers: dict[tuple[str, str], dict[str, list[ProfessionTier]]] = {}
 		self.currency_names: dict[int, str] = {}
 		self.guild_homes: dict[str, set[str]] = {}
 		self._txn_index: dict[tuple[Any, ...], Txn] = {}
@@ -2977,15 +3039,42 @@ class DataStoreReader(object):
 			else:
 				pairs = [(str(k), v) for k, v in lua_dict(professions).items() if isinstance(v, dict)]
 			for profession, info in pairs:
+				prof_name: str = profession or str(info.get("Name") or "")
+				# CategoryInfo[i] packs tier i's skill (bits 0-9 rank, 10-19 max,
+				# 20+ its category id); Categories[i] lists that tier's
+				# sub-categories, which is where each recipe is filed.
+				tier_of: dict[int, str] = {}
+				tiers: dict[str, ProfessionTier] = {}
+				groups: list[Any] = lua_list(info.get("Categories"))
+				for index, packed_tier in enumerate(lua_list(info.get("CategoryInfo"))):
+					if not isinstance(packed_tier, int) or packed_tier <= 0:
+						continue
+					tier_name: str = str(categories.get(packed_tier >> 20) or "")
+					label: str = expansion_label(tier_name, prof_name)
+					for sub in lua_list(groups[index]) if index < len(groups) else []:
+						if isinstance(sub, int):
+							tier_of[sub] = label
+					rank, cap = packed_tier & 1023, (packed_tier >> 10) & 1023
+					# 0/0 is a tier never learned; and DataStore sometimes files
+					# another profession's tiers under this one ("Midnight Mining"
+					# under Herbalism), which say nothing of this profession.
+					if cap <= 0 or tier_is_foreign(tier_name, prof_name):
+						continue
+					seen: Optional[ProfessionTier] = tiers.get(label)
+					if seen is None or rank > seen.rank:
+						tiers[label] = ProfessionTier(label, rank, cap, tier_name)
+				if tiers:
+					self.data.profession_tiers.setdefault((name, realm), {})[prof_name] = sorted(tiers.values(), key=lambda t: (expansion_order(t.expansion), t.expansion))
 				for category_id, recipes in lua_dict(info.get("Crafts")).items():
 					for packed in lua_list(recipes):
 						if not isinstance(packed, int) or packed <= 0:
 							continue
 						self.data.recipes.append(KnownRecipe(
-							account=self.account, char=name, realm=realm, profession=profession or str(info.get("Name") or ""),
+							account=self.account, char=name, realm=realm, profession=prof_name,
 							recipe_id=packed >> 7, category_id=int(category_id) if isinstance(category_id, int) else 0,
 							category=str(categories.get(category_id) or ""), learned=bool(packed & 4),
 							rank=(packed >> 3) & 3, max_rank=(packed >> 5) & 3, difficulty=packed & 3, source="datastore",
+							expansion=tier_of.get(category_id, "") if isinstance(category_id, int) else "",
 						))
 
 
@@ -5061,18 +5150,22 @@ def get_professions(ctx: Context) -> Doc:
 	for char in data.characters.values():
 		if not filters.char_ok(char):
 			continue
+		tiers: dict[str, list[ProfessionTier]] = data.profession_tiers.get((char.name, char.realm), {})
 		for name, prof in char.professions.items():
 			info: dict[Any, Any] = lua_dict(prof)
 			rows.append({
 				"char": char.name, "realm": char.realm, "profession": name, "level": info.get("level"),
 				"max": info.get("maxLevel"), "secondary": "yes" if info.get("isSecondary") else "",
+				"expansions": profession_tiers_text(tiers.get(str(name), [])) or None,
 			})
 	doc: Doc = Doc("Professions", "get_professions")
 	table: Table = Table([
 		Column("char", "Character"), Column("realm", "Realm"), Column("profession", "Profession"),
 		Column("level", "Skill", "int"), Column("max", "Max", "int"), Column("secondary", "Secondary"),
+		Column("expansions", "By expansion", max_width=90),
 	], rows)
 	doc.section("Professions").table(table)
+	doc.section("Professions").text("Skill is the line TSM saw last; By expansion is every expansion's rank/max from DataStore (open each profession window once per character).")
 	apply_main(ctx, doc, table, default_sort="char", default_limit=0)
 	return doc
 
@@ -5554,8 +5647,8 @@ def get_recipes(ctx: Context, query: Optional[str]) -> Doc:
 		if text and text != str(recipe.recipe_id) and text not in recipe.category.lower() and text not in name.lower():
 			continue
 		rows.append({
-			"char": recipe.char, "realm": recipe.realm, "profession": recipe.profession, "category": recipe.category or None,
-			"recipe": name or None, "id": recipe.recipe_id, "rank": f"{recipe.rank}/{recipe.max_rank}" if recipe.max_rank > 1 else "",
+			"char": recipe.char, "realm": recipe.realm, "profession": recipe.profession, "expansion": recipe.expansion or None,
+			"category": recipe.category or None, "recipe": name or None, "id": recipe.recipe_id, "rank": f"{recipe.rank}/{recipe.max_rank}" if recipe.max_rank > 1 else "",
 			"learned": "yes" if recipe.learned else "no", "difficulty": RECIPE_DIFFICULTY.get(recipe.difficulty, str(recipe.difficulty)) if recipe.source == "datastore" else None,
 			"makes": data.item_name(craft.item) if craft else None, "reagents": len(craft.mats) if craft else None,
 			"url": f"https://www.wowhead.com/spell={recipe.recipe_id}", "source": recipe.source, "account": recipe.account,
@@ -5570,8 +5663,8 @@ def get_recipes(ctx: Context, query: Optional[str]) -> Doc:
 		("With TSM craft data", sum(1 for r in rows if r["makes"] is not None), "int"),
 	])
 	table: Table = Table([
-		Column("char", "Character"), Column("realm", "Realm"), Column("profession", "Profession"), Column("category", "Category", max_width=30),
-		Column("recipe", "Recipe", max_width=30), Column("id", "Recipe id"), Column("rank", "Rank"), Column("learned", "Learned", wide=True),
+		Column("char", "Character"), Column("realm", "Realm"), Column("profession", "Profession"), Column("expansion", "Expansion"),
+		Column("category", "Category", max_width=30), Column("recipe", "Recipe", max_width=30), Column("id", "Recipe id"), Column("rank", "Rank"), Column("learned", "Learned", wide=True),
 		Column("difficulty", "Difficulty", wide=True), Column("makes", "Makes", max_width=30, wide=True), Column("reagents", "Reagents", wide=True),
 		Column("url", "Wowhead", wide=True), Column("source", "Source", wide=True), Column("account", "Account", wide=True),
 	], rows, empty="no recipe data (needs TSM's Crafting data, or Altoholic's DataStore, with the profession window opened once per character)")
@@ -7463,7 +7556,7 @@ class VentureExport(object):
 				"played_seconds": char.played, "login_account": char.account, "zone": char.zone,
 			}
 			line["attrs"] = {k: (venture_clip(v) if isinstance(v, str) else v) for k, v in attrs.items() if v not in (None, "", 0)}
-			line["attrs"].update(venture_profession_attrs(char))
+			line["attrs"].update(venture_profession_attrs(char, data.profession_tiers.get((char.name, char.realm))))
 			plan: VenturePlan = self._plan(key, char.account, line)
 			if char.money_source:
 				plan.covers.add("balances")
@@ -8652,7 +8745,12 @@ def venture_push(ctx: Context) -> Doc:
 		lock.close()
 
 
-def venture_profession_attrs(char: Character) -> dict[str, Any]:
+def profession_tiers_text(tiers: list[ProfessionTier]) -> str:
+	"""A profession's ranks per expansion, oldest first: "Classic 300/300; ...; Midnight 65/100"."""
+	return "; ".join(f"{t.expansion} {t.rank}/{t.max_rank}" for t in tiers)
+
+
+def venture_profession_attrs(char: Character, tiers: Optional[dict[str, list[ProfessionTier]]] = None) -> dict[str, Any]:
 	"""
 	A character's professions (TSM's playerProfessions) as flat account
 	attrs, the only shape the protocol's attrs allow: "profession:<Name>"
@@ -8672,6 +8770,16 @@ def venture_profession_attrs(char: Character) -> dict[str, Any]:
 			attrs[venture_clip(f"profession_max:{name}", 64)] = int(cap)
 		if info.get("isSecondary"):
 			attrs[venture_clip(f"profession_secondary:{name}", 64)] = True
+	# Every expansion's skill line in one scalar per profession: attrs are
+	# flat and capped at VENTURE_MAX_ATTRS members, too few for one each.
+	for name, lines in sorted((tiers or {}).items()):
+		text: str = profession_tiers_text(lines)
+		if text:
+			# Under the value cap by whole entries, newest kept, never a cut one.
+			entries: list[str] = text.split("; ")
+			while len("; ".join(entries).encode("utf-8")) > VENTURE_MAX_KEY and len(entries) > 1:
+				entries.pop(0)
+			attrs[venture_clip(f"profession_tiers:{name}", 64)] = venture_clip("; ".join(entries))
 	return attrs
 
 
@@ -8697,9 +8805,12 @@ def venture_recipe_payload(ctx: Context) -> tuple[list[dict[str, Any]], dict[str
 	filters: Filters = ctx.filters()
 	profession: str = (getattr(ctx.args, "profession", None) or "").strip().lower()
 	categories: dict[int, str] = {}
+	expansions: dict[int, str] = {}
 	for recipe in data.recipes:
 		if recipe.category and recipe.recipe_id not in categories:
 			categories[recipe.recipe_id] = recipe.category
+		if recipe.expansion and recipe.recipe_id not in expansions:
+			expansions[recipe.recipe_id] = recipe.expansion
 	out: list[dict[str, Any]] = []
 	skipped: dict[str, int] = {}
 
@@ -8730,7 +8841,8 @@ def venture_recipe_payload(ctx: Context) -> tuple[list[dict[str, Any]], dict[str
 		quantity: Any = int(craft.num_result) if float(craft.num_result).is_integer() else round(craft.num_result, 3)
 		out.append({
 			"spell_id": craft.spell_id, "name": craft.name, "profession": craft.profession,
-			"category": categories.get(craft.spell_id), "item": int(item_id(craft.item)), "quantity": quantity,
+			"category": categories.get(craft.spell_id), "expansion": expansions.get(craft.spell_id),
+			"item": int(item_id(craft.item)), "quantity": quantity,
 			"reagents": reagents, "known_by": [venture_account_key(char, realm) for char, realm, _account in players],
 		})
 	return out, skipped
@@ -8763,7 +8875,7 @@ def venture_recipes(ctx: Context) -> Doc:
 		summary.text(f"- left out {count}: {reason}")
 	if getattr(args, "dry_run", False):
 		table: Table = Table([
-			Column("profession", "Profession"), Column("category", "Category", max_width=24), Column("name", "Recipe", max_width=36),
+			Column("profession", "Profession"), Column("expansion", "Expansion"), Column("category", "Category", max_width=24), Column("name", "Recipe", max_width=36),
 			Column("makes", "Makes", max_width=30), Column("item", "Item id", wide=True), Column("quantity", "Qty"), Column("reagents", "Reagents"),
 			Column("known_by", "Known by", max_width=40, wide=True),
 		], [{**r, "makes": ctx.data.item_name(f"i:{r['item']}"), "reagents": len(r["reagents"]), "known_by": ", ".join(r["known_by"])} for r in recipes],

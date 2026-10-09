@@ -503,6 +503,11 @@ def recipe(recipe_id: int, learned: bool, rank: int = 0, ranks: int = 0, difficu
 	return difficulty + ((1 if learned else 0) << 2) + (rank << 3) + (ranks << 5) + (recipe_id << 7)
 
 
+def tier(rank: int, max_rank: int, category_id: int) -> int:
+	"""DataStore_Crafts CategoryInfo entry: bits 0-9 rank, 10-19 max, 20+ the tier's category id."""
+	return rank + (max_rank << 10) + (category_id << 20)
+
+
 def item_link(item_id: int, name: str, bonuses: list[int] = ()) -> str:  # type: ignore[assignment]
 	"""A modern item link; bonus ids sit after the context field (index 12 is their count)."""
 	bonus: str = f"{len(bonuses)}:" + ":".join(str(b) for b in bonuses) if bonuses else ""
@@ -636,9 +641,13 @@ def write_ops_fixture(base: Path) -> None:
 		},
 	})
 	write_sv(sv / "DataStore_Crafts.lua", {
-		"DataStore_Crafts_RecipeCategories": {100: "Bags"},
+		"DataStore_Crafts_RecipeCategories": {100: "Bags", 101: "Cloth", 900: "Tailoring Patterns", 901: "Khaz Algar Tailoring", 902: "Midnight Mining", 903: "Legion Patterns"},
+		# Tiers: Classic (Bags), Khaz Algar (Cloth, where TSM's Hat is), a
+		# misfiled Mining tier and a Legion tier never learned (0/0).
 		"DataStore_Crafts_Characters": {1: {"lastUpdate": NOW - 60, "Professions": [
-			{"Name": "Tailoring", "Crafts": {100: [recipe(12345, True, 1, 3), recipe(12346, False, 0, 0, 3)]}},
+			{"Name": "Tailoring", "Categories": [[100], [101], [], []],
+			 "CategoryInfo": [tier(300, 300, 900), tier(65, 100, 901), tier(1, 100, 902), tier(0, 0, 903)],
+			 "Crafts": {100: [recipe(12345, True, 1, 3), recipe(12346, False, 0, 0, 3)], 101: [recipe(3002, True)]}},
 		]}},
 	})
 	write_sv(sv / "Syndicator.lua", {"SYNDICATOR_DATA": {
@@ -897,7 +906,7 @@ class OptionalSourceCliTests(unittest.TestCase):
 		names: dict[tuple[str, int], str] = {(c.char, c.currency_id): c.name for c in data.currencies}
 		self.assertEqual(names[("Delta", 1191)], "Valor")
 		recipes: list[Any] = sorted(data.recipes, key=lambda r: r.recipe_id)
-		self.assertEqual([(r.recipe_id, r.learned, r.rank, r.max_rank, r.difficulty, r.category) for r in recipes], [(12345, True, 1, 3, 0, "Bags"), (12346, False, 0, 0, 3, "Bags")])
+		self.assertEqual([(r.recipe_id, r.learned, r.rank, r.max_rank, r.difficulty, r.category, r.expansion) for r in recipes], [(3002, True, 0, 0, 0, "Cloth", "Khaz Algar"), (12345, True, 1, 3, 0, "Bags", "Classic"), (12346, False, 0, 0, 3, "Bags", "Classic")])
 		alpha: Any = data.char_ref("alpha", "Testrealm")
 		self.assertEqual((alpha.money_source, alpha.last_seen), ("datastore", NOW - 60))
 		self.assertEqual(sorted(alpha.sources), ["datastore", "syndicator", "tsm"])
@@ -984,11 +993,12 @@ class OptionalSourceCliTests(unittest.TestCase):
 
 	def test_recipes(self) -> None:
 		rows: list[dict[str, Any]] = self.table("get", "recipes")["rows"]
-		self.assertEqual([(r["id"], r["category"], r["rank"]) for r in rows if r["source"] == "datastore"], [(12345, "Bags", "1/3")])
-		# TSM's crafts add what DataStore did not list: Alpha's three, Delta's one.
-		self.assertEqual(sorted((r["char"], r["id"]) for r in rows if r["source"] == "tsm"), [("Alpha", 3001), ("Alpha", 3002), ("Alpha", 3003), ("Delta", 3001)])
-		self.assertEqual(len(self.table("get", "recipes", "--all")["rows"]), 2 + 4)
-		self.assertEqual(len(self.table("get", "recipes", "--profession", "tail", "--char", "Alpha")["rows"]), 1 + 3)
+		self.assertEqual([(r["id"], r["category"], r["rank"], r["expansion"]) for r in rows if r["source"] == "datastore"], [(12345, "Bags", "1/3", "Classic"), (3002, "Cloth", "", "Khaz Algar")])
+		# TSM's crafts add what DataStore did not list: Alpha's other two, Delta's one.
+		self.assertEqual(sorted((r["char"], r["id"]) for r in rows if r["source"] == "tsm"), [("Alpha", 3001), ("Alpha", 3003), ("Delta", 3001)])
+		self.assertEqual(next(r for r in rows if r["id"] == 3002)["recipe"], "Hat", "named from TSM's crafts")
+		self.assertEqual(len(self.table("get", "recipes", "--all")["rows"]), 3 + 3)
+		self.assertEqual(len(self.table("get", "recipes", "--profession", "tail", "--char", "Alpha")["rows"]), 2 + 2)
 		self.assertEqual(len(self.table("get", "recipes", "--profession", "mining")["rows"]), 0)
 
 	def test_attention_order_and_thresholds(self) -> None:
@@ -2041,7 +2051,7 @@ class CraftTests(unittest.TestCase):
 		self.assertEqual(proc.returncode, 0, proc.stderr)
 		rows: list[dict[str, Any]] = json.loads(proc.stdout)["sections"][0]["tables"][0]["rows"]
 		hat: dict[str, Any] = next(r for r in rows if r["id"] == 3002)
-		self.assertEqual((hat["recipe"], hat["makes"], hat["reagents"], hat["source"]), ("Hat", "Trinket", 2, "tsm"))
+		self.assertEqual((hat["recipe"], hat["makes"], hat["reagents"], hat["source"], hat["expansion"]), ("Hat", "Trinket", 2, "datastore", "Khaz Algar"), "DataStore's row, named from TSM")
 		self.assertIn(("Delta", 3001), {(r["char"], r["id"]) for r in rows})
 
 	def test_export_carries_professions(self) -> None:
@@ -2054,6 +2064,28 @@ class CraftTests(unittest.TestCase):
 		self.assertEqual(attrs["profession_max:Tailoring"], 100)
 		self.assertIs(attrs["profession_secondary:Cooking"], True)
 		self.assertNotIn("profession_secondary:Tailoring", attrs)
+
+	def test_expansion_labels(self) -> None:
+		cases: dict[tuple[str, str], str] = {
+			("Khaz Algar Tailoring", "Tailoring"): "Khaz Algar", ("Pandaren Plans", "Blacksmithing"): "Pandaria",
+			("Food of the Broken Isles", "Cooking"): "Legion", ("Old World Recipes", "Cooking"): "Classic",
+			("Tailoring Patterns", "Tailoring"): "Classic", ("Mining", "Mining"): "Classic",
+			("Zandalari Alchemy", "Alchemy"): "Kul Tiras", ("Something New", "Alchemy"): "Something New",
+		}
+		for (name, profession), label in cases.items():
+			self.assertEqual(tsmctl.expansion_label(name, profession), label, name)
+		self.assertTrue(tsmctl.tier_is_foreign("Midnight Mining", "Herbalism"))
+		self.assertFalse(tsmctl.tier_is_foreign("Food of Draenor", "Cooking"))
+
+	def test_professions_by_expansion(self) -> None:
+		proc: subprocess.CompletedProcess[str] = self.run_cli("-o", "json", "get", "professions")
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		rows: list[dict[str, Any]] = json.loads(proc.stdout)["sections"][0]["tables"][0]["rows"]
+		tailoring: dict[str, Any] = next(r for r in rows if r["char"] == "Alpha" and r["profession"] == "Tailoring")
+		self.assertEqual(tailoring["expansions"], "Classic 300/300; Khaz Algar 65/100", "oldest first; misfiled and unlearned tiers left out")
+		export: subprocess.CompletedProcess[str] = self.run_cli("export")
+		alpha: dict[str, Any] = next(json.loads(l) for l in export.stdout.splitlines() if '"key":"Alpha-Testrealm"' in l and '"type":"account"' in l)
+		self.assertEqual(alpha["attrs"]["profession_tiers:Tailoring"], "Classic 300/300; Khaz Algar 65/100")
 
 	def test_recipes_dry_run_sends_nothing(self) -> None:
 		proc: subprocess.CompletedProcess[str] = self.run_cli("-o", "json", "venture", "recipes", "--dry-run", "-n", "0")
@@ -2079,6 +2111,8 @@ class CraftTests(unittest.TestCase):
 		self.assertEqual(by_spell[3001]["reagents"], [{"item": 1004, "quantity": 4}], "optional reagents are not costs")
 		self.assertEqual(by_spell[3001]["known_by"], ["Alpha-Testrealm", "Delta-Linkedrealm"], "the knowers' account keys")
 		self.assertEqual((by_spell[3002]["item"], by_spell[3002]["quantity"], by_spell[3002]["name"]), (1005, 2, "Hat"))
+		self.assertEqual((by_spell[3002]["expansion"], by_spell[3002]["category"]), ("Khaz Algar", "Cloth"), "from DataStore by spell id")
+		self.assertIsNone(by_spell[3001]["expansion"], "no DataStore list names it")
 		self.assertIn("Created", proc.stdout)
 		self.assertNotIn(self.TOKEN, proc.stdout + proc.stderr)
 
