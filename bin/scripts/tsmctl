@@ -23,8 +23,9 @@ tsmctl reads the files TSM leaves on disk and never writes to them:
   * WTF/Account/<account>/SavedVariables/TradeSkillMaster.lua
       accounting ledgers (sales, buys, income, expenses, expired, cancelled),
       per-character gold and gold logs, bag/bank/mail/auction/warbank/guild
-      inventory, TSM groups, and the TSM item-info cache (names, quality,
-      vendor prices).
+      inventory, TSM groups, the TSM item-info cache (names, quality,
+      vendor prices), each character's professions, and the crafts TSM's
+      Crafting module knows (recipe, product, reagents, who knows it).
   * Interface/AddOns/TradeSkillMaster_AppHelper/AppData.lua
       the AuctionDB market data the TSM desktop app downloads (realm min
       buyout, market value, historical; region market, sale avg, sale rate,
@@ -48,7 +49,9 @@ Everything prints to stdout. Besides its cache, nothing is written unless
 asked for: --save writes an org-mode report into the notes repo (or a given
 path), `export --file` an export, `venture install-units --write` systemd
 units. `export --format venture` and `venture push` feed VENTURE (see the
-VENTURE section); push sends to the configured server over HTTPS.
+VENTURE section); push sends to the configured server over HTTPS, and
+`venture recipes` sends the crafts your characters know to its recipe
+import.
 
 Only the Python standard library is used.
 """
@@ -757,6 +760,11 @@ class Settings(object):
 	venture_url: str = ""
 	venture_source: str = ""
 	venture_organization: str = ""
+	# `tsmctl venture recipes`: the market data source whose import_recipes
+	# action takes them (a blizzard_auctions source, not the push source)
+	# and the venture that products made for new items belong to.
+	venture_recipe_source: str = ""
+	venture_recipe_venture: str = ""
 	venture_token_file: str = ""
 	venture_currency: str = DEFAULT_VENTURE_CURRENCY
 	venture_market: str = DEFAULT_VENTURE_MARKET
@@ -869,6 +877,8 @@ def build_settings(args: argparse.Namespace) -> Settings:
 	settings.venture_url = str(pick("venture_url", getattr(args, "url", None), ("TSMCTL_VENTURE_URL",), "") or "").strip()
 	settings.venture_source = str(pick("venture_source", getattr(args, "venture_source_id", None), ("TSMCTL_VENTURE_SOURCE",), "") or "").strip()
 	settings.venture_organization = str(pick("venture_organization", getattr(args, "organization", None), ("TSMCTL_VENTURE_ORGANIZATION",), "") or "").strip()
+	settings.venture_recipe_source = str(pick("venture_recipe_source", getattr(args, "recipe_source", None), ("TSMCTL_VENTURE_RECIPE_SOURCE",), "") or "").strip()
+	settings.venture_recipe_venture = str(pick("venture_recipe_venture", getattr(args, "venture_id", None), ("TSMCTL_VENTURE_RECIPE_VENTURE",), "") or "").strip()
 	settings.venture_token_file = str(pick("venture_token_file", None, ("TSMCTL_VENTURE_TOKEN_FILE",), "") or "").strip()
 	settings.venture_currency = str(pick("venture_currency", getattr(args, "currency", None), ("TSMCTL_VENTURE_CURRENCY",), DEFAULT_VENTURE_CURRENCY)).strip().upper()
 	if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,14}", settings.venture_currency):
@@ -876,7 +886,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
 	settings.venture_market = str(pick("venture_market", getattr(args, "market", None), ("TSMCTL_VENTURE_MARKET",), DEFAULT_VENTURE_MARKET)).strip().lower()
 	if settings.venture_market not in VENTURE_MARKET_MODES:
 		raise TsmctlError(f"market scope must be one of {', '.join(VENTURE_MARKET_MODES)} (got {settings.venture_market!r})")
-	for name in ("venture_source", "venture_organization"):
+	for name in ("venture_source", "venture_organization", "venture_recipe_source", "venture_recipe_venture"):
 		value: str = getattr(settings, name)
 		if value and not (value.isdigit() and int(value) > 0):
 			raise TsmctlError(f"{name} must be a positive id number (got {value!r})")
@@ -1546,6 +1556,28 @@ class KnownRecipe(object):
 	source: str = ""
 
 
+@dataclass(slots=True)
+class TsmCraft(object):
+	"""
+	A craft TSM's Crafting module knows (f@<faction> - <realm>@internalData@crafts,
+	keyed "c:<spell id>"): the recipe's name and profession, the item it
+	makes and how many, its reagents and the characters who know it. The
+	spell id is DataStore's recipe id too, which is how the two are joined.
+	`mats` holds plain items (i:ID) only; optional and quality reagents
+	(o:..., q:...) are choices, not costs, and are counted in `optional`.
+	"""
+
+	spell_id: int
+	name: str
+	profession: str
+	item: str
+	num_result: float = 1.0
+	mats: dict[str, int] = field(default_factory=dict)
+	optional: int = 0
+	# (character, realm, account) of everyone who knows it.
+	players: set[tuple[str, str, str]] = field(default_factory=set)
+
+
 @dataclass
 class CharObservation(object):
 	"""What one optional source says about a character, merged in finish()."""
@@ -1758,6 +1790,7 @@ class TsmData(object):
 		self.mails: list[Mail] = []
 		self.currencies: list[CurrencyHolding] = []
 		self.recipes: list[KnownRecipe] = []
+		self.crafts: dict[int, TsmCraft] = {}
 		self.currency_names: dict[int, str] = {}
 		self.guild_homes: dict[str, set[str]] = {}
 		self._txn_index: dict[tuple[Any, ...], Txn] = {}
@@ -2018,6 +2051,42 @@ class TsmData(object):
 				char: Optional[Character] = self.characters.get(f"{char_name} - {faction} - {realm}")
 				if char is not None and isinstance(guild, str):
 					char.guild = guild
+		elif name == "crafts":
+			self._load_tsm_crafts(account, realm, value)
+
+	def _load_tsm_crafts(self, account: str, realm: str, value: Any) -> None:
+		"""
+		One faction-realm's crafts ({"c:<spell>": {name, profession,
+		itemString, numResult, mats, players}}). The same spell on two realms
+		is one craft known by the players of both; the recipe itself (name,
+		item, reagents) is the game's, so the first copy read stands.
+		"""
+		for key, entry in lua_dict(value).items():
+			if not (isinstance(key, str) and key.startswith("c:") and isinstance(entry, dict)):
+				continue
+			spell: int = _to_int(key[2:])
+			item: Any = entry.get("itemString")
+			if spell <= 0 or not isinstance(item, str) or not item:
+				continue
+			craft: Optional[TsmCraft] = self.crafts.get(spell)
+			if craft is None:
+				result: Any = entry.get("numResult")
+				craft = TsmCraft(
+					spell_id=spell, name=str(entry.get("name") or ""), profession=str(entry.get("profession") or ""),
+					item=item, num_result=float(result) if isinstance(result, (int, float)) and result > 0 else 1.0,
+				)
+				for mat, qty in lua_dict(entry.get("mats")).items():
+					if not isinstance(mat, str) or not isinstance(qty, (int, float)) or qty <= 0:
+						continue
+					if mat.startswith("i:"):
+						base: str = item_base(mat)
+						craft.mats[base] = craft.mats.get(base, 0) + int(qty)
+					else:
+						craft.optional += 1
+				self.crafts[spell] = craft
+			for player in lua_dict(entry.get("players")):
+				if isinstance(player, str) and player:
+					craft.players.add((player, realm, account))
 
 	def _load_global_value(self, account: str, name: str, value: Any) -> None:
 		if name == "warbankMoney" and isinstance(value, (int, float)):
@@ -5455,27 +5524,41 @@ RECIPE_DIFFICULTY: dict[int, str] = {0: "optimal", 1: "medium", 2: "easy", 3: "t
 
 
 def get_recipes(ctx: Context, query: Optional[str]) -> Doc:
-	"""Recipes each character's professions list (learned only unless --all)."""
+	"""
+	Recipes each character's professions list (learned only unless --all):
+	DataStore's per-character lists, named and given their product and
+	reagents from TSM's crafts (joined by spell id), plus the crafts TSM
+	knows of a character DataStore has no list for.
+	"""
 	data: TsmData = ctx.data
 	filters: Filters = ctx.filters()
 	profession: str = (getattr(ctx.args, "profession", None) or "").strip().lower()
 	text: str = (query or "").strip().lower()
 	show_all: bool = bool(getattr(ctx.args, "all", False))
+	known: list[KnownRecipe] = list(data.recipes)
+	listed: set[tuple[str, str, int]] = {(r.char.lower(), r.realm, r.recipe_id) for r in known}
+	for craft in data.crafts.values():
+		for char, realm, account in sorted(craft.players):
+			if (char.lower(), realm, craft.spell_id) not in listed:
+				known.append(KnownRecipe(account=account, char=char, realm=realm, profession=craft.profession, recipe_id=craft.spell_id, source="tsm"))
 	rows: list[dict[str, Any]] = []
-	for recipe in data.recipes:
+	for recipe in known:
+		craft: Optional[TsmCraft] = data.crafts.get(recipe.recipe_id)
+		name: str = recipe.name or (craft.name if craft else "")
 		if not filters.owner_ok(recipe.account, recipe.char, recipe.realm):
 			continue
 		if profession and profession not in recipe.profession.lower():
 			continue
 		if not recipe.learned and not show_all:
 			continue
-		if text and text != str(recipe.recipe_id) and text not in recipe.category.lower() and text not in recipe.name.lower():
+		if text and text != str(recipe.recipe_id) and text not in recipe.category.lower() and text not in name.lower():
 			continue
 		rows.append({
 			"char": recipe.char, "realm": recipe.realm, "profession": recipe.profession, "category": recipe.category or None,
-			"recipe": recipe.name or None, "id": recipe.recipe_id, "rank": f"{recipe.rank}/{recipe.max_rank}" if recipe.max_rank > 1 else "",
-			"learned": "yes" if recipe.learned else "no", "difficulty": RECIPE_DIFFICULTY.get(recipe.difficulty, str(recipe.difficulty)),
-			"url": f"https://www.wowhead.com/spell={recipe.recipe_id}", "account": recipe.account,
+			"recipe": name or None, "id": recipe.recipe_id, "rank": f"{recipe.rank}/{recipe.max_rank}" if recipe.max_rank > 1 else "",
+			"learned": "yes" if recipe.learned else "no", "difficulty": RECIPE_DIFFICULTY.get(recipe.difficulty, str(recipe.difficulty)) if recipe.source == "datastore" else None,
+			"makes": data.item_name(craft.item) if craft else None, "reagents": len(craft.mats) if craft else None,
+			"url": f"https://www.wowhead.com/spell={recipe.recipe_id}", "source": recipe.source, "account": recipe.account,
 		})
 	rows.sort(key=lambda r: (r["char"].lower(), r["realm"], r["profession"], r["category"] or "", r["id"]))
 	doc: Doc = Doc("Recipes", "get_recipes")
@@ -5484,14 +5567,16 @@ def get_recipes(ctx: Context, query: Optional[str]) -> Doc:
 		("Recipes", len(rows), "int"),
 		("Characters with recipes", len({(r["char"], r["realm"]) for r in rows}), "int"),
 		("Professions", ", ".join(sorted({r["profession"] for r in rows})) or None, "str"),
+		("With TSM craft data", sum(1 for r in rows if r["makes"] is not None), "int"),
 	])
 	table: Table = Table([
 		Column("char", "Character"), Column("realm", "Realm"), Column("profession", "Profession"), Column("category", "Category", max_width=30),
-		Column("recipe", "Recipe", max_width=30, wide=True), Column("id", "Recipe id"), Column("rank", "Rank"), Column("learned", "Learned", wide=True),
-		Column("difficulty", "Difficulty", wide=True), Column("url", "Wowhead", wide=True), Column("account", "Account", wide=True),
-	], rows, empty="no recipe data (needs Altoholic's DataStore with the profession window opened once per character)")
+		Column("recipe", "Recipe", max_width=30), Column("id", "Recipe id"), Column("rank", "Rank"), Column("learned", "Learned", wide=True),
+		Column("difficulty", "Difficulty", wide=True), Column("makes", "Makes", max_width=30, wide=True), Column("reagents", "Reagents", wide=True),
+		Column("url", "Wowhead", wide=True), Column("source", "Source", wide=True), Column("account", "Account", wide=True),
+	], rows, empty="no recipe data (needs TSM's Crafting data, or Altoholic's DataStore, with the profession window opened once per character)")
 	section.table(table)
-	section.text("DataStore stores recipe (spell) ids and categories but not recipe names; the Wowhead column links each one.")
+	section.text("Names, products and reagents come from TSM's crafts (spell id = DataStore's recipe id); DataStore adds categories and unlearned recipes.")
 	apply_main(ctx, doc, table, default_limit=100)
 	return doc
 
@@ -6650,6 +6735,11 @@ money: g
 # venture_url: https://venture.example
 # venture_source: 12
 # venture_organization: 1
+# `tsmctl venture recipes`: the blizzard_auctions data source whose
+# import_recipes action takes the crafts TSM knows, and the venture that
+# products made for their items belong to.
+# venture_recipe_source: 1
+# venture_recipe_venture: 3
 # venture_token_file: ~/.config/tsmctl/venture-token
 # venture_currency: GOLD
 # AuctionDB figures in the export: scope (what you hold/post/trade + groups), all, none.
@@ -6670,7 +6760,7 @@ def cmd_config(ctx: Context) -> Doc:
 	settings: Settings = ctx.settings
 	doc: Doc = Doc("tsmctl config", "config")
 	rows: list[dict[str, Any]] = []
-	for name in ("host", "wow_dir", "flavor", "cache_dir", "accounts", "sources", "realm", "price_source", "market_source", "sell_source", "ah_cut", "notes_dir", "report_dir", "money", "color", "author", "categories", "region", "venture_url", "venture_source", "venture_organization", "venture_token_file", "venture_currency", "venture_market", "venture_logins", "account_labels", "battlenet_groups", "warband", "hosts"):
+	for name in ("host", "wow_dir", "flavor", "cache_dir", "accounts", "sources", "realm", "price_source", "market_source", "sell_source", "ah_cut", "notes_dir", "report_dir", "money", "color", "author", "categories", "region", "venture_url", "venture_source", "venture_organization", "venture_recipe_source", "venture_recipe_venture", "venture_token_file", "venture_currency", "venture_market", "venture_logins", "account_labels", "battlenet_groups", "warband", "hosts"):
 		value: Any = getattr(settings, "data_sources" if name == "sources" else name)
 		if name == "ah_cut":
 			value = f"{value * 100:g}%"
@@ -7373,6 +7463,7 @@ class VentureExport(object):
 				"played_seconds": char.played, "login_account": char.account, "zone": char.zone,
 			}
 			line["attrs"] = {k: (venture_clip(v) if isinstance(v, str) else v) for k, v in attrs.items() if v not in (None, "", 0)}
+			line["attrs"].update(venture_profession_attrs(char))
 			plan: VenturePlan = self._plan(key, char.account, line)
 			if char.money_source:
 				plan.covers.add("balances")
@@ -8463,7 +8554,9 @@ def cmd_venture(ctx: Context) -> Optional[Doc]:
 		return venture_status(ctx)
 	if action in ("install-units", "units"):
 		return venture_install_units(ctx)
-	raise TsmctlError("venture takes: push, status or install-units")
+	if action == "recipes":
+		return venture_recipes(ctx)
+	raise TsmctlError("venture takes: push, status, recipes or install-units")
 
 
 def venture_push(ctx: Context) -> Doc:
@@ -8507,6 +8600,7 @@ def venture_push(ctx: Context) -> Doc:
 					previous = ""
 				if previous == body_sha:
 					doc.section("Push").kv([("Server", base_url, "str"), ("Source", settings.venture_source, "str"), ("Result", "unchanged since the last push; nothing sent", "str")])
+					venture_push_recipes(ctx, doc, base_url, token, where)
 					return doc
 			buffer.seek(0)
 			query: dict[str, str] = {}
@@ -8551,9 +8645,218 @@ def venture_push(ctx: Context) -> Doc:
 		if ctx.exit_code == 0:
 			state.parent.mkdir(parents=True, exist_ok=True)
 			state.write_text(body_sha + "\n", encoding="utf-8")
+		if ctx.exit_code == 0:
+			venture_push_recipes(ctx, doc, base_url, token, where)
 		return doc
 	finally:
 		lock.close()
+
+
+def venture_profession_attrs(char: Character) -> dict[str, Any]:
+	"""
+	A character's professions (TSM's playerProfessions) as flat account
+	attrs, the only shape the protocol's attrs allow: "profession:<Name>"
+	is the skill, "profession_max:<Name>" the cap, and
+	"profession_secondary:<Name>" is true for Cooking, Fishing and the like.
+	A skill of 0 is still sent: a learned profession with no points is known.
+	"""
+	attrs: dict[str, Any] = {}
+	for name, prof in sorted(char.professions.items(), key=lambda p: str(p[0])):
+		info: dict[Any, Any] = lua_dict(prof)
+		level: Any = info.get("level")
+		if not isinstance(name, str) or not name or not isinstance(level, (int, float)):
+			continue
+		attrs[venture_clip(f"profession:{name}", 64)] = int(level)
+		cap: Any = info.get("maxLevel")
+		if isinstance(cap, (int, float)) and cap > 0:
+			attrs[venture_clip(f"profession_max:{name}", 64)] = int(cap)
+		if info.get("isSecondary"):
+			attrs[venture_clip(f"profession_secondary:{name}", 64)] = True
+	return attrs
+
+
+def venture_account_key(char: str, realm: str) -> str:
+	"""A character's account key, as its `account` line names it."""
+	return venture_clip(f"{char}-{realm}")
+
+
+# Crafts per import_recipes request: well under the server's cap, and small
+# enough that one request's work (instruments, products, components) stays
+# a short transaction on the server's main thread.
+VENTURE_RECIPES_BATCH: int = 250
+
+
+def venture_recipe_payload(ctx: Context) -> tuple[list[dict[str, Any]], dict[str, int]]:
+	"""
+	TSM's crafts as import_recipes' `recipes` elements, filtered by --char,
+	--realm, --login and --profession, plus counts of what was left out
+	and why. The category is DataStore's for the same spell id when a
+	character's list has one.
+	"""
+	data: TsmData = ctx.data
+	filters: Filters = ctx.filters()
+	profession: str = (getattr(ctx.args, "profession", None) or "").strip().lower()
+	categories: dict[int, str] = {}
+	for recipe in data.recipes:
+		if recipe.category and recipe.recipe_id not in categories:
+			categories[recipe.recipe_id] = recipe.category
+	out: list[dict[str, Any]] = []
+	skipped: dict[str, int] = {}
+
+	def skip(reason: str) -> None:
+		skipped[reason] = skipped.get(reason, 0) + 1
+
+	for spell in sorted(data.crafts):
+		craft: TsmCraft = data.crafts[spell]
+		players: list[tuple[str, str, str]] = sorted(p for p in craft.players if filters.owner_ok(p[2], p[0], p[1]))
+		if not players:
+			continue
+		if profession and profession not in craft.profession.lower():
+			continue
+		if not craft.name or not craft.profession:
+			skip("no name or profession in TSM's data")
+			continue
+		if not craft.item.startswith("i:") or not item_id(craft.item).isdigit():
+			skip("makes something that is not an item (a pet, an enchant on gear)")
+			continue
+		reagents: list[dict[str, int]] = [
+			{"item": int(item_id(mat)), "quantity": qty}
+			for mat, qty in sorted(craft.mats.items(), key=lambda m: int(item_id(m[0])) if item_id(m[0]).isdigit() else 0)
+			if item_id(mat).isdigit()
+		]
+		if not reagents:
+			skip("no plain reagents (only optional or quality ones)")
+			continue
+		quantity: Any = int(craft.num_result) if float(craft.num_result).is_integer() else round(craft.num_result, 3)
+		out.append({
+			"spell_id": craft.spell_id, "name": craft.name, "profession": craft.profession,
+			"category": categories.get(craft.spell_id), "item": int(item_id(craft.item)), "quantity": quantity,
+			"reagents": reagents, "known_by": [venture_account_key(char, realm) for char, realm, _account in players],
+		})
+	return out, skipped
+
+
+def venture_recipes(ctx: Context) -> Doc:
+	"""
+	`tsmctl venture recipes`: the crafts your characters know, as TSM's
+	Crafting module saved them (name, product, number made, reagents, who
+	knows it), sent to the import_recipes action of a blizzard_auctions
+	data source -- POST /api/v1/data_source/<id>/actions/import_recipes with
+	{"recipes": [...]} in batches -- so VENTURE's Crafting page prices exactly
+	what can be made. --dry-run prints what would be sent and sends nothing.
+	Running it again is safe: the server matches each recipe by its spell id.
+	"""
+	args: argparse.Namespace = ctx.args
+	settings: Settings = ctx.settings
+	recipes, skipped = venture_recipe_payload(ctx)
+	doc: Doc = Doc("tsmctl venture recipes", "venture_recipes")
+	by_profession: dict[str, int] = {}
+	for recipe in recipes:
+		by_profession[recipe["profession"]] = by_profession.get(recipe["profession"], 0) + 1
+	summary: Section = doc.section("Recipes")
+	summary.kv([
+		("Crafts known", len(recipes), "int"),
+		("Professions", ", ".join(f"{name} {count}" for name, count in sorted(by_profession.items())) or None, "str"),
+		("Characters", len({who for recipe in recipes for who in recipe["known_by"]}), "int"),
+	])
+	for reason, count in sorted(skipped.items()):
+		summary.text(f"- left out {count}: {reason}")
+	if getattr(args, "dry_run", False):
+		table: Table = Table([
+			Column("profession", "Profession"), Column("category", "Category", max_width=24), Column("name", "Recipe", max_width=36),
+			Column("makes", "Makes", max_width=30), Column("item", "Item id", wide=True), Column("quantity", "Qty"), Column("reagents", "Reagents"),
+			Column("known_by", "Known by", max_width=40, wide=True),
+		], [{**r, "makes": ctx.data.item_name(f"i:{r['item']}"), "reagents": len(r["reagents"]), "known_by": ", ".join(r["known_by"])} for r in recipes],
+			empty="no crafts in TSM's data")
+		summary.table(table)
+		apply_main(ctx, doc, table, default_limit=50)
+		return doc
+	if not recipes:
+		return doc
+	base_url: str = venture_base_url(settings.venture_url, bool(getattr(args, "allow_http", False)))
+	if not settings.venture_recipe_source:
+		raise TsmctlError("no recipe source: give --recipe-source ID, $TSMCTL_VENTURE_RECIPE_SOURCE or venture_recipe_source in the config (the blizzard_auctions data source, not the push source)")
+	token, where = venture_token(settings)
+	venture_send_recipes(ctx, doc, recipes, base_url, token, where)
+	if ctx.exit_code == 0:
+		venture_remember_recipes(settings, base_url, recipes)
+	return doc
+
+
+def venture_recipes_digest(recipes: list[dict[str, Any]]) -> str:
+	return hashlib.sha256(json.dumps(recipes, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def venture_recipes_state(settings: Settings, base_url: str) -> Path:
+	"""Where the last recipe set sent to this server, source and organization is remembered."""
+	tag: str = hashlib.sha256(f"{base_url}|{settings.venture_recipe_source}|{settings.venture_organization}|{settings.venture_recipe_venture}".encode("utf-8")).hexdigest()[:16]
+	return settings.cache_dir / "venture" / f"last-recipes-{tag}.sha256"
+
+
+def venture_remember_recipes(settings: Settings, base_url: str, recipes: list[dict[str, Any]]) -> None:
+	state: Path = venture_recipes_state(settings, base_url)
+	state.parent.mkdir(parents=True, exist_ok=True)
+	state.write_text(venture_recipes_digest(recipes) + "\n", encoding="utf-8")
+
+
+def venture_send_recipes(ctx: Context, doc: Doc, recipes: list[dict[str, Any]], base_url: str, token: Optional[str], where: str) -> None:
+	"""POST `recipes` to the recipe source's import_recipes in batches; report into `doc`, set ctx.exit_code on a refusal."""
+	settings: Settings = ctx.settings
+	client: VentureClient = VentureClient(base_url, token, VENTURE_WAIT_TIMEOUT)
+	query: dict[str, str] = {"organization_id": settings.venture_organization} if settings.venture_organization else {}
+	totals: dict[str, int] = {}
+	reasons: list[str] = []
+	path: str = f"/api/v1/data_source/{settings.venture_recipe_source}/actions/import_recipes"
+	for start in range(0, len(recipes), VENTURE_RECIPES_BATCH):
+		params: dict[str, Any] = {"recipes": recipes[start:start + VENTURE_RECIPES_BATCH]}
+		if settings.venture_recipe_venture:
+			params["create_products"] = True
+			params["venture_id"] = int(settings.venture_recipe_venture)
+		body: bytes = json.dumps(params, ensure_ascii=False).encode("utf-8")
+		status, payload = client.request("POST", path, query, body, len(body), "application/json")
+		if status >= 300:
+			ctx.exit_code = EXIT_REFUSED
+			print(f"{PROG}: error: VENTURE refused recipes {start + 1}-{start + len(params['recipes'])} (HTTP {status}): {venture_error_text(status, payload)}", file=sys.stderr)
+			break
+		result: Any = payload.get("result") if isinstance(payload, dict) else None
+		if isinstance(result, dict):
+			for key, value in result.items():
+				if isinstance(value, int) and not isinstance(value, bool):
+					totals[key] = totals.get(key, 0) + value
+				elif key in ("reasons", "skipped_reasons") and isinstance(value, list):
+					reasons.extend(str(v) for v in value)
+		elif result:
+			reasons.append(str(result))
+	section: Section = doc.section("Recipes sent")
+	section.kv([("Server", base_url, "str"), ("Data source", settings.venture_recipe_source, "str"), ("Token", where, "str"),
+		("Recipes", len(recipes), "int"), ("Products for venture", settings.venture_recipe_venture or "(none: items without a product are skipped)", "str")]
+		+ [(key.replace("_", " ").capitalize(), value, "int") for key, value in sorted(totals.items())])
+	for reason in reasons[:20]:
+		section.text(f"- {reason}")
+
+
+def venture_push_recipes(ctx: Context, doc: Doc, base_url: str, token: Optional[str], where: str) -> None:
+	"""
+	After a push: the crafts too, when a recipe source is configured and
+	--no-recipes was not given, and only when they changed since the last
+	set VENTURE took (learning a recipe changes them; a sale does not).
+	"""
+	settings: Settings = ctx.settings
+	if not settings.venture_recipe_source or getattr(ctx.args, "no_recipes", False):
+		return
+	recipes, _skipped = venture_recipe_payload(ctx)
+	if not recipes:
+		return
+	try:
+		previous: str = venture_recipes_state(settings, base_url).read_text(encoding="utf-8").strip()
+	except OSError:
+		previous = ""
+	if previous == venture_recipes_digest(recipes):
+		doc.section("Recipes sent").kv([("Result", f"{len(recipes)} unchanged since the last import; nothing sent", "str")])
+		return
+	venture_send_recipes(ctx, doc, recipes, base_url, token, where)
+	if ctx.exit_code == 0:
+		venture_remember_recipes(settings, base_url, recipes)
 
 
 def venture_status(ctx: Context) -> Doc:
@@ -9002,7 +9305,7 @@ def build_parser() -> argparse.ArgumentParser:
 	add_venture_options(export)
 
 	venture: argparse.ArgumentParser = sub("venture", "push to a VENTURE server, show its state, or make systemd units", cmd_venture)
-	venture.add_argument("action", help="push, status or install-units")
+	venture.add_argument("action", help="push, status, recipes or install-units")
 	venture.add_argument("--url", metavar="URL", help="VENTURE server, e.g. https://venture.example (config venture_url, $TSMCTL_VENTURE_URL)")
 	venture.add_argument("--organization", metavar="ID", help="organization id the data source belongs to (config venture_organization)")
 	venture.add_argument("--wait", action="store_true", help="push: wait (up to 120 s) for VENTURE to apply it and print the run")
@@ -9011,13 +9314,21 @@ def build_parser() -> argparse.ArgumentParser:
 	venture.add_argument("--lock-timeout", type=int, metavar="SECONDS", help=f"push: how long to wait for another push to finish (default {DEFAULT_VENTURE_LOCK_TIMEOUT})")
 	venture.add_argument("--allow-http", action="store_true", help="allow a plain-http server that is not this machine (the token would cross the network unencrypted)")
 	venture.add_argument("--runs", type=int, metavar="N", help="status: how many recent runs to list (default 10)")
+	venture.add_argument("--recipe-source", metavar="ID", help="recipes: the blizzard_auctions data source to import into (config venture_recipe_source)")
+	venture.add_argument("--venture", dest="venture_id", metavar="ID", help="recipes: make products for new items under this venture (config venture_recipe_venture)")
+	venture.add_argument("--profession", metavar="NAME", help="recipes: only this profession (substring)")
+	venture.add_argument("--dry-run", action="store_true", help="recipes: show what would be sent and send nothing")
+	venture.add_argument("--no-recipes", action="store_true", help="push: do not also send the crafts (sent by default when venture_recipe_source is set, and only when they changed)")
 	venture.add_argument("--write", action="store_true", help="install-units: write the units to ~/.config/systemd/user instead of printing them")
 	venture.add_argument("--interval", metavar="SPAN", help="install-units: the timer's interval (systemd span, default 30min)")
 	add_venture_options(venture)
 	venture.epilog = """\
 actions:
-  push            export and POST to /api/v1/feeds/<source>/push (application/x-ndjson)
+  push            export and POST to /api/v1/feeds/<source>/push (application/x-ndjson);
+                  with venture_recipe_source set, then the crafts too when they changed
   status          settings, server health and the data source's newest runs
+  recipes         send the crafts TSM knows (name, product, reagents, who knows
+                  it) to a blizzard_auctions source's import_recipes action
   install-units   print (or --write) systemd user units that push when WoW writes its files
 
 here --source ID is the VENTURE data source (provider push, currency GOLD with
@@ -9033,6 +9344,8 @@ examples:
   tsmctl venture push --url https://venture.example --source 12 --wait
   tsmctl venture push --settle 20s --if-changed --wait
   tsmctl venture status --runs 5
+  tsmctl venture recipes --dry-run --profession tailoring
+  tsmctl venture recipes --recipe-source 1 --venture 3
   tsmctl venture install-units > /tmp/units.txt
   tsmctl venture install-units --write
 """

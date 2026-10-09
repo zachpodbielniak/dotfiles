@@ -526,6 +526,10 @@ def write_ops_fixture(base: Path) -> None:
 	  * Alpha's auctions: #111 in both DataStore and Syndicator (joined),
 	    #222 posted for two days, #333 already expired (DataStore), #444
 	    expired days ago (Syndicator only).
+	  * Professions and crafts (TSM): Alpha is a Tailoring 65/100 with
+	    Cooking 5/75 secondary. Testrealm's crafts: Bolt of Cloth (Alpha;
+	    Delta knows it on Linkedrealm too, one craft known by both), Hat
+	    (Alpha; makes 2) and Fancy Thing (only optional reagents: left out).
 	"""
 	sv: Path = base / "_retail_" / "WTF" / "Account" / "MAIN" / "SavedVariables"
 	sv.mkdir(parents=True)
@@ -536,10 +540,17 @@ def write_ops_fixture(base: Path) -> None:
 		f'["s@Alpha - Alliance - Testrealm@internalData@goldLogLastUpdate"] = {NOW - 7200},',
 		'["s@Alpha - Alliance - Testrealm@internalData@bagQuantity"] = { ["i:1001"] = 4, },',
 		'["s@Alpha - Alliance - Testrealm@internalData@bankQuantity"] = { ["i:1002"] = 1, },',
+		'["s@Alpha - Alliance - Testrealm@internalData@playerProfessions"] = { ["Tailoring"] = { ["level"] = 65, ["maxLevel"] = 100, ["isSecondary"] = false, }, ["Cooking"] = { ["level"] = 5, ["maxLevel"] = 75, ["isSecondary"] = true, }, },',
 		'["s@Beta - Alliance - Testrealm@internalData@money"] = 500000,',
 		'["s@Beta - Alliance - Testrealm@internalData@classKey"] = "MAGE",',
 		f'["s@Beta - Alliance - Testrealm@internalData@goldLogLastUpdate"] = {NOW - 20 * 86400},',
 		'["s@Beta - Alliance - Testrealm@internalData@bagQuantity"] = { ["i:1001"] = 2, },',
+		'["f@Alliance - Testrealm@internalData@crafts"] = {',
+		'["c:3001"] = { ["mats"] = { ["i:1004"] = 4, ["o:1:180055,180057"] = 1, }, ["itemString"] = "i:1003", ["profession"] = "Tailoring", ["players"] = { ["Alpha"] = { ["maxRecipeQuality"] = 1, }, }, ["rootCategoryId"] = 1, ["name"] = "Bolt of Cloth", ["numResult"] = 1, },',
+		'["c:3002"] = { ["mats"] = { ["i:1003"] = 2, ["i:1004"] = 1, }, ["itemString"] = "i:1005", ["profession"] = "Tailoring", ["players"] = { ["Alpha"] = { ["maxRecipeQuality"] = 1, }, }, ["name"] = "Hat", ["numResult"] = 2, },',
+		'["c:3003"] = { ["mats"] = { ["o:1:180055"] = 1, }, ["itemString"] = "i:1001", ["profession"] = "Tailoring", ["players"] = { ["Alpha"] = { }, }, ["name"] = "Fancy Thing", ["numResult"] = 1, },',
+		'},',
+		'["f@Alliance - Linkedrealm@internalData@crafts"] = { ["c:3001"] = { ["mats"] = { ["i:1004"] = 4, }, ["itemString"] = "i:1003", ["profession"] = "Tailoring", ["players"] = { ["Delta"] = { }, }, ["name"] = "Bolt of Cloth", ["numResult"] = 1, }, },',
 		f'["f@Alliance - Testrealm@internalData@expiringAuction"] = {{ ["Beta"] = {NOW - 3600}, }},',
 		'["f@Alliance - Testrealm@internalData@expiringMail"] = {},',
 		'["f@Alliance - Testrealm@internalData@guildVaults"] = { ["Guildies"] = { ["i:1003"] = 1, }, },',
@@ -973,9 +984,11 @@ class OptionalSourceCliTests(unittest.TestCase):
 
 	def test_recipes(self) -> None:
 		rows: list[dict[str, Any]] = self.table("get", "recipes")["rows"]
-		self.assertEqual([(r["id"], r["category"], r["rank"]) for r in rows], [(12345, "Bags", "1/3")])
-		self.assertEqual(len(self.table("get", "recipes", "--all")["rows"]), 2)
-		self.assertEqual(len(self.table("get", "recipes", "--profession", "tail", "--char", "Alpha")["rows"]), 1)
+		self.assertEqual([(r["id"], r["category"], r["rank"]) for r in rows if r["source"] == "datastore"], [(12345, "Bags", "1/3")])
+		# TSM's crafts add what DataStore did not list: Alpha's three, Delta's one.
+		self.assertEqual(sorted((r["char"], r["id"]) for r in rows if r["source"] == "tsm"), [("Alpha", 3001), ("Alpha", 3002), ("Alpha", 3003), ("Delta", 3001)])
+		self.assertEqual(len(self.table("get", "recipes", "--all")["rows"]), 2 + 4)
+		self.assertEqual(len(self.table("get", "recipes", "--profession", "tail", "--char", "Alpha")["rows"]), 1 + 3)
 		self.assertEqual(len(self.table("get", "recipes", "--profession", "mining")["rows"]), 0)
 
 	def test_attention_order_and_thresholds(self) -> None:
@@ -1979,6 +1992,120 @@ class VenturePushTests(unittest.TestCase):
 		self.assertIn("symlink", results["tsmctl-venture-push.service"], "a stowed unit is never written through")
 		self.assertIn("already exists", results["tsmctl-venture-push.timer"])
 		self.assertTrue(results["tsmctl-venture-push.path"].startswith("written"), "the generated path unit is refreshed")
+
+
+class CraftTests(unittest.TestCase):
+	"""TSM's professions and crafts: get recipes, the export's attrs and `venture recipes`."""
+
+	TOKEN: str = "vt_test_crafts_0123456789"
+
+	@classmethod
+	def setUpClass(cls) -> None:
+		cls.temp: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(prefix="tsmctl-crafts-")
+		cls.base: Path = Path(cls.temp.name)
+		cls.wow: Path = cls.base / "wow"
+		write_ops_fixture(cls.wow)
+
+	@classmethod
+	def tearDownClass(cls) -> None:
+		cls.temp.cleanup()
+
+	def setUp(self) -> None:
+		self.fake: FakeVenture = FakeVenture(self.TOKEN)
+		self.home: Path = Path(tempfile.mkdtemp(prefix="home-", dir=self.base))
+		self.env: dict[str, str] = {**os.environ, "HOME": str(self.home), "XDG_CACHE_HOME": str(self.home / "cache"), "XDG_CONFIG_HOME": str(self.home / "config"), "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1", "TSMCTL_VENTURE_TOKEN": self.TOKEN}
+		for name in ("TSMCTL_HOST", "TSMCTL_CONFIG", "TSMCTL_WOW_DIR", "TSM_WOW_DIR", "TSMCTL_SOURCES", "VENTURE_TOKEN", "TSMCTL_VENTURE_URL", "TSMCTL_VENTURE_SOURCE", "TSMCTL_VENTURE_TOKEN_FILE", "TSMCTL_VENTURE_RECIPE_SOURCE", "TSMCTL_VENTURE_RECIPE_VENTURE"):
+			self.env.pop(name, None)
+
+	def tearDown(self) -> None:
+		self.fake.close()
+
+	def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+		cmd: list[str] = [sys.executable, str(SCRIPT), "--no-config", "--local", "--wow-dir", str(self.wow), "-q", *args]
+		return subprocess.run(cmd, capture_output=True, text=True, env=self.env, timeout=120)
+
+	def recipe_posts(self) -> list[dict[str, Any]]:
+		return [r for r in self.fake.requests if "/actions/import_recipes" in r["path"]]
+
+	def test_crafts_load_and_merge(self) -> None:
+		data: Any = tsmctl.TsmData()
+		data.load_account("MAIN", self.wow / "_retail_" / "WTF" / "Account" / "MAIN" / "SavedVariables" / "TradeSkillMaster.lua")
+		self.assertEqual(sorted(data.crafts), [3001, 3002, 3003])
+		bolt: Any = data.crafts[3001]
+		self.assertEqual((bolt.name, bolt.profession, bolt.item, bolt.mats, bolt.optional), ("Bolt of Cloth", "Tailoring", "i:1003", {"i:1004": 4}, 1))
+		self.assertEqual({(p[0], p[1]) for p in bolt.players}, {("Alpha", "Testrealm"), ("Delta", "Linkedrealm")}, "one craft, known on both realms")
+		self.assertEqual(data.crafts[3002].num_result, 2.0)
+
+	def test_get_recipes_names_from_tsm(self) -> None:
+		proc: subprocess.CompletedProcess[str] = self.run_cli("-o", "json", "get", "recipes", "-n", "0")
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		rows: list[dict[str, Any]] = json.loads(proc.stdout)["sections"][0]["tables"][0]["rows"]
+		hat: dict[str, Any] = next(r for r in rows if r["id"] == 3002)
+		self.assertEqual((hat["recipe"], hat["makes"], hat["reagents"], hat["source"]), ("Hat", "Trinket", 2, "tsm"))
+		self.assertIn(("Delta", 3001), {(r["char"], r["id"]) for r in rows})
+
+	def test_export_carries_professions(self) -> None:
+		proc: subprocess.CompletedProcess[str] = self.run_cli("export")
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		self.assertEqual(contract_problems(proc.stdout), [])
+		alpha: dict[str, Any] = next(json.loads(l) for l in proc.stdout.splitlines() if '"key":"Alpha-Testrealm"' in l and '"type":"account"' in l)
+		attrs: dict[str, Any] = alpha["attrs"]
+		self.assertEqual(attrs["profession:Tailoring"], 65)
+		self.assertEqual(attrs["profession_max:Tailoring"], 100)
+		self.assertIs(attrs["profession_secondary:Cooking"], True)
+		self.assertNotIn("profession_secondary:Tailoring", attrs)
+
+	def test_recipes_dry_run_sends_nothing(self) -> None:
+		proc: subprocess.CompletedProcess[str] = self.run_cli("-o", "json", "venture", "recipes", "--dry-run", "-n", "0")
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		section: dict[str, Any] = json.loads(proc.stdout)["sections"][0]
+		self.assertEqual(section["values"]["Crafts known"], 2)
+		self.assertTrue(any("only optional" in t for t in section.get("texts", []) + [json.dumps(section)]))
+		self.assertEqual(self.fake.requests, [])
+
+	def test_recipes_sent_shape(self) -> None:
+		self.fake.answers["/api/v1/data_source/9/actions/import_recipes"] = (200, {"id": 9, "result": {"created": 2, "updated": 0, "unchanged": 0, "skipped": 0}}, {})
+		proc: subprocess.CompletedProcess[str] = self.run_cli("venture", "recipes", "--url", self.fake.url, "--recipe-source", "9", "--venture", "4", "--organization", "2")
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		posts: list[dict[str, Any]] = self.recipe_posts()
+		self.assertEqual(len(posts), 1)
+		self.assertEqual(posts[0]["path"], "/api/v1/data_source/9/actions/import_recipes?organization_id=2")
+		self.assertEqual(posts[0]["headers"]["Content-Type"], "application/json")
+		self.assertFalse(posts[0]["leaked"])
+		body: dict[str, Any] = json.loads(posts[0]["body"])
+		self.assertEqual((body["create_products"], body["venture_id"]), (True, 4))
+		by_spell: dict[int, dict[str, Any]] = {r["spell_id"]: r for r in body["recipes"]}
+		self.assertEqual(sorted(by_spell), [3001, 3002])
+		self.assertEqual(by_spell[3001]["reagents"], [{"item": 1004, "quantity": 4}], "optional reagents are not costs")
+		self.assertEqual(by_spell[3001]["known_by"], ["Alpha-Testrealm", "Delta-Linkedrealm"], "the knowers' account keys")
+		self.assertEqual((by_spell[3002]["item"], by_spell[3002]["quantity"], by_spell[3002]["name"]), (1005, 2, "Hat"))
+		self.assertIn("Created", proc.stdout)
+		self.assertNotIn(self.TOKEN, proc.stdout + proc.stderr)
+
+	def test_push_sends_recipes_only_when_changed(self) -> None:
+		self.fake.answers["/api/v1/feeds/7/push"] = (202, {"status": "queued", "push_id": "p"}, {})
+		self.fake.answers["/api/v1/data_source/9/actions/import_recipes"] = (200, {"result": {"created": 2}}, {})
+		push: list[str] = ["venture", "push", "--url", self.fake.url, "--source", "7", "--recipe-source", "9", "--if-changed"]
+		self.assertEqual(self.run_cli(*push).returncode, 0)
+		self.assertEqual(len(self.recipe_posts()), 1, "the first push sends the crafts")
+		second: subprocess.CompletedProcess[str] = self.run_cli(*push)
+		self.assertEqual(second.returncode, 0, second.stderr)
+		self.assertEqual(len(self.recipe_posts()), 1, "unchanged crafts are not sent again")
+		self.assertIn("unchanged", second.stdout)
+		without: subprocess.CompletedProcess[str] = self.run_cli("venture", "push", "--url", self.fake.url, "--source", "7")
+		self.assertEqual(without.returncode, 0, without.stderr)
+		self.assertEqual(len(self.recipe_posts()), 1, "no recipe source configured: no recipes")
+
+	def test_refused_recipes_are_retried(self) -> None:
+		self.fake.answers["/api/v1/feeds/7/push"] = (202, {"status": "queued", "push_id": "p"}, {})
+		self.fake.answers["/api/v1/data_source/9/actions/import_recipes"] = (422, {"error": {"message": "recipes: element 1 has no item"}}, {})
+		push: list[str] = ["venture", "push", "--url", self.fake.url, "--source", "7", "--recipe-source", "9"]
+		refused: subprocess.CompletedProcess[str] = self.run_cli(*push)
+		self.assertEqual(refused.returncode, 4)
+		self.assertIn("element 1 has no item", refused.stderr)
+		self.fake.answers["/api/v1/data_source/9/actions/import_recipes"] = (200, {"result": {"created": 2}}, {})
+		self.assertEqual(self.run_cli(*push).returncode, 0)
+		self.assertEqual(len(self.recipe_posts()), 2, "a refused set is sent again")
 
 
 @unittest.skipUnless(os.environ.get("TSMCTL_TEST_VENTURE_URL"), "set TSMCTL_TEST_VENTURE_URL, TSMCTL_TEST_VENTURE_SOURCE and TSMCTL_TEST_VENTURE_TOKEN_FILE to push to a real VENTURE")
