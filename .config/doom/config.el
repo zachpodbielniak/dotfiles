@@ -546,6 +546,14 @@ No-op on TTY frames — terminal transparency is the emulator's job."
   (setq ns-use-native-fullscreen nil)
   (add-to-list 'default-frame-alist '(fullscreen . maximized)))
 
+;;; Steam Frame: gamescope's VR overlay hands the mouse laser to X
+;;; windows as touchscreen touches, so a left-drag scrolls like a finger
+;;; swipe instead of selecting.  Convert every touch into plain mouse
+;;; down / motion / drag / up events.  Drag-to-scroll is lost; the
+;;; wheel still scrolls.
+(when (equal (system-name) "frame-zach")
+  (setq touch-screen-simple-mouse-conversion t))
+
 ;;; Gowl compositor modules (only when running as Wayland compositor).
 ;;; IS-GOWL must precede `(load! "+gowl")' since the body of that file
 ;;; is gated on this constant.
