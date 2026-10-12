@@ -1,0 +1,374 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+readonly default_dest="${SCP_STEAM_FRAME_DEST:-zach@lt-zach:/var/home/zach/Downloads}"
+readonly default_frame_host="${SCP_STEAM_FRAME_HOST:-steamos@frame-zach}"
+
+usage () {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [DEST]
+
+Copy the newest Steam Frame screenshot(s) to DEST with rsync (or scp).
+
+Run on the Frame itself, the screenshots are read locally. Run anywhere
+else, they are fetched from the Frame over SSH (see --frame-host). DEST
+may be a local directory or an rsync/scp style [user@]host:path; a DEST
+whose host is this machine is treated as a local path.
+
+Sources (--source):
+  png   SteamVR's full-quality PNGs in \$XDG_RUNTIME_DIR (lost on reboot)
+  jpg   Steam's SteamVR screenshot library (userdata/*/760/remote/250820)
+  auto  png if any exist, otherwise jpg (default)
+
+Options:
+  -n, --count N         Copy the newest N screenshots (default: 1)
+  -d, --dest DEST       Copy destination (default: ${default_dest})
+  -H, --frame-host HOST SSH host of the Frame when run elsewhere
+                        (default: ${default_frame_host})
+  -s, --source SRC      png, jpg or auto (default: auto)
+      --local           Force "running on the Frame" mode
+      --remote          Force "fetch from the Frame over SSH" mode
+      --scp             Use scp instead of rsync
+  -l, --list            Only print the selected screenshot paths
+  -v, --verbose         Print what is being done to stderr
+  -h, --help            Show this help
+      --license         Show license information
+
+Environment:
+  SCP_STEAM_FRAME_DEST  Overrides the default destination
+  SCP_STEAM_FRAME_HOST  Overrides the default Frame SSH host
+
+Examples:
+  $(basename "$0")                         # newest screenshot to lt-zach
+  $(basename "$0") -n 5                    # newest five
+  $(basename "$0") ~/Pictures              # into a local directory
+  $(basename "$0") -n 3 -d nas:/srv/shots  # elsewhere, over SSH
+  $(basename "$0") --list -n 10 -s jpg     # show the ten newest JPEGs
+
+Exit status: 0 on success, 1 on bad usage or no screenshots, otherwise the
+status of the failed ssh/rsync/scp.
+EOF
+}
+
+show_license () {
+	cat <<EOF
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak
+License: GNU AGPL version 3 or later <https://www.gnu.org/licenses/agpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+EOF
+}
+
+die () {
+	printf 'Error: %s\n' "$*" >&2
+	exit 1
+}
+
+log () {
+	if [[ "${verbose}" == "true" ]]
+	then
+		printf '%s\n' "$*" >&2
+	fi
+}
+
+# Print the newest COUNT screenshot paths, newest first. This function is
+# also sent verbatim over SSH (via declare -f), so it must be
+# self-contained and only use tools present on SteamOS.
+list_screenshots () {
+	local count="$1"
+	local source="$2"
+	local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+	local found
+
+	list_png () {
+		find "${runtime_dir}" -maxdepth 1 -type f -name 'Screenshot_*.png' \
+			-printf '%T@\t%p\n' 2>/dev/null || true
+	}
+
+	# Native Steam and Flatpak Steam; an unmatched glob just makes find
+	# fail quietly. The thumbnails/ subdirectory is skipped by -maxdepth.
+	list_jpg () {
+		local steam
+		for steam in "${HOME}/.local/share/Steam" \
+			"${HOME}/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+		do
+			find "${steam}"/userdata/*/760/remote/250820/screenshots \
+				-maxdepth 1 -type f -name '*.jpg' \
+				-printf '%T@\t%p\n' 2>/dev/null || true
+		done
+	}
+
+	case "${source}" in
+		png)
+			found="$(list_png)"
+			;;
+		jpg)
+			found="$(list_jpg)"
+			;;
+		auto)
+			found="$(list_png)"
+			if [[ -z "${found}" ]]
+			then
+				found="$(list_jpg)"
+			fi
+			;;
+	esac
+
+	if [[ -n "${found}" ]]
+	then
+		printf '%s\n' "${found}" | sort -rn | head -n "${count}" | cut -f2-
+	fi
+}
+
+is_steam_frame () {
+	[[ "$(uname -m)" == "aarch64" ]] \
+		&& grep -qs '^ID=steamos' /etc/os-release
+}
+
+# Echo DEST's path if its host part names this machine, else echo nothing.
+local_dest_path () {
+	local dest="$1"
+	local host_part user host name
+
+	if [[ ! "${dest}" =~ ^([^/:]+):(.*)$ ]]
+	then
+		printf '%s\n' "${dest}"
+		return
+	fi
+
+	host_part="${BASH_REMATCH[1]}"
+	if [[ "${host_part}" == *@* ]]
+	then
+		user="${host_part%@*}"
+		host="${host_part#*@}"
+	else
+		user=""
+		host="${host_part}"
+	fi
+
+	if [[ -n "${user}" && "${user}" != "$(id -un)" ]]
+	then
+		return
+	fi
+
+	for name in localhost "$(hostname)" "$(hostname -s 2>/dev/null || true)"
+	do
+		if [[ -n "${name}" && "${host}" == "${name}" ]]
+		then
+			printf '%s\n' "${BASH_REMATCH[2]:-.}"
+			return
+		fi
+	done
+}
+
+# copy_files DEST SOURCE... ; sources may be local paths or host:path.
+copy_files () {
+	local dest="$1"
+	shift
+
+	if [[ "${use_scp}" == "true" ]]
+	then
+		log "scp -p $* ${dest}"
+		scp -p "$@" "${dest}"
+	else
+		log "rsync -t $* ${dest}"
+		rsync -t --human-readable --progress "$@" "${dest}"
+	fi
+}
+
+count=1
+dest="${default_dest}"
+frame_host="${default_frame_host}"
+source="auto"
+mode="auto"
+use_scp="false"
+list_only="false"
+verbose="false"
+dest_given="false"
+
+while [[ $# -gt 0 ]]
+do
+	case "$1" in
+		-h|--help)
+			usage
+			exit 0
+			;;
+		--license)
+			show_license
+			exit 0
+			;;
+		-n|--count)
+			[[ $# -ge 2 ]] || die "$1 needs a value"
+			count="$2"
+			shift 2
+			;;
+		-d|--dest)
+			[[ $# -ge 2 ]] || die "$1 needs a value"
+			dest="$2"
+			dest_given="true"
+			shift 2
+			;;
+		-H|--frame-host)
+			[[ $# -ge 2 ]] || die "$1 needs a value"
+			frame_host="$2"
+			shift 2
+			;;
+		-s|--source)
+			[[ $# -ge 2 ]] || die "$1 needs a value"
+			source="$2"
+			shift 2
+			;;
+		--local)
+			mode="local"
+			shift
+			;;
+		--remote)
+			mode="remote"
+			shift
+			;;
+		--scp)
+			use_scp="true"
+			shift
+			;;
+		-l|--list)
+			list_only="true"
+			shift
+			;;
+		-v|--verbose)
+			verbose="true"
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			die "unknown option: $1 (see --help)"
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if [[ $# -gt 1 ]]
+then
+	die "too many arguments (see --help)"
+elif [[ $# -eq 1 ]]
+then
+	[[ "${dest_given}" == "false" ]] || die "give DEST once, as -d or as an argument"
+	dest="$1"
+fi
+
+[[ "${count}" =~ ^[1-9][0-9]*$ ]] || die "--count must be a positive integer, got '${count}'"
+[[ "${source}" =~ ^(png|jpg|auto)$ ]] || die "--source must be png, jpg or auto, got '${source}'"
+[[ -n "${dest}" ]] || die "empty destination"
+
+if [[ "${mode}" == "auto" ]]
+then
+	if is_steam_frame
+	then
+		mode="local"
+	else
+		mode="remote"
+	fi
+fi
+log "mode: ${mode}"
+
+if [[ "${use_scp}" == "false" ]] && ! command -v rsync >/dev/null 2>&1
+then
+	log "rsync not found, falling back to scp"
+	use_scp="true"
+fi
+
+# Collect the screenshot paths, locally or by running list_screenshots on
+# the Frame. count and source are validated above, so they are safe to
+# interpolate into the remote command.
+files=()
+if [[ "${mode}" == "local" ]]
+then
+	mapfile -t files < <(list_screenshots "${count}" "${source}")
+else
+	log "listing screenshots on ${frame_host}"
+	# Expanding locally is intended: it sends the function definition.
+	# shellcheck disable=SC2087
+	listing="$(ssh "${frame_host}" bash -s <<EOF
+$(declare -f list_screenshots)
+list_screenshots ${count} ${source}
+EOF
+)" || die "could not list screenshots on ${frame_host}"
+	if [[ -n "${listing}" ]]
+	then
+		mapfile -t files <<< "${listing}"
+	fi
+fi
+
+if [[ ${#files[@]} -eq 0 ]]
+then
+	where="this machine"
+	if [[ "${mode}" == "remote" ]]
+	then
+		where="${frame_host}"
+	fi
+	die "no ${source/auto/png or jpg} screenshots found on ${where}"
+fi
+if [[ ${#files[@]} -lt ${count} ]]
+then
+	printf 'Warning: only %d screenshot(s) found\n' "${#files[@]}" >&2
+fi
+
+if [[ "${list_only}" == "true" ]]
+then
+	printf '%s\n' "${files[@]}"
+	exit 0
+fi
+
+# A host:path naming this machine is copied as a plain local path.
+local_dest="$(local_dest_path "${dest}")"
+
+if [[ "${mode}" == "local" ]]
+then
+	copy_files "${local_dest:-${dest}}" "${files[@]}"
+	exit 0
+fi
+
+# Remote mode: point each source at the Frame.
+sources=()
+for file in "${files[@]}"
+do
+	sources+=("${frame_host}:${file}")
+done
+
+if [[ -n "${local_dest}" ]]
+then
+	copy_files "${local_dest}" "${sources[@]}"
+elif [[ "${use_scp}" == "true" ]]
+then
+	# Frame -> third host, relayed through this machine.
+	log "scp -3 -p ${sources[*]} ${dest}"
+	scp -3 -p "${sources[@]}" "${dest}"
+else
+	# rsync cannot copy remote to remote: stage in a private temp dir.
+	relay_dir="$(mktemp -d)"
+	trap 'rm -rf -- "${relay_dir}"' EXIT
+	copy_files "${relay_dir}/" "${sources[@]}"
+	copy_files "${dest}" "${relay_dir}"/*
+fi
