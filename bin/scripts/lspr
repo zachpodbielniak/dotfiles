@@ -1,0 +1,2125 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# ==============================================================================
+# lspr - List pull requests or issues on the projects you own
+# ==============================================================================
+# Forgejo is the default. GitHub and GitLab are opt-in.
+# --issues (alias --issue) lists issues instead of pull requests.
+#
+# "Owned" is deliberate, and it is different per forge:
+#   Forgejo: the authenticated user, plus every org that user belongs to.
+#            This server is yours; org membership is the project set.
+#   GitHub:  the authenticated user, plus orgs where your role is admin.
+#            A plain member role (employer orgs) is not "your projects".
+#   GitLab:  top-level groups you own (access level 50), including their
+#            subgroups, plus projects in your personal namespace.
+#            The global scope=all endpoint times out on gitlab.com.
+#
+# Tokens stay in the environment. They are sent as headers and never printed.
+# ==============================================================================
+
+SCRIPT_NAME="$(basename "${0}")"
+readonly SCRIPT_NAME
+readonly VERSION="1.2.0"
+
+readonly DEFAULT_FORGEJO_URL="https://git.podbielniak.com"
+readonly DEFAULT_GITLAB_URL="https://gitlab.com"
+readonly DEFAULT_GITHUB_API="https://api.github.com"
+
+# Stop a runaway pagination loop. 20 pages is 1000 Forgejo rows or 2000
+# GitHub search rows, which is also GitHub's search cap.
+readonly PAGE_CAP=20
+readonly FORGEJO_PAGE_SIZE=50
+readonly GITHUB_PAGE_SIZE=100
+readonly GITLAB_PAGE_SIZE=100
+readonly GITLAB_PROJECT_PAGE=25
+
+forgejo_base="${LSPR_FORGEJO_URL:-${DEFAULT_FORGEJO_URL}}"
+gitlab_base="${LSPR_GITLAB_URL:-${DEFAULT_GITLAB_URL}}"
+github_api="${LSPR_GITHUB_API:-${DEFAULT_GITHUB_API}}"
+forgejo_base="${forgejo_base%/}"
+gitlab_base="${gitlab_base%/}"
+github_api="${github_api%/}"
+
+verbose=false
+opt_fzf=false
+opt_plain=false
+opt_mine=false
+opt_state="open"
+opt_limit=0
+opt_issues=false
+forge_forgejo=false
+forge_github=false
+forge_gitlab=false
+
+declare -a REPOS=()
+declare -a CURL=(curl)
+
+tmpdir=""
+rows=""
+body_seq=0
+meta_count=0
+meta_total=""
+meta_cursor=""
+declare -a gh_orgs=()
+
+# ==============================================================================
+# Help
+# ==============================================================================
+
+usage () {
+	cat << EOF
+${SCRIPT_NAME} - List pull requests or issues on the projects you own
+
+USAGE:
+	${SCRIPT_NAME} [OPTIONS] [OWNER/REPO ...]
+
+OPTIONS:
+	-h, --help           Show this help message
+	--license            Show license information
+	-V, --version        Show version
+	-v, --verbose        Print request URLs on stderr
+	-f, --fzf            Pick a row and open it with xdg-open
+	--plain              Tab-separated rows, even on a terminal
+	-m, --mine           Only items you opened
+	-i, --issues, --issue
+	                     List issues instead of pull requests
+	-s, --state STATE    open (default), closed, merged, or all
+	-n, --limit N        Show at most N rows (0 means no limit)
+	-R, -r, --repo OWNER/REPO
+	                     Limit to one repository; repeatable
+	--forgejo            Query Forgejo (the default when no forge is given)
+	--github             Query GitHub
+	--gitlab             Query GitLab
+	--all                Query Forgejo, GitHub, and GitLab
+	--forge NAME         Same as the flag for that forge; repeatable
+
+EXAMPLES:
+	# Open pull requests on your Forgejo user and orgs
+	${SCRIPT_NAME}
+
+	# Open issues instead
+	${SCRIPT_NAME} --issues
+
+	# Issues on one repository. -i and -R cluster.
+	${SCRIPT_NAME} -iR zachpodbielniak/venture
+
+	# Pick one or more and open them in the browser
+	${SCRIPT_NAME} --fzf
+
+	# GitHub orgs you admin, plus your user
+	${SCRIPT_NAME} --github
+
+	# GitLab groups you own, plus your personal projects
+	${SCRIPT_NAME} --gitlab --mine
+
+	# One repository on the default forge
+	${SCRIPT_NAME} --repo zachpodbielniak/libresite
+
+	# Every forge, closed and merged, as TSV
+	${SCRIPT_NAME} --all --state closed --plain
+
+DESCRIPTION:
+	A terminal shows an aligned table. A pipe, and --plain, print TSV with
+	no header so the rows can go straight into cut or awk:
+
+	  1 forge  2 repo  3 number  4 state  5 title
+	  6 author  7 updated  8 url
+
+	--fzf prints nothing to the pager's stdout. Enter opens the highlighted
+	row. Tab marks extra rows. Esc cancels (exit 130).
+
+	Forgejo is ${forgejo_base}. GitLab is ${gitlab_base}.
+	GitHub uses ${github_api}.
+
+	Without OWNER/REPO arguments the project set is:
+
+	  Forgejo  your user, and organizations you belong to
+	  GitHub   your user, and organizations you admin
+	  GitLab   groups you own, and your personal projects
+
+	OWNER/REPO replaces that set. GitLab accepts group/sub/name. Pass the
+	same path the forge uses. --mine still applies.
+
+	--issues (alias --issue, -i) lists issues on that same project set.
+	merged is only valid for pull requests.
+
+	Short flags cluster. A flag that takes a value must be last, and the
+	value is the rest of the cluster or the next argument:
+	-iR owner/name, -iRowner/name, -s open, -n5.
+
+	closed includes merged on GitHub and Forgejo pull requests. On GitLab,
+	closed pull requests are the union of the closed and merged states.
+	A Forgejo merged query walks closed pull requests and keeps the merged
+	ones, because that API has no merged-only filter.
+
+ENV:
+	FORGEJO_TOKEN       Forgejo token (Authorization: token)
+	GITHUB_TOKEN        GitHub token (Authorization: Bearer)
+	GITLAB_TOKEN        GitLab token (PRIVATE-TOKEN)
+	NO_COLOR            Disable ANSI color
+	LSPR_FORGEJO_URL    Override the Forgejo base URL
+	LSPR_GITLAB_URL     Override the GitLab base URL
+	LSPR_GITHUB_API     Override the GitHub API base URL
+
+EXIT STATUS:
+	0    Rows were shown, nothing was open, or the list was empty
+	1    Usage error, missing token, or the forge rejected the request
+	130  --fzf was cancelled
+
+EOF
+}
+
+show_license () {
+	cat << 'EOF'
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak — AGPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+EOF
+}
+
+# ==============================================================================
+# Logging and argument parsing
+# ==============================================================================
+
+die () {
+	printf '%s: %s\n' "${SCRIPT_NAME}" "$*" >&2
+	exit 1
+}
+
+warn () {
+	printf '%s: %s\n' "${SCRIPT_NAME}" "$*" >&2
+}
+
+log_verbose () {
+	if [[ "${verbose}" == true ]]
+	then
+		printf '%s\n' "$*" >&2
+	fi
+}
+
+# need_arg OPTION REMAINING...
+# OPTION is the flag the user typed. The next word must be its value.
+need_arg () {
+	local opt="${1}"
+
+	if [[ $# -lt 2 || -z "${2}" ]]
+	then
+		die "${opt} requires a value"
+	fi
+}
+
+select_forge () {
+	case "${1}" in
+		forgejo)
+			forge_forgejo=true
+			;;
+		github)
+			forge_github=true
+			;;
+		gitlab)
+			forge_gitlab=true
+			;;
+		*)
+			die "unknown forge: ${1}"
+			;;
+	esac
+}
+
+# owner/name, or group/sub/name for GitLab. Reject spaces and URL noise
+# before any of it gets interpolated into a request path.
+validate_repo () {
+	local repo="${1}"
+
+	if [[ ! "${repo}" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]]
+	then
+		die "repository must look like owner/name: ${repo}"
+	fi
+}
+
+# Short flags cluster: -iR owner/name is -i plus -R owner/name.
+# A flag that takes a value ends the cluster. Its value is the rest of
+# the cluster (-iRowner/name) or the next argument (-iR owner/name).
+# PARSE_CONSUMED is 1 or 2, the number of argv words this call used.
+parse_short_cluster () {
+	local cluster="${1#-}"
+	local opt=""
+	local value=""
+
+	PARSE_CONSUMED=1
+	if [[ -z "${cluster}" ]]
+	then
+		die "unknown option: ${1}"
+	fi
+
+	while [[ -n "${cluster}" ]]
+	do
+		opt="${cluster:0:1}"
+		cluster="${cluster:1}"
+		case "${opt}" in
+			i)
+				opt_issues=true
+				;;
+			f)
+				opt_fzf=true
+				;;
+			m)
+				opt_mine=true
+				;;
+			v)
+				verbose=true
+				;;
+			h)
+				usage
+				exit 0
+				;;
+			V)
+				printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"
+				exit 0
+				;;
+			R|r|s|n)
+				if [[ -n "${cluster}" ]]
+				then
+					value="${cluster}"
+					cluster=""
+				else
+					if [[ $# -lt 2 || -z "${2}" ]]
+					then
+						die "-${opt} requires a value"
+					fi
+					value="${2}"
+					PARSE_CONSUMED=2
+				fi
+				case "${opt}" in
+					R|r)
+						REPOS+=("${value}")
+						;;
+					s)
+						opt_state="${value}"
+						;;
+					n)
+						opt_limit="${value}"
+						;;
+				esac
+				;;
+			*)
+				die "unknown option: -${opt}"
+				;;
+		esac
+	done
+}
+
+parse_args () {
+	while [[ $# -gt 0 ]]
+	do
+		case "${1}" in
+			-h|--help)
+				usage
+				exit 0
+				;;
+			--license)
+				show_license
+				exit 0
+				;;
+			-V|--version)
+				printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"
+				exit 0
+				;;
+			--verbose)
+				verbose=true
+				shift
+				;;
+			--fzf)
+				opt_fzf=true
+				shift
+				;;
+			--plain)
+				opt_plain=true
+				shift
+				;;
+			--mine)
+				opt_mine=true
+				shift
+				;;
+			--issues|--issue)
+				opt_issues=true
+				shift
+				;;
+			--forgejo)
+				forge_forgejo=true
+				shift
+				;;
+			--github)
+				forge_github=true
+				shift
+				;;
+			--gitlab)
+				forge_gitlab=true
+				shift
+				;;
+			--all)
+				forge_forgejo=true
+				forge_github=true
+				forge_gitlab=true
+				shift
+				;;
+			--forge)
+				need_arg "$@"
+				select_forge "${2}"
+				shift 2
+				;;
+			--forge=*)
+				select_forge "${1#*=}"
+				shift
+				;;
+			--state)
+				need_arg "$@"
+				opt_state="${2}"
+				shift 2
+				;;
+			--state=*)
+				opt_state="${1#*=}"
+				shift
+				;;
+			--limit)
+				need_arg "$@"
+				opt_limit="${2}"
+				shift 2
+				;;
+			--limit=*)
+				opt_limit="${1#*=}"
+				shift
+				;;
+			--repo)
+				need_arg "$@"
+				REPOS+=("${2}")
+				shift 2
+				;;
+			-[A-Za-z]*)
+				parse_short_cluster "$@"
+				shift "${PARSE_CONSUMED}"
+				;;
+			--repo=*)
+				REPOS+=("${1#*=}")
+				shift
+				;;
+			--)
+				shift
+				while [[ $# -gt 0 ]]
+				do
+					REPOS+=("${1}")
+					shift
+				done
+				;;
+			-*)
+				die "unknown option: ${1}"
+				;;
+			*)
+				REPOS+=("${1}")
+				shift
+				;;
+		esac
+	done
+}
+
+validate_args () {
+	local repo
+
+	case "${opt_state}" in
+		open|closed|merged|all)
+			;;
+		*)
+			die "state must be open, closed, merged, or all"
+			;;
+	esac
+
+	if [[ "${opt_issues}" == true && "${opt_state}" == "merged" ]]
+	then
+		die "issues have no merged state"
+	fi
+
+	if [[ ! "${opt_limit}" =~ ^[0-9]+$ ]]
+	then
+		die "limit must be a non-negative integer"
+	fi
+
+	if [[ "${forge_forgejo}" == false && "${forge_github}" == false && "${forge_gitlab}" == false ]]
+	then
+		forge_forgejo=true
+	fi
+
+	for repo in "${REPOS[@]}"
+	do
+		validate_repo "${repo}"
+	done
+}
+
+require_cmd () {
+	local cmd="${1}"
+	local package="${2}"
+
+	if ! command -v "${cmd}" >/dev/null 2>&1
+	then
+		die "missing command: ${cmd} (package ${package})"
+	fi
+}
+
+# Strip a trailing newline that a hand-edited env file sometimes leaves.
+# Print nothing. The value is written back with printf -v.
+require_token () {
+	local name="${1}"
+	local value="${!name:-}"
+
+	value="${value//$'\r'/}"
+	value="${value//$'\n'/}"
+	if [[ -z "${value}" ]]
+	then
+		die "${name} is not set"
+	fi
+	printf -v "${name}" '%s' "${value}"
+}
+
+require_runtime () {
+	require_cmd python3 python3
+	if [[ -n "${LSPR_CURL:-}" ]]
+	then
+		if [[ ! -x "${LSPR_CURL}" ]]
+		then
+			die "LSPR_CURL is not executable: ${LSPR_CURL}"
+		fi
+		CURL=("${LSPR_CURL}")
+	else
+		require_cmd curl curl
+		CURL=(curl)
+	fi
+
+	if [[ "${opt_fzf}" == true ]]
+	then
+		require_cmd fzf fzf
+		require_cmd xdg-open xdg-utils
+	fi
+
+	if [[ "${forge_forgejo}" == true ]]
+	then
+		require_token FORGEJO_TOKEN
+	fi
+	if [[ "${forge_github}" == true ]]
+	then
+		require_token GITHUB_TOKEN
+	fi
+	if [[ "${forge_gitlab}" == true ]]
+	then
+		require_token GITLAB_TOKEN
+	fi
+}
+
+# Singular or plural label for the thing this run lists.
+item_label () {
+	local count="${1}"
+
+	if [[ "${opt_issues}" == true ]]
+	then
+		if [[ "${count}" -eq 1 ]]
+		then
+			printf 'issue'
+		else
+			printf 'issues'
+		fi
+		return 0
+	fi
+	if [[ "${count}" -eq 1 ]]
+	then
+		printf 'pull request'
+	else
+		printf 'pull requests'
+	fi
+}
+
+# Author filter is per forge because the login string is per forge.
+# Empty means "do not filter". Call this before any rows for that forge.
+begin_author () {
+	if [[ "${opt_mine}" == true ]]
+	then
+		export LSPR_AUTHOR="${1}"
+	else
+		export LSPR_AUTHOR=""
+	fi
+}
+
+# ==============================================================================
+# HTTP
+# ==============================================================================
+# Tokens are header values, not URL parameters, so a verbose URL is safe to
+# print. curl --silent keeps the progress bar off stdout; the status code is
+# the only thing http_get / http_post write to stdout.
+
+next_body () {
+	body_seq=$((body_seq + 1))
+	printf '%s/body-%04d.json' "${tmpdir}" "${body_seq}"
+}
+
+header_value () {
+	local file="${1}"
+	local name="${2}"
+
+	awk -v name="${name}" '
+		BEGIN { lname = tolower(name) }
+		{
+			line = $0
+			sub(/\r$/, "", line)
+			n = index(line, ":")
+			if (n <= 0) {
+				next
+			}
+			key = tolower(substr(line, 1, n - 1))
+			if (key == lname) {
+				val = substr(line, n + 1)
+				gsub(/^[ \t]+/, "", val)
+				print val
+			}
+		}
+	' "${file}" | tail -n 1
+}
+
+# http_get URL OUTFILE [HEADER ...]
+# HEADER is a full "Name: value" string. Prints the HTTP status.
+http_get () {
+	local url="${1}"
+	local outfile="${2}"
+	shift 2
+	local hdr="${outfile}.hdr"
+	local -a header_args=()
+	local h
+	local code
+
+	for h in "$@"
+	do
+		header_args+=(--header "${h}")
+	done
+
+	log_verbose "GET ${url}"
+	code=$("${CURL[@]}" \
+		--silent \
+		--show-error \
+		--location \
+		--max-time 60 \
+		--user-agent "lspr" \
+		--dump-header "${hdr}" \
+		--output "${outfile}" \
+		--write-out '%{http_code}' \
+		--header "Accept: application/json" \
+		"${header_args[@]}" \
+		--url "${url}") || die "request failed: ${url%%\?*}"
+	code="${code//[!0-9]/}"
+	if [[ -z "${code}" ]]
+	then
+		die "empty HTTP status from ${url%%\?*}"
+	fi
+	printf '%s' "${code}"
+}
+
+# http_post URL JSONFILE OUTFILE [HEADER ...]
+http_post () {
+	local url="${1}"
+	local bodyfile="${2}"
+	local outfile="${3}"
+	shift 3
+	local hdr="${outfile}.hdr"
+	local -a header_args=()
+	local h
+	local code
+
+	for h in "$@"
+	do
+		header_args+=(--header "${h}")
+	done
+
+	log_verbose "POST ${url}"
+	code=$("${CURL[@]}" \
+		--silent \
+		--show-error \
+		--location \
+		--max-time 60 \
+		--user-agent "lspr" \
+		--dump-header "${hdr}" \
+		--output "${outfile}" \
+		--write-out '%{http_code}' \
+		--header "Accept: application/json" \
+		--header "Content-Type: application/json" \
+		"${header_args[@]}" \
+		--data-binary "@${bodyfile}" \
+		--url "${url}") || die "request failed: ${url%%\?*}"
+	code="${code//[!0-9]/}"
+	if [[ -z "${code}" ]]
+	then
+		die "empty HTTP status from ${url%%\?*}"
+	fi
+	printf '%s' "${code}"
+}
+
+require_http () {
+	local code="${1}"
+	local body="${2}"
+	local what="${3}"
+	local token_name="${4}"
+	local msg=""
+
+	if [[ "${code}" == 2* ]]
+	then
+		return 0
+	fi
+
+	msg="$(py api_message "${body}" || true)"
+	if [[ "${code}" == "401" || "${code}" == "403" ]]
+	then
+		die "${what} rejected ${token_name} (HTTP ${code})${msg:+: ${msg}}"
+	fi
+	die "${what} failed (HTTP ${code})${msg:+: ${msg}}"
+}
+
+# ==============================================================================
+# JSON helper
+# ==============================================================================
+# One Python process image, dispatched by argv, so the shell never parses
+# JSON. Row files are TSV:
+#   epoch, forge, repo, number, state, title, author, updated, url
+# Pagination meta, printed on stdout by `rows`, is:
+#   raw_count, total, next_cursor
+# raw_count is the page size the server returned, before --mine / --state
+# filtering, so a short page still ends the loop.
+
+py () {
+	python3 - "$@" << 'PY'
+import json
+import os
+import sys
+import time
+import urllib.parse
+from datetime import datetime
+
+WANT = os.environ.get("LSPR_WANT", "open")
+AUTHOR = os.environ.get("LSPR_AUTHOR", "")
+# "issue" lists issues. Anything else lists pull requests.
+LISTING_ISSUES = os.environ.get("LSPR_KIND", "pr") == "issue"
+
+
+def one_line(value, collapse=True):
+	text = "" if value is None else str(value)
+	text = text.replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+	if collapse:
+		text = " ".join(text.split())
+	return text
+
+
+def load_json(path):
+	with open(path, encoding="utf-8") as handle:
+		raw = handle.read()
+	if not raw.strip():
+		return None
+	try:
+		return json.loads(raw)
+	except json.JSONDecodeError as exc:
+		sys.stderr.write(f"lspr: invalid JSON in {path}: {exc}\n")
+		sys.exit(1)
+
+
+def api_message(path):
+	try:
+		data = load_json(path)
+	except SystemExit:
+		raise
+	except OSError as exc:
+		sys.stderr.write(f"lspr: {exc}\n")
+		sys.exit(1)
+	if isinstance(data, dict):
+		for key in ("message", "error", "error_description"):
+			val = data.get(key)
+			if isinstance(val, str) and val.strip():
+				print(one_line(val)[:300])
+				return
+		errs = data.get("errors")
+		if isinstance(errs, list) and errs:
+			first = errs[0]
+			if isinstance(first, dict):
+				print(one_line(first.get("message") or first)[:300])
+			else:
+				print(one_line(first)[:300])
+			return
+	if isinstance(data, str):
+		print(one_line(data)[:300])
+		return
+	try:
+		with open(path, encoding="utf-8", errors="replace") as handle:
+			text = handle.read(200)
+	except OSError:
+		return
+	text = one_line(text)
+	if text:
+		print(text[:300])
+
+
+def epoch_of(value):
+	text = "" if value is None else str(value).strip()
+	if not text:
+		return 0
+	if text.endswith("Z"):
+		text = text[:-1] + "+00:00"
+	try:
+		return int(datetime.fromisoformat(text).timestamp())
+	except ValueError:
+		return 0
+
+
+def norm_state(raw, draft, merged):
+	text = ("" if raw is None else str(raw)).lower()
+	if merged or text == "merged":
+		return "merged"
+	if text in ("open", "opened"):
+		return "draft" if draft else "open"
+	if text in ("closed", "locked"):
+		return "closed"
+	return text or "unknown"
+
+
+def keep_state(state):
+	if WANT == "all":
+		return True
+	if WANT == "open":
+		return state in ("open", "draft")
+	if WANT == "closed":
+		return state in ("closed", "merged")
+	if WANT == "merged":
+		return state == "merged"
+	return True
+
+
+def emit(forge, repo, number, state, title, author, iso, url, handle):
+	repo = one_line(repo)
+	number = one_line(number)
+	url = one_line(url, collapse=False)
+	author = one_line(author)
+	if AUTHOR and author != AUTHOR:
+		return
+	if not repo or not number or not url:
+		kind_name = "issue" if LISTING_ISSUES else "pull request"
+		sys.stderr.write(f"lspr: skipping a {forge} {kind_name} with no repo, number, or URL\n")
+		return
+	if not keep_state(state):
+		return
+	fields = [
+		str(epoch_of(iso)),
+		one_line(forge),
+		repo,
+		number,
+		one_line(state),
+		one_line(title) or "(no title)",
+		author or "?",
+		"" if iso is None else str(iso).strip(),
+		url,
+	]
+	handle.write("\t".join(fields) + "\n")
+
+
+def repo_from_github(url, hint):
+	path = urllib.parse.urlparse(url or "").path.strip("/")
+	parts = [part for part in path.split("/") if part]
+	if len(parts) >= 2:
+		return f"{parts[0]}/{parts[1]}"
+	return hint
+
+
+def repo_from_gitlab_ref(item, hint):
+	full = ""
+	refs = item.get("references")
+	if isinstance(refs, dict):
+		full = refs.get("full") or ""
+	# Merge requests use owner/repo!iid. Issues use owner/repo#iid.
+	for sep in ("!", "#"):
+		if sep in full:
+			return full.split(sep, 1)[0]
+	return hint
+
+
+def emit_forgejo_item(item, hint, forge, handle):
+	if not isinstance(item, dict):
+		return
+	pull = item.get("pull_request") if isinstance(item.get("pull_request"), dict) else {}
+	# A pull_request object means this row is a PR. Issue searches can still
+	# leak one; drop it. The pulls endpoint returns PR objects that may not
+	# nest that key, so PR mode does not require it.
+	if LISTING_ISSUES and pull:
+		return
+	merged = bool(item.get("merged") or pull.get("merged"))
+	draft = bool(item.get("draft") or pull.get("draft"))
+	repo = ""
+	repository = item.get("repository")
+	if isinstance(repository, dict):
+		repo = repository.get("full_name") or ""
+	if not repo:
+		repo = hint
+	user = item.get("user") if isinstance(item.get("user"), dict) else {}
+	author = user.get("login") or user.get("username") or ""
+	url = item.get("html_url") or pull.get("html_url") or ""
+	iso = item.get("updated_at") or item.get("created_at") or ""
+	emit(
+		forge,
+		repo,
+		item.get("number"),
+		norm_state(item.get("state"), draft, merged),
+		item.get("title"),
+		author,
+		iso,
+		url,
+		handle,
+	)
+
+
+def emit_github_item(item, hint, handle):
+	if not isinstance(item, dict):
+		return
+	# Search results include "pull_request" only for PRs. An explicit null
+	# is not a PR. Issue mode keeps the rest; PR mode drops them.
+	has_pr = isinstance(item.get("pull_request"), dict)
+	if LISTING_ISSUES == has_pr:
+		return
+	pull = item.get("pull_request") if has_pr else {}
+	merged = bool(pull.get("merged_at"))
+	draft = bool(item.get("draft") or pull.get("draft"))
+	url = item.get("html_url") or ""
+	user = item.get("user") if isinstance(item.get("user"), dict) else {}
+	# is:merged is authoritative. A missing merged_at must not relabel it.
+	if WANT == "merged":
+		merged = True
+	emit(
+		"github",
+		repo_from_github(url, hint),
+		item.get("number"),
+		norm_state(item.get("state"), draft, merged),
+		item.get("title"),
+		user.get("login") or "",
+		item.get("updated_at") or item.get("created_at") or "",
+		url,
+		handle,
+	)
+
+
+def emit_gitlab_item(item, hint, handle):
+	if not isinstance(item, dict):
+		return
+	author = item.get("author") if isinstance(item.get("author"), dict) else {}
+	raw_state = item.get("state")
+	draft = bool(item.get("draft") or item.get("work_in_progress"))
+	emit(
+		"gitlab",
+		repo_from_gitlab_ref(item, hint),
+		item.get("iid"),
+		norm_state(raw_state, draft, raw_state == "merged"),
+		item.get("title"),
+		author.get("username") or "",
+		item.get("updated_at") or item.get("created_at") or "",
+		item.get("web_url") or "",
+		handle,
+	)
+
+
+def emit_gql_node(node, repo, handle):
+	if not isinstance(node, dict):
+		return
+	author = node.get("author") if isinstance(node.get("author"), dict) else {}
+	raw_state = node.get("state")
+	emit(
+		"gitlab",
+		repo,
+		node.get("iid"),
+		norm_state(raw_state, bool(node.get("draft")), raw_state == "merged"),
+		node.get("title"),
+		author.get("username") or "",
+		node.get("updatedAt") or node.get("updated_at") or "",
+		node.get("webUrl") or node.get("web_url") or "",
+		handle,
+	)
+
+
+def rows_from(kind, hint, data, handle):
+	"""Return (raw_count, total, next_cursor)."""
+	if kind == "forgejo":
+		items = data if isinstance(data, list) else []
+		for item in items:
+			emit_forgejo_item(item, hint, "forgejo", handle)
+		return len(items), "", ""
+
+	if kind == "github":
+		if not isinstance(data, dict):
+			sys.stderr.write("lspr: GitHub search did not return an object\n")
+			sys.exit(1)
+		if data.get("incomplete_results"):
+			sys.stderr.write("lspr: GitHub search returned incomplete results\n")
+		items = data.get("items") if isinstance(data.get("items"), list) else []
+		for item in items:
+			emit_github_item(item, hint, handle)
+		total = data.get("total_count")
+		total_text = "" if total is None else str(total)
+		return len(items), total_text, ""
+
+	if kind == "gitlab":
+		items = data if isinstance(data, list) else []
+		for item in items:
+			emit_gitlab_item(item, hint, handle)
+		return len(items), "", ""
+
+	if kind == "gitlab_gql":
+		if not isinstance(data, dict):
+			sys.stderr.write("lspr: GitLab GraphQL did not return an object\n")
+			sys.exit(1)
+		errors = data.get("errors")
+		if errors:
+			first = errors[0] if isinstance(errors, list) and errors else errors
+			if isinstance(first, dict):
+				message = one_line(first.get("message") or first)
+			else:
+				message = one_line(first)
+			sys.stderr.write(f"lspr: GitLab GraphQL: {message}\n")
+			sys.exit(1)
+		try:
+			projects = data["data"]["user"]["namespace"]["projects"]
+		except (KeyError, TypeError):
+			sys.stderr.write("lspr: GitLab GraphQL response has no projects\n")
+			sys.exit(1)
+		nodes = projects.get("nodes") if isinstance(projects.get("nodes"), list) else []
+		page = projects.get("pageInfo") if isinstance(projects.get("pageInfo"), dict) else {}
+		for project in nodes:
+			if not isinstance(project, dict):
+				continue
+			repo = project.get("fullPath") or hint
+			for key, value in project.items():
+				if key == "fullPath" or not isinstance(value, dict):
+					continue
+				mrs = value.get("nodes")
+				if not isinstance(mrs, list):
+					continue
+				if len(mrs) >= 50:
+					capped = "issues" if LISTING_ISSUES else "merge requests"
+					sys.stderr.write(
+						f"lspr: GitLab capped {capped} at 50 for {repo}\n"
+					)
+				for node in mrs:
+					emit_gql_node(node, repo, handle)
+		cursor = ""
+		if page.get("hasNextPage") and page.get("endCursor"):
+			cursor = str(page.get("endCursor"))
+		return len(nodes), "", cursor
+
+	sys.stderr.write(f"lspr: unknown row kind {kind}\n")
+	sys.exit(2)
+
+
+def login_from(path, kind):
+	data = load_json(path)
+	if not isinstance(data, dict):
+		return ""
+	if kind == "gitlab":
+		return one_line(data.get("username") or "")
+	return one_line(data.get("login") or data.get("username") or "")
+
+
+def forgejo_orgs(path):
+	data = load_json(path)
+	if not isinstance(data, list):
+		return
+	for org in data:
+		if not isinstance(org, dict):
+			continue
+		name = one_line(org.get("username") or org.get("login") or "")
+		if name:
+			print(name)
+
+
+def github_orgs(path):
+	# role=admin is the ownership cut. role=member includes employer orgs.
+	data = load_json(path)
+	if not isinstance(data, list):
+		return
+	for membership in data:
+		if not isinstance(membership, dict):
+			continue
+		if membership.get("state") not in (None, "active"):
+			continue
+		if membership.get("role") != "admin":
+			continue
+		org = membership.get("organization")
+		if not isinstance(org, dict):
+			continue
+		name = one_line(org.get("login") or "")
+		if name:
+			print(name)
+
+
+def gitlab_groups(path):
+	data = load_json(path)
+	if not isinstance(data, list):
+		return
+	for group in data:
+		if not isinstance(group, dict):
+			continue
+		gid = group.get("id")
+		path_text = one_line(group.get("full_path") or "")
+		if gid is None or not path_text:
+			continue
+		print(f"{gid}\t{path_text}")
+
+
+def gql_escape(value):
+	return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def graphql_body(username, cursor):
+	if LISTING_ISSUES:
+		states = {
+			"open": [("issues", "opened")],
+			"closed": [("issues", "closed")],
+			"all": [("issues", "all")],
+		}.get(WANT, [("issues", "opened")])
+		connection = "issues"
+	else:
+		states = {
+			"open": [("mergeRequests", "opened")],
+			"merged": [("mergeRequests", "merged")],
+			"closed": [("closedRequests", "closed"), ("mergedRequests", "merged")],
+			"all": [("mergeRequests", "all")],
+		}.get(WANT, [("mergeRequests", "opened")])
+		connection = "mergeRequests"
+	author_arg = ""
+	if AUTHOR:
+		author_arg = f', authorUsername: "{gql_escape(AUTHOR)}"'
+	fields = []
+	for alias, state in states:
+		fields.append(
+			f"{alias}: {connection}(state: {state}, first: 50{author_arg}) "
+			"{ nodes { iid title webUrl state updatedAt author { username } } }"
+		)
+	field_text = "\n          ".join(fields)
+	query = f"""
+query($cursor: String) {{
+  user(username: "{gql_escape(username)}") {{
+    namespace {{
+      projects(includeSubgroups: false, first: {int(os.environ.get("LSPR_GL_PROJECTS", "25"))}, after: $cursor) {{
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{
+          fullPath
+          {field_text}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+	payload = {
+		"query": query,
+		"variables": {"cursor": cursor or None},
+	}
+	print(json.dumps(payload))
+
+
+def trunc(text, width):
+	if len(text) <= width:
+		return text
+	if width <= 1:
+		return text[:width]
+	return text[: width - 1] + "…"
+
+
+def colorize(text, code, enabled):
+	if not enabled or not code:
+		return text
+	return f"\033[{code}m{text}\033[0m"
+
+
+def age_of(epoch_text):
+	try:
+		epoch = int(epoch_text)
+	except ValueError:
+		return "-"
+	if epoch <= 0:
+		return "-"
+	delta = max(0, int(time.time()) - epoch)
+	if delta < 60:
+		return f"{delta}s"
+	if delta < 3600:
+		return f"{delta // 60}m"
+	if delta < 86400:
+		return f"{delta // 3600}h"
+	if delta < 86400 * 45:
+		return f"{delta // 86400}d"
+	if delta < 86400 * 365:
+		return f"{delta // (86400 * 30)}mo"
+	return f"{delta // (86400 * 365)}y"
+
+
+STATE_COLOR = {
+	"open": "32",
+	"draft": "33",
+	"merged": "35",
+	"closed": "2",
+}
+
+
+def iter_rows(path):
+	with open(path, encoding="utf-8") as handle:
+		for line in handle:
+			fields = line.rstrip("\n").split("\t")
+			if len(fields) < 9:
+				continue
+			yield fields
+
+
+def cell(text, width, code, enabled):
+	shown = trunc(text, width)
+	painted = colorize(shown, code, enabled)
+	pad = width - len(shown)
+	if pad > 0:
+		painted += " " * pad
+	return painted
+
+
+def format_pretty(path, enabled, cols):
+	forge_w, num_w, state_w, repo_w, author_w, age_w = 7, 7, 6, 32, 16, 4
+	gap = "  "
+	used = forge_w + num_w + state_w + repo_w + author_w + age_w + (2 * 5)
+	title_w = cols - used
+	if title_w < 28:
+		repo_w, author_w = 24, 12
+		used = forge_w + num_w + state_w + repo_w + author_w + age_w + (2 * 5)
+		title_w = max(16, cols - used)
+	header = gap.join(
+		[
+			cell("FORGE", forge_w, "2", enabled),
+			cell("#", num_w, "2", enabled),
+			cell("STATE", state_w, "2", enabled),
+			cell("REPO", repo_w, "2", enabled),
+			cell("TITLE", title_w, "2", enabled),
+			cell("AUTHOR", author_w, "2", enabled),
+			cell("AGE", age_w, "2", enabled),
+		]
+	)
+	print(header)
+	for fields in iter_rows(path):
+		epoch, forge, repo, number, state, title, author, _iso, _url = fields[:9]
+		print(
+			gap.join(
+				[
+					cell(forge, forge_w, "2", enabled),
+					cell("#" + number, num_w, "36", enabled),
+					cell(state, state_w, STATE_COLOR.get(state, ""), enabled),
+					cell(repo, repo_w, "32", enabled),
+					cell(title, title_w, "", enabled),
+					cell(author, author_w, "33", enabled),
+					cell(age_of(epoch), age_w, "2", enabled),
+				]
+			)
+		)
+
+
+def format_plain(path):
+	for fields in iter_rows(path):
+		_epoch, forge, repo, number, state, title, author, iso, url = fields[:9]
+		print("\t".join([forge, repo, number, state, title, author, iso, url]))
+
+
+def format_fzf(path, enabled):
+	for fields in iter_rows(path):
+		epoch, forge, repo, number, state, title, author, _iso, url = fields[:9]
+		parts = [
+			colorize(forge, "2", enabled),
+			colorize("#" + number, "36", enabled),
+			colorize(repo, "32", enabled),
+			title,
+			colorize(author, "33", enabled),
+			colorize(state, STATE_COLOR.get(state, ""), enabled),
+			colorize(age_of(epoch), "2", enabled),
+		]
+		sys.stdout.write("  ".join(parts) + "\t" + url + "\n")
+
+
+def main():
+	if len(sys.argv) < 2:
+		sys.stderr.write("lspr: internal python command missing\n")
+		sys.exit(2)
+	cmd = sys.argv[1]
+	if cmd == "rows":
+		kind, hint, src, dest = sys.argv[2:6]
+		data = load_json(src)
+		with open(dest, "a", encoding="utf-8") as handle:
+			count, total, cursor = rows_from(kind, hint, data, handle)
+		print(f"{count}\t{total}\t{cursor}")
+		return
+	if cmd == "api_message":
+		api_message(sys.argv[2])
+		return
+	if cmd == "urlencode":
+		print(urllib.parse.quote(sys.argv[2], safe=""))
+		return
+	if cmd == "count_list":
+		data = load_json(sys.argv[2])
+		print(len(data) if isinstance(data, list) else 0)
+		return
+	if cmd == "login":
+		print(login_from(sys.argv[2], sys.argv[3]))
+		return
+	if cmd == "forgejo_orgs":
+		forgejo_orgs(sys.argv[2])
+		return
+	if cmd == "github_orgs":
+		github_orgs(sys.argv[2])
+		return
+	if cmd == "gitlab_groups":
+		gitlab_groups(sys.argv[2])
+		return
+	if cmd == "graphql_body":
+		graphql_body(sys.argv[2], sys.argv[3])
+		return
+	if cmd == "format":
+		mode = sys.argv[2]
+		enabled = sys.argv[3] == "1"
+		cols = int(sys.argv[4] or "120")
+		path = sys.argv[5]
+		if mode == "pretty":
+			format_pretty(path, enabled, cols)
+		elif mode == "plain":
+			format_plain(path)
+		elif mode == "fzf":
+			format_fzf(path, enabled)
+		else:
+			sys.stderr.write(f"lspr: unknown format {mode}\n")
+			sys.exit(2)
+		return
+	sys.stderr.write(f"lspr: unknown internal command {cmd}\n")
+	sys.exit(2)
+
+
+if __name__ == "__main__":
+	main()
+PY
+}
+
+# Read a python helper that prints lines. Failure exits the script.
+py_lines () {
+	local text=""
+
+	if ! text="$(py "$@")"
+	then
+		exit 1
+	fi
+	printf '%s' "${text}"
+}
+
+# ==============================================================================
+# Pagination
+# ==============================================================================
+
+# Read `count total cursor` from the rows helper.
+read_meta () {
+	local meta="${1}"
+	meta_count=0
+	meta_total=""
+	meta_cursor=""
+	IFS=$'\t' read -r meta_count meta_total meta_cursor <<< "${meta}"
+	if [[ ! "${meta_count}" =~ ^[0-9]+$ ]]
+	then
+		die "bad pagination count from the forge response"
+	fi
+}
+
+# True when this page is the last one we should request.
+page_done () {
+	local page_size="${1}"
+	local fetched="${2}"
+
+	if [[ "${meta_count}" -lt "${page_size}" ]]
+	then
+		return 0
+	fi
+	if [[ -n "${meta_total}" && "${fetched}" -ge "${meta_total}" ]]
+	then
+		return 0
+	fi
+	return 1
+}
+
+# ==============================================================================
+# Forgejo
+# ==============================================================================
+
+forgejo_api_state () {
+	case "${opt_state}" in
+		open)
+			printf 'open'
+			;;
+		merged|closed)
+			printf 'closed'
+			;;
+		all)
+			printf 'all'
+			;;
+	esac
+}
+
+forgejo_auth () {
+	printf 'Authorization: token %s' "${FORGEJO_TOKEN}"
+}
+
+fetch_forgejo_login () {
+	local body code login
+
+	body="$(next_body)"
+	code="$(http_get "${forgejo_base}/api/v1/user" "${body}" "$(forgejo_auth)")"
+	require_http "${code}" "${body}" "Forgejo" "FORGEJO_TOKEN"
+	login="$(py_lines login "${body}" forgejo)"
+	if [[ -z "${login}" ]]
+	then
+		die "Forgejo did not return a login"
+	fi
+	printf '%s' "${login}"
+}
+
+fetch_forgejo_search () {
+	local owner="${1}"
+	local api_state="${2}"
+	local page=1
+	local fetched=0
+	local hit_cap=true
+	local body code meta url owner_q
+
+	owner_q="$(py_lines urlencode "${owner}")"
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		local kind="pulls"
+		if [[ "${opt_issues}" == true ]]
+		then
+			kind="issues"
+		fi
+		url="${forgejo_base}/api/v1/repos/issues/search?type=${kind}&state=${api_state}&sort=recentupdate&limit=${FORGEJO_PAGE_SIZE}&page=${page}&owner=${owner_q}"
+		if [[ -n "${LSPR_AUTHOR}" ]]
+		then
+			url+="&created_by=$(py_lines urlencode "${LSPR_AUTHOR}")"
+		fi
+		body="$(next_body)"
+		code="$(http_get "${url}" "${body}" "$(forgejo_auth)")"
+		require_http "${code}" "${body}" "Forgejo" "FORGEJO_TOKEN"
+		if ! meta="$(py rows forgejo "" "${body}" "${rows}")"
+		then
+			exit 1
+		fi
+		read_meta "${meta}"
+		fetched=$((fetched + meta_count))
+		if page_done "${FORGEJO_PAGE_SIZE}" "${fetched}"
+		then
+			hit_cap=false
+			break
+		fi
+		page=$((page + 1))
+	done
+	if [[ "${hit_cap}" == true ]]
+	then
+		warn "Forgejo: stopped after ${PAGE_CAP} pages for ${owner}"
+	fi
+}
+
+fetch_forgejo_repo () {
+	local spec="${1}"
+	local api_state="${2}"
+	local owner="${spec%%/*}"
+	local name="${spec#*/}"
+	local page=1
+	local fetched=0
+	local hit_cap=true
+	local body code meta url
+
+	owner="$(py_lines urlencode "${owner}")"
+	name="$(py_lines urlencode "${name}")"
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		if [[ "${opt_issues}" == true ]]
+		then
+			url="${forgejo_base}/api/v1/repos/${owner}/${name}/issues?type=issues&state=${api_state}&limit=${FORGEJO_PAGE_SIZE}&page=${page}"
+		else
+			url="${forgejo_base}/api/v1/repos/${owner}/${name}/pulls?state=${api_state}&limit=${FORGEJO_PAGE_SIZE}&page=${page}"
+		fi
+		body="$(next_body)"
+		code="$(http_get "${url}" "${body}" "$(forgejo_auth)")"
+		require_http "${code}" "${body}" "Forgejo" "FORGEJO_TOKEN"
+		if ! meta="$(py rows forgejo "${spec}" "${body}" "${rows}")"
+		then
+			exit 1
+		fi
+		read_meta "${meta}"
+		fetched=$((fetched + meta_count))
+		if page_done "${FORGEJO_PAGE_SIZE}" "${fetched}"
+		then
+			hit_cap=false
+			break
+		fi
+		page=$((page + 1))
+	done
+	if [[ "${hit_cap}" == true ]]
+	then
+		warn "Forgejo: stopped after ${PAGE_CAP} pages for ${spec}"
+	fi
+}
+
+fetch_forgejo () {
+	local login=""
+	local api_state
+	local org_text=""
+	local -a orgs=()
+	local spec org body code
+
+	api_state="$(forgejo_api_state)"
+	if [[ "${opt_mine}" == true || ${#REPOS[@]} -eq 0 ]]
+	then
+		login="$(fetch_forgejo_login)"
+	fi
+	begin_author "${login}"
+
+	if [[ ${#REPOS[@]} -gt 0 ]]
+	then
+		for spec in "${REPOS[@]}"
+		do
+			fetch_forgejo_repo "${spec}" "${api_state}"
+		done
+		return 0
+	fi
+
+	local org_page=1
+	local org_next=""
+	while [[ "${org_page}" -le "${PAGE_CAP}" ]]
+	do
+		body="$(next_body)"
+		code="$(http_get "${forgejo_base}/api/v1/user/orgs?limit=50&page=${org_page}" "${body}" "$(forgejo_auth)")"
+		require_http "${code}" "${body}" "Forgejo" "FORGEJO_TOKEN"
+		org_text="$(py_lines forgejo_orgs "${body}")"
+		if [[ -n "${org_text}" ]]
+		then
+			local -a page_orgs=()
+			mapfile -t page_orgs <<< "${org_text}"
+			orgs+=("${page_orgs[@]}")
+		fi
+		# A short page is the end. Some servers omit the total and the link.
+		if [[ "$(py_lines count_list "${body}")" -lt 50 ]]
+		then
+			break
+		fi
+		org_next="$(header_value "${body}.hdr" "X-Next-Page")"
+		if [[ -n "${org_next}" && "${org_next}" =~ ^[0-9]+$ && "${org_next}" -gt "${org_page}" ]]
+		then
+			org_page="${org_next}"
+		else
+			org_page=$((org_page + 1))
+		fi
+	done
+
+	fetch_forgejo_search "${login}" "${api_state}"
+	for org in "${orgs[@]}"
+	do
+		if [[ -n "${org}" && "${org}" != "${login}" ]]
+		then
+			fetch_forgejo_search "${org}" "${api_state}"
+		fi
+	done
+}
+
+# ==============================================================================
+# GitHub
+# ==============================================================================
+
+github_auth_headers () {
+	# http_get already sends Accept: application/json, which this API accepts.
+	# The version header selects the stable REST shape.
+	printf '%s\n' \
+		"Authorization: Bearer ${GITHUB_TOKEN}" \
+		"X-GitHub-Api-Version: 2022-11-28"
+}
+
+fetch_github_login () {
+	local body code login
+	local -a headers=()
+
+	mapfile -t headers <<< "$(github_auth_headers)"
+	body="$(next_body)"
+	code="$(http_get "${github_api}/user" "${body}" "${headers[@]}")"
+	require_http "${code}" "${body}" "GitHub" "GITHUB_TOKEN"
+	login="$(py_lines login "${body}" github)"
+	if [[ -z "${login}" ]]
+	then
+		die "GitHub did not return a login"
+	fi
+	printf '%s' "${login}"
+}
+
+# Print the search qualifiers. login may be empty when --repo is set and
+# --mine is not, because the repo: terms are the whole scope.
+github_query () {
+	local login="${1}"
+	local q="is:pr"
+	if [[ "${opt_issues}" == true ]]
+	then
+		q="is:issue"
+	fi
+	local part=""
+	local org repo
+
+	case "${opt_state}" in
+		open)
+			q+=" is:open"
+			;;
+		closed)
+			q+=" is:closed"
+			;;
+		merged)
+			q+=" is:merged"
+			;;
+		all)
+			;;
+	esac
+
+	if [[ ${#REPOS[@]} -gt 0 ]]
+	then
+		for repo in "${REPOS[@]}"
+		do
+			if [[ -n "${part}" ]]
+			then
+				part+=" OR "
+			fi
+			part+="repo:${repo}"
+		done
+	else
+		part="user:${login}"
+		for org in "${gh_orgs[@]}"
+		do
+			if [[ -n "${org}" ]]
+			then
+				part+=" OR org:${org}"
+			fi
+		done
+	fi
+	q+=" (${part})"
+	if [[ "${opt_mine}" == true ]]
+	then
+		q+=" author:${login}"
+	fi
+	printf '%s' "${q}"
+}
+
+fetch_github () {
+	local login=""
+	local q=""
+	local page=1
+	local fetched=0
+	local hit_cap=true
+	local body code meta url
+	local org_text=""
+	local -a headers=()
+	gh_orgs=()
+
+	mapfile -t headers <<< "$(github_auth_headers)"
+	if [[ "${opt_mine}" == true || ${#REPOS[@]} -eq 0 ]]
+	then
+		login="$(fetch_github_login)"
+	fi
+	begin_author "${login}"
+
+	if [[ ${#REPOS[@]} -eq 0 ]]
+	then
+		body="$(next_body)"
+		code="$(http_get "${github_api}/user/memberships/orgs?per_page=100&state=active" "${body}" "${headers[@]}")"
+		require_http "${code}" "${body}" "GitHub" "GITHUB_TOKEN"
+		org_text="$(py_lines github_orgs "${body}")"
+		if [[ -n "${org_text}" ]]
+		then
+			mapfile -t gh_orgs <<< "${org_text}"
+		fi
+	fi
+
+	q="$(github_query "${login}")"
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		url="${github_api}/search/issues?per_page=${GITHUB_PAGE_SIZE}&page=${page}&sort=updated&order=desc&q=$(py_lines urlencode "${q}")"
+		body="$(next_body)"
+		code="$(http_get "${url}" "${body}" "${headers[@]}")"
+		require_http "${code}" "${body}" "GitHub" "GITHUB_TOKEN"
+		if ! meta="$(py rows github "" "${body}" "${rows}")"
+		then
+			exit 1
+		fi
+		read_meta "${meta}"
+		fetched=$((fetched + meta_count))
+		if page_done "${GITHUB_PAGE_SIZE}" "${fetched}"
+		then
+			hit_cap=false
+			break
+		fi
+		page=$((page + 1))
+	done
+	if [[ "${hit_cap}" == true ]]
+	then
+		warn "GitHub: stopped after ${PAGE_CAP} search pages"
+	fi
+}
+
+# ==============================================================================
+# GitLab
+# ==============================================================================
+# Group merge requests are one REST call per owned top-level group.
+# Personal projects go through GraphQL because listing every owned project
+# and then requesting its merge requests is a couple hundred calls, and
+# scope=all on gitlab.com returns HTTP 408.
+
+gitlab_state_params () {
+	# Issues have opened, closed, and all. Pull requests also have merged,
+	# and "closed" there does not include merged.
+	if [[ "${opt_issues}" == true ]]
+	then
+		case "${opt_state}" in
+			open)
+				printf '%s\n' opened
+				;;
+			closed)
+				printf '%s\n' closed
+				;;
+			all)
+				printf '%s\n' all
+				;;
+		esac
+		return 0
+	fi
+	case "${opt_state}" in
+		open)
+			printf '%s\n' opened
+			;;
+		merged)
+			printf '%s\n' merged
+			;;
+		closed)
+			printf '%s\n' closed
+			printf '%s\n' merged
+			;;
+		all)
+			printf '%s\n' all
+			;;
+	esac
+}
+
+fetch_gitlab_login () {
+	local body code login
+
+	body="$(next_body)"
+	code="$(http_get "${gitlab_base}/api/v4/user" "${body}" "PRIVATE-TOKEN: ${GITLAB_TOKEN}")"
+	require_http "${code}" "${body}" "GitLab" "GITLAB_TOKEN"
+	login="$(py_lines login "${body}" gitlab)"
+	if [[ -z "${login}" ]]
+	then
+		die "GitLab did not return a username"
+	fi
+	printf '%s' "${login}"
+}
+
+fetch_gitlab_group () {
+	local group_id="${1}"
+	local state="${2}"
+	local page=1
+	local fetched=0
+	local hit_cap=true
+	local body code meta url next=""
+
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		local collection="merge_requests"
+		if [[ "${opt_issues}" == true ]]
+		then
+			collection="issues"
+		fi
+		url="${gitlab_base}/api/v4/groups/${group_id}/${collection}?state=${state}&per_page=${GITLAB_PAGE_SIZE}&page=${page}&order_by=updated_at&sort=desc"
+		if [[ -n "${LSPR_AUTHOR}" ]]
+		then
+			url+="&author_username=$(py_lines urlencode "${LSPR_AUTHOR}")"
+		fi
+		body="$(next_body)"
+		code="$(http_get "${url}" "${body}" "PRIVATE-TOKEN: ${GITLAB_TOKEN}")"
+		require_http "${code}" "${body}" "GitLab" "GITLAB_TOKEN"
+		if ! meta="$(py rows gitlab "" "${body}" "${rows}")"
+		then
+			exit 1
+		fi
+		read_meta "${meta}"
+		fetched=$((fetched + meta_count))
+		if page_done "${GITLAB_PAGE_SIZE}" "${fetched}"
+		then
+			hit_cap=false
+			break
+		fi
+		next="$(header_value "${body}.hdr" "X-Next-Page")"
+		if [[ -z "${next}" || ! "${next}" =~ ^[0-9]+$ || "${next}" -le "${page}" ]]
+		then
+			hit_cap=false
+			break
+		fi
+		page="${next}"
+	done
+	if [[ "${hit_cap}" == true ]]
+	then
+		warn "GitLab: stopped after ${PAGE_CAP} pages for group ${group_id}"
+	fi
+}
+
+fetch_gitlab_project () {
+	local spec="${1}"
+	local state="${2}"
+	local page=1
+	local fetched=0
+	local hit_cap=true
+	local body code meta url encoded next=""
+
+	encoded="$(py_lines urlencode "${spec}")"
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		local collection="merge_requests"
+		if [[ "${opt_issues}" == true ]]
+		then
+			collection="issues"
+		fi
+		url="${gitlab_base}/api/v4/projects/${encoded}/${collection}?state=${state}&per_page=${GITLAB_PAGE_SIZE}&page=${page}&order_by=updated_at&sort=desc"
+		if [[ -n "${LSPR_AUTHOR}" ]]
+		then
+			url+="&author_username=$(py_lines urlencode "${LSPR_AUTHOR}")"
+		fi
+		body="$(next_body)"
+		code="$(http_get "${url}" "${body}" "PRIVATE-TOKEN: ${GITLAB_TOKEN}")"
+		require_http "${code}" "${body}" "GitLab" "GITLAB_TOKEN"
+		if ! meta="$(py rows gitlab "${spec}" "${body}" "${rows}")"
+		then
+			exit 1
+		fi
+		read_meta "${meta}"
+		fetched=$((fetched + meta_count))
+		if page_done "${GITLAB_PAGE_SIZE}" "${fetched}"
+		then
+			hit_cap=false
+			break
+		fi
+		next="$(header_value "${body}.hdr" "X-Next-Page")"
+		if [[ -z "${next}" || ! "${next}" =~ ^[0-9]+$ || "${next}" -le "${page}" ]]
+		then
+			hit_cap=false
+			break
+		fi
+		page="${next}"
+	done
+	if [[ "${hit_cap}" == true ]]
+	then
+		warn "GitLab: stopped after ${PAGE_CAP} pages for ${spec}"
+	fi
+}
+
+fetch_gitlab_personal () {
+	local username="${1}"
+	local cursor=""
+	local page=0
+	local hit_cap=true
+	local req body code meta
+
+	while [[ "${page}" -lt "${PAGE_CAP}" ]]
+	do
+		page=$((page + 1))
+		req="$(next_body).req"
+		py graphql_body "${username}" "${cursor}" > "${req}"
+		body="$(next_body)"
+		code="$(http_post "${gitlab_base}/api/graphql" "${req}" "${body}" "PRIVATE-TOKEN: ${GITLAB_TOKEN}")"
+		require_http "${code}" "${body}" "GitLab" "GITLAB_TOKEN"
+		if ! meta="$(py rows gitlab_gql "" "${body}" "${rows}")"
+		then
+			exit 1
+		fi
+		read_meta "${meta}"
+		if [[ -z "${meta_cursor}" ]]
+		then
+			hit_cap=false
+			break
+		fi
+		if [[ "${meta_cursor}" == "${cursor}" ]]
+		then
+			hit_cap=false
+			break
+		fi
+		cursor="${meta_cursor}"
+	done
+	if [[ "${hit_cap}" == true ]]
+	then
+		warn "GitLab: stopped after ${PAGE_CAP} personal-project pages"
+	fi
+}
+
+fetch_gitlab_groups () {
+	local page=1
+	local body code next=""
+	local group_text=""
+	local line gid state
+
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		body="$(next_body)"
+		code="$(http_get "${gitlab_base}/api/v4/groups?min_access_level=50&top_level_only=true&simple=true&per_page=100&page=${page}" "${body}" "PRIVATE-TOKEN: ${GITLAB_TOKEN}")"
+		require_http "${code}" "${body}" "GitLab" "GITLAB_TOKEN"
+		group_text="$(py_lines gitlab_groups "${body}")"
+		if [[ -n "${group_text}" ]]
+		then
+			while IFS=$'\t' read -r gid _rest
+			do
+				if [[ -z "${gid}" ]]
+				then
+					continue
+				fi
+				if [[ ! "${gid}" =~ ^[0-9]+$ ]]
+				then
+					die "unexpected GitLab group id: ${gid}"
+				fi
+				while IFS= read -r state
+				do
+					fetch_gitlab_group "${gid}" "${state}"
+				done <<< "$(gitlab_state_params)"
+			done <<< "${group_text}"
+		fi
+		next="$(header_value "${body}.hdr" "X-Next-Page")"
+		if [[ -z "${next}" || ! "${next}" =~ ^[0-9]+$ || "${next}" -le "${page}" ]]
+		then
+			break
+		fi
+		page="${next}"
+	done
+}
+
+fetch_gitlab () {
+	local login=""
+	local spec state
+
+	if [[ ${#REPOS[@]} -eq 0 || "${opt_mine}" == true ]]
+	then
+		login="$(fetch_gitlab_login)"
+	fi
+	begin_author "${login}"
+
+	if [[ ${#REPOS[@]} -gt 0 ]]
+	then
+		while IFS= read -r state
+		do
+			for spec in "${REPOS[@]}"
+			do
+				fetch_gitlab_project "${spec}" "${state}"
+			done
+		done <<< "$(gitlab_state_params)"
+		return 0
+	fi
+
+	fetch_gitlab_groups
+	fetch_gitlab_personal "${login}"
+}
+
+# ==============================================================================
+# Presentation
+# ==============================================================================
+
+cleanup () {
+	if [[ -n "${tmpdir}" && -d "${tmpdir}" ]]
+	then
+		rm -rf "${tmpdir}"
+	fi
+}
+
+term_cols () {
+	local cols=""
+
+	if command -v tput >/dev/null 2>&1
+	then
+		cols="$(tput cols 2>/dev/null || true)"
+	fi
+	if [[ -z "${cols}" || ! "${cols}" =~ ^[0-9]+$ || "${cols}" -le 0 ]]
+	then
+		cols=120
+	fi
+	printf '%s' "${cols}"
+}
+
+pick_and_open () {
+	local shown="${1}"
+	local count="${2}"
+	local selected=""
+	local status=0
+	local color=0
+	local line url failed=0
+	local header
+
+	if [[ -z "${NO_COLOR:-}" ]]
+	then
+		color=1
+	fi
+	header="$(printf '%s %s · enter opens · tab marks · esc cancels' \
+		"${count}" "$(item_label "${count}")")"
+	local prompt="pr > "
+	if [[ "${opt_issues}" == true ]]
+	then
+		prompt="issue > "
+	fi
+	selected="$(py format fzf "${color}" 0 "${shown}" | fzf \
+		--ansi \
+		--multi \
+		--no-sort \
+		--delimiter=$'\t' \
+		--with-nth=1 \
+		--prompt="${prompt}" \
+		--header="${header}" \
+		--preview='printf "%s\n" {2}' \
+		--preview-window='down:2:wrap:border-top')" || status=$?
+	if [[ "${status}" -ne 0 ]]
+	then
+		exit "${status}"
+	fi
+	if [[ -z "${selected}" ]]
+	then
+		exit 0
+	fi
+
+	while IFS= read -r line
+	do
+		if [[ -z "${line}" ]]
+		then
+			continue
+		fi
+		url="${line#*$'\t'}"
+		if [[ -z "${url}" || "${url}" == "${line}" ]]
+		then
+			warn "selected line has no URL"
+			failed=1
+			continue
+		fi
+		if ! xdg-open "${url}" >/dev/null 2>&1
+		then
+			warn "xdg-open failed for ${url}"
+			printf '%s\n' "${url}" >&2
+			failed=1
+		fi
+	done <<< "${selected}"
+	exit "${failed}"
+}
+
+present () {
+	local deduped="${tmpdir}/deduped.tsv"
+	local sorted="${tmpdir}/sorted.tsv"
+	local shown="${tmpdir}/shown.tsv"
+	local count cols color=0
+
+	# `if` has to sit inside an action. A top-level if is a syntax error.
+	awk -F '\t' '
+		NF < 9 { next }
+		{
+			key = $2 "|" $3 "|" $4
+			if (seen[key]++) {
+				next
+			}
+			print
+		}
+	' "${rows}" > "${deduped}"
+	sort -t $'\t' -k1,1nr -s -o "${sorted}" "${deduped}"
+	if [[ "${opt_limit}" -gt 0 ]]
+	then
+		head -n "${opt_limit}" "${sorted}" > "${shown}"
+	else
+		cp "${sorted}" "${shown}"
+	fi
+
+	count="$(wc -l < "${shown}" | tr -d '[:space:]')"
+	if [[ -z "${count}" || "${count}" -eq 0 ]]
+	then
+		warn "no ${opt_state} $(item_label 2)"
+		exit 0
+	fi
+
+	if [[ "${opt_fzf}" == true ]]
+	then
+		pick_and_open "${shown}" "${count}"
+	fi
+
+	if [[ "${opt_plain}" == true || ! -t 1 ]]
+	then
+		py format plain 0 0 "${shown}"
+		return 0
+	fi
+
+	if [[ -z "${NO_COLOR:-}" ]]
+	then
+		color=1
+	fi
+	cols="$(term_cols)"
+	py format pretty "${color}" "${cols}" "${shown}"
+	printf '%s %s\n' "${count}" "$(item_label "${count}")" >&2
+}
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+main () {
+	parse_args "$@"
+	validate_args
+	require_runtime
+
+	tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/lspr.XXXXXX")"
+	trap cleanup EXIT
+	rows="${tmpdir}/rows.tsv"
+	: > "${rows}"
+	export LSPR_WANT="${opt_state}"
+	export LSPR_AUTHOR=""
+	if [[ "${opt_issues}" == true ]]
+	then
+		export LSPR_KIND="issue"
+	else
+		export LSPR_KIND="pr"
+	fi
+	export LSPR_GL_PROJECTS="${GITLAB_PROJECT_PAGE}"
+
+	if [[ "${forge_forgejo}" == true ]]
+	then
+		fetch_forgejo
+	fi
+	if [[ "${forge_github}" == true ]]
+	then
+		fetch_github
+	fi
+	if [[ "${forge_gitlab}" == true ]]
+	then
+		fetch_gitlab
+	fi
+
+	present
+}
+
+main "$@"
