@@ -89,15 +89,25 @@ _path_append \
 # breaks Claude Cowork's `-sandbox on` VM launch. Keep system binaries winning
 # and call the brew build by full path when you specifically want it.
 #
-# The prefix is resolved with `readlink -f` so it matches the exact string
-# /etc/profile.d/linuxbrew.sh appends. _path_append dedups by literal string,
-# so an unresolved "${HOME}/../linuxbrew/..." would leave that entry stranded
-# in the middle of $PATH ahead of /usr/bin instead of moving it to the end.
-_brew_prefix="$(readlink -f "${HOME}/../linuxbrew/.linuxbrew" 2>/dev/null)"
-if [[ -n "${_brew_prefix}" ]] && [[ -d "${_brew_prefix}/bin" ]]
-then
-	_path_append "${_brew_prefix}/bin" "${_brew_prefix}/sbin"
-fi
+# /home and /var/home are the same directory (one inode, two spellings).
+# /etc/profile.d/linuxbrew.sh appends /var/home/linuxbrew/.linuxbrew, but
+# `brew --prefix` and `brew shellenv` print /home/linuxbrew/.linuxbrew.
+# readlink -f does not collapse those, and _path_append matches the string
+# only. Leave the /home spelling in place and Homebrew's pkg-config stays
+# ahead of /usr/bin. That pkg-config ignores /usr/lib64/pkgconfig, so gst's
+# crispy compile misses xft and json-glib, drops -I/usr/include/freetype2
+# (ft2build.h), and injects brew glib 2.90 into a module loaded by system gst.
+_brew_prefix="$(readlink -f "${HOME}/../linuxbrew/.linuxbrew" 2>/dev/null || true)"
+for _brew_prefix in \
+	"${_brew_prefix}" \
+	"/home/linuxbrew/.linuxbrew" \
+	"/var/home/linuxbrew/.linuxbrew"
+do
+	if [[ -n "${_brew_prefix}" ]] && [[ -d "${_brew_prefix}/bin" ]]
+	then
+		_path_append "${_brew_prefix}/bin" "${_brew_prefix}/sbin"
+	fi
+done
 unset _brew_prefix
 
 
