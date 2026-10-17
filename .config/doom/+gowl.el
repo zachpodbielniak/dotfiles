@@ -278,6 +278,48 @@ A single Emacs frame is kept regardless of monitor count."
       (when dp2 (gowl-set-monitor-position 2560 0 dp2))
       (when edp (gowl-set-monitor-position 1501 2880 edp)))))
 
+(defun cmacs-gowl-rotate (transform)
+  "Rotate the focused monitor to TRANSFORM and redraw the wallpaper.
+TRANSFORM is an integer 0-7 as taken by `gowl-set-monitor-transform'
+\(0 normal, 1 90°, 2 180°, 3 270°, 4-7 flipped).
+From a shell: emacsctl eval '(cmacs-gowl-rotate 1)'
+
+The wallpaper module only re-renders a monitor when its logical size
+changes, so a 90°<->270° flip (same size) keeps the stale buffer.  Force
+a re-render by drawing once at the swapped orientation first.  The
+transform lands asynchronously, so wait for the monitor geometry to
+reach the new size before each redraw, or it renders at the old size."
+  (interactive
+   (let ((choices '(("normal" . 0) ("90" . 1) ("180" . 2) ("270" . 3))))
+     (list (cdr (assoc (completing-read "Rotate: " choices nil t)
+                       choices)))))
+  (let ((info (gowl-wallpaper-info)))
+    (cl-flet ((apply-transform (tr)
+                (prog1 (gowl-set-monitor-transform tr)
+                  (cmacs-gowl--await-transform tr)
+                  (when info
+                    (gowl-set-wallpaper (cdr (assq 'path info))
+                                        (cdr (assq 'mode info)))))))
+      ;; Odd transforms are 90/270 (swapped w/h); 0 and 1 differ in size.
+      (when info
+        (apply-transform (if (cl-oddp transform) 0 1)))
+      (and (apply-transform transform) t))))
+
+(defun cmacs-gowl--await-transform (transform &optional timeout)
+  "Block until the focused monitor's geometry matches TRANSFORM.
+Gives up after TIMEOUT seconds (default 1.0)."
+  (let* ((deadline (+ (float-time) (or timeout 1.0)))
+         (monitor-info (lambda () (gowl-monitor-info (car (gowl-list-monitors)))))
+         (mode (cdr (assq 'current-mode (funcall monitor-info))))
+         ;; Logical size: odd transforms swap the panel's native w/h.
+         (want (if (cl-oddp transform)
+                   (list (nth 1 mode) (nth 0 mode))
+                 (list (nth 0 mode) (nth 1 mode)))))
+    (while (and (not (equal (last (cdr (assq 'geometry (funcall monitor-info))) 2)
+                            want))
+                (< (float-time) deadline))
+      (sleep-for 0.02))))
+
 ;; Doom's persp-mode workspace autosave file
 ;; (~/.config/emacs/.local/etc/workspaces/autosave) carries a cosmetic
 ;; file-local `eval: (progn (pp-buffer)(indent-buffer))' footer.  persp visits
