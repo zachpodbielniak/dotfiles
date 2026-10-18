@@ -23,6 +23,8 @@ set -euo pipefail
 # ==============================================================================
 # Forgejo is the default. GitHub and GitLab are opt-in.
 # --issues (alias --issue) lists issues instead of pull requests.
+# --mine keeps items you opened. --review lists pull requests that request
+# your review, including repositories you do not own. --view prints one item.
 #
 # "Owned" is deliberate, and it is different per forge:
 #   Forgejo: the authenticated user, plus every org that user belongs to.
@@ -38,7 +40,7 @@ set -euo pipefail
 
 SCRIPT_NAME="$(basename "${0}")"
 readonly SCRIPT_NAME
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 
 readonly DEFAULT_FORGEJO_URL="https://git.podbielniak.com"
 readonly DEFAULT_GITLAB_URL="https://gitlab.com"
@@ -63,12 +65,19 @@ verbose=false
 opt_fzf=false
 opt_plain=false
 opt_mine=false
+opt_review=false
+opt_view=""
 opt_state="open"
 opt_limit=0
 opt_issues=false
 forge_forgejo=false
 forge_github=false
 forge_gitlab=false
+forge_explicit=false
+VIEW_FORGE=""
+VIEW_REPO=""
+VIEW_NUMBER=""
+VIEW_KIND=""
 
 declare -a REPOS=()
 declare -a CURL=(curl)
@@ -100,6 +109,8 @@ OPTIONS:
 	-f, --fzf            Pick a row and open it with xdg-open
 	--plain              Tab-separated rows, even on a terminal
 	-m, --mine           Only items you opened
+	--review             Pull requests that request your review
+	--view REF           Print one pull request or issue and its comments
 	-i, --issues, --issue
 	                     List issues instead of pull requests
 	-s, --state STATE    open (default), closed, merged, or all
@@ -121,6 +132,16 @@ EXAMPLES:
 
 	# Issues on one repository. -i and -R cluster.
 	${SCRIPT_NAME} -iR zachpodbielniak/venture
+
+	# Pull requests you opened
+	${SCRIPT_NAME} --mine
+
+	# Pull requests waiting on your review, on every selected forge
+	${SCRIPT_NAME} --review --all
+
+	# One item, including the description and comments
+	${SCRIPT_NAME} --view zachpodbielniak/venture#190
+	${SCRIPT_NAME} --view https://git.podbielniak.com/zachpodbielniak/venture/issues/190
 
 	# Pick one or more and open them in the browser
 	${SCRIPT_NAME} --fzf
@@ -161,6 +182,16 @@ DESCRIPTION:
 
 	--issues (alias --issue, -i) lists issues on that same project set.
 	merged is only valid for pull requests.
+
+	--mine keeps items you opened. It composes with --review and with a
+	repository. --review is a different set: open pull requests where your
+	review was requested, on any repository the token can see. It does not
+	list issues.
+
+	--view REF prints that item instead of a table. REF is a URL, owner/repo#n,
+	or a GitLab owner/repo!n. A forge prefix works too: github:owner/repo#4.
+	A URL picks the forge. A bare ref uses the one forge you named, or
+	Forgejo when you named none. GitLab ! is always a merge request.
 
 	Short flags cluster. A flag that takes a value must be last, and the
 	value is the rest of the cluster or the next argument:
@@ -246,6 +277,7 @@ select_forge () {
 			die "unknown forge: ${1}"
 			;;
 	esac
+	forge_explicit=true
 }
 
 # owner/name, or group/sub/name for GitLab. Reject spaces and URL noise
@@ -363,26 +395,47 @@ parse_args () {
 				opt_mine=true
 				shift
 				;;
+			--review)
+				opt_review=true
+				shift
+				;;
+			--view)
+				need_arg "$@"
+				opt_view="${2}"
+				shift 2
+				;;
+			--view=*)
+				opt_view="${1#*=}"
+				if [[ -z "${opt_view}" ]]
+				then
+					die "--view requires a value"
+				fi
+				shift
+				;;
 			--issues|--issue)
 				opt_issues=true
 				shift
 				;;
 			--forgejo)
 				forge_forgejo=true
+				forge_explicit=true
 				shift
 				;;
 			--github)
 				forge_github=true
+				forge_explicit=true
 				shift
 				;;
 			--gitlab)
 				forge_gitlab=true
+				forge_explicit=true
 				shift
 				;;
 			--all)
 				forge_forgejo=true
 				forge_github=true
 				forge_gitlab=true
+				forge_explicit=true
 				shift
 				;;
 			--forge)
@@ -460,12 +513,35 @@ validate_args () {
 		die "issues have no merged state"
 	fi
 
+	if [[ "${opt_review}" == true && "${opt_issues}" == true ]]
+	then
+		die "reviews are pull requests"
+	fi
+
+	if [[ -n "${opt_view}" && "${opt_review}" == true ]]
+	then
+		die "--view shows one item"
+	fi
+
+	if [[ -n "${opt_view}" && "${opt_fzf}" == true ]]
+	then
+		die "--view shows one item"
+	fi
+
+	if [[ -n "${opt_view}" && ${#REPOS[@]} -gt 0 ]]
+	then
+		die "--view takes the item, not a repository list"
+	fi
+
 	if [[ ! "${opt_limit}" =~ ^[0-9]+$ ]]
 	then
 		die "limit must be a non-negative integer"
 	fi
 
-	if [[ "${forge_forgejo}" == false && "${forge_github}" == false && "${forge_gitlab}" == false ]]
+	if [[ -n "${opt_view}" ]]
+	then
+		resolve_view_ref
+	elif [[ "${forge_forgejo}" == false && "${forge_github}" == false && "${forge_gitlab}" == false ]]
 	then
 		forge_forgejo=true
 	fi
@@ -474,6 +550,46 @@ validate_args () {
 	do
 		validate_repo "${repo}"
 	done
+}
+
+# Turn --view REF into one forge, repo, number, and kind. A URL or a
+# forge prefix wins over --github and the other forge flags.
+resolve_view_ref () {
+	local selected=""
+	local parsed=""
+
+	if [[ "${forge_explicit}" == true ]]
+	then
+		if [[ "${forge_forgejo}" == true ]]
+		then
+			selected+="forgejo,"
+		fi
+		if [[ "${forge_github}" == true ]]
+		then
+			selected+="github,"
+		fi
+		if [[ "${forge_gitlab}" == true ]]
+		then
+			selected+="gitlab,"
+		fi
+	fi
+
+	parsed="$(py_lines parse_ref "${opt_view}" "${forgejo_base}" "${gitlab_base}" "${selected}")"
+	IFS=$'\t' read -r VIEW_FORGE VIEW_REPO VIEW_NUMBER VIEW_KIND <<< "${parsed}"
+	if [[ -z "${VIEW_FORGE}" || -z "${VIEW_REPO}" || -z "${VIEW_NUMBER}" || -z "${VIEW_KIND}" ]]
+	then
+		die "could not read ${opt_view}"
+	fi
+	validate_repo "${VIEW_REPO}"
+	if [[ ! "${VIEW_NUMBER}" =~ ^[0-9]+$ ]]
+	then
+		die "could not read a number from ${opt_view}"
+	fi
+
+	forge_forgejo=false
+	forge_github=false
+	forge_gitlab=false
+	select_forge "${VIEW_FORGE}"
 }
 
 require_cmd () {
@@ -539,6 +655,16 @@ require_runtime () {
 item_label () {
 	local count="${1}"
 
+	if [[ "${opt_review}" == true ]]
+	then
+		if [[ "${count}" -eq 1 ]]
+		then
+			printf 'review request'
+		else
+			printf 'review requests'
+		fi
+		return 0
+	fi
 	if [[ "${opt_issues}" == true ]]
 	then
 		if [[ "${count}" -eq 1 ]]
@@ -714,7 +840,9 @@ py () {
 	python3 - "$@" << 'PY'
 import json
 import os
+import re
 import sys
+import textwrap
 import time
 import urllib.parse
 from datetime import datetime
@@ -723,6 +851,9 @@ WANT = os.environ.get("LSPR_WANT", "open")
 AUTHOR = os.environ.get("LSPR_AUTHOR", "")
 # "issue" lists issues. Anything else lists pull requests.
 LISTING_ISSUES = os.environ.get("LSPR_KIND", "pr") == "issue"
+# Set only for --review when repositories were named. The review search is
+# wider than one repo, and this drops the rest after the response arrives.
+REPO_FILTER = {line for line in os.environ.get("LSPR_REPOS", "").splitlines() if line}
 
 
 def one_line(value, collapse=True):
@@ -820,6 +951,8 @@ def emit(forge, repo, number, state, title, author, iso, url, handle):
 	number = one_line(number)
 	url = one_line(url, collapse=False)
 	author = one_line(author)
+	if REPO_FILTER and repo not in REPO_FILTER:
+		return
 	if AUTHOR and author != AUTHOR:
 		return
 	if not repo or not number or not url:
@@ -1262,6 +1395,335 @@ def format_fzf(path, enabled):
 		sys.stdout.write("  ".join(parts) + "\t" + url + "\n")
 
 
+
+def parse_ref(ref, forgejo_base, gitlab_base, selected):
+	"""Print forge, repo, number, and kind for --view. kind is issue, pr, or item."""
+	ref = (ref or "").strip()
+	chosen = [part for part in (selected or "").split(",") if part]
+	explicit = ""
+	prefix = re.match(r"^(forgejo|github|gitlab):(.*)$", ref)
+	if prefix:
+		explicit = prefix.group(1)
+		ref = prefix.group(2).strip()
+
+	kind = "item"
+	repo = ""
+	number = ""
+
+	if ref.startswith("http://") or ref.startswith("https://"):
+		parsed = urllib.parse.urlparse(ref)
+		host = parsed.netloc.split("@")[-1].split(":")[0].lower()
+		fj_host = urllib.parse.urlparse(forgejo_base).netloc.split("@")[-1].split(":")[0].lower()
+		gl_host = urllib.parse.urlparse(gitlab_base).netloc.split("@")[-1].split(":")[0].lower()
+		if host == fj_host:
+			explicit = "forgejo"
+		elif host in ("github.com", "www.github.com", "api.github.com"):
+			explicit = "github"
+		elif host == gl_host or host == "www.gitlab.com":
+			explicit = "gitlab"
+		else:
+			sys.stderr.write(f"lspr: unrecognized forge host: {host}\n")
+			sys.exit(1)
+		parts = [part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part]
+		if len(parts) < 3 or not parts[-1].isdigit():
+			sys.stderr.write("lspr: URL has no pull request or issue number\n")
+			sys.exit(1)
+		number = parts[-1]
+		marker = parts[-2]
+		if marker in ("pulls", "pull", "merge_requests"):
+			kind = "pr"
+		elif marker in ("issues", "work_items"):
+			kind = "issue" if explicit == "gitlab" else "item"
+		else:
+			sys.stderr.write(f"lspr: URL is not a pull request or an issue: {marker}\n")
+			sys.exit(1)
+		if "-" in parts:
+			repo = "/".join(parts[: parts.index("-")])
+		else:
+			repo = "/".join(parts[:-2])
+	else:
+		match = re.match(r"^([A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)+)([#!])([0-9]+)$", ref)
+		if not match:
+			sys.stderr.write("lspr: view ref must be a URL, owner/repo#n, or owner/repo!n\n")
+			sys.exit(1)
+		repo = match.group(1)
+		number = match.group(3)
+		if match.group(2) == "!":
+			if explicit and explicit != "gitlab":
+				sys.stderr.write("lspr: owner/repo!n is a GitLab merge request\n")
+				sys.exit(1)
+			explicit = "gitlab"
+			kind = "pr"
+		elif explicit == "gitlab":
+			kind = "issue"
+
+	if not explicit:
+		if len(chosen) > 1:
+			sys.stderr.write("lspr: pass one forge, or a URL, for --view\n")
+			sys.exit(1)
+		explicit = chosen[0] if chosen else "forgejo"
+	if explicit == "gitlab" and kind == "item":
+		kind = "issue"
+	if not repo or "/" not in repo:
+		sys.stderr.write("lspr: view ref has no repository\n")
+		sys.exit(1)
+	print(f"{explicit}\t{repo}\t{number}\t{kind}")
+
+
+def concat_lists(dest, paths):
+	items = []
+	for path in paths:
+		data = load_json(path)
+		if data is None:
+			continue
+		if not isinstance(data, list):
+			sys.stderr.write(f"lspr: expected a JSON list in {path}\n")
+			sys.exit(1)
+		items.extend(data)
+	with open(dest, "w", encoding="utf-8") as handle:
+		json.dump(items, handle)
+
+
+def detect_kind(path):
+	data = load_json(path)
+	if isinstance(data, dict):
+		pull = data.get("pull_request")
+		if isinstance(pull, dict):
+			print("pr")
+			return
+		if data.get("source_branch") and data.get("target_branch"):
+			print("pr")
+			return
+		head = data.get("head")
+		base = data.get("base")
+		if isinstance(head, dict) and isinstance(base, dict):
+			print("pr")
+			return
+	print("issue")
+
+
+def person_name(obj):
+	if isinstance(obj, str):
+		return one_line(obj)
+	if not isinstance(obj, dict):
+		return ""
+	for key in ("login", "username", "name"):
+		val = obj.get(key)
+		if isinstance(val, str) and val.strip():
+			return one_line(val)
+	for key in ("user", "author"):
+		nested = obj.get(key)
+		if isinstance(nested, dict):
+			name = person_name(nested)
+			if name:
+				return name
+	return ""
+
+
+def name_list(value):
+	names = []
+	if isinstance(value, dict):
+		value = [value]
+	if not isinstance(value, list):
+		return names
+	for item in value:
+		if isinstance(item, str) and item.strip():
+			names.append(one_line(item))
+		elif isinstance(item, dict):
+			name = one_line(item.get("name") or item.get("title") or "")
+			if not name:
+				name = person_name(item)
+			if name:
+				names.append(name)
+	return names
+
+
+def branch_line(item, pull):
+	sources = [pull, item]
+	source = ""
+	target = ""
+	for obj in sources:
+		if not isinstance(obj, dict):
+			continue
+		if not source:
+			source = one_line(obj.get("source_branch") or "")
+		if not target:
+			target = one_line(obj.get("target_branch") or "")
+		head = obj.get("head") if isinstance(obj.get("head"), dict) else {}
+		base = obj.get("base") if isinstance(obj.get("base"), dict) else {}
+		if not source:
+			source = one_line(head.get("ref") or head.get("label") or "")
+		if not target:
+			target = one_line(base.get("ref") or base.get("label") or "")
+	if source and target:
+		return f"{source} -> {target}"
+	return ""
+
+
+def wrap_text(text, width):
+	width = max(20, width)
+	lines = []
+	fenced = False
+	for raw in (text or "").splitlines():
+		stripped = raw.strip()
+		if stripped.startswith("```"):
+			fenced = not fenced
+			lines.append(raw)
+			continue
+		if fenced or raw.startswith("    ") or raw.startswith("\t"):
+			lines.append(raw.rstrip())
+			continue
+		if not stripped:
+			lines.append("")
+			continue
+		lines.extend(textwrap.wrap(raw, width=width) or [""])
+	return "\n".join(lines).rstrip()
+
+
+def discussion_entry(obj):
+	if not isinstance(obj, dict) or obj.get("system") is True:
+		return None
+	body = obj.get("body")
+	body = "" if body is None else str(body).strip()
+	state = one_line(obj.get("state") or "")
+	interesting = {
+		"APPROVED",
+		"CHANGES_REQUESTED",
+		"COMMENTED",
+		"PENDING",
+		"REQUEST_CHANGES",
+		"REJECTED",
+		"DISMISSED",
+		"COMMENT",
+		"REQUEST",
+	}
+	tag = state.lower() if state.upper() in interesting else ""
+	if not body and not tag:
+		return None
+	iso = (
+		obj.get("created_at")
+		or obj.get("submitted_at")
+		or obj.get("updated_at")
+		or ""
+	)
+	iso = "" if iso is None else str(iso).strip()
+	path = one_line(obj.get("path") or "")
+	line_no = obj.get("line")
+	if line_no in (None, ""):
+		line_no = obj.get("original_line") or ""
+	extra = ""
+	if path:
+		extra = f"{path}:{line_no}" if line_no not in (None, "") else path
+	author = person_name(obj) or "?"
+	return (epoch_of(iso), iso, author, tag, extra, body)
+
+
+def show_item(enabled, cols, item_path, pull_path, comments_path, reviews_path, review_comments_path):
+	item = load_json(item_path)
+	pull = load_json(pull_path)
+	if not isinstance(item, dict):
+		sys.stderr.write("lspr: the forge did not return an object\n")
+		sys.exit(1)
+	if not isinstance(pull, dict):
+		pull = {}
+
+	def load_entries(path):
+		data = load_json(path)
+		if not isinstance(data, list):
+			return []
+		found = []
+		for obj in data:
+			entry = discussion_entry(obj)
+			if entry:
+				found.append(entry)
+		return found
+
+	entries = []
+	entries.extend(load_entries(comments_path))
+	entries.extend(load_entries(reviews_path))
+	entries.extend(load_entries(review_comments_path))
+	entries.sort(key=lambda row: (row[0], row[2], row[3]))
+
+	author = person_name(item.get("user") or item.get("author") or item)
+	title = one_line(item.get("title") or "") or "(no title)"
+	number = one_line(item.get("number") or item.get("iid") or "")
+	url = one_line(item.get("html_url") or item.get("web_url") or pull.get("html_url") or "", collapse=False)
+	repo = ""
+	repository = item.get("repository")
+	if isinstance(repository, dict):
+		repo = one_line(repository.get("full_name") or "")
+	if not repo:
+		repo = repo_from_gitlab_ref(item, "")
+	if not repo:
+		repo = repo_from_github(url, "")
+	raw_state = item.get("state") or pull.get("state") or ""
+	draft = bool(item.get("draft") or item.get("work_in_progress") or pull.get("draft"))
+	merged = bool(item.get("merged") or pull.get("merged") or raw_state == "merged")
+	pull_obj = item.get("pull_request") if isinstance(item.get("pull_request"), dict) else {}
+	merged = merged or bool(pull_obj.get("merged") or pull.get("merged_at"))
+	state = norm_state(raw_state, draft, merged)
+	created = one_line(item.get("created_at") or pull.get("created_at") or "", collapse=False)
+	updated = one_line(item.get("updated_at") or pull.get("updated_at") or "", collapse=False)
+	labels = name_list(item.get("labels"))
+	assignees = name_list(item.get("assignees") or item.get("assignee"))
+	body = item.get("body")
+	if body in (None, ""):
+		body = item.get("description")
+	body = "" if body is None else str(body).strip()
+	branches = branch_line(item, pull)
+	forge = ""
+	# The shell passes the forge as the first field of the URL host decision.
+	# show_item learns it from argv via the closure below; set by caller through attribute.
+	forge = SHOW_FORGE
+
+	def paint(text, code):
+		return colorize(text, code, enabled)
+
+	print(paint(title, "1"))
+	ident = f"{forge}  {repo}#{number}" if repo else f"{forge}  #{number}"
+	print(f"{paint(ident, '2')}  {paint(state, STATE_COLOR.get(state, ''))}")
+	meta = []
+	if author:
+		meta.append(author)
+	if created:
+		meta.append(f"opened {created}")
+	if updated:
+		meta.append(f"updated {updated}")
+	if meta:
+		print(paint(" · ".join(meta), "33"))
+	if url:
+		print(paint(url, "36"))
+	if branches:
+		print(branches)
+	if labels:
+		print("labels: " + ", ".join(labels))
+	if assignees:
+		print("assignees: " + ", ".join(assignees))
+	print()
+	print(wrap_text(body, cols) if body else paint("(no description)", "2"))
+	print()
+	count = len(entries)
+	noun = "comment" if count == 1 else "comments"
+	print(paint(f"── discussion ({count} {noun}) ──", "2"))
+	if count == 0:
+		print(paint("no comments", "2"))
+		return
+	for _epoch, iso, who, tag, extra, text in entries:
+		bits = [paint(who, "33")]
+		if tag:
+			bits.append(paint(tag, "35"))
+		if extra:
+			bits.append(paint(extra, "2"))
+		if iso:
+			bits.append(paint(iso, "2"))
+		print()
+		print("  ".join(bits))
+		if text:
+			print(wrap_text(text, cols))
+
+
+SHOW_FORGE = ""
+
 def main():
 	if len(sys.argv) < 2:
 		sys.stderr.write("lspr: internal python command missing\n")
@@ -1298,6 +1760,22 @@ def main():
 		return
 	if cmd == "graphql_body":
 		graphql_body(sys.argv[2], sys.argv[3])
+		return
+	if cmd == "parse_ref":
+		parse_ref(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else "")
+		return
+	if cmd == "concat":
+		concat_lists(sys.argv[2], sys.argv[3:])
+		return
+	if cmd == "detect_kind":
+		detect_kind(sys.argv[2])
+		return
+	if cmd == "show":
+		global SHOW_FORGE
+		SHOW_FORGE = sys.argv[2]
+		enabled = sys.argv[3] == "1"
+		cols = int(sys.argv[4] or "120")
+		show_item(enabled, cols, sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9])
 		return
 	if cmd == "format":
 		mode = sys.argv[2]
@@ -1411,7 +1889,10 @@ fetch_forgejo_search () {
 	local hit_cap=true
 	local body code meta url owner_q
 
-	owner_q="$(py_lines urlencode "${owner}")"
+	if [[ -n "${owner}" ]]
+	then
+		owner_q="$(py_lines urlencode "${owner}")"
+	fi
 	while [[ "${page}" -le "${PAGE_CAP}" ]]
 	do
 		local kind="pulls"
@@ -1419,7 +1900,15 @@ fetch_forgejo_search () {
 		then
 			kind="issues"
 		fi
-		url="${forgejo_base}/api/v1/repos/issues/search?type=${kind}&state=${api_state}&sort=recentupdate&limit=${FORGEJO_PAGE_SIZE}&page=${page}&owner=${owner_q}"
+		url="${forgejo_base}/api/v1/repos/issues/search?type=${kind}&state=${api_state}&sort=recentupdate&limit=${FORGEJO_PAGE_SIZE}&page=${page}"
+		if [[ -n "${owner}" ]]
+		then
+			url+="&owner=${owner_q}"
+		fi
+		if [[ "${opt_review}" == true ]]
+		then
+			url+="&review_requested=true"
+		fi
 		if [[ -n "${LSPR_AUTHOR}" ]]
 		then
 			url+="&created_by=$(py_lines urlencode "${LSPR_AUTHOR}")"
@@ -1488,6 +1977,39 @@ fetch_forgejo_repo () {
 	fi
 }
 
+# Review requests are global for the token. owner= only narrows a named
+# repository; it does not walk organizations you belong to.
+fetch_forgejo_reviews () {
+	local api_state="${1}"
+	local login=""
+	local spec=""
+	local owner=""
+	local -A seen=()
+
+	if [[ "${opt_mine}" == true ]]
+	then
+		login="$(fetch_forgejo_login)"
+	fi
+	begin_author "${login}"
+
+	if [[ ${#REPOS[@]} -eq 0 ]]
+	then
+		fetch_forgejo_search "" "${api_state}"
+		return 0
+	fi
+
+	for spec in "${REPOS[@]}"
+	do
+		owner="${spec%%/*}"
+		if [[ -n "${seen[${owner}]:-}" ]]
+		then
+			continue
+		fi
+		seen["${owner}"]=1
+		fetch_forgejo_search "${owner}" "${api_state}"
+	done
+}
+
 fetch_forgejo () {
 	local login=""
 	local api_state
@@ -1496,6 +2018,11 @@ fetch_forgejo () {
 	local spec org body code
 
 	api_state="$(forgejo_api_state)"
+	if [[ "${opt_review}" == true ]]
+	then
+		fetch_forgejo_reviews "${api_state}"
+		return 0
+	fi
 	if [[ "${opt_mine}" == true || ${#REPOS[@]} -eq 0 ]]
 	then
 		login="$(fetch_forgejo_login)"
@@ -1603,6 +2130,13 @@ github_query () {
 			;;
 	esac
 
+	if [[ "${opt_review}" == true ]]
+	then
+		# @me is the authenticated user. Do not add user: or org:; those
+		# would hide review requests on repositories you do not own.
+		q+=" review-requested:@me"
+	fi
+
 	if [[ ${#REPOS[@]} -gt 0 ]]
 	then
 		for repo in "${REPOS[@]}"
@@ -1613,7 +2147,8 @@ github_query () {
 			fi
 			part+="repo:${repo}"
 		done
-	else
+	elif [[ "${opt_review}" == false ]]
+	then
 		part="user:${login}"
 		for org in "${gh_orgs[@]}"
 		do
@@ -1623,7 +2158,10 @@ github_query () {
 			fi
 		done
 	fi
-	q+=" (${part})"
+	if [[ -n "${part}" ]]
+	then
+		q+=" (${part})"
+	fi
 	if [[ "${opt_mine}" == true ]]
 	then
 		q+=" author:${login}"
@@ -1643,13 +2181,13 @@ fetch_github () {
 	gh_orgs=()
 
 	mapfile -t headers <<< "$(github_auth_headers)"
-	if [[ "${opt_mine}" == true || ${#REPOS[@]} -eq 0 ]]
+	if [[ "${opt_mine}" == true || ( ${#REPOS[@]} -eq 0 && "${opt_review}" == false ) ]]
 	then
 		login="$(fetch_github_login)"
 	fi
 	begin_author "${login}"
 
-	if [[ ${#REPOS[@]} -eq 0 ]]
+	if [[ ${#REPOS[@]} -eq 0 && "${opt_review}" == false ]]
 	then
 		body="$(next_body)"
 		code="$(http_get "${github_api}/user/memberships/orgs?per_page=100&state=active" "${body}" "${headers[@]}")"
@@ -1809,6 +2347,10 @@ fetch_gitlab_project () {
 			collection="issues"
 		fi
 		url="${gitlab_base}/api/v4/projects/${encoded}/${collection}?state=${state}&per_page=${GITLAB_PAGE_SIZE}&page=${page}&order_by=updated_at&sort=desc"
+		if [[ -n "${LSPR_REVIEWER:-}" ]]
+		then
+			url+="&reviewer_username=$(py_lines urlencode "${LSPR_REVIEWER}")"
+		fi
 		if [[ -n "${LSPR_AUTHOR}" ]]
 		then
 			url+="&author_username=$(py_lines urlencode "${LSPR_AUTHOR}")"
@@ -1918,9 +2460,74 @@ fetch_gitlab_groups () {
 	done
 }
 
+# GitLab's default scope is created_by_me. Review requests need scope=all
+# plus reviewer_username, or a project you do not own never shows up.
+fetch_gitlab_reviews () {
+	local login="${1}"
+	local state="${2}"
+	local page=1
+	local fetched=0
+	local hit_cap=true
+	local body code meta url next=""
+
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		url="${gitlab_base}/api/v4/merge_requests?scope=all&state=${state}&reviewer_username=$(py_lines urlencode "${login}")&per_page=${GITLAB_PAGE_SIZE}&page=${page}&order_by=updated_at&sort=desc"
+		if [[ -n "${LSPR_AUTHOR}" ]]
+		then
+			url+="&author_username=$(py_lines urlencode "${LSPR_AUTHOR}")"
+		fi
+		body="$(next_body)"
+		code="$(http_get "${url}" "${body}" "PRIVATE-TOKEN: ${GITLAB_TOKEN}")"
+		require_http "${code}" "${body}" "GitLab" "GITLAB_TOKEN"
+		if ! meta="$(py rows gitlab "" "${body}" "${rows}")"
+		then
+			exit 1
+		fi
+		read_meta "${meta}"
+		fetched=$((fetched + meta_count))
+		if page_done "${GITLAB_PAGE_SIZE}" "${fetched}"
+		then
+			hit_cap=false
+			break
+		fi
+		next="$(header_value "${body}.hdr" "X-Next-Page")"
+		if [[ -z "${next}" || ! "${next}" =~ ^[0-9]+$ || "${next}" -le "${page}" ]]
+		then
+			hit_cap=false
+			break
+		fi
+		page="${next}"
+	done
+	if [[ "${hit_cap}" == true ]]
+	then
+		warn "GitLab: stopped after ${PAGE_CAP} pages of review requests"
+	fi
+}
+
 fetch_gitlab () {
 	local login=""
 	local spec state
+
+	if [[ "${opt_review}" == true ]]
+	then
+		login="$(fetch_gitlab_login)"
+		begin_author "${login}"
+		export LSPR_REVIEWER="${login}"
+		while IFS= read -r state
+		do
+			if [[ ${#REPOS[@]} -gt 0 ]]
+			then
+				for spec in "${REPOS[@]}"
+				do
+					fetch_gitlab_project "${spec}" "${state}"
+				done
+			else
+				fetch_gitlab_reviews "${login}" "${state}"
+			fi
+		done <<< "$(gitlab_state_params)"
+		return 0
+	fi
 
 	if [[ ${#REPOS[@]} -eq 0 || "${opt_mine}" == true ]]
 	then
@@ -1942,6 +2549,216 @@ fetch_gitlab () {
 
 	fetch_gitlab_groups
 	fetch_gitlab_personal "${login}"
+}
+
+# ==============================================================================
+# One item
+# ==============================================================================
+
+# GitLab encodes the whole path as one segment. The others encode each name
+# and keep the slashes.
+encode_repo_path () {
+	local repo="${1}"
+	local forge="${2}"
+	local part=""
+	local encoded=""
+	local -a parts=()
+
+	if [[ "${forge}" == "gitlab" ]]
+	then
+		py_lines urlencode "${repo}"
+		return 0
+	fi
+
+	IFS='/' read -r -a parts <<< "${repo}"
+	for part in "${parts[@]}"
+	do
+		if [[ -z "${part}" ]]
+		then
+			continue
+		fi
+		if [[ -n "${encoded}" ]]
+		then
+			encoded+="/"
+		fi
+		encoded+="$(py_lines urlencode "${part}")"
+	done
+	printf '%s' "${encoded}"
+}
+
+# fetch_json_list URL DEST WHAT TOKEN_NAME [HEADER ...]
+# URL already includes the page size. Pages stop on a short page.
+fetch_json_list () {
+	local url="${1}"
+	local dest="${2}"
+	local what="${3}"
+	local token_name="${4}"
+	shift 4
+	local page=1
+	local body=""
+	local code=""
+	local count=0
+	local sep='?'
+	local -a parts=()
+
+	if [[ "${url}" == *'?'* ]]
+	then
+		sep='&'
+	fi
+
+	while [[ "${page}" -le "${PAGE_CAP}" ]]
+	do
+		body="$(next_body)"
+		code="$(http_get "${url}${sep}page=${page}" "${body}" "$@")"
+		require_http "${code}" "${body}" "${what}" "${token_name}"
+		parts+=("${body}")
+		count="$(py_lines count_list "${body}")"
+		if [[ "${count}" -lt 50 ]]
+		then
+			py concat "${dest}" "${parts[@]}"
+			return 0
+		fi
+		page=$((page + 1))
+	done
+
+	warn "${what}: stopped after ${PAGE_CAP} comment pages"
+	py concat "${dest}" "${parts[@]}"
+}
+
+view_print () {
+	local color=0
+	local cols=""
+
+	if [[ "${opt_plain}" == false && -t 1 && -z "${NO_COLOR:-}" ]]
+	then
+		color=1
+	fi
+	cols="$(term_cols)"
+	py show "${VIEW_FORGE}" "${color}" "${cols}" "$@"
+}
+
+view_forgejo () {
+	local encoded="${1}"
+	local item="${2}"
+	local pull="${3}"
+	local comments="${4}"
+	local reviews="${5}"
+	local body=""
+	local code=""
+	local kind="${VIEW_KIND}"
+
+	body="$(next_body)"
+	code="$(http_get "${forgejo_base}/api/v1/repos/${encoded}/issues/${VIEW_NUMBER}" "${body}" "$(forgejo_auth)")"
+	require_http "${code}" "${body}" "Forgejo" "FORGEJO_TOKEN"
+	cp "${body}" "${item}"
+	fetch_json_list \
+		"${forgejo_base}/api/v1/repos/${encoded}/issues/${VIEW_NUMBER}/comments?limit=50" \
+		"${comments}" Forgejo FORGEJO_TOKEN "$(forgejo_auth)"
+	if [[ "${kind}" == "item" ]]
+	then
+		kind="$(py_lines detect_kind "${item}")"
+	fi
+	if [[ "${kind}" == "pr" ]]
+	then
+		body="$(next_body)"
+		code="$(http_get "${forgejo_base}/api/v1/repos/${encoded}/pulls/${VIEW_NUMBER}" "${body}" "$(forgejo_auth)")"
+		require_http "${code}" "${body}" "Forgejo" "FORGEJO_TOKEN"
+		cp "${body}" "${pull}"
+		fetch_json_list \
+			"${forgejo_base}/api/v1/repos/${encoded}/pulls/${VIEW_NUMBER}/reviews?limit=50" \
+			"${reviews}" Forgejo FORGEJO_TOKEN "$(forgejo_auth)"
+	fi
+}
+
+view_github () {
+	local encoded="${1}"
+	local item="${2}"
+	local pull="${3}"
+	local comments="${4}"
+	local reviews="${5}"
+	local rcomments="${6}"
+	local -a headers=()
+	local body=""
+	local code=""
+	local kind="${VIEW_KIND}"
+
+	mapfile -t headers <<< "$(github_auth_headers)"
+	body="$(next_body)"
+	code="$(http_get "${github_api}/repos/${encoded}/issues/${VIEW_NUMBER}" "${body}" "${headers[@]}")"
+	require_http "${code}" "${body}" "GitHub" "GITHUB_TOKEN"
+	cp "${body}" "${item}"
+	fetch_json_list \
+		"${github_api}/repos/${encoded}/issues/${VIEW_NUMBER}/comments?per_page=50" \
+		"${comments}" GitHub GITHUB_TOKEN "${headers[@]}"
+	if [[ "${kind}" == "item" ]]
+	then
+		kind="$(py_lines detect_kind "${item}")"
+	fi
+	if [[ "${kind}" == "pr" ]]
+	then
+		body="$(next_body)"
+		code="$(http_get "${github_api}/repos/${encoded}/pulls/${VIEW_NUMBER}" "${body}" "${headers[@]}")"
+		require_http "${code}" "${body}" "GitHub" "GITHUB_TOKEN"
+		cp "${body}" "${pull}"
+		fetch_json_list \
+			"${github_api}/repos/${encoded}/pulls/${VIEW_NUMBER}/reviews?per_page=50" \
+			"${reviews}" GitHub GITHUB_TOKEN "${headers[@]}"
+		fetch_json_list \
+			"${github_api}/repos/${encoded}/pulls/${VIEW_NUMBER}/comments?per_page=50" \
+			"${rcomments}" GitHub GITHUB_TOKEN "${headers[@]}"
+	fi
+}
+
+view_gitlab () {
+	local encoded="${1}"
+	local item="${2}"
+	local comments="${3}"
+	local collection="issues"
+	local body=""
+	local code=""
+
+	if [[ "${VIEW_KIND}" == "pr" ]]
+	then
+		collection="merge_requests"
+	fi
+	body="$(next_body)"
+	code="$(http_get "${gitlab_base}/api/v4/projects/${encoded}/${collection}/${VIEW_NUMBER}" "${body}" "PRIVATE-TOKEN: ${GITLAB_TOKEN}")"
+	require_http "${code}" "${body}" "GitLab" "GITLAB_TOKEN"
+	cp "${body}" "${item}"
+	fetch_json_list \
+		"${gitlab_base}/api/v4/projects/${encoded}/${collection}/${VIEW_NUMBER}/notes?per_page=50&sort=asc" \
+		"${comments}" GitLab GITLAB_TOKEN "PRIVATE-TOKEN: ${GITLAB_TOKEN}"
+}
+
+view_item () {
+	local encoded=""
+	local item="${tmpdir}/item.json"
+	local pull="${tmpdir}/pull.json"
+	local comments="${tmpdir}/comments.json"
+	local reviews="${tmpdir}/reviews.json"
+	local rcomments="${tmpdir}/rcomments.json"
+
+	printf '%s\n' '{}' > "${pull}"
+	printf '%s\n' '[]' > "${comments}"
+	printf '%s\n' '[]' > "${reviews}"
+	printf '%s\n' '[]' > "${rcomments}"
+	encoded="$(encode_repo_path "${VIEW_REPO}" "${VIEW_FORGE}")"
+
+	case "${VIEW_FORGE}" in
+		forgejo)
+			view_forgejo "${encoded}" "${item}" "${pull}" "${comments}" "${reviews}"
+			;;
+		github)
+			view_github "${encoded}" "${item}" "${pull}" "${comments}" "${reviews}" "${rcomments}"
+			;;
+		gitlab)
+			view_gitlab "${encoded}" "${item}" "${comments}"
+			;;
+		*)
+			die "unknown forge: ${VIEW_FORGE}"
+			;;
+	esac
+	view_print "${item}" "${pull}" "${comments}" "${reviews}" "${rcomments}"
 }
 
 # ==============================================================================
@@ -1985,7 +2802,10 @@ pick_and_open () {
 	header="$(printf '%s %s · enter opens · tab marks · esc cancels' \
 		"${count}" "$(item_label "${count}")")"
 	local prompt="pr > "
-	if [[ "${opt_issues}" == true ]]
+	if [[ "${opt_review}" == true ]]
+	then
+		prompt="review > "
+	elif [[ "${opt_issues}" == true ]]
 	then
 		prompt="issue > "
 	fi
@@ -2105,6 +2925,20 @@ main () {
 		export LSPR_KIND="pr"
 	fi
 	export LSPR_GL_PROJECTS="${GITLAB_PROJECT_PAGE}"
+	export LSPR_REVIEWER=""
+	if [[ "${opt_review}" == true && ${#REPOS[@]} -gt 0 ]]
+	then
+		LSPR_REPOS="$(printf '%s\n' "${REPOS[@]}")"
+		export LSPR_REPOS
+	else
+		export LSPR_REPOS=""
+	fi
+
+	if [[ -n "${opt_view}" ]]
+	then
+		view_item
+		return 0
+	fi
 
 	if [[ "${forge_forgejo}" == true ]]
 	then

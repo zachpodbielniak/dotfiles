@@ -95,6 +95,163 @@ cat > "${FIX}/fj_issues.json" << 'EOF'
   "repository": {"full_name": "zach/libresite"}
 }]
 EOF
+cat > "${FIX}/fj_review.json" << 'EOF'
+[
+  {
+    "number": 8,
+    "title": "please review",
+    "html_url": "https://forgejo.test/widgets/demo/pulls/8",
+    "state": "open",
+    "updated_at": "2026-09-01T00:00:00Z",
+    "user": {"login": "ada"},
+    "pull_request": {"merged": false, "draft": false},
+    "repository": {"full_name": "widgets/demo"}
+  },
+  {
+    "number": 2,
+    "title": "other review",
+    "html_url": "https://forgejo.test/other/repo/pulls/2",
+    "state": "open",
+    "updated_at": "2026-09-02T00:00:00Z",
+    "user": {"login": "ada"},
+    "pull_request": {"merged": false, "draft": false},
+    "repository": {"full_name": "other/repo"}
+  }
+]
+EOF
+cat > "${FIX}/fj_view_issue.json" << 'EOF'
+{
+  "number": 9,
+  "title": "repo issue",
+  "body": "the build is red\n\nsecond paragraph",
+  "html_url": "https://forgejo.test/widgets/demo/issues/9",
+  "state": "open",
+  "created_at": "2026-06-01T00:00:00Z",
+  "updated_at": "2026-07-01T00:00:00Z",
+  "user": {"login": "ada"},
+  "labels": [{"name": "bug"}],
+  "assignees": [{"login": "zach"}]
+}
+EOF
+cat > "${FIX}/fj_view_comments.json" << 'EOF'
+[{
+  "user": {"login": "ben"},
+  "created_at": "2026-07-02T00:00:00Z",
+  "body": "I can reproduce this."
+}]
+EOF
+cat > "${FIX}/fj_view_pull.json" << 'EOF'
+{
+  "number": 9,
+  "title": "repo issue",
+  "body": "the build is red",
+  "html_url": "https://forgejo.test/widgets/demo/pulls/9",
+  "state": "open",
+  "base": {"ref": "main"},
+  "head": {"ref": "feature"}
+}
+EOF
+cat > "${FIX}/fj_view_reviews.json" << 'EOF'
+[]
+EOF
+cat > "${FIX}/gh_review.json" << 'EOF'
+{
+  "total_count": 1,
+  "incomplete_results": false,
+  "items": [{
+    "number": 3,
+    "title": "needs you",
+    "html_url": "https://github.com/other/repo/pull/3",
+    "state": "open",
+    "updated_at": "2026-09-01T00:00:00Z",
+    "user": {"login": "ada"},
+    "pull_request": {}
+  }]
+}
+EOF
+cat > "${FIX}/gh_view_issue.json" << 'EOF'
+{
+  "number": 3,
+  "title": "needs you",
+  "body": "please look",
+  "html_url": "https://github.com/widgets/demo/pull/3",
+  "state": "open",
+  "user": {"login": "ada"},
+  "created_at": "2026-09-01T00:00:00Z",
+  "updated_at": "2026-09-02T00:00:00Z",
+  "pull_request": {"url": "https://github.test/repos/widgets/demo/pulls/3"}
+}
+EOF
+cat > "${FIX}/gh_view_pull.json" << 'EOF'
+{
+  "number": 3,
+  "title": "needs you",
+  "body": "please look",
+  "html_url": "https://github.com/widgets/demo/pull/3",
+  "state": "open",
+  "draft": false,
+  "base": {"ref": "main"},
+  "head": {"ref": "feature"},
+  "user": {"login": "ada"}
+}
+EOF
+cat > "${FIX}/gh_view_comments.json" << 'EOF'
+[{
+  "user": {"login": "ben"},
+  "created_at": "2026-09-02T01:00:00Z",
+  "body": "issue thread"
+}]
+EOF
+cat > "${FIX}/gh_view_reviews.json" << 'EOF'
+[{
+  "user": {"login": "zach"},
+  "state": "APPROVED",
+  "submitted_at": "2026-09-02T02:00:00Z",
+  "body": "LGTM"
+}]
+EOF
+cat > "${FIX}/gh_view_rcomments.json" << 'EOF'
+[{
+  "user": {"login": "zach"},
+  "created_at": "2026-09-02T03:00:00Z",
+  "path": "main.c",
+  "line": 10,
+  "body": "nit here"
+}]
+EOF
+cat > "${FIX}/gl_reviews.json" << 'EOF'
+[{
+  "iid": 4,
+  "title": "please review mr",
+  "web_url": "https://gitlab.com/other/repo/-/merge_requests/4",
+  "state": "opened",
+  "updated_at": "2026-09-02T00:00:00Z",
+  "author": {"username": "ada"},
+  "references": {"full": "other/repo!4"}
+}]
+EOF
+cat > "${FIX}/gl_view_mr.json" << 'EOF'
+{
+  "iid": 4,
+  "title": "please review mr",
+  "description": "the change itself",
+  "web_url": "https://gitlab.test/widgets/demo/-/merge_requests/4",
+  "state": "opened",
+  "source_branch": "feature",
+  "target_branch": "main",
+  "author": {"username": "ada"},
+  "references": {"full": "widgets/demo!4"}
+}
+EOF
+cat > "${FIX}/gl_view_notes.json" << 'EOF'
+[
+  {"author": {"username": "bot"}, "system": true, "body": "assigned to zach", "created_at": "2026-09-01T00:00:00Z"},
+  {"author": {"username": "ben"}, "system": false, "body": "ship it", "created_at": "2026-09-03T00:00:00Z"}
+]
+EOF
+cat > "${FIX}/gl_view_issue.json" << 'EOF'
+{"iid": 1, "title": "unused", "description": "unused", "state": "opened", "web_url": "https://gitlab.test/widgets/demo/-/issues/1"}
+EOF
 cat > "${FIX}/fj_repo_issues.json" << 'EOF'
 [{
   "number": 9,
@@ -324,7 +481,10 @@ case "${path}" in
 		write_json "${LSPR_FIX}/fj_orgs.json"
 		;;
 	https://forgejo.test/api/v1/repos/issues/search)
-		if [[ "${query}" == *type=issues* ]]
+		if [[ "${query}" == *review_requested=true* ]]
+		then
+			write_json "${LSPR_FIX}/fj_review.json"
+		elif [[ "${query}" == *type=issues* ]]
 		then
 			write_json "${LSPR_FIX}/fj_issues.json"
 		elif [[ "${query}" == *state=closed* || "${query}" == *state=all* ]]
@@ -333,6 +493,18 @@ case "${path}" in
 		else
 			write_json "${LSPR_FIX}/fj_open.json"
 		fi
+		;;
+	https://forgejo.test/api/v1/repos/*/issues/*/comments)
+		write_json "${LSPR_FIX}/fj_view_comments.json"
+		;;
+	https://forgejo.test/api/v1/repos/*/pulls/*/reviews)
+		write_json "${LSPR_FIX}/fj_view_reviews.json"
+		;;
+	https://forgejo.test/api/v1/repos/*/pulls/*)
+		write_json "${LSPR_FIX}/fj_view_pull.json"
+		;;
+	https://forgejo.test/api/v1/repos/*/issues/*)
+		write_json "${LSPR_FIX}/fj_view_issue.json"
 		;;
 	https://forgejo.test/api/v1/repos/*/pulls)
 		write_json "${LSPR_FIX}/fj_pulls.json"
@@ -347,12 +519,45 @@ case "${path}" in
 		write_json "${LSPR_FIX}/gh_orgs.json"
 		;;
 	https://github.test/search/issues)
-		if [[ "${query}" == *is%3Aissue* ]]
+		if [[ "${query}" == *review-requested* ]]
+		then
+			write_json "${LSPR_FIX}/gh_review.json"
+		elif [[ "${query}" == *is%3Aissue* ]]
 		then
 			write_json "${LSPR_FIX}/gh_issues.json"
 		else
 			write_json "${LSPR_FIX}/gh_search.json"
 		fi
+		;;
+	https://github.test/repos/*/issues/*/comments)
+		write_json "${LSPR_FIX}/gh_view_comments.json"
+		;;
+	https://github.test/repos/*/pulls/*/comments)
+		write_json "${LSPR_FIX}/gh_view_rcomments.json"
+		;;
+	https://github.test/repos/*/pulls/*/reviews)
+		write_json "${LSPR_FIX}/gh_view_reviews.json"
+		;;
+	https://github.test/repos/*/pulls/*)
+		write_json "${LSPR_FIX}/gh_view_pull.json"
+		;;
+	https://github.test/repos/*/issues/*)
+		write_json "${LSPR_FIX}/gh_view_issue.json"
+		;;
+	https://gitlab.test/api/v4/merge_requests)
+		write_json "${LSPR_FIX}/gl_reviews.json"
+		;;
+	https://gitlab.test/api/v4/projects/*/issues/*/notes)
+		write_json "${LSPR_FIX}/gl_view_notes.json"
+		;;
+	https://gitlab.test/api/v4/projects/*/merge_requests/*/notes)
+		write_json "${LSPR_FIX}/gl_view_notes.json"
+		;;
+	https://gitlab.test/api/v4/projects/*/merge_requests/*)
+		write_json "${LSPR_FIX}/gl_view_mr.json"
+		;;
+	https://gitlab.test/api/v4/projects/*/issues/*)
+		write_json "${LSPR_FIX}/gl_view_issue.json"
 		;;
 	https://gitlab.test/api/v4/user)
 		write_json "${LSPR_FIX}/gl_user.json"
@@ -470,7 +675,7 @@ else
 fi
 
 run env -u FORGEJO_TOKEN PATH=/usr/bin:/bin "${SCRIPT}" --version
-if [[ "${status}" -eq 0 ]] && grep -q 'lspr 1.2.0' "${OUT}"
+if [[ "${status}" -eq 0 ]] && grep -q 'lspr 1.3.0' "${OUT}"
 then
 	ok "version"
 else
@@ -834,6 +1039,157 @@ if code != 0 or "FORGE" not in text or "libresite" not in text or "\033[32m" not
     sys.exit(1)
 PY
 ok "pretty table on a tty"
+
+run base_env "${SCRIPT}" --review --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q "$(printf 'forgejo\twidgets/demo\t8\topen\tplease review')" "${OUT}" \
+	&& grep -q "$(printf 'forgejo\tother/repo\t2\topen\tother review')" "${OUT}" \
+	&& grep -q 'review_requested=true' "${CURL_LOG}" \
+	&& ! grep -q '/user/orgs' "${CURL_LOG}" \
+	&& ! grep -q '/api/v1/user' "${CURL_LOG}"
+then
+	ok "review requests are not the owned-project set"
+else
+	bad "forgejo review"
+	printf '%s\n' "${OUT}" >&2
+fi
+
+run base_env "${SCRIPT}" --review -R widgets/demo --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q 'please review' "${OUT}" \
+	&& ! grep -q 'other review' "${OUT}" \
+	&& grep -q 'owner=widgets' "${CURL_LOG}" \
+	&& grep -q 'review_requested=true' "${CURL_LOG}"
+then
+	ok "review can be limited to a repo"
+else
+	bad "review repo filter"
+fi
+
+run base_env "${SCRIPT}" --review --github --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q "$(printf 'github\tother/repo\t3\topen\tneeds you')" "${OUT}" \
+	&& grep -q 'review-requested' "${CURL_LOG}" \
+	&& ! grep -q 'memberships/orgs' "${CURL_LOG}" \
+	&& ! grep -q 'org%3Awidgets' "${CURL_LOG}"
+then
+	ok "github review-requested"
+else
+	bad "github review"
+fi
+
+run base_env "${SCRIPT}" --review --gitlab --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q "$(printf 'gitlab\tother/repo\t4\topen\tplease review mr')" "${OUT}" \
+	&& grep -q '/api/v4/merge_requests?' "${CURL_LOG}" \
+	&& grep -q 'reviewer_username=zach' "${CURL_LOG}" \
+	&& grep -q 'scope=all' "${CURL_LOG}" \
+	&& ! grep -q '/groups/' "${CURL_LOG}"
+then
+	ok "gitlab review requests"
+else
+	bad "gitlab review"
+	cat "${CURL_LOG}" >&2
+fi
+
+run base_env "${SCRIPT}" --review --mine --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q 'review_requested=true' "${CURL_LOG}" \
+	&& grep -q 'created_by=zach' "${CURL_LOG}"
+then
+	ok "review composes with --mine"
+else
+	bad "review --mine"
+fi
+
+run env -u FORGEJO_TOKEN PATH=/usr/bin:/bin "${SCRIPT}" --review --issues
+if [[ "${status}" -eq 1 ]] && grep -q 'reviews are pull requests' "${ERR}"
+then
+	ok "review rejects issues"
+else
+	bad "review rejects issues"
+fi
+
+run base_env "${SCRIPT}" --view widgets/demo#9 --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q 'repo issue' "${OUT}" \
+	&& grep -q 'the build is red' "${OUT}" \
+	&& grep -q 'second paragraph' "${OUT}" \
+	&& grep -q 'labels: bug' "${OUT}" \
+	&& grep -q 'assignees: zach' "${OUT}" \
+	&& grep -q 'I can reproduce this.' "${OUT}" \
+	&& grep -q 'widgets/demo#9' "${OUT}" \
+	&& ! grep -q $'\033' "${OUT}" \
+	&& grep -q '/repos/widgets/demo/issues/9' "${CURL_LOG}" \
+	&& ! grep -q '/pulls/' "${CURL_LOG}"
+then
+	ok "view an issue"
+else
+	bad "view an issue"
+	printf '%s\n' "${OUT}" >&2
+fi
+
+run base_env "${SCRIPT}" --view 'https://forgejo.test/widgets/demo/issues/9' --plain
+if [[ "${status}" -eq 0 ]] && grep -q '/repos/widgets/demo/issues/9' "${CURL_LOG}"
+then
+	ok "view a forgejo URL"
+else
+	bad "view a forgejo URL"
+fi
+
+run base_env "${SCRIPT}" --view 'https://github.com/widgets/demo/pull/3' --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q 'feature -> main' "${OUT}" \
+	&& grep -q 'LGTM' "${OUT}" \
+	&& grep -q 'approved' "${OUT}" \
+	&& grep -q 'main.c:10' "${OUT}" \
+	&& grep -q 'nit here' "${OUT}" \
+	&& grep -q '/repos/widgets/demo/pulls/3' "${CURL_LOG}"
+then
+	ok "view a github pull request"
+else
+	bad "view a github pull request"
+	printf '%s\n' "${OUT}" >&2
+fi
+
+run base_env "${SCRIPT}" --view 'https://gitlab.test/widgets/demo/-/merge_requests/4' --plain
+if [[ "${status}" -eq 0 ]] \
+	&& grep -q 'the change itself' "${OUT}" \
+	&& grep -q 'ship it' "${OUT}" \
+	&& grep -q 'feature -> main' "${OUT}" \
+	&& ! grep -q 'assigned to zach' "${OUT}" \
+	&& grep -q '/projects/widgets%2Fdemo/merge_requests/4' "${CURL_LOG}"
+then
+	ok "view a gitlab merge request"
+else
+	bad "view a gitlab merge request"
+	printf '%s\n' "${OUT}" >&2
+	cat "${CURL_LOG}" >&2
+fi
+
+run base_env "${SCRIPT}" --view 'widgets/demo!4' --plain
+if [[ "${status}" -eq 0 ]] && grep -q '/projects/widgets%2Fdemo/merge_requests/4' "${CURL_LOG}"
+then
+	ok "gitlab ! ref"
+else
+	bad "gitlab ! ref"
+fi
+
+run env -u FORGEJO_TOKEN PATH=/usr/bin:/bin "${SCRIPT}" --view
+if [[ "${status}" -eq 1 ]] && grep -q 'requires a value' "${ERR}"
+then
+	ok "view needs a value"
+else
+	bad "view needs a value"
+fi
+
+run env -u FORGEJO_TOKEN PATH=/usr/bin:/bin "${SCRIPT}" --all --view widgets/demo#9
+if [[ "${status}" -eq 1 ]] && grep -q 'pass one forge' "${ERR}"
+then
+	ok "view with every forge needs a URL"
+else
+	bad "ambiguous view"
+fi
 
 printf '%s passed, %s failed\n' "${PASS}" "${FAIL}"
 if [[ "${FAIL}" -ne 0 ]]
