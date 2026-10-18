@@ -189,7 +189,7 @@ keep this list small.  Use the symbol `agenda' to scan all
     (:section launch :key "t" :label "timeblock"      :key-display "SPC n T" :command org-timeblock)
     (:section launch :key "b" :label "recipes"        :key-display "SPC o k" :command recipes)
     (:section launch :key "m" :label "mail"           :key-display "SPC o m" :command mu4e)
-    (:section launch :key "e" :label "rss"            :key-display "SPC o r" :command elfeed)
+    (:section launch :key "e" :label "rss"            :key-display "SPC o r" :command zach/elfeed)
     (:section launch :key "x" :label "matrix"         :key-display "SPC M M" :command ement-connect)
     (:section ai :key "i" :label "▶ ask claude"      :key-display "SPC a c" :command claude-code-start)
     (:section ai :key "v" :label "send region"        :key-display "SPC a s" :command claude-code-send-region)

@@ -30,27 +30,96 @@
 
 ;;; Code:
 
-;;; RSS feeds (elfeed, replaces feed.nvim)
-;;; All 14 feeds from nvim config ported with matching tags
+;;; RSS feeds (elfeed + elfeed-org, replaces feed.nvim)
+;;;
+;;; The feed list lives in feeds.org next to this file (elfeed-org).
+;;; Edit it there; headings inherit tags and elfeed picks changes up on
+;;; the next `elfeed' start or `M-x elfeed-org'.
+;;;
+;;; Reddit RSS is intentionally absent: Reddit ends feed support on
+;;; 2026-11-13.  Topic coverage that used to come from subreddits is
+;;; handled by hnrss.org keyword feeds below.
+;;;
+;;; Tags drive the saved filters in `zach/elfeed-filters' (press F in
+;;; the search buffer).  Keep every feed tagged with at least one topic.
+(defvar rmh-elfeed-org-files nil)
+(setq rmh-elfeed-org-files (list (expand-file-name "feeds.org" doom-user-dir)))
+
 (after! elfeed
-  (setq elfeed-feeds
-        '(;; Reddit feeds
-          ("https://www.reddit.com/r/bash/.rss?sort=new" reddit tech)
-          ("https://www.reddit.com/r/C_Programming/.rss?sort=new" reddit tech)
-          ("https://www.reddit.com/r/Fedora/.rss?sort=new" reddit tech)
-          ("https://www.reddit.com/r/Fire/.rss?sort=new" reddit finance)
-          ("https://www.reddit.com/r/dividends/.rss?sort=new" reddit finance investing)
-          ;; NewsMax feeds
-          ("https://www.newsmax.com/rss/Newsfront/16/" news headlines)
-          ("https://www.newsmax.com/rss/US/18/" news)
-          ("https://www.newsmax.com/rss/Health-News/177/" news health)
-          ("https://www.newsmax.com/rss/Companies/6/" news finance)
-          ("https://www.newsmax.com/rss/InvestingAnalysis/17/" news finance investing)
-          ("https://www.newsmax.com/rss/Economy/2/" news finance)
-          ("https://www.newsmax.com/rss/FinanceNews/4/" news finance)
-          ("https://www.newsmax.com/rss/Headline/76/" news finance headlines)
-          ;; DailyWire
-          ("https://www.dailywire.com/feeds/rss.xml" news))))
+  (setq elfeed-search-filter "@2-weeks-ago +unread"
+        elfeed-search-title-max-width 100)
+
+  ;; elfeed-goodies replaces the stock entry line and drops the date
+  ;; column.  This one draws: date | feed | tags | title.
+  (defun zach/elfeed-print-entry (entry)
+    "Print ENTRY as date, feed, tags, then title."
+    (let* ((date (elfeed-search-format-date (elfeed-entry-date entry)))
+           (title (or (elfeed-meta entry :title) (elfeed-entry-title entry) ""))
+           (title-faces (elfeed-search--faces (elfeed-entry-tags entry)))
+           (feed (elfeed-entry-feed entry))
+           (feed-title (when feed
+                         (or (elfeed-meta feed :title) (elfeed-feed-title feed) "")))
+           (tags (mapcar #'symbol-name (elfeed-entry-tags entry)))
+           (tags-str (concat "[" (mapconcat #'identity tags ",") "]")))
+      (insert (propertize date 'face 'elfeed-search-date-face) " ")
+      (insert (propertize (elfeed-format-column feed-title 22 :left)
+                          'face 'elfeed-search-feed-face) " ")
+      (insert (propertize (elfeed-format-column tags-str 24 :left)
+                          'face 'elfeed-search-tag-face) " ")
+      (insert (propertize title 'face title-faces 'kbd-help title))))
+
+  (add-hook 'elfeed-search-mode-hook
+            (defun zach/elfeed-use-date-column ()
+              (setq-local elfeed-search-print-entry-function
+                          #'zach/elfeed-print-entry)))
+
+  (defvar zach/elfeed-filters
+    '(("everything"  . "@2-weeks-ago +unread")
+      ("emacs"       . "@4-weeks-ago +unread +emacs")
+      ("opensource"  . "@2-weeks-ago +unread +opensource")
+      ("decomp/ports" . "@4-weeks-ago +unread +decomp")
+      ("gnu"         . "@4-weeks-ago +unread +gnu")
+      ("ai"          . "@2-weeks-ago +unread +ai")
+      ("github"      . "@1-week-ago +unread +github")
+      ("steam"       . "@2-weeks-ago +unread +steam")
+      ("ublue"       . "@4-weeks-ago +unread +ublue")
+      ("blogs"       . "@4-weeks-ago +unread +blog")
+      ("news"        . "@1-week-ago +unread +news")
+      ("starred"     . "+star"))
+    "Alist of (NAME . ELFEED-FILTER) for `zach/elfeed-filter'.")
+
+  (defun zach/elfeed-filter ()
+    "Pick a saved filter from `zach/elfeed-filters' and apply it."
+    (interactive)
+    (let* ((name (completing-read "Feed filter: " zach/elfeed-filters nil t))
+           (filter (cdr (assoc name zach/elfeed-filters))))
+      (elfeed-search-set-filter filter)))
+
+  (map! :map elfeed-search-mode-map
+        :n "F" #'zach/elfeed-filter))
+
+(defvar zach/elfeed-stale-seconds 3600
+  "Seconds after which opening `zach/elfeed' triggers an update.")
+
+(defvar zach/elfeed--last-update nil
+  "Float time of the last update started by `zach/elfeed', or nil.")
+
+(defun zach/elfeed ()
+  "Open elfeed, refreshing the feeds first if they are stale.
+Updates run asynchronously so the search buffer appears immediately and
+fills in as feeds come back.  Use `elfeed-update' (SPC o R u) to force."
+  (interactive)
+  (elfeed)
+  (when (or (null zach/elfeed--last-update)
+            (> (- (float-time) zach/elfeed--last-update)
+               zach/elfeed-stale-seconds))
+    (setq zach/elfeed--last-update (float-time))
+    (elfeed-update)))
+
+(defun zach/elfeed-edit-feeds ()
+  "Visit the elfeed-org feed list (feeds.org) for editing."
+  (interactive)
+  (find-file (car rmh-elfeed-org-files)))
 
 ;; `o R' was previously bound to `elfeed-update' directly; clear it
 ;; with an explicit nil so Doom can rebuild it as a prefix.  Mirrors
@@ -58,7 +127,8 @@
 (map! :leader :desc "reddit/rss" "o R" nil)
 
 (map! :leader
-      :desc "Open RSS"         "o r"   #'elfeed
+      :desc "Open RSS"         "o r"   #'zach/elfeed
+      :desc "Edit RSS feeds"   "o F"   #'zach/elfeed-edit-feeds
       :desc "Reddit main"      "o R r" #'reddigg-view-main
       :desc "Reddit subreddit" "o R s" #'reddigg-view-sub
       :desc "Reddit comments"  "o R c" #'reddigg-view-comments
