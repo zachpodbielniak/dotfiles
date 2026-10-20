@@ -125,6 +125,38 @@
     (add-to-list 'cmacs-gowl-float-rules
                  '(:app-id "steam_app_tsm" :tags 256)))
 
+  ;; mpv stays fully opaque -- the alpha module's 0.9 makes video look
+  ;; washed out.  `cmacs-gowl-float-rules' cannot carry :opacity (its
+  ;; applier goes through `gowl-add-rule-full'), and that applier calls
+  ;; `gowl-clear-rules' first, so the rule is re-added after every push
+  ;; rather than once at load.
+  (defun +gowl--add-opacity-rules (&rest _)
+    "Add per-app opacity rules after `cmacs-gowl-float-rules' is pushed."
+    (when (gowl-running-p)
+      (gowl-add-rule-entry '((app-id . "mpv") (opacity . 1.0)))))
+  (with-eval-after-load 'cmacs-gowl
+    (advice-add 'cmacs-gowl--apply-float-rules :after
+                #'+gowl--add-opacity-rules))
+
+  ;; The rule only sets opacity at map: the alpha module re-applies
+  ;; focused/unfocused alpha to every client on each focus change (a
+  ;; screenshot's region picker is enough), so re-assert it afterwards.
+  ;; Deferred one tick so it lands after the alpha module's handler.
+  (defvar +gowl-opaque-app-ids '("mpv")
+    "App-ids whose windows are kept at opacity 1.0.")
+  (defun +gowl--keep-opaque (&rest _)
+    "Set every client in `+gowl-opaque-app-ids' back to opacity 1.0."
+    (run-at-time
+     0 nil
+     (lambda ()
+       (when (gowl-running-p)
+         (dolist (client (gowl-list-clients))
+           (when (member (alist-get 'app-id (gowl-client-info client))
+                         +gowl-opaque-app-ids)
+             (gowl-set-client-alpha client 1.0)))))))
+  (add-hook 'cmacs-gowl-focus-changed-functions #'+gowl--keep-opaque)
+  (add-hook 'gowl-screenshot-done-hook #'+gowl--keep-opaque)
+
   ;; Dropdown terminals: guake-style drop-from-top windows toggled by
   ;; Super+grave.  Entries come from `cmacs-gowl-dropdowns' and are
   ;; pushed + adopted by `cmacs-gowl-mode' below.  Must be enabled
