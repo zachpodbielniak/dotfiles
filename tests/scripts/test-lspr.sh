@@ -992,12 +992,18 @@ fi
 
 # Pretty output needs a terminal. The pty closes when lspr exits.
 python3 - "${SCRIPT}" "${STUB_BIN}" "${FIX}" "${CURL_LOG}" "${OPEN_LOG}" << 'PY'
+import fcntl
 import os
 import pty
+import re
+import struct
 import sys
+import termios
 
 script, stub_bin, fix, curl_log, open_log = sys.argv[1:6]
 master, slave = pty.openpty()
+# 80 columns. lspr must stay inside that, including the spare last column.
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
 # A minimal environment, so a parent NO_COLOR or BASH_ENV cannot disable color.
 env = {
     "FORGEJO_TOKEN": "test-fj",
@@ -1034,8 +1040,10 @@ _, status = os.waitpid(pid, 0)
 text = b"".join(chunks).decode("utf-8", "replace")
 code = os.waitstatus_to_exitcode(status)
 # The title is truncated to the pty width, so match the repo and a color, not the full title.
-if code != 0 or "FORGE" not in text or "libresite" not in text or "\033[32m" not in text or "pull request" not in text:
-    sys.stderr.write(f"pretty status={code}\n{text}\n")
+visible = re.sub(r"\033\[[0-9;]*m", "", text)
+wide = [line for line in visible.splitlines() if len(line) >= 80]
+if code != 0 or "FORGE" not in text or "libresite" not in text or "\033[32m" not in text or "pull request" not in text or wide:
+    sys.stderr.write(f"pretty status={code} wide={wide!r}\n{text}\n")
     sys.exit(1)
 PY
 ok "pretty table on a tty"

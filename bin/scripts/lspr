@@ -159,7 +159,7 @@ EXAMPLES:
 	${SCRIPT_NAME} --all --state closed --plain
 
 DESCRIPTION:
-	A terminal shows an aligned table. A pipe, and --plain, print TSV with
+	A terminal shows an aligned table that fits the terminal width. A pipe, and --plain, print TSV with
 	no header so the rows can go straight into cut or awk:
 
 	  1 forge  2 repo  3 number  4 state  5 title
@@ -844,6 +844,7 @@ import re
 import sys
 import textwrap
 import time
+import unicodedata
 import urllib.parse
 from datetime import datetime
 
@@ -1275,12 +1276,48 @@ query($cursor: String) {{
 	print(json.dumps(payload))
 
 
+def glyph_width(ch):
+	# Combining marks take no column. Fullwidth and wide glyphs take two.
+	# Ambiguous glyphs (including "…") are one column here, which matches
+	# a non-CJK terminal. Counting them as two would shift the columns.
+	if unicodedata.combining(ch):
+		return 0
+	if unicodedata.east_asian_width(ch) in ("W", "F"):
+		return 2
+	return 1
+
+
+def text_width(text):
+	return sum(glyph_width(ch) for ch in text)
+
+
 def trunc(text, width):
-	if len(text) <= width:
+	if width <= 0:
+		return ""
+	if text_width(text) <= width:
 		return text
-	if width <= 1:
-		return text[:width]
-	return text[: width - 1] + "…"
+	ell = "…"
+	ell_w = glyph_width(ell)
+	if ell_w >= width:
+		out = []
+		used = 0
+		for ch in text:
+			w = glyph_width(ch)
+			if used + w > width:
+				break
+			out.append(ch)
+			used += w
+		return "".join(out)
+	limit = width - ell_w
+	out = []
+	used = 0
+	for ch in text:
+		w = glyph_width(ch)
+		if used + w > limit:
+			break
+		out.append(ch)
+		used += w
+	return "".join(out) + ell
 
 
 def colorize(text, code, enabled):
@@ -1330,21 +1367,71 @@ def iter_rows(path):
 def cell(text, width, code, enabled):
 	shown = trunc(text, width)
 	painted = colorize(shown, code, enabled)
-	pad = width - len(shown)
+	pad = width - text_width(shown)
 	if pad > 0:
 		painted += " " * pad
 	return painted
 
 
+def column_widths(cols):
+	# Seven cells, six gaps of two. The last column is left empty: a line
+	# that fills it wraps on a real terminal.
+	budget = cols - 1 if cols > 1 else 1
+	gap_w = 2 * 6
+	# Shrunk in this order, down to the floor, so the title keeps room.
+	specs = [
+		("author", 16, 8),
+		("repo", 32, 12),
+		("num", 7, 5),
+		("forge", 7, 6),
+		("age", 4, 3),
+		("state", 6, 4),
+	]
+	widths = {name: pref for name, pref, _floor in specs}
+	floors = {name: floor for name, _pref, floor in specs}
+	title_floor = 16
+
+	def chrome():
+		return sum(widths.values()) + gap_w
+
+	title = budget - chrome()
+	while title < title_floor:
+		moved = False
+		for name, _pref, _floor in specs:
+			if widths[name] > floors[name]:
+				widths[name] -= 1
+				title += 1
+				moved = True
+				if title >= title_floor:
+					break
+		if not moved:
+			break
+	# Still wider than the terminal: give up the title floor, then the
+	# other floors, until the row fits.
+	if title < 1 or chrome() + max(title, 1) > budget:
+		title = 1
+		while chrome() + title > budget:
+			moved = False
+			for name, _pref, _floor in specs:
+				if widths[name] > 1:
+					widths[name] -= 1
+					moved = True
+					break
+			if not moved:
+				title = max(0, budget - chrome())
+				break
+	return widths, title
+
+
 def format_pretty(path, enabled, cols):
-	forge_w, num_w, state_w, repo_w, author_w, age_w = 7, 7, 6, 32, 16, 4
+	widths, title_w = column_widths(cols)
+	forge_w = widths["forge"]
+	num_w = widths["num"]
+	state_w = widths["state"]
+	repo_w = widths["repo"]
+	author_w = widths["author"]
+	age_w = widths["age"]
 	gap = "  "
-	used = forge_w + num_w + state_w + repo_w + author_w + age_w + (2 * 5)
-	title_w = cols - used
-	if title_w < 28:
-		repo_w, author_w = 24, 12
-		used = forge_w + num_w + state_w + repo_w + author_w + age_w + (2 * 5)
-		title_w = max(16, cols - used)
 	header = gap.join(
 		[
 			cell("FORGE", forge_w, "2", enabled),
