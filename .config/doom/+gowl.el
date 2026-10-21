@@ -133,7 +133,12 @@
   (defun +gowl--add-opacity-rules (&rest _)
     "Add per-app opacity rules after `cmacs-gowl-float-rules' is pushed."
     (when (gowl-running-p)
-      (gowl-add-rule-entry '((app-id . "mpv") (opacity . 1.0)))))
+      (gowl-add-rule-entry '((app-id . "mpv") (opacity . 1.0)))
+      ;; librefall is a game: no transparency, blur, shadow or open/close
+      ;; animation.  It maps with an empty app-id, so match its
+      ;; "librefall - <title>" window title instead.
+      (gowl-add-rule-entry '((title . "librefall - *") (opacity . 1.0)
+                             (no-blur . t) (no-shadow . t) (no-anim . t)))))
   (with-eval-after-load 'cmacs-gowl
     (advice-add 'cmacs-gowl--apply-float-rules :after
                 #'+gowl--add-opacity-rules))
@@ -144,15 +149,24 @@
   ;; Deferred one tick so it lands after the alpha module's handler.
   (defvar +gowl-opaque-app-ids '("mpv")
     "App-ids whose windows are kept at opacity 1.0.")
+  (defvar +gowl-opaque-titles '("librefall - *")
+    "Title globs whose windows are kept at opacity 1.0.
+For clients with no usable app-id, such as librefall.")
+  (defun +gowl--opaque-client-p (info)
+    "Return non-nil when client INFO matches an opaque app-id or title."
+    (or (member (alist-get 'app-id info) +gowl-opaque-app-ids)
+        (let ((title (or (alist-get 'title info) "")))
+          (seq-some (lambda (glob)
+                      (string-match-p (wildcard-to-regexp glob) title))
+                    +gowl-opaque-titles))))
   (defun +gowl--keep-opaque (&rest _)
-    "Set every client in `+gowl-opaque-app-ids' back to opacity 1.0."
+    "Set every client matching `+gowl--opaque-client-p' back to opacity 1.0."
     (run-at-time
      0 nil
      (lambda ()
        (when (gowl-running-p)
          (dolist (client (gowl-list-clients))
-           (when (member (alist-get 'app-id (gowl-client-info client))
-                         +gowl-opaque-app-ids)
+           (when (+gowl--opaque-client-p (gowl-client-info client))
              (gowl-set-client-alpha client 1.0)))))))
   (add-hook 'cmacs-gowl-focus-changed-functions #'+gowl--keep-opaque)
   (add-hook 'gowl-screenshot-done-hook #'+gowl--keep-opaque)
