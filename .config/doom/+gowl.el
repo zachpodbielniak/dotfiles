@@ -144,15 +144,21 @@
   ;; applier goes through `gowl-add-rule-full'), and that applier calls
   ;; `gowl-clear-rules' first, so the rule is re-added after every push
   ;; rather than once at load.
+  (defvar +gowl-opaque-titles '("librefall - *" "librewow*")
+    "Title globs whose windows are kept at opacity 1.0.
+For clients with no usable app-id, such as librefall and librewow.
+Matching windows also get no blur, shadow or open/close animation.")
   (defun +gowl--add-opacity-rules (&rest _)
     "Add per-app opacity rules after `cmacs-gowl-float-rules' is pushed."
     (when (gowl-running-p)
       (gowl-add-rule-entry '((app-id . "mpv") (opacity . 1.0)))
-      ;; librefall is a game: no transparency, blur, shadow or open/close
-      ;; animation.  It maps with an empty app-id, so match its
-      ;; "librefall - <title>" window title instead.
-      (gowl-add-rule-entry '((title . "librefall - *") (opacity . 1.0)
-                             (no-blur . t) (no-shadow . t) (no-anim . t)))))
+      ;; librefall and librewow are games: no transparency, blur, shadow
+      ;; or open/close animation.  They map with an empty app-id, so
+      ;; match their window titles instead.  librewow titles itself
+      ;; "librewow", "librewow - <title>" or "librewow-box-N - <name>".
+      (dolist (title +gowl-opaque-titles)
+        (gowl-add-rule-entry `((title . ,title) (opacity . 1.0)
+                               (no-blur . t) (no-shadow . t) (no-anim . t))))))
   (with-eval-after-load 'cmacs-gowl
     (advice-add 'cmacs-gowl--apply-float-rules :after
                 #'+gowl--add-opacity-rules))
@@ -163,9 +169,6 @@
   ;; Deferred one tick so it lands after the alpha module's handler.
   (defvar +gowl-opaque-app-ids '("mpv")
     "App-ids whose windows are kept at opacity 1.0.")
-  (defvar +gowl-opaque-titles '("librefall - *")
-    "Title globs whose windows are kept at opacity 1.0.
-For clients with no usable app-id, such as librefall.")
   (defun +gowl--opaque-client-p (info)
     "Return non-nil when client INFO matches an opaque app-id or title."
     (or (member (alist-get 'app-id info) +gowl-opaque-app-ids)
