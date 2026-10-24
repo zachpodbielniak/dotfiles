@@ -35,6 +35,9 @@
 ;;   - Multi-monitor physical layout via `cmacs-gowl-setup-monitors'.
 ;;     A single Emacs frame is kept regardless of monitor count.
 ;;   - On mob-zach only, the PCsensor fishing pedal (see below).
+;;   - Personal gabbrev matches (`cmacs-gowl-gabbrev-define'), after
+;;     `gowl-start' has loaded the module.  A later define replaces
+;;     the same trigger.
 ;;
 ;; The `(when IS-GOWL ...)' block here no-ops on non-gowl Emacs.
 ;; `cmacs-gowl-setup-monitors' is defined unconditionally so it can be
@@ -45,6 +48,17 @@
 (when IS-GOWL
   ;; Initialize gowl Elisp integration (loads bundled modules)
   (gowl-start)
+
+  ;; Personal gabbrev matches.  `gowl-start' has already loaded
+  ;; `cmacs-gowl-gabbrev' and pushed the built-ins; `cmacs-gowl-gabbrev-define'
+  ;; stores the match and schedules one push, and a later define of the same
+  ;; trigger replaces it.  Triggers fire on the last character, so none of
+  ;; these may be a prefix of another.
+  (when (fboundp 'cmacs-gowl-gabbrev-define)
+    (cmacs-gowl-gabbrev-define
+     ";merge"
+     "look to merge it into master here. if there is anything where its not up to our standards, feel free to make any changes that are needed as you merge."
+     :label "Merge into master")))
 
   ;; Per-host monitor rotation: otg-zach and pda-zach have their panels
   ;; physically mounted at 270°, so apply transform 3 to compensate.
