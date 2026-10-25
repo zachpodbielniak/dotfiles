@@ -58,7 +58,7 @@
     (cmacs-gowl-gabbrev-define
      ";merge"
      "look to merge it into master here. if there is anything where its not up to our standards, feel free to make any changes that are needed as you merge."
-     :label "Merge into master")))
+     :label "Merge into master"))
 
   ;; Per-host monitor rotation: otg-zach and pda-zach have their panels
   ;; physically mounted at 270°, so apply transform 3 to compensate.
