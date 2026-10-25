@@ -336,6 +336,7 @@ install-skills:
         https://github.com/Leonxlnx/taste-skill
         https://github.com/petergyang/no-ai-slop
         https://github.com/mvanhorn/last30days-skill
+        https://github.com/typesafe-ai/skills
     )
 
     for skill in "${SKILLS[@]}"
