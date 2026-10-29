@@ -130,9 +130,9 @@ gsurf_config_init(void)
 
 	/* ===== Browser / general ===== */
 	g_free(config->homepage);
-	config->homepage = g_strdup("https://duckduckgo.com");
+	config->homepage = g_strdup("http://127.0.0.1:9000/");
 	g_free(config->new_view_uri);
-	config->new_view_uri = g_strdup("https://duckduckgo.com");
+	config->new_view_uri = g_strdup("http://127.0.0.1:9000/");
 	config->default_zoom = 1.0;
 	config->smooth_scroll = TRUE;
 	config->fullscreen_on_start = FALSE;
