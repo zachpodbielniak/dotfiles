@@ -284,6 +284,8 @@
 ;; Fireplace — animated ASCII fireplace (ambience, not a game).  MELPA.
 (package! fireplace)
 
-;; Tamagotchi — virtual pet, first-elisp-project quality but fun.  GitHub only.
-(package! tamagotchi
-  :recipe (:host github :repo "tiatatida/tamagotchi-on-emacs"))
+;; Tamagotchi — virtual pet, first-elisp-project quality but fun.  Its repo
+;; (tiatatida/tamagotchi-on-emacs) and author account are gone from GitHub,
+;; and a recipe pointing there makes `doom sync' hang on git's username
+;; prompt.  It is public domain (Unlicense), so the last upstream commit
+;; (2549378) is vendored under tamaemacs/ and loaded from +games.el.

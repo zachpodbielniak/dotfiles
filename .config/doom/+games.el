@@ -259,7 +259,11 @@ external binaries are checked first with a friendly error."
 (use-package! speed-type    :defer t)
 (use-package! autotetris-mode :defer t)
 (use-package! fireplace     :defer t)
-(use-package! tamagotchi    :defer t)
+;; tamaemacs is vendored under tamaemacs/ (its GitHub repo is gone, see
+;; packages.el): on `load-path' with the command autoloaded, as straight
+;; would have done.
+(add-to-list 'load-path (expand-file-name "tamaemacs" doom-user-dir))
+(autoload 'tamaemacs "tamaemacs" "Start the Tamagotchi game." t)
 
 ;;; -----------------------------------------------------------------
 ;;; Built-in registrations (18)
@@ -366,14 +370,13 @@ external binaries are checked first with a friendly error."
                 :cmd #'elcity-player-start :source 'recipe :keybind "e"
                 :requires (lambda () (require 'elcity-player)))
 
-;; The tamagotchi-on-emacs repo's main file is `tamaemacs.el', providing
-;; the feature `tamaemacs' (not `tamagotchi') and the command `tamaemacs'.
-;; Our `--launch' fallback requires by command symbol's name, so just
-;; pointing `:cmd' at #'tamaemacs is enough.
+;; tamaemacs.el (vendored under tamaemacs/) provides the feature
+;; `tamaemacs' (not `tamagotchi') and the command `tamaemacs'.
 (games-register :id 'tamagotchi    :name "Tamagotchi"
                 :category "Simulation"
                 :description "Virtual pet — care for it, don't let it die"
-                :cmd #'tamaemacs :source 'recipe)
+                :cmd #'tamaemacs :source 'recipe
+                :requires (lambda () (require 'tamaemacs)))
 
 ;; emacslife — local module living under .config/doom/emacslife/.
 ;; Loaded by `(load! "emacslife/emacslife")' in config.el; the :requires
