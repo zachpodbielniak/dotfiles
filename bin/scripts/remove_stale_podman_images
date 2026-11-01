@@ -1,0 +1,161 @@
+#!/bin/bash
+
+# dotfiles - Personal configuration files and scripts
+# Copyright (C) 2026  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+usage () {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Remove orphaned buildah working-containers, then prune dangling (<none>)
+podman images.
+
+Interrupted builds leave buildah "*-working-container-N" containers behind.
+They are only listed by \`podman ps -a --external\` (status "Storage") and
+they pin every <none> image they were built from, so a plain
+\`podman image prune\` removes nothing. This removes those containers first.
+
+Refuses to run while a buildah or podman build is in progress, since its
+working-container would be removed out from under it (see --force).
+
+Options:
+  -n, --dry-run   List the stale containers and dangling images, change nothing
+  -a, --all       Prune every image not used by a container (podman image
+                  prune -a), not just dangling ones; base images must be
+                  pulled again later
+  -f, --force     Skip the "build in progress" check
+  -h, --help      Show this help
+      --license   Show license information
+
+Examples:
+  $(basename "$0")             # remove stale build containers, prune <none>
+  $(basename "$0") --dry-run   # see what would go
+  $(basename "$0") --all       # also drop unused tagged images
+
+Exit status: 0 on success, 1 on bad usage or a running build, otherwise the
+status of the failed podman command.
+EOF
+}
+
+show_license () {
+	cat <<EOF
+dotfiles - Personal configuration files and scripts
+Copyright (C) 2026  Zach Podbielniak
+License: GNU AGPL version 3 or later <https://www.gnu.org/licenses/agpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+EOF
+}
+
+die () {
+	printf 'Error: %s\n' "$*" >&2
+	exit 1
+}
+
+# Print podman's image storage summary line.
+image_usage () {
+	podman system df | awk 'NR == 2'
+}
+
+dry_run="false"
+prune_all="false"
+force="false"
+
+while [[ $# -gt 0 ]]
+do
+	case "$1" in
+		-h|--help)
+			usage
+			exit 0
+			;;
+		--license)
+			show_license
+			exit 0
+			;;
+		-n|--dry-run)
+			dry_run="true"
+			shift
+			;;
+		-a|--all)
+			prune_all="true"
+			shift
+			;;
+		-f|--force)
+			force="true"
+			shift
+			;;
+		*)
+			die "unknown argument: $1 (see --help)"
+			;;
+	esac
+done
+
+command -v podman >/dev/null 2>&1 || die "podman not found"
+
+# A running build owns a working-container that looks exactly like the
+# stale ones. pgrep without -a keeps command lines (and any secrets in
+# them) out of the output.
+if [[ "${force}" == "false" ]] \
+	&& { pgrep -x buildah >/dev/null || pgrep -f '^podman (image )?build( |$)' >/dev/null; }
+then
+	die "a buildah/podman build is running; wait for it or pass --force"
+fi
+
+# `--filter status=storage` is rejected by podman ("unknown container
+# state"), so pick the Storage-only containers out of the Status column.
+mapfile -t stale_ids < <(
+	podman ps -a --external --format '{{.ID}} {{.Status}}' \
+		| awk '$2 == "Storage" { print $1 }'
+)
+
+printf 'Before: %s\n' "$(image_usage)"
+printf 'Stale build containers: %d\n' "${#stale_ids[@]}"
+
+if [[ "${dry_run}" == "true" ]]
+then
+	if [[ ${#stale_ids[@]} -gt 0 ]]
+	then
+		podman ps -a --external --format '{{.ID}} {{.Names}} {{.Image}} {{.CreatedHuman}}' \
+			| grep -Ff <(printf '%s\n' "${stale_ids[@]}")
+	fi
+	printf 'Dangling images:\n'
+	podman image ls --filter dangling=true --format '{{.ID}} {{.Size}} {{.CreatedSince}}'
+	exit 0
+fi
+
+# podman rm errors on an empty argument list, so only call it when needed.
+if [[ ${#stale_ids[@]} -gt 0 ]]
+then
+	podman rm -f "${stale_ids[@]}" >/dev/null
+fi
+
+if [[ "${prune_all}" == "true" ]]
+then
+	podman image prune -a -f >/dev/null
+else
+	podman image prune -f >/dev/null
+fi
+
+printf 'After:  %s\n' "$(image_usage)"
+
+# Whatever <none> is left is in use by a real container (distrobox, quadlet).
+remaining="$(podman image ls --filter dangling=true -q | wc -l)"
+if [[ "${remaining}" -gt 0 ]]
+then
+	printf '%d dangling image(s) remain, in use by containers\n' "${remaining}"
+fi
