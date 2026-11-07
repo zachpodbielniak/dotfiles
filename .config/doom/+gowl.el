@@ -144,11 +144,13 @@
   ;; applier goes through `gowl-add-rule-full'), and that applier calls
   ;; `gowl-clear-rules' first, so the rule is re-added after every push
   ;; rather than once at load.
-  (defvar +gowl-opaque-titles '("librefall - *" "librewow*" "*libregnum editor")
+  (defvar +gowl-opaque-titles '("librefall - *" "librewow*" "*libregnum editor"
+                                "gsurf" "* — gsurf")
     "Title globs whose windows are kept at opacity 1.0.
-For clients with no usable app-id, such as librefall, librewow and
+For clients with no usable app-id, such as librefall, librewow,
 lrgeditor (the libregnum editor, titled \"[● ]<file>[ - <project>] -
-libregnum editor\").
+libregnum editor\") and gsurf in --lrg=3d mode (raylib, titled
+\"<page> — gsurf\" or just \"gsurf\").
 Matching windows also get no blur, shadow or open/close animation.")
   (defun +gowl--add-opacity-rules (&rest _)
     "Add per-app opacity rules after `cmacs-gowl-float-rules' is pushed."
