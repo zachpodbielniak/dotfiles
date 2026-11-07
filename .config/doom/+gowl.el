@@ -139,19 +139,25 @@
     (add-to-list 'cmacs-gowl-float-rules
                  '(:app-id "steam_app_tsm" :tags 256)))
 
-  ;; mpv stays fully opaque -- the alpha module's 0.9 makes video look
+  ;; mpv and gsurf stay fully opaque -- the alpha module's 0.9 makes video look
   ;; washed out.  `cmacs-gowl-float-rules' cannot carry :opacity (its
   ;; applier goes through `gowl-add-rule-full'), and that applier calls
   ;; `gowl-clear-rules' first, so the rule is re-added after every push
   ;; rather than once at load.
-  (defvar +gowl-opaque-titles '("librefall - *" "librewow*")
+  (defvar +gowl-opaque-titles '("librefall - *" "librewow*" "*libregnum editor")
     "Title globs whose windows are kept at opacity 1.0.
-For clients with no usable app-id, such as librefall and librewow.
+For clients with no usable app-id, such as librefall, librewow and
+lrgeditor (the libregnum editor, titled \"[● ]<file>[ - <project>] -
+libregnum editor\").
 Matching windows also get no blur, shadow or open/close animation.")
   (defun +gowl--add-opacity-rules (&rest _)
     "Add per-app opacity rules after `cmacs-gowl-float-rules' is pushed."
     (when (gowl-running-p)
       (gowl-add-rule-entry '((app-id . "mpv") (opacity . 1.0)))
+      ;; gsurf is a browser: page content should render untouched, so no
+      ;; transparency, blur, shadow or open/close animation.
+      (gowl-add-rule-entry '((app-id . "gsurf") (opacity . 1.0)
+                             (no-blur . t) (no-shadow . t) (no-anim . t)))
       ;; librefall and librewow are games: no transparency, blur, shadow
       ;; or open/close animation.  They map with an empty app-id, so
       ;; match their window titles instead.  librewow titles itself
@@ -167,7 +173,7 @@ Matching windows also get no blur, shadow or open/close animation.")
   ;; focused/unfocused alpha to every client on each focus change (a
   ;; screenshot's region picker is enough), so re-assert it afterwards.
   ;; Deferred one tick so it lands after the alpha module's handler.
-  (defvar +gowl-opaque-app-ids '("mpv")
+  (defvar +gowl-opaque-app-ids '("mpv" "gsurf")
     "App-ids whose windows are kept at opacity 1.0.")
   (defun +gowl--opaque-client-p (info)
     "Return non-nil when client INFO matches an opaque app-id or title."
