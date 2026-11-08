@@ -25,11 +25,18 @@ umu launcher and Proton runner bundled with the Lutris flatpak.
   start               Launch the app detached (default command).
   run                 Launch the app in the foreground.
   stop                Stop the app.
+  restart             Stop and start again; use when the window was closed,
+                      since TSM hides to a tray icon Wine cannot show.
   status              Print whether the app is running.
-  install             Download the current installer, (re)install silently,
-                      then run fix-certs.
-  fix-certs           Seed the prefix's empty Windows CA store; without it the
-                      app's login fails with "unknown error".
+  install             Download the latest Electron installer, verify its
+                      sha512, and (re)install silently. Also how to update.
+  fix-wm              Make the prefix behave under gowl (install runs it):
+                      run in a 1280x1600 Wine virtual desktop so dropdowns
+                      are not grabbed and closed by the compositor, and
+                      hide Wine's invisible fallback systray window, which
+                      covers the TSM window and eats clicks.
+  fix-certs           Seed the prefix's empty Windows CA store; only the
+                      legacy Python app (TSMApplication.exe) needs this.
   paths               Print the prefix, WoW directory, and log locations.
   -h, --help          Show help.
   --license           Show license.
@@ -39,13 +46,26 @@ Battle.net prefix, so the two never run separate wineservers on one prefix.
 In the app, set the WoW directory to the "World of Warcraft" path printed by
 `tsm-app paths` (as Z:\...). The app updates itself while running.
 
+TSM is the Electron app (TradeSkillMaster.exe, 1.0.x). The old Python app
+(TSMApplication.exe, v4.15) is only a migration stub that downloads it.
+Under gowl it runs inside one "Wine Desktop" window (floating, tag 9).
+Closing the TSM window hides it to a tray nobody can see: tsm-app restart.
+
+Wine's powershell.exe stub exits 0 no matter what, so the electron-builder
+installer's "is TSM running?" probe always says yes and refuses to update.
+Every launch disables that stub (WINEDLLOVERRIDES=powershell.exe=d).
+It also turns off Proton's Xalia accessibility layer (PROTON_USE_XALIA=0),
+which drops or misplaces mouse clicks in the TSM window.
+
 Environment overrides: TSM_ROOT, TSM_PROTONPATH, TSM_WOW_DIR.
 
 Examples:
   tsm-app
   tsm-app status
   tsm-app run
-  tsm-app install
+  tsm-app restart          # window closed by accident
+  tsm-app install          # install or update to the latest release
+  tsm-app stop && tsm-app fix-wm
   tsm-app paths
 
 Exit status: 0 on success; nonzero for invalid input or failed operations.
@@ -64,8 +84,9 @@ tsm_root="${TSM_ROOT:-${HOME}/data/games/tsm}"
 tsm_prefix="${tsm_root}/prefix"
 tsm_logs="${tsm_root}/logs"
 tsm_setup="${tsm_root}/TSMSetup.exe"
-tsm_setup_url='https://app-cdn.tradeskillmaster.xyz/legacyDesktopApp/setup.exe'
-tsm_exe="${tsm_prefix}/drive_c/Program Files (x86)/TradeSkillMaster Application/app/TSMApplication.exe"
+tsm_release_url='https://desktop-backend.tradeskillmaster.com/app-updates/release'
+tsm_exe="${tsm_prefix}/drive_c/users/steamuser/AppData/Local/Programs/TradeSkillMaster/TradeSkillMaster.exe"
+tsm_proc_re='(TradeSkillMaster|TSMApplication)\.exe'
 proton_path="${TSM_PROTONPATH:-${lutris_data}/runners/wine/proton-cachyos-x86_64}"
 umu_run="${lutris_data}/runtime/umu/umu-run"
 wow_dir="${TSM_WOW_DIR:-${HOME}/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/compatdata/2555556235/pfx/drive_c/Program Files (x86)/World of Warcraft}"
@@ -81,6 +102,8 @@ umu () {
 		--env=PROTONPATH="${proton_path}" \
 		--env=GAMEID=umu-tsm \
 		--env=STORE=none \
+		--env=WINEDLLOVERRIDES='powershell.exe=d' \
+		--env=PROTON_USE_XALIA=0 \
 		--command="${umu_run}" \
 		"${lutris_app}" "$@"
 }
@@ -109,13 +132,62 @@ fix_certs () {
 	umu regedit /S "Z:${reg//\//\\}" >>"${tsm_logs}/regedit.log" 2>&1 || fail "regedit failed; see ${tsm_logs}/regedit.log"
 }
 
+# Prefix settings for running under gowl:
+#  - Virtual desktop: Electron's <select> dropdowns are separate popup
+#    windows; gowl floats, resizes, and centres them, the app loses focus,
+#    and the dropdown closes at once. Inside one Wine desktop window the
+#    compositor never sees the popups.
+#  - No fallback systray: with no XEmbed tray to dock into, explorer.exe
+#    maps an untitled, invisible systray window that gowl floats over the
+#    TSM window, where it swallows clicks.
+fix_wm () {
+	local reg="${tsm_root}/fix_wm.reg"
+
+	{
+		printf 'Windows Registry Editor Version 5.00\r\n\r\n'
+		printf '[HKEY_CURRENT_USER\\Software\\Wine\\Explorer]\r\n"Desktop"="Default"\r\n\r\n'
+		printf '[HKEY_CURRENT_USER\\Software\\Wine\\Explorer\\Desktops]\r\n"Default"="1280x1600"\r\n\r\n'
+		printf '[HKEY_CURRENT_USER\\Software\\Wine\\Explorer]\r\n"ShowSystray"=dword:00000000\r\n\r\n'
+		printf '[HKEY_CURRENT_USER\\Software\\Wine\\Explorer\\Desktops\\Default]\r\n"ShowSystray"=dword:00000000\r\n'
+	} > "${reg}"
+	umu regedit /S "Z:${reg//\//\\}" >>"${tsm_logs}/regedit.log" 2>&1 || fail "regedit failed; see ${tsm_logs}/regedit.log"
+}
+
 # Print a 32-bit value as little-endian hex.
 le32 () {
 	printf '%08x' "${1}" | sed -E 's/(..)(..)(..)(..)/\4\3\2\1/'
 }
 
 is_running () {
-	pgrep -f 'TSMApplication\.exe' >/dev/null
+	pgrep -f -- "${tsm_proc_re}" >/dev/null
+}
+
+# Kill the app and wait up to 15s for every process to exit.
+stop_app () {
+	local i
+
+	pkill -f -- "${tsm_proc_re}" || true
+	for (( i = 0; i < 30; i++ ))
+	do
+		is_running || return 0
+		sleep 0.5
+	done
+	pkill -KILL -f -- "${tsm_proc_re}" || true
+}
+
+# Download the latest Electron installer named by latest.yml and check it
+# against the published sha512 (base64) before running it.
+fetch_setup () {
+	local meta name want have
+
+	meta="$(curl -fsSL "${tsm_release_url}/latest.yml")" || fail "Download failed: ${tsm_release_url}/latest.yml"
+	name="$(yq -r '.path' <<<"${meta}")"
+	want="$(yq -r '.sha512' <<<"${meta}")"
+	[[ -n "${name}" && "${name}" != null ]] || fail 'latest.yml has no installer path'
+	curl -fsSL -o "${tsm_setup}" "${tsm_release_url}/${name// /%20}" || fail "Download failed: ${name}"
+	have="$(openssl dgst -sha512 -binary "${tsm_setup}" | base64 -w0)"
+	[[ "${have}" == "${want}" ]] || fail "sha512 mismatch for ${name}"
+	printf 'tsm-app: fetched %s\n' "${name}"
 }
 
 # Warn when the sandbox cannot write the WoW folder; the app would silently
@@ -132,7 +204,7 @@ case "${1:-start}" in
 	-h|--help) usage; exit 0 ;;
 	--license) printf '%s\n' 'AGPL-3.0-or-later: https://www.gnu.org/licenses/agpl-3.0.html'; exit 0 ;;
 	start)
-		is_running && { printf 'tsm-app: already running\n'; exit 0; }
+		is_running && { printf 'tsm-app: already running (window hidden? closing it hides TSM to the tray; use: tsm-app restart)\n'; exit 0; }
 		[[ -f "${tsm_exe}" ]] || fail 'App is not installed; run: tsm-app install'
 		check_override
 		umu "${tsm_exe}" >"${tsm_logs}/app.log" 2>&1 &
@@ -146,8 +218,14 @@ case "${1:-start}" in
 		;;
 	stop)
 		is_running || { printf 'tsm-app: not running\n'; exit 0; }
-		pkill -f 'TSMApplication\.exe'
+		stop_app
 		printf 'tsm-app: stopped\n'
+		;;
+	restart)
+		# Closing the window hides TSM to a tray icon Wine cannot show here,
+		# so a restart is the only way to get the window back.
+		is_running && stop_app
+		exec "${0}" start
 		;;
 	status)
 		if is_running; then printf 'running\n'; else printf 'stopped\n'; exit 3; fi
@@ -155,13 +233,18 @@ case "${1:-start}" in
 	install)
 		is_running && fail 'Stop the app first: tsm-app stop'
 		mkdir -p -- "${tsm_root}"
-		curl -fsSL -o "${tsm_setup}" "${tsm_setup_url}" || fail "Download failed: ${tsm_setup_url}"
-		# Inno Setup installer; these flags skip every dialog.
-		umu "${tsm_setup}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- >"${tsm_logs}/install.log" 2>&1 \
+		fetch_setup
+		# electron-builder NSIS installer; /S is a silent per-user install.
+		umu "${tsm_setup}" /S >"${tsm_logs}/install.log" 2>&1 \
 			|| fail "Installer failed; see ${tsm_logs}/install.log"
 		[[ -f "${tsm_exe}" ]] || fail "Installer exited cleanly but ${tsm_exe} is missing"
-		fix_certs
+		fix_wm
 		printf 'tsm-app: installed %s\n' "${tsm_exe}"
+		;;
+	fix-wm)
+		is_running && fail 'Stop the app first: tsm-app stop'
+		fix_wm
+		printf 'tsm-app: applied the virtual desktop and systray settings\n'
 		;;
 	fix-certs)
 		is_running && fail 'Stop the app first: tsm-app stop'
