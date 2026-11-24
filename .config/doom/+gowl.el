@@ -60,9 +60,9 @@
      "look to merge it into master here. if there is anything where its not up to our standards, feel free to make any changes that are needed as you merge."
      :label "Merge into master"))
 
-  ;; Per-host monitor rotation: otg-zach and pda-zach have their panels
+  ;; Per-host monitor rotation: otg-zach, pda-zach and nb-zach have their panels
   ;; physically mounted at 270°, so apply transform 3 to compensate.
-  (when (member (system-name) '("otg-zach" "pda-zach"))
+  (when (member (system-name) '("otg-zach" "pda-zach" "nb-zach"))
     (gowl-set-monitor-transform 3))
 
   ;; WoW fishing pedal.  PCsensor FootSwitch (3553:b001) shows up as its
