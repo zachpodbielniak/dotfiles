@@ -323,6 +323,46 @@ PERL_MB_OPT="--install_base \"${HOME}/perl5\""; export PERL_MB_OPT;
 PERL_MM_OPT="INSTALL_BASE=${HOME}/perl5"; export PERL_MM_OPT;
 
 
+# Reset mouse and focus reporting at every prompt.
+#
+# A full-screen program (tmux, vim, htop) turns on mouse reporting (DECSET
+# 1000/1002/1003, encodings 1005/1006/1015) and focus events (1004), and
+# turns them off again when it exits cleanly.  If it never gets the chance --
+# the classic case is an ssh session to a host running tmux that dies across
+# `systemctl suspend' -- the modes stay on in whatever owns this tty.  Under
+# a local tmux that is the pane, so tmux keeps forwarding mouse events into
+# it and readline prints them as `^[[<35;12;7M' garbage.  This is not a
+# terminal (gst) bug; the terminal is doing what the pane asked for.
+#
+# A prompt being drawn means no program owns the mouse, so switching these
+# off here is always correct, and costs one printf per prompt.  Interactive
+# shells only, and skipped under TERM=dumb (Emacs M-x shell, comint), which
+# would show the raw sequences.
+#
+# This must run before starship init below, so it lands ahead of
+# starship_precmd (PROMPT_COMMAND[0] ends up "__reset_mouse_modes;
+# starship_precmd"; systemd's own hook in [1] is left alone).  The hook
+# returns the status it was given, so starship still sees the real $? and
+# never printf's 0.  Some starship versions move an existing PROMPT_COMMAND
+# into STARSHIP_PROMPT_COMMAND instead; that works the same way.
+if [[ $- == *i* && "${TERM:-dumb}" != "dumb" ]]
+then
+    __reset_mouse_modes () {
+        local last_status="${?}"
+
+        printf '\e[?1000l\e[?1002l\e[?1003l\e[?1004l\e[?1005l\e[?1006l\e[?1015l'
+        return "${last_status}"
+    }
+
+    # Re-sourcing this file must not add it twice.  Check both places
+    # starship may have left it.
+    if [[ "${PROMPT_COMMAND:-}${STARSHIP_PROMPT_COMMAND:-}" != *"__reset_mouse_modes"* ]]
+    then
+        PROMPT_COMMAND="__reset_mouse_modes${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
+    fi
+fi
+
+
 # Starship
 # Use system starship instead of the custom binary to avoid PS0 issues.
 #
